@@ -93,7 +93,9 @@ pub async fn h_group_get(
         .with_db(|db| db.group_get(id))
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::from(anyhow::anyhow!("Group not found")))?;
-    Ok(Json(serde_json::to_value(group).unwrap()))
+    Ok(Json(serde_json::to_value(group).map_err(|e| {
+        ApiError::from(anyhow::anyhow!("Serialisation error: {e}"))
+    })?))
 }
 
 /// GET /api/groups/{id}/status
@@ -299,8 +301,11 @@ pub async fn h_header_mark_read(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut count = 0u64;
     for id in &input.header_ids {
-        let _ = state.queue_manager.with_db(|db| db.header_mark_read(*id));
-        count += 1;
+        if let Err(e) = state.queue_manager.with_db(|db| db.header_mark_read(*id)) {
+            tracing::warn!(header_id = id, error = %e, "Failed to mark header as read");
+        } else {
+            count += 1;
+        }
     }
     Ok(Json(serde_json::json!({ "marked": count })))
 }
@@ -390,7 +395,9 @@ pub async fn h_header_download(
             let esc = |s: &str| {
                 s.replace('&', "&amp;")
                     .replace('<', "&lt;")
+                    .replace('>', "&gt;")
                     .replace('"', "&quot;")
+                    .replace('\'', "&apos;")
             };
             nzb.push_str(&format!(
                 "  <file poster=\"{}\" date=\"0\" subject=\"{}\">\n    <groups><group>{}</group></groups>\n    <segments>\n      <segment bytes=\"{}\" number=\"1\">{}</segment>\n    </segments>\n  </file>\n",

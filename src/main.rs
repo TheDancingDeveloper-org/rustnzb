@@ -240,11 +240,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("rustnzb v{}", env!("CARGO_PKG_VERSION"));
 
-    // If OTEL metrics enabled, spawn a metrics reporter
-    if config.otel.enabled && _otel_meter_provider.is_some() {
-        // We'll spawn the reporter after initialization when we have the queue_manager
-    }
-
     // Initialize the engine (config, DB, queue manager, background services)
     let result = nzb_web::startup::initialize(
         StartupConfig {

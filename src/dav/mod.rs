@@ -20,6 +20,9 @@ use uuid::Uuid;
 
 pub struct DavHandle {
     pub store: Arc<DatabaseStore>,
+    /// Persistent connection reused by enqueue_nzb / pipeline_status; the queue
+    /// loop uses its own connections to avoid blocking the main runtime.
+    db: Arc<SqliteDavDatabase>,
     db_path: String,
     cancel: CancellationToken,
     _thread: std::thread::JoinHandle<()>,
@@ -35,6 +38,10 @@ impl DavHandle {
         let dav_db: Arc<SqliteDavDatabase> =
             Arc::new(SqliteDavDatabase::new(Arc::new(Mutex::new(conn))));
         nzbdav_core::seed::seed_root_items(&*dav_db).await?;
+
+        // Retain a reference for enqueue_nzb / pipeline_status before passing
+        // ownership into DatabaseStore.
+        let db_for_handle = Arc::clone(&dav_db);
 
         // Build NNTP pools from rustnzbd's server configs (same nzb-nntp types).
         let pools: Vec<Arc<ConnectionPool>> = servers
@@ -75,6 +82,7 @@ impl DavHandle {
         info!("WebDAV media library initialised (db: {db_path})");
         Ok(Self {
             store,
+            db: db_for_handle,
             db_path,
             cancel,
             _thread: thread,
@@ -89,7 +97,7 @@ impl DavHandle {
         job_name: &str,
         nzb_data: &[u8],
     ) -> anyhow::Result<Uuid> {
-        let db = open_db(&self.db_path)?;
+        let db = &*self.db;
         let item_id = Uuid::new_v4();
         let item = QueueItem {
             id: item_id,
@@ -105,13 +113,14 @@ impl DavHandle {
         };
         db.put_nzb_blob(item_id, nzb_data).await?;
         db.insert_queue_item(&item).await?;
+
         info!(job_name, "queued for DAV pipeline");
         Ok(item_id)
     }
 
     /// Return the current state of the DAV pipeline: queued items + history.
     pub async fn pipeline_status(&self) -> anyhow::Result<DavPipelineStatus> {
-        let db = open_db(&self.db_path)?;
+        let db = &*self.db;
         let queue = db.list_queue_items().await?;
         let history = db.list_history_items(0, 200).await?;
         Ok(DavPipelineStatus { queue, history })
