@@ -9,7 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         ca-certificates \
         git \
-        xz-utils && \
+        xz-utils \
+        make \
+        perl && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
@@ -62,7 +64,7 @@ RUN RUST_TARGET=$(cat /tmp/rust_target) && \
              CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
              CARGO_PROFILE_RELEASE_STRIP=symbols; \
     fi && \
-    cargo zigbuild --release --features webdav --target "$RUST_TARGET" && \
+    cargo zigbuild --release --features webdav,vendored-openssl --target "$RUST_TARGET" && \
     cp "target/$RUST_TARGET/release/rustnzb" /build/rustnzb-out
 
 

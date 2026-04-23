@@ -160,13 +160,13 @@ steps:
     commands:
       - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
       - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu protobuf-compiler
+      - apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu protobuf-compiler make perl
       - rustup target add aarch64-unknown-linux-gnu
       - export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
       - export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
       - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
       - if [ -n "$CI_COMMIT_TAG" ]; then export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols; fi
-      - cargo build --release --target aarch64-unknown-linux-gnu
+      - cargo build --release --target aarch64-unknown-linux-gnu --features vendored-openssl
       - ls -lh target/aarch64-unknown-linux-gnu/release/rustnzb
       - |
         if [ -n "$CI_COMMIT_TAG" ]; then
