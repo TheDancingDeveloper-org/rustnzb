@@ -35,6 +35,13 @@ interface DavConfig {
   category_rules: string[];
 }
 
+interface GeneralDirs {
+  data_dir: string;
+  incomplete_dir: string;
+  complete_dir: string;
+  watch_dir: string | null;
+}
+
 function emptyServer(): ServerConfig {
   return {
     id: '', name: '', host: '', port: 563, ssl: true, ssl_verify: true,
@@ -378,13 +385,42 @@ function emptyCategory(): CategoryConfig {
 
           <div class="panel">
             <h3>Directories</h3>
-            <div class="body" style="font-size:13px;line-height:1.8">
-              <div><b>Data dir</b> — SQLite, queue state, job blobs · set via <code>RUSTNZB_DATA_DIR</code> or <code>--data-dir</code></div>
-              <div><b>Downloads</b> — <code>/downloads/complete</code> (configured per category)</div>
-              <div><b>Incomplete</b> — <code>/downloads/incomplete</code></div>
-              <div><b>Watch dir</b> — <code>/downloads/watch</code> · <code>.nzb</code> drops auto-enqueue</div>
-              <div><b>Temp</b> — <code>&lt;data&gt;/tmp</code></div>
-              <div><b>Logs</b> — <code>&lt;data&gt;/logs</code></div>
+            <div class="body dir-table">
+              <div class="dir-row">
+                <span class="dir-label">Data dir</span>
+                <code class="dir-val">{{ dirs()?.data_dir ?? '…' }}</code>
+                <span class="dir-hint">SQLite, queue state, job blobs · set via <code>RUSTNZB_DATA_DIR</code> or <code>--data-dir</code></span>
+              </div>
+              <div class="dir-row">
+                <span class="dir-label">Downloads</span>
+                <code class="dir-val">{{ dirs()?.complete_dir ?? '…' }}</code>
+                <span class="dir-hint">configured per category</span>
+              </div>
+              <div class="dir-row">
+                <span class="dir-label">Incomplete</span>
+                <code class="dir-val">{{ dirs()?.incomplete_dir ?? '…' }}</code>
+                <span class="dir-hint">in-progress download working area</span>
+              </div>
+              <div class="dir-row">
+                <span class="dir-label">Watch dir</span>
+                @if (dirs()?.watch_dir) {
+                  <code class="dir-val">{{ dirs()!.watch_dir }}</code>
+                  <span class="dir-hint"><code>.nzb</code> drops auto-enqueue</span>
+                } @else {
+                  <span class="dir-val dim">— not configured</span>
+                  <span class="dir-hint">set <code>watch_dir</code> in config to enable</span>
+                }
+              </div>
+              <div class="dir-row">
+                <span class="dir-label">Temp</span>
+                <code class="dir-val">{{ dirs() ? dirs()!.data_dir + '/tmp' : '…' }}</code>
+                <span class="dir-hint">transient working files</span>
+              </div>
+              <div class="dir-row">
+                <span class="dir-label">Logs</span>
+                <code class="dir-val">{{ dirs() ? dirs()!.data_dir + '/logs' : '…' }}</code>
+                <span class="dir-hint">per-job log files</span>
+              </div>
             </div>
           </div>
 
@@ -676,6 +712,13 @@ function emptyCategory(): CategoryConfig {
 
     .dav-cats { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
     .dim { color: var(--mute); font-size: 12px; }
+
+    .dir-table { display: flex; flex-direction: column; gap: 0; font-size: 13px; }
+    .dir-row { display: grid; grid-template-columns: 100px 1fr; gap: 8px 12px; align-items: baseline; padding: 7px 0; border-bottom: 1px solid var(--line); }
+    .dir-row:last-child { border: none; }
+    .dir-label { font-weight: 600; white-space: nowrap; }
+    .dir-val { grid-column: 2; font-size: 12px; }
+    .dir-hint { grid-column: 2; color: var(--mute); font-size: 11px; margin-top: -2px; }
   `],
 })
 export class SettingsViewComponent implements OnInit {
@@ -711,6 +754,9 @@ export class SettingsViewComponent implements OnInit {
   // DAV config
   davConfig: DavConfig = { auto_send_all: false, category_rules: [] };
 
+  // Directory paths (from /api/config)
+  dirs = signal<GeneralDirs | null>(null);
+
   constructor(private api: ApiService, private snack: MatSnackBar) {}
 
   ngOnInit(): void {
@@ -718,6 +764,7 @@ export class SettingsViewComponent implements OnInit {
     this.loadCategories();
     this.loadGeneralSettings();
     this.loadStatus();
+    this.loadDirs();
   }
 
   loadStatus(): void {
@@ -726,6 +773,13 @@ export class SettingsViewComponent implements OnInit {
         this.status.set(s);
         if (s.webdav_enabled) this.loadDavConfig();
       },
+      error: () => {},
+    });
+  }
+
+  loadDirs(): void {
+    this.api.get<{ general: GeneralDirs }>('/config').subscribe({
+      next: cfg => this.dirs.set(cfg.general),
       error: () => {},
     });
   }
