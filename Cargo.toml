@@ -4,7 +4,7 @@ members = []
 exclude = ["benchnzb", "desktop"]
 
 [workspace.package]
-version = "1.2.2"
+version = "1.2.3"
 edition = "2024"
 license = "MIT"
 
@@ -76,7 +76,7 @@ unicode-normalization = "0.1"
 # Shared NZB crates ([patch] sections redirect to local for dev)
 nzb-web = { version = "0.4.14", features = ["groups-db"] }
 nzb-nntp = { version = "0.2.17" }
-nzb-core = { version = "0.2.11", features = ["groups-db"] }
+nzb-core = { version = "0.2.12", features = ["groups-db"] }
 nzb-decode = { version = "0.1.2" }
 nzb-postproc = { version = "0.2.5" }
 rust-par2 = { version = "0.1.2" }

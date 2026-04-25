@@ -346,8 +346,29 @@ async fn main() -> anyhow::Result<()> {
         let router = {
             let mut r = rustnzb::server::build_router(result.state.clone());
             if let Some(ref dav) = dav_handle {
-                r = r.nest("/dav", nzbdav_dav::dav_router(Arc::clone(&dav.store)));
-                info!("WebDAV media library mounted at /dav");
+                let auth_state = result.state.clone();
+                let dav_auth = axum::middleware::from_fn(
+                    move |headers: axum::http::HeaderMap,
+                          req: axum::extract::Request,
+                          next: axum::middleware::Next| {
+                        let st = auth_state.clone();
+                        async move { rustnzb::dav::auth::dav_auth(st, headers, req, next).await }
+                    },
+                );
+                let dav_router = nzbdav_dav::dav_router(Arc::clone(&dav.store)).layer(dav_auth);
+                r = r.nest("/dav", dav_router);
+                let cfg = result.state.config();
+                if cfg.dav.username.is_none()
+                    && cfg.dav.password.is_none()
+                    && cfg.dav.api_key.is_none()
+                {
+                    tracing::warn!(
+                        "WebDAV media library mounted at /dav (UNAUTHENTICATED — \
+                         set dav.username/password or dav.api_key in config)"
+                    );
+                } else {
+                    info!("WebDAV media library mounted at /dav (auth enabled)");
+                }
             }
             // Always layer Option<Arc<DavHandle>> so h_status and h_dav_add can extract it.
             r.layer(Extension(dav_handle))

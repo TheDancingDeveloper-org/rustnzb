@@ -1,3 +1,5 @@
+pub mod auth;
+
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;

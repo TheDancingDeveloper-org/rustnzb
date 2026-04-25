@@ -1,0 +1,61 @@
+#
+# Local-only Docker build for rustnzb.
+# Uses the parent dir as build context so the libs/ path deps resolve,
+# picking up uncommitted/unpublished changes to nzb-* crates.
+#
+# Build:
+#   cd ~/Working/Active/apps
+#   docker build -f rustnzbd/Dockerfile.local \
+#       --build-arg GIT_AUTH_TOKEN="$TOKEN" \
+#       -t rustnzb:local .
+#
+FROM rust:1.88-alpine3.21 AS builder
+
+RUN apk add --no-cache musl-dev build-base protoc openssl-dev openssl-libs-static curl nodejs npm git
+
+WORKDIR /build
+
+# Copy libs (path deps referenced by rustnzbd/Cargo.toml [patch] section)
+COPY libs /build/libs
+
+# Frontend deps (cached layer)
+COPY rustnzbd/frontend/package.json rustnzbd/frontend/package-lock.json /build/rustnzbd/frontend/
+RUN cd /build/rustnzbd/frontend && npm ci
+
+# Frontend build
+COPY rustnzbd/frontend /build/rustnzbd/frontend
+RUN cd /build/rustnzbd/frontend && npx ng build --configuration=production
+
+# Rust source
+COPY rustnzbd/Cargo.toml rustnzbd/Cargo.lock rustnzbd/build.rs /build/rustnzbd/
+COPY rustnzbd/src /build/rustnzbd/src
+COPY rustnzbd/tests /build/rustnzbd/tests
+
+# Forgejo creds (still needed for private nzbdav-* crates — webdav feature)
+ARG GIT_AUTH_TOKEN
+RUN TOKEN="${GIT_AUTH_TOKEN}" && \
+    git config --global url."http://x-access-token:${TOKEN}@100.92.54.45:3002/".insteadOf "http://100.92.54.45:3002/" && \
+    printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n\n[registry]\ndefault = "forgejo"\n' > $CARGO_HOME/config.toml && \
+    printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$TOKEN" > $CARGO_HOME/credentials.toml
+
+# KEY DIFFERENCE vs Dockerfile: do NOT strip [patch] sections — we want the
+# libs/ path overrides to take effect so local uncommitted changes are built in.
+
+WORKDIR /build/rustnzbd
+RUN cargo build --release --features webdav
+
+
+FROM lscr.io/linuxserver/baseimage-alpine:3.21
+
+RUN apk add --no-cache \
+        ca-certificates \
+        curl \
+        7zip
+
+COPY --from=builder /build/rustnzbd/target/release/rustnzb /usr/local/bin/rustnzb
+
+COPY rustnzbd/root/ /
+
+EXPOSE 9090
+
+VOLUME ["/config", "/data", "/downloads"]
