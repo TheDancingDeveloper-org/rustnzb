@@ -160,7 +160,8 @@ steps:
     commands:
       - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
       - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu protobuf-compiler make perl
+      - rm -rf /var/lib/apt/lists/* && apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu protobuf-compiler make perl
+      - which aarch64-linux-gnu-gcc
       - rustup target add aarch64-unknown-linux-gnu
       - export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
       - export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
