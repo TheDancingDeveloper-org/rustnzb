@@ -198,6 +198,7 @@ steps:
       - apt-get update && apt-get install -y --no-install-recommends clang llvm lld
       - cargo install cargo-xwin@0.18.6 --index https://github.com/rust-lang/crates.io-index
       - rustup target add x86_64-pc-windows-msvc
+      - rm -rf ~/.cache/cargo-xwin
       - if [ -n "$CI_COMMIT_TAG" ]; then export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols; fi
       - cargo xwin build --release --target x86_64-pc-windows-msvc
       - ls -lh target/x86_64-pc-windows-msvc/release/rustnzb.exe
