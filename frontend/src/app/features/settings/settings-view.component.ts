@@ -695,7 +695,7 @@ function emptyCategory(): CategoryConfig {
           <div class="panel">
             <div class="body">
               <div class="form">
-                <label>Version</label><div>1.2.3</div>
+                <label>Version</label><div>1.2.4</div>
                 <label>Rust edition</label><div>2024</div>
                 <label>Web framework</label><div>Axum 0.8 + Tower</div>
                 <label>TLS</label><div>rustls 0.23 (ring)</div>

@@ -4,7 +4,7 @@ members = []
 exclude = ["benchnzb", "desktop"]
 
 [workspace.package]
-version = "1.2.3"
+version = "1.2.4"
 edition = "2024"
 license = "MIT"
 
@@ -74,12 +74,12 @@ feed-rs = "2"
 unicode-normalization = "0.1"
 
 # Shared NZB crates
-nzb-web = { version = "0.4.15", features = ["groups-db"] }
-nzb-nntp = { version = "0.2.17" }
-nzb-core = { version = "0.2.12", features = ["groups-db"] }
+nzb-web = { version = "0.4.16", features = ["groups-db"] }
+nzb-nntp = { version = "0.2.19" }
+nzb-core = { version = "0.2.14", features = ["groups-db"] }
 nzb-decode = { version = "0.1.2" }
-nzb-postproc = { version = "0.2.5" }
-rust-par2 = { version = "0.1.2" }
+nzb-postproc = { version = "0.2.6" }
+rust-par2 = { version = "0.1.3" }
 yenc-simd = { version = "0.1.1" }
 
 [package]
