@@ -1,5 +1,5 @@
 use std::io::{Cursor, Read as _};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Json;
@@ -20,12 +20,21 @@ static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::
         .expect("Failed to build shared HTTP client")
 });
 
+const MAX_NZB_DECOMPRESSED_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_FETCH_BODY_BYTES: usize = 100 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // SSRF guard
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
+struct FetchUrlPlan {
+    url: reqwest::Url,
+    resolved_addrs: Option<(String, Vec<SocketAddr>)>,
+}
+
 /// Returns `Err` if `raw_url` is not http/https or resolves to a private/reserved address.
-async fn validate_fetch_url(raw_url: &str) -> Result<(), ApiError> {
+async fn validate_fetch_url(raw_url: &str) -> Result<FetchUrlPlan, ApiError> {
     let url = reqwest::Url::parse(raw_url)
         .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid URL: {e}")))?;
 
@@ -40,7 +49,8 @@ async fn validate_fetch_url(raw_url: &str) -> Result<(), ApiError> {
 
     let host = url
         .host_str()
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("URL has no host")))?;
+        .ok_or_else(|| ApiError::from(anyhow::anyhow!("URL has no host")))?
+        .to_string();
 
     // IP literal: validate directly without a DNS round-trip.
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -49,16 +59,26 @@ async fn validate_fetch_url(raw_url: &str) -> Result<(), ApiError> {
                 "URL targets a private/reserved address"
             )));
         }
-        return Ok(());
+        return Ok(FetchUrlPlan {
+            url,
+            resolved_addrs: None,
+        });
     }
 
     // Hostname: resolve and check every returned address.
     let port = url.port_or_known_default().unwrap_or(80);
-    let addrs = tokio::net::lookup_host(format!("{host}:{port}"))
+    let addrs: Vec<_> = tokio::net::lookup_host(format!("{host}:{port}"))
         .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!("DNS resolution failed for '{host}': {e}")))?;
+        .map_err(|e| ApiError::from(anyhow::anyhow!("DNS resolution failed for '{host}': {e}")))?
+        .collect();
 
-    for addr in addrs {
+    if addrs.is_empty() {
+        return Err(ApiError::from(anyhow::anyhow!(
+            "DNS resolution returned no addresses for '{host}'"
+        )));
+    }
+
+    for addr in &addrs {
         if !is_globally_routable(addr.ip()) {
             return Err(ApiError::from(anyhow::anyhow!(
                 "URL resolves to a private/reserved address"
@@ -66,7 +86,41 @@ async fn validate_fetch_url(raw_url: &str) -> Result<(), ApiError> {
         }
     }
 
-    Ok(())
+    Ok(FetchUrlPlan {
+        url,
+        resolved_addrs: Some((host, addrs)),
+    })
+}
+
+fn build_fetch_client(plan: &FetchUrlPlan) -> Result<reqwest::Client, ApiError> {
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+    if let Some((host, addrs)) = &plan.resolved_addrs {
+        builder = builder.resolve_to_addrs(host, addrs.as_slice());
+    }
+    builder
+        .build()
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to build fetch client: {e}")))
+}
+
+async fn read_response_bytes_limited(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ApiError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to read response: {e}")))?
+    {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(ApiError::from(anyhow::anyhow!(
+                "Fetched body exceeds the {} MB limit",
+                max_bytes / 1024 / 1024
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn is_globally_routable(ip: IpAddr) -> bool {
@@ -287,18 +341,17 @@ fn extract_nzbs(file_name: &str, data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, 
 
     // .nzb.gz or .gz containing an nzb
     if lower.ends_with(".gz") {
-        const MAX_DECOMPRESSED: u64 = 100 * 1024 * 1024; // 100 MB
         let mut decoder = GzDecoder::new(data);
         let mut decompressed = Vec::new();
         decoder
             .by_ref()
-            .take(MAX_DECOMPRESSED + 1)
+            .take(MAX_NZB_DECOMPRESSED_BYTES + 1)
             .read_to_end(&mut decompressed)
             .map_err(|e| anyhow::anyhow!("Failed to decompress gzip: {e}"))?;
-        if decompressed.len() as u64 > MAX_DECOMPRESSED {
+        if decompressed.len() as u64 > MAX_NZB_DECOMPRESSED_BYTES {
             anyhow::bail!(
                 "Decompressed NZB exceeds the {} MB limit",
-                MAX_DECOMPRESSED / 1024 / 1024
+                MAX_NZB_DECOMPRESSED_BYTES / 1024 / 1024
             );
         }
         let inner_name = file_name
@@ -314,16 +367,35 @@ fn extract_nzbs(file_name: &str, data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, 
         let mut archive = zip::ZipArchive::new(cursor)
             .map_err(|e| anyhow::anyhow!("Failed to read zip archive: {e}"))?;
         let mut nzbs = Vec::new();
+        let mut total_uncompressed = 0u64;
         for i in 0..archive.len() {
             let mut entry = archive
                 .by_index(i)
                 .map_err(|e| anyhow::anyhow!("Zip entry error: {e}"))?;
             let entry_name = entry.name().to_string();
             if entry_name.to_lowercase().ends_with(".nzb") {
+                total_uncompressed = total_uncompressed
+                    .checked_add(entry.size())
+                    .ok_or_else(|| anyhow::anyhow!("Zip archive size overflow"))?;
+                if total_uncompressed > MAX_NZB_DECOMPRESSED_BYTES {
+                    anyhow::bail!(
+                        "Decompressed NZB exceeds the {} MB limit",
+                        MAX_NZB_DECOMPRESSED_BYTES / 1024 / 1024
+                    );
+                }
+
                 let mut buf = Vec::new();
                 entry
+                    .by_ref()
+                    .take(MAX_NZB_DECOMPRESSED_BYTES + 1)
                     .read_to_end(&mut buf)
                     .map_err(|e| anyhow::anyhow!("Failed to read zip entry '{entry_name}': {e}"))?;
+                if buf.len() as u64 > MAX_NZB_DECOMPRESSED_BYTES {
+                    anyhow::bail!(
+                        "Decompressed NZB exceeds the {} MB limit",
+                        MAX_NZB_DECOMPRESSED_BYTES / 1024 / 1024
+                    );
+                }
                 nzbs.push((entry_name, buf));
             }
         }
@@ -467,11 +539,17 @@ pub async fn h_queue_add_url(
         return Err(ApiError::from(anyhow::anyhow!("No URL provided")));
     }
 
-    validate_fetch_url(&body.url).await?;
+    let fetch_plan = validate_fetch_url(&body.url).await?;
     tracing::info!(url = %body.url, "Fetching NZB from URL");
 
-    let response = HTTP_CLIENT
-        .get(&body.url)
+    let client = fetch_plan
+        .resolved_addrs
+        .as_ref()
+        .map(|_| build_fetch_client(&fetch_plan))
+        .transpose()?
+        .unwrap_or_else(|| HTTP_CLIENT.clone());
+    let response = client
+        .get(fetch_plan.url.clone())
         .send()
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to fetch URL: {e}")))?;
@@ -483,10 +561,7 @@ pub async fn h_queue_add_url(
         )));
     }
 
-    let data = response
-        .bytes()
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to read response: {e}")))?;
+    let data = read_response_bytes_limited(response, MAX_FETCH_BODY_BYTES).await?;
 
     // Derive file name from URL path for archive extraction and job naming.
     let file_name = body
@@ -1237,9 +1312,15 @@ pub async fn h_rss_item_download(
         .ok_or_else(|| ApiError::from(anyhow::anyhow!("No download URL for this item")))?;
 
     // Fetch the NZB
-    validate_fetch_url(url).await?;
-    let response = HTTP_CLIENT
-        .get(url)
+    let fetch_plan = validate_fetch_url(url).await?;
+    let client = fetch_plan
+        .resolved_addrs
+        .as_ref()
+        .map(|_| build_fetch_client(&fetch_plan))
+        .transpose()?
+        .unwrap_or_else(|| HTTP_CLIENT.clone());
+    let response = client
+        .get(fetch_plan.url.clone())
         .send()
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to fetch NZB: {e}")))?;
@@ -1251,10 +1332,7 @@ pub async fn h_rss_item_download(
         )));
     }
 
-    let data = response
-        .bytes()
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to read response: {e}")))?;
+    let data = read_response_bytes_limited(response, MAX_FETCH_BODY_BYTES).await?;
 
     let mut job = nzb_parser::parse_nzb(&item.title, &data)
         .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to parse NZB: {e}")))?;
@@ -1747,7 +1825,13 @@ pub async fn h_import_sabnzbd_api(
 ) -> Result<impl IntoResponse, ApiError> {
     let base_url = req.url.trim_end_matches('/');
 
-    validate_fetch_url(base_url).await?;
+    let fetch_plan = validate_fetch_url(base_url).await?;
+    let client = fetch_plan
+        .resolved_addrs
+        .as_ref()
+        .map(|_| build_fetch_client(&fetch_plan))
+        .transpose()?
+        .unwrap_or_else(|| HTTP_CLIENT.clone());
 
     // SABnzbd exposes its API at /api (default) or /sabnzbd/api (when configured
     // with a URL base prefix). Try /api first, fall back to /sabnzbd/api.
@@ -1764,7 +1848,7 @@ pub async fn h_import_sabnzbd_api(
 
     let mut last_err = String::new();
     for url in &candidates {
-        let resp = match HTTP_CLIENT.get(url).send().await {
+        let resp = match client.get(url).send().await {
             Ok(r) => r,
             Err(e) => {
                 last_err = format!("Failed to connect to SABnzbd: {e}");
@@ -2015,4 +2099,81 @@ pub async fn h_dav_config_set(
     config.dav = body;
     state.update_config(config).map_err(ApiError::from)?;
     Ok(Json(serde_json::json!({ "status": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_NZB_DECOMPRESSED_BYTES, extract_nzbs, sanitize_server_config, validate_fetch_url,
+    };
+    use std::io::Write;
+
+    use nzb_web::nzb_core::config::ServerConfig;
+    use zip::CompressionMethod;
+    use zip::write::SimpleFileOptions;
+
+    fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+        for (name, contents) in entries {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(contents).unwrap();
+        }
+
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[tokio::test]
+    async fn validate_fetch_url_rejects_private_ip_literals() {
+        let err = validate_fetch_url("http://127.0.0.1/file.nzb")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("private/reserved"));
+    }
+
+    #[tokio::test]
+    async fn validate_fetch_url_rejects_localhost_hostname() {
+        let err = validate_fetch_url("http://localhost/file.nzb")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("private/reserved"));
+    }
+
+    #[test]
+    fn extract_nzbs_rejects_zip_bombs() {
+        let oversized = vec![b'x'; (MAX_NZB_DECOMPRESSED_BYTES + 1) as usize];
+        let zip = build_zip(&[("oversized.nzb", oversized.as_slice())]);
+        let err = extract_nzbs("oversized.zip", &zip).unwrap_err();
+        assert!(err.to_string().contains("100 MB limit"));
+    }
+
+    #[test]
+    fn extract_nzbs_accepts_small_zip_nzb() {
+        let zip = build_zip(&[("sample.nzb", br#"<nzb><file subject="ok" /></nzb>"#)]);
+        let nzbs = extract_nzbs("sample.zip", &zip).unwrap();
+        assert_eq!(nzbs.len(), 1);
+        assert_eq!(nzbs[0].0, "sample.nzb");
+        assert_eq!(nzbs[0].1, br#"<nzb><file subject="ok" /></nzb>"#);
+    }
+
+    #[test]
+    fn sanitize_server_config_trims_string_fields() {
+        let mut server = ServerConfig::new("srv-1", " news.example.com \n");
+        server.name = " Primary ".into();
+        server.username = Some(" user ".into());
+        server.password = Some(" pass ".into());
+        server.proxy_url = Some(" socks5://proxy ".into());
+        server.trusted_fingerprint = Some(" abc123 ".into());
+
+        sanitize_server_config(&mut server);
+
+        assert_eq!(server.host, "news.example.com");
+        assert_eq!(server.name, "Primary");
+        assert_eq!(server.username.as_deref(), Some("user"));
+        assert_eq!(server.password.as_deref(), Some("pass"));
+        assert_eq!(server.proxy_url.as_deref(), Some("socks5://proxy"));
+        assert_eq!(server.trusted_fingerprint.as_deref(), Some("abc123"));
+    }
 }

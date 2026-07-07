@@ -73,7 +73,7 @@ notify = "7"
 feed-rs = "2"
 unicode-normalization = "0.1"
 
-# Shared NZB crates ([patch] sections redirect to local for dev)
+# Shared NZB crates
 nzb-web = { version = "0.4.15", features = ["groups-db"] }
 nzb-nntp = { version = "0.2.17" }
 nzb-core = { version = "0.2.12", features = ["groups-db"] }
@@ -137,11 +137,12 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # Vendored openssl for cross-compile (feature-gated; see [features] vendored-openssl)
 openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 
-# WebDAV feature (opt-in: cargo build --features webdav)
-nzbdav-core = { version = "0.4.1", registry = "forgejo", optional = true }
-nzbdav-stream = { version = "0.4.1", registry = "forgejo", optional = true }
-nzbdav-dav = { version = "0.4.1", registry = "forgejo", optional = true }
-nzbdav-pipeline = { version = "0.4.1", registry = "forgejo", optional = true, default-features = false }
+# WebDAV feature (opt-in: cargo build --features webdav). CI must use
+# published crates only, so these stay on crates.io.
+nzbdav-core = { version = "0.4.0", optional = true }
+nzbdav-stream = { version = "0.4.0", optional = true }
+nzbdav-dav = { version = "0.4.0", optional = true }
+nzbdav-pipeline = { version = "0.4.0", optional = true, default-features = false }
 
 [package.metadata.deb]
 maintainer = "AusAgentSmith <admin@rustnzb.dev>"
@@ -164,24 +165,5 @@ serde_json = { workspace = true }
 axum = { workspace = true }
 tempfile = "3"
 arc-swap.workspace = true
-
-
-
-[patch.crates-io]
-nzb-web = { path = "../libs/nzb-web" }
-nzb-dispatch = { path = "../libs/nzb-dispatch" }
-nzb-nntp = { path = "../libs/nzb-nntp" }
-nzb-news = { path = "../libs/nzb-news" }
-nzb-core = { path = "../libs/nzb-core" }
-nzb-postproc = { path = "../libs/nzb-postproc" }
-nzb-decode = { path = "../libs/nzb-decode" }
-
-# Local dev patch for nzbdav crates: uncomment when working against unpublished nzbdav-rs changes.
-# CI fetches from the forgejo registry directly, so this must stay commented out.
-# [patch.forgejo]
-# nzbdav-core = { path = "../nzbdav-rs/crates/nzbdav-core" }
-# nzbdav-stream = { path = "../nzbdav-rs/crates/nzbdav-stream" }
-# nzbdav-dav = { path = "../nzbdav-rs/crates/nzbdav-dav" }
-# nzbdav-pipeline = { path = "../nzbdav-rs/crates/nzbdav-pipeline" }
 
 [profile.release]

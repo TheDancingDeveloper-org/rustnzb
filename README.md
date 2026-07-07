@@ -136,6 +136,8 @@ A modular Rust workspace with clean separation of concerns.
 | Crate | Purpose |
 |-------|---------|
 | **nzb-core** | NZB parser, config, SQLite database, shared models |
+| **nzb-news** | Download orchestration primitives and queue/worker coordination |
+| **nzb-dispatch** | Server-aware dispatch engine that feeds article fetch work to `nzb-news` |
 | **nzb-nntp** | NNTP protocol, connection pool, TLS (rustls), pipelining, server failover |
 | **nzb-decode** | yEnc decoder, CRC32 validation, file assembler |
 | **nzb-postproc** | PAR2 verify & repair, RAR/7z/ZIP extraction, cleanup |
@@ -144,11 +146,15 @@ A modular Rust workspace with clean separation of concerns.
 ### Download Pipeline
 
 ```
-Parse NZB ─> Download (NNTP pipelining, multi-server failover)
-         ─> Decode (yEnc + CRC32)
-         ─> Verify & Repair (PAR2)
-         ─> Extract (RAR, 7z, ZIP)
-         ─> Complete
+Parse NZB
+  -> nzb-web queue manager
+  -> nzb-dispatch
+  -> nzb-news
+  -> Download (nzb-nntp pipelining, multi-server failover)
+  -> Decode (yEnc + CRC32)
+  -> Verify & Repair (PAR2)
+  -> Extract (RAR, 7z, ZIP)
+  -> Complete
 ```
 
 ---

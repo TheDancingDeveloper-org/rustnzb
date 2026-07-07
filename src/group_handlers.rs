@@ -228,19 +228,37 @@ pub async fn h_header_fetch(
         while batch_start <= end {
             let batch_end = (batch_start + batch_size - 1).min(end);
             match conn.xover(batch_start, batch_end).await {
-                Ok(entries) => {
-                    let count = qm
-                        .with_db(|db| db.header_insert_batch(group_id, &entries))
-                        .unwrap_or(0);
-                    total_stored += count;
-                    let _ = qm.with_db(|db| db.group_update_watermark(group_id, batch_end as i64));
-                    tracing::info!(
-                        group = %group_name,
-                        batch = %format!("{batch_start}-{batch_end}"),
-                        stored = count,
-                        "Header batch fetched"
-                    );
-                }
+                Ok(entries) => match qm.with_db(|db| db.header_insert_batch(group_id, &entries)) {
+                    Ok(count) => {
+                        total_stored += count;
+                        if let Err(e) =
+                            qm.with_db(|db| db.group_update_watermark(group_id, batch_end as i64))
+                        {
+                            tracing::error!(
+                                error = %e,
+                                group = %group_name,
+                                batch = %format!("{batch_start}-{batch_end}"),
+                                "Failed to update header fetch watermark"
+                            );
+                            break;
+                        }
+                        tracing::info!(
+                            group = %group_name,
+                            batch = %format!("{batch_start}-{batch_end}"),
+                            stored = count,
+                            "Header batch fetched"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            group = %group_name,
+                            batch = %format!("{batch_start}-{batch_end}"),
+                            "Failed to persist fetched headers"
+                        );
+                        break;
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(error = %e, "XOVER batch failed");
                     break;

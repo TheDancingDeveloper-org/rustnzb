@@ -9,86 +9,52 @@ labels:
   platform: linux/amd64
 
 steps:
-  # ─── Strip local [patch.*] overrides (not available in CI) ───────────────
-  - name: strip-patches
-    image: rust:1.88-bookworm
-    commands:
-      - |
-        python3 << 'PYEOF'
-        lines = open('Cargo.toml').readlines()
-        result = []
-        in_patch = False
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('[patch.'):
-                in_patch = True
-                continue
-            if in_patch:
-                if stripped.startswith('[') and not stripped.startswith('#'):
-                    in_patch = False
-                    result.append(line)
-            else:
-                result.append(line)
-        open('Cargo.toml', 'w').writelines(result)
-        print('Stripped [patch.*] sections from Cargo.toml')
-        PYEOF
-
   # ─── Quality checks (run on all events) ──────────────────────────────────
 
   - name: fmt
     image: rust:1.88-bookworm
     environment:
-      GIT_AUTH_TOKEN:
-        from_secret: git_auth_token
+      RUSTNZB_SKIP_FRONTEND_BUILD: "1"
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
       - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
       - rustup component add rustfmt
       - cargo fmt --all -- --check
 
   - name: check
     image: rust:1.88-bookworm
     environment:
-      GIT_AUTH_TOKEN:
-        from_secret: git_auth_token
+      RUSTNZB_SKIP_FRONTEND_BUILD: "1"
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
       - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - cargo check --workspace
+      - cargo check --locked --all-targets --no-default-features
+      - cargo check --locked --features webdav
       - sccache --show-stats
 
   - name: test
     image: rust:1.88-bookworm
     environment:
-      GIT_AUTH_TOKEN:
-        from_secret: git_auth_token
+      CI: "1"
+      RUSTNZB_SKIP_FRONTEND_BUILD: "1"
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
       - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - cargo test --workspace
+      - cargo test --locked --no-default-features
 
   - name: clippy
     image: rust:1.88-bookworm
     environment:
-      GIT_AUTH_TOKEN:
-        from_secret: git_auth_token
+      RUSTNZB_SKIP_FRONTEND_BUILD: "1"
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
       - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
       - rustup component add clippy
-      - cargo clippy --workspace -- -D warnings
+      - cargo clippy --locked --all-targets --no-default-features -- -D warnings
 
   # ─── Playwright E2E (push, PR, manual) ───────────────────────────────────
   # Builds the frontend + debug binary, then runs the Playwright suite.
@@ -99,8 +65,6 @@ steps:
   - name: e2e
     image: rust:1.88-bookworm
     environment:
-      GIT_AUTH_TOKEN:
-        from_secret: git_auth_token
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     when:
@@ -110,15 +74,13 @@ steps:
       - event: manual
     commands:
       - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
       - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && apt-get clean && rm -rf /var/lib/apt/lists/*
       - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
       - apt-get install -y --no-install-recommends nodejs && apt-get clean && rm -rf /var/lib/apt/lists/*
       # Frontend deps + production build (build.rs expects dist to exist)
       - cd frontend && npm ci && npx ng build --configuration=production && cd ..
       # Debug binary is enough for E2E (release takes too long for every PR)
-      - cargo build --bin rustnzb
+      - cargo build --locked --bin rustnzb
       # Install Playwright (browsers + system deps)
       - cd e2e && npm ci && npx playwright install --with-deps chromium
       # Fresh + fresh-auth projects are currently green end-to-end
@@ -141,16 +103,12 @@ steps:
   - name: build-linux
     image: rust:1.88-bookworm
     environment:
-      GIT_AUTH_TOKEN:
-        from_secret: git_auth_token
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
       - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
       - if [ -n "$CI_COMMIT_TAG" ]; then export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols; fi
-      - cargo build --release
+      - cargo build --locked --release --features webdav
       - ls -lh target/release/rustnzb
       - |
         if [ -n "$CI_COMMIT_TAG" ]; then
@@ -174,19 +132,15 @@ steps:
   - name: build-linux-arm64
     image: rust:1.88-bookworm
     environment:
-      GIT_AUTH_TOKEN:
-        from_secret: git_auth_token
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
       - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
       - curl -fsSL "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz" | tar -xJ -C /opt && mv /opt/zig-linux-x86_64-0.13.0 /opt/zig && ln -s /opt/zig/zig /usr/local/bin/zig
       - cargo install cargo-zigbuild --version 0.20.0 --locked
       - rustup target add aarch64-unknown-linux-gnu
       - if [ -n "$CI_COMMIT_TAG" ]; then export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols; fi
-      - cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.17 --features vendored-openssl
+      - cargo zigbuild --locked --release --target aarch64-unknown-linux-gnu.2.17 --features webdav,vendored-openssl
       - ls -lh target/aarch64-unknown-linux-gnu/release/rustnzb
       - |
         if [ -n "$CI_COMMIT_TAG" ]; then
@@ -210,20 +164,16 @@ steps:
   - name: build-windows
     image: rust:1.88-bookworm
     environment:
-      GIT_AUTH_TOKEN:
-        from_secret: git_auth_token
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
       - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
       - apt-get update && apt-get install -y --no-install-recommends clang llvm lld
       - cargo install cargo-xwin@0.18.6 --index https://github.com/rust-lang/crates.io-index
       - rustup target add x86_64-pc-windows-msvc
       - rm -rf ~/.cache/cargo-xwin
       - if [ -n "$CI_COMMIT_TAG" ]; then export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols; fi
-      - cargo xwin build --release --target x86_64-pc-windows-msvc
+      - cargo xwin build --locked --release --target x86_64-pc-windows-msvc --features webdav
       - ls -lh target/x86_64-pc-windows-msvc/release/rustnzb.exe
     when:
       - event: push
