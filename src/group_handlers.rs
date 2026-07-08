@@ -24,6 +24,18 @@ pub struct HeaderListQuery {
     pub offset: Option<usize>,
 }
 
+fn mark_headers_read<F, E>(header_ids: &[i64], mut mark: F) -> Result<u64, E>
+where
+    F: FnMut(i64) -> Result<(), E>,
+{
+    let mut marked = 0u64;
+    for &id in header_ids {
+        mark(id)?;
+        marked += 1;
+    }
+    Ok(marked)
+}
+
 /// GET /api/groups
 pub async fn h_group_list(
     State(state): State<Arc<AppState>>,
@@ -317,14 +329,10 @@ pub async fn h_header_mark_read(
     Path(_group_id): Path<i64>,
     Json(input): Json<nzb_web::nzb_core::models::MarkReadInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut count = 0u64;
-    for id in &input.header_ids {
-        if let Err(e) = state.queue_manager.with_db(|db| db.header_mark_read(*id)) {
-            tracing::warn!(header_id = id, error = %e, "Failed to mark header as read");
-        } else {
-            count += 1;
-        }
-    }
+    let count = state
+        .queue_manager
+        .with_db(|db| mark_headers_read(&input.header_ids, |id| db.header_mark_read(id)))
+        .map_err(ApiError::from)?;
     Ok(Json(serde_json::json!({ "marked": count })))
 }
 
@@ -456,4 +464,42 @@ pub async fn h_header_download(
         "status": true, "job_id": job_id,
         "message": format!("Added '{}' to queue", name),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mark_headers_read;
+
+    #[test]
+    fn mark_headers_read_counts_every_success() {
+        let ids = [11, 22, 33];
+        let mut seen = Vec::new();
+
+        let marked = mark_headers_read(&ids, |id| {
+            seen.push(id);
+            Ok::<(), &'static str>(())
+        })
+        .expect("mark succeeds");
+
+        assert_eq!(marked, 3);
+        assert_eq!(seen, ids);
+    }
+
+    #[test]
+    fn mark_headers_read_stops_on_first_error() {
+        let ids = [11, 22, 33];
+        let mut seen = Vec::new();
+
+        let err = mark_headers_read(&ids, |id| {
+            seen.push(id);
+            if id == 22 {
+                return Err("boom");
+            }
+            Ok(())
+        })
+        .expect_err("expected failure");
+
+        assert_eq!(err, "boom");
+        assert_eq!(seen, vec![11, 22]);
+    }
 }

@@ -93,6 +93,14 @@
           "options": {
             "proxyConfig": "proxy.conf.json"
           }
+        },
+        "test": {
+          "builder": "@angular/build:unit-test",
+          "options": {
+            "buildTarget": "frontend:build:development",
+            "tsConfig": "tsconfig.spec.json",
+            "watch": false
+          }
         }
       }
     }

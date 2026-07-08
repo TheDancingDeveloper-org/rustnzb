@@ -4,7 +4,7 @@ import { FormsModule } from '@angular/forms';
 import { RouterModule } from '@angular/router';
 import { HttpClient } from '@angular/common/http';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
-import { Subscription } from 'rxjs';
+import { Observable, Subscription, finalize } from 'rxjs';
 import { ApiService } from '../../core/services/api.service';
 import { AddNzbService } from '../../core/services/add-nzb.service';
 import { NzbJob, QueueResponse, StatusResponse } from '../../core/models/queue.model';
@@ -284,11 +284,11 @@ interface PipelineStep {
                 </td>
                 <td class="actions">
                   @if (job.status === 'paused') {
-                    <button class="row-action" (click)="resumeJob(job.id)" title="resume">▶</button>
+                    <button class="row-action" [disabled]="isActionPending(job.id)" (click)="resumeJob(job.id)" title="resume">▶</button>
                   } @else {
-                    <button class="row-action" (click)="pauseJob(job.id)" title="pause">❚❚</button>
+                    <button class="row-action" [disabled]="isActionPending(job.id)" (click)="pauseJob(job.id)" title="pause">❚❚</button>
                   }
-                  <button class="row-action danger" (click)="deleteJob(job.id)" title="remove">✕</button>
+                  <button class="row-action danger" [disabled]="isActionPending(job.id)" (click)="deleteJob(job.id)" title="remove">✕</button>
                 </td>
               </tr>
             }
@@ -455,6 +455,7 @@ interface PipelineStep {
     .pri-select.pri-force  { color: #a78bfa; border-color: #a78bfa; }
     .prog-sub { color: var(--mute); font-size: 11px; margin-top: 2px; }
     .actions { white-space: nowrap; }
+    .row-action:disabled { opacity: .45; cursor: wait; background: transparent; }
     .empty-cell {
       text-align: center; padding: 36px 20px !important;
       color: var(--mute); font-size: 13px;
@@ -469,6 +470,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   status = signal<StatusResponse | null>(null);
   selectedIds = signal<Set<string>>(new Set());
   paused = signal(false);
+  actionPendingIds = signal<Set<string>>(new Set());
 
   readonly POOL_KEY = 'rustnzb.poolPanelCollapsed';
   poolCollapsed = signal(localStorage.getItem('rustnzb.poolPanelCollapsed') === 'true');
@@ -719,8 +721,45 @@ export class QueueViewComponent implements OnInit, OnDestroy {
 
   // ---- Per-job actions ----
 
-  pauseJob(id: string): void { this.api.post(`/queue/${id}/pause`).subscribe(() => this.loadQueue()); }
-  resumeJob(id: string): void { this.api.post(`/queue/${id}/resume`).subscribe(() => this.loadQueue()); }
+  isActionPending(id: string): boolean {
+    return this.actionPendingIds().has(id);
+  }
+
+  private withPendingJobAction(id: string, actionFactory: () => Observable<unknown>, successMessage?: string): void {
+    if (this.isActionPending(id)) return;
+
+    const pending = new Set(this.actionPendingIds());
+    pending.add(id);
+    this.actionPendingIds.set(pending);
+
+    actionFactory().pipe(
+      finalize(() => {
+        const next = new Set(this.actionPendingIds());
+        next.delete(id);
+        this.actionPendingIds.set(next);
+      }),
+    ).subscribe({
+      next: () => {
+        if (successMessage) {
+          this.snackBar.open(successMessage, 'Close', { duration: 2500 });
+        }
+        this.loadQueue();
+      },
+      error: (err: any) => {
+        const msg = err?.error?.message || err?.message || 'Action failed. Please try again.';
+        this.snackBar.open(msg, 'Close', { duration: 4000 });
+        this.loadQueue();
+      },
+    });
+  }
+
+  pauseJob(id: string): void {
+    this.withPendingJobAction(id, () => this.api.post(`/queue/${id}/pause`), 'Job paused');
+  }
+
+  resumeJob(id: string): void {
+    this.withPendingJobAction(id, () => this.api.post(`/queue/${id}/resume`), 'Job resumed');
+  }
 
   setPriority(job: NzbJob, priority: number): void {
     this.api.put(`/queue/${job.id}/priority`, { priority }).subscribe({
@@ -728,8 +767,9 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       error: () => {},
     });
   }
+
   deleteJob(id: string): void {
-    this.api.delete(`/queue/${id}`).subscribe(() => this.loadQueue());
+    this.withPendingJobAction(id, () => this.api.delete(`/queue/${id}`));
   }
 
   // ---- Bulk ----
@@ -775,23 +815,39 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   // ---- Formatting ----
 
   percent(job: { total_bytes: number; downloaded_bytes: number }): number {
-    if (job.total_bytes === 0) return 0;
-    return Math.round((job.downloaded_bytes / job.total_bytes) * 100);
+    const total = this.normalizeNonNegative(job.total_bytes);
+    if (total <= 0) return 0;
+    const downloaded = this.normalizeNonNegative(job.downloaded_bytes);
+    return Math.max(0, Math.min(100, Math.round((downloaded / total) * 100)));
   }
 
   eta(job: NzbJob): string {
-    if (job.speed_bps === 0) return '—';
-    const secs = (job.total_bytes - job.downloaded_bytes) / job.speed_bps;
+    const speed = this.normalizeNonNegative(job.speed_bps);
+    if (speed <= 0) return '—';
+    const secs = this.remainingForJob(job) / speed;
+    if (!Number.isFinite(secs) || secs <= 0) return '—';
     return this.formatDuration(secs);
   }
 
   formatDuration(secs: number): string {
+    if (!Number.isFinite(secs) || secs <= 0) return '0s';
     const h = Math.floor(secs / 3600);
     const m = Math.floor((secs % 3600) / 60);
     const s = Math.floor(secs % 60);
     if (h > 0) return `${h}h ${m}m`;
     if (m > 0) return `${m}m ${s}s`;
     return `${s}s`;
+  }
+
+  private remainingForJob(job: { total_bytes: number; downloaded_bytes: number }): number {
+    return Math.max(
+      0,
+      this.normalizeNonNegative(job.total_bytes) - this.normalizeNonNegative(job.downloaded_bytes),
+    );
+  }
+
+  private normalizeNonNegative(value: number): number {
+    return Number.isFinite(value) && value > 0 ? value : 0;
   }
 
   priorityLabel(p: number): string {
