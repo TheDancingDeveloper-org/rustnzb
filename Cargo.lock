@@ -1873,9 +1873,9 @@ dependencies = [
 
 [[package]]
 name = "nzb-web"
-version = "0.4.18"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c0b14778d8bf1688e57419d8d1b5229a15f8766df73f22492a2f8a1a234946f"
+checksum = "aeb549cf90cb8b121520a1cbb8d5eb52ce0287c64618b1839030ca67c076ae9e"
 dependencies = [
  "anyhow",
  "arc-swap",

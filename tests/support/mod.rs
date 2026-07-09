@@ -69,7 +69,6 @@ pub async fn start_test_server(server_configs: Vec<ServerConfig>) -> TestApp {
         config.general.early_failure_check,
         config.general.required_completion_pct,
         config.general.article_timeout_secs,
-        None,
     );
     let token_store = Arc::new(TokenStore::new());
     let credential_store = Arc::new(CredentialStore::new(tmp_dir.path().to_path_buf()));
