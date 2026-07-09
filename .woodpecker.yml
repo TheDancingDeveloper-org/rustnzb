@@ -305,8 +305,10 @@ steps:
         - dev
         - ${CI_COMMIT_SHA}
       build_args:
-        - RUSTNZB_BUILD_REF=${CI_COMMIT_SHA}
+        RUSTNZB_BUILD_REF: ${CI_COMMIT_SHA}
       build_args_from_env:
+        - CI_COMMIT_SHA
+        - CI_COMMIT_TAG
         - PLUGIN_PASSWORD
 
   - name: push-ghcr-dev
@@ -361,9 +363,11 @@ steps:
         - ${CI_COMMIT_TAG}-amd64
         - latest-amd64
       build_args:
-        - RELEASE_OPTIMIZED=true
-        - RUSTNZB_BUILD_REF=${CI_COMMIT_TAG}
+        RELEASE_OPTIMIZED: "true"
+        RUSTNZB_BUILD_REF: ${CI_COMMIT_TAG}
       build_args_from_env:
+        - CI_COMMIT_SHA
+        - CI_COMMIT_TAG
         - PLUGIN_PASSWORD
 
   - name: build-and-push-release-arm64
@@ -382,9 +386,11 @@ steps:
         - ${CI_COMMIT_TAG}-arm64
         - latest-arm64
       build_args:
-        - RELEASE_OPTIMIZED=true
-        - RUSTNZB_BUILD_REF=${CI_COMMIT_TAG}
+        RELEASE_OPTIMIZED: "true"
+        RUSTNZB_BUILD_REF: ${CI_COMMIT_TAG}
       build_args_from_env:
+        - CI_COMMIT_SHA
+        - CI_COMMIT_TAG
         - PLUGIN_PASSWORD
 
   - name: manifest-release

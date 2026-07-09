@@ -837,6 +837,18 @@ interface PipelineStep {
         text-align: center;
         vertical-align: middle;
       }
+      .queue-table-panel table.data {
+        width: 100%;
+        table-layout: fixed;
+      }
+      .queue-table-panel table.data td > *,
+      .queue-table-panel table.data th > * {
+        margin-left: auto;
+        margin-right: auto;
+      }
+      .queue-table-panel input[type='checkbox'] {
+        display: block;
+      }
       .job-name {
         font-size: 13px;
         color: var(--text);
@@ -862,6 +874,8 @@ interface PipelineStep {
         line-height: 18px;
         transition: border-color 0.15s;
         -webkit-appearance: auto;
+        text-align: center;
+        text-align-last: center;
       }
       .pri-select:focus {
         outline: none;
@@ -1016,9 +1030,14 @@ export class QueueViewComponent implements OnInit, OnDestroy {
 
   serversEnabled = computed(() => this.servers().filter((s) => s.enabled).length);
   connsTotal = computed(() =>
-    this.servers()
+    this.enabledServers()
       .filter((s) => s.enabled)
       .reduce((n, s) => n + s.connections, 0),
+  );
+  enabledServers = computed(() =>
+    this.servers()
+      .filter((s) => s.enabled)
+      .sort((a, b) => a.priority - b.priority),
   );
   /**
    * Active connection count across the pool. We don't have a live "in-use"
@@ -1030,7 +1049,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     const total = this.connsTotal();
     if (active === 0 || total === 0) return 0;
     // Simple: assume each active job saturates ~half the primary server's conns.
-    const primary = this.servers().find((s) => s.enabled && s.priority === 0);
+    const primary = this.enabledServers().find((s) => s.priority === 0);
     const primaryConns = primary?.connections ?? total;
     return Math.min(total, Math.round(primaryConns * active));
   });
@@ -1045,9 +1064,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
    * `connsActive()` across enabled servers in priority order.
    */
   visibleServersWithConns = computed(() => {
-    const enabled = this.servers()
-      .filter((s) => s.enabled)
-      .sort((a, b) => a.priority - b.priority);
+    const enabled = this.enabledServers();
     let remainingActive = this.connsActive();
     return enabled.map((s) => {
       const active = Math.min(s.connections, remainingActive);

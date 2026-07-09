@@ -215,6 +215,8 @@ import { GroupBrowserDialogComponent } from './group-browser-dialog.component';
         border-radius: 8px;
         display: flex;
         flex-direction: column;
+        align-self: stretch;
+        height: 100%;
         min-height: 100%;
       }
       .side-head {
@@ -284,6 +286,10 @@ import { GroupBrowserDialogComponent } from './group-browser-dialog.component';
 
       .main {
         min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        height: 100%;
       }
       .ctr {
         text-align: center;

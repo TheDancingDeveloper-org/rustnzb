@@ -19,6 +19,8 @@ fn main() {
     let build_ref = env::var("RUSTNZB_BUILD_REF")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| ci_ref("CI_COMMIT_TAG"))
+        .or_else(|| ci_ref("CI_COMMIT_SHA"))
         .or_else(git_head_ref);
     let build_version = build_ref
         .map(|build_ref| format!("{package_version}+{build_ref}"))
@@ -89,6 +91,10 @@ fn main() {
 
     // Create minimal placeholder so rust-embed has something to embed
     write_placeholder(dist);
+}
+
+fn ci_ref(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn git_head_ref() -> Option<String> {

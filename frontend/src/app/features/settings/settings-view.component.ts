@@ -989,10 +989,9 @@ function emptyCategory(): CategoryConfig {
         width: 100%;
         box-sizing: border-box;
         align-self: start;
-        position: sticky;
-        top: 16px;
-        max-height: calc(100vh - 32px);
-        overflow-y: auto;
+        position: static;
+        max-height: none;
+        overflow: visible;
       }
       .settings-side .sg {
         color: var(--mute);
