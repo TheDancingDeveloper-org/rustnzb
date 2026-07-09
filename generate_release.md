@@ -174,7 +174,9 @@ git commit -m "release: vX.Y.Z"
 git push origin main
 ```
 
-Wait for Woodpecker CI to go green (Forgejo build, Docker push, Komodo deploy).
+Wait for the Forgejo dev image publish to complete for this commit. A `main`
+pipeline can still end red if unrelated quality gates fail after
+`build-and-push-dev` has already published the deployable image.
 
 Expected Docker result for a normal `main` push:
 
@@ -184,6 +186,37 @@ Expected Docker result for a normal `main` push:
 - GHCR `ghcr.io/ausagentsmith-org/rustnzb:<full-commit-sha>`
 
 `latest` should remain unchanged here.
+
+### 3a. Deploy a dev build to Komodo
+
+For Komodo-managed stacks, deploy the exact Forgejo commit image, not `:dev`
+and not GHCR:
+
+1. Confirm Woodpecker published:
+   - `repo.indexarr.net/indexarr/rustnzbd:<full-commit-sha>`
+2. Update the target stack in `indexarr/ops` to pin that exact image tag.
+   Current arr stack path:
+   - `personal/arr/compose.yaml`
+3. Push the ops commit, then trigger a redeploy:
+
+```bash
+mydevenv2-agent-auth run -- python3 \
+  ~/.codex/skills/komodo-stack-deploy/scripts/deploy_stack.py personal-arr
+```
+
+4. Verify the live container on Node B:
+
+```bash
+tailscale ssh sprooty@winrarhost \
+  'docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep rustnzb'
+```
+
+Notes:
+
+- Prefer the Forgejo `:<sha>` tag for dev deploys. GHCR mirror steps can be
+  skipped if earlier jobs fail, even when the Forgejo image already exists.
+- Do not advance `latest` for dev testing. `latest` remains tied to the most
+  recent tagged release.
 
 ### 4. Tag the release on Forgejo
 
@@ -242,7 +275,8 @@ gh release create vX.Y.Z \
 
 ### 7. Verify
 
-- [ ] Forgejo CI green on `main` and tag
+- [ ] Forgejo dev image exists for the `main` commit SHA you plan to deploy
+- [ ] Tag pipeline green
 - [ ] Komodo deployed new container (check `http://192.168.1.75:3011`)
 - [ ] `dl.rustnzb.dev/vX.Y.Z/` contains Linux + Windows binaries
 - [ ] Forgejo has `repo.indexarr.net/indexarr/rustnzbd:vX.Y.Z`
@@ -259,7 +293,10 @@ gh release create vX.Y.Z \
 
 - **Bad crate published**: crates.io is immutable. Yank with `cargo yank --version X.Y.Z <crate>`, then publish a fixed patch version.
 - **Bad rustnzb release**: revert the offending commit on `main`, bump patch version, repeat Phase 2. Force-pushing tags is forbidden.
-- **Bad Komodo deploy**: edit the image SHA in `repo.indexarr.net/indexarr/ops` `prod/<stack>/docker-compose.yml` back to the previous SHA and re-trigger DeployStack via the Komodo API.
+- **Bad Komodo deploy**: edit the image SHA in the relevant
+  `repo.indexarr.net/indexarr/ops` stack compose file back to the previous SHA
+  (currently `personal/arr/compose.yaml` for the arr stack), push that ops
+  commit, then re-trigger DeployStack via the Komodo API or the deploy script.
 
 ---
 
