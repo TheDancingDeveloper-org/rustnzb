@@ -44,6 +44,7 @@ RUN cd frontend && npx ng build --configuration=production
 
 # Rust source
 COPY Cargo.toml Cargo.lock build.rs ./
+COPY crates crates
 COPY src src
 COPY tests tests
 
