@@ -4,6 +4,55 @@ End-to-end release flow: publish all NZB shared crates to crates.io (and Forgejo
 
 ---
 
+## CI Docker Publishing Model
+
+Woodpecker publishes two different Docker tracks:
+
+- `main` pushes publish development images
+- tag pushes publish release images and advance `latest`
+
+### Development images (`main` pushes)
+
+Every push to `main` publishes amd64-only Docker images to both registries:
+
+- Forgejo: `repo.indexarr.net/indexarr/rustnzbd:dev`
+- Forgejo: `repo.indexarr.net/indexarr/rustnzbd:<full-commit-sha>`
+- GHCR: `ghcr.io/ausagentsmith-org/rustnzb:dev`
+- GHCR: `ghcr.io/ausagentsmith-org/rustnzb:<full-commit-sha>`
+
+Rules:
+
+- `dev` is the moving integration tag for unreleased `main`
+- `latest` must not move on ordinary branch pushes
+- arm64 is still release-only because the current buildx worker exhausts its overlayfs during routine `main` cross-builds
+
+### Release images (tag pushes)
+
+Pushing `vX.Y.Z` publishes this release set:
+
+1. Forgejo per-arch tags:
+   - `repo.indexarr.net/indexarr/rustnzbd:vX.Y.Z-amd64`
+   - `repo.indexarr.net/indexarr/rustnzbd:vX.Y.Z-arm64`
+   - `repo.indexarr.net/indexarr/rustnzbd:latest-amd64`
+   - `repo.indexarr.net/indexarr/rustnzbd:latest-arm64`
+2. Forgejo multi-arch tags:
+   - `repo.indexarr.net/indexarr/rustnzbd:vX.Y.Z`
+   - `repo.indexarr.net/indexarr/rustnzbd:latest`
+3. GHCR multi-arch mirrors:
+   - `ghcr.io/ausagentsmith-org/rustnzb:vX.Y.Z`
+   - `ghcr.io/ausagentsmith-org/rustnzb:latest`
+
+`latest` therefore always means "most recent tagged release", not "most recent commit on main".
+
+### CI verification and failure mode
+
+Woodpecker verifies registry state after publishing:
+
+- `main` pushes verify Forgejo `:dev` and `:<sha>`, then GHCR `:dev` and `:<sha>`
+- tag pushes verify Forgejo `:vX.Y.Z` and `:latest` for amd64 and arm64, then GHCR `:vX.Y.Z` and `:latest` for amd64 and arm64
+
+If an unrelated earlier step has already failed the workflow, downstream Docker mirror steps can be skipped even when the Forgejo image build itself succeeded. When that happens, do not assume GHCR is current just because Forgejo is.
+
 ## Phase 1 — Publish NZB crates to crates.io + Forgejo
 
 ### Crates in scope
@@ -127,6 +176,15 @@ git push origin main
 
 Wait for Woodpecker CI to go green (Forgejo build, Docker push, Komodo deploy).
 
+Expected Docker result for a normal `main` push:
+
+- Forgejo `repo.indexarr.net/indexarr/rustnzbd:dev`
+- Forgejo `repo.indexarr.net/indexarr/rustnzbd:<full-commit-sha>`
+- GHCR `ghcr.io/ausagentsmith-org/rustnzb:dev`
+- GHCR `ghcr.io/ausagentsmith-org/rustnzb:<full-commit-sha>`
+
+`latest` should remain unchanged here.
+
 ### 4. Tag the release on Forgejo
 
 ```bash
@@ -135,6 +193,12 @@ git push origin vX.Y.Z
 ```
 
 The tag push triggers the release pipeline (cross-compile binaries, scp to `dl.rustnzb.dev`, Docker → Forgejo + GHCR, Discord notification).
+
+Expected Docker result for the tag:
+
+- Forgejo per-arch: `vX.Y.Z-amd64`, `vX.Y.Z-arm64`, `latest-amd64`, `latest-arm64`
+- Forgejo multi-arch: `vX.Y.Z`, `latest`
+- GHCR multi-arch: `vX.Y.Z`, `latest`
 
 ### 5. Merge `main` → `public-main` and push to GitHub
 
@@ -181,7 +245,10 @@ gh release create vX.Y.Z \
 - [ ] Forgejo CI green on `main` and tag
 - [ ] Komodo deployed new container (check `http://192.168.1.75:3011`)
 - [ ] `dl.rustnzb.dev/vX.Y.Z/` contains Linux + Windows binaries
+- [ ] Forgejo has `repo.indexarr.net/indexarr/rustnzbd:vX.Y.Z`
+- [ ] Forgejo has `repo.indexarr.net/indexarr/rustnzbd:latest`
 - [ ] GHCR has `ghcr.io/ausagentsmith-org/rustnzb:vX.Y.Z`
+- [ ] GHCR has `ghcr.io/ausagentsmith-org/rustnzb:latest`
 - [ ] GitHub release published with artefacts attached
 - [ ] Discord changelog webhook fired
 - [ ] `public-main` on GitHub is at the new tag
