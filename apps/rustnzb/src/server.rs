@@ -29,7 +29,7 @@ struct ApiDoc;
 
 /// Embed the Angular SPA build at compile time.
 #[derive(Embed)]
-#[folder = "frontend/dist/frontend/browser"]
+#[folder = "$CARGO_MANIFEST_DIR/frontend/dist/frontend/browser"]
 struct StaticAssets;
 
 /// Serve the root page (index.html) from embedded static assets.
