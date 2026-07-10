@@ -5,6 +5,8 @@ import { RouterModule } from '@angular/router';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { ApiService } from '../../core/services/api.service';
 import { StatusResponse } from '../../core/models/queue.model';
+import { ConfirmService } from '../../shared/confirm.service';
+import { IconComponent } from '../../shared/icon.component';
 
 interface ServerConfig {
   id: string;
@@ -24,6 +26,7 @@ interface ServerConfig {
   compress: boolean;
   ramp_up_delay_ms: number;
   proxy_url: string | null;
+  connect_timeout_secs: number;
 }
 
 interface CategoryConfig {
@@ -97,6 +100,7 @@ function emptyServer(): ServerConfig {
     compress: false,
     ramp_up_delay_ms: 250,
     proxy_url: null,
+    connect_timeout_secs: 30,
   };
 }
 
@@ -107,7 +111,7 @@ function emptyCategory(): CategoryConfig {
 @Component({
   selector: 'app-settings-view',
   standalone: true,
-  imports: [CommonModule, FormsModule, RouterModule, MatSnackBarModule],
+  imports: [CommonModule, FormsModule, RouterModule, MatSnackBarModule, IconComponent],
   template: `
     <div class="settings-shell">
       <!-- Sidebar -->
@@ -156,7 +160,7 @@ function emptyCategory(): CategoryConfig {
           <div class="panel">
             @for (s of servers(); track s.id) {
               <div class="srv-row">
-                <div class="drag">⋮⋮</div>
+                <div class="drag"><app-icon name="drag-handle" [size]="14" /></div>
                 <div>
                   <div class="title" [class.dim]="!s.enabled">
                     {{ s.name || s.host }}
@@ -191,6 +195,9 @@ function emptyCategory(): CategoryConfig {
                     >
                     <span
                       >ramp-up <b>{{ s.ramp_up_delay_ms }} ms</b></span
+                    >
+                    <span
+                      >timeout <b>{{ s.connect_timeout_secs }} s</b></span
                     >
                     @if (s.compress) {
                       <span><b>compression</b></span>
@@ -350,6 +357,18 @@ function emptyCategory(): CategoryConfig {
                   <div class="inline">
                     <input type="number" [(ngModel)]="editingServer.ramp_up_delay_ms" min="0" />
                     <span style="color:var(--mute);font-size:11px">ms between opening conns</span>
+                  </div>
+
+                  <label>Connection timeout</label>
+                  <div class="inline">
+                    <input
+                      type="number"
+                      [(ngModel)]="editingServer.connect_timeout_secs"
+                      min="1"
+                    />
+                    <span style="color:var(--mute);font-size:11px"
+                      >seconds to wait before treating this server as unreachable</span
+                    >
                   </div>
 
                   <label>Retention</label>
@@ -1269,6 +1288,7 @@ export class SettingsViewComponent implements OnInit {
   constructor(
     private api: ApiService,
     private snack: MatSnackBar,
+    private confirmSvc: ConfirmService,
   ) {}
 
   ngOnInit(): void {
@@ -1435,14 +1455,23 @@ export class SettingsViewComponent implements OnInit {
   }
 
   deleteServer(id: string): void {
-    if (!confirm('Remove this server?')) return;
-    this.api.delete(`/config/servers/${id}`).subscribe({
-      next: () => {
-        this.loadServers();
-        this.snack.open('Server removed', 'Close', { duration: 2000 });
-      },
-      error: () => this.snack.open('Failed to delete server', 'Close', { duration: 3000 }),
-    });
+    this.confirmSvc
+      .confirm({
+        title: 'Remove this server?',
+        message: 'Downloads in progress on this server may be interrupted.',
+        confirmLabel: 'Remove',
+        danger: true,
+      })
+      .subscribe((ok) => {
+        if (!ok) return;
+        this.api.delete(`/config/servers/${id}`).subscribe({
+          next: () => {
+            this.loadServers();
+            this.snack.open('Server removed', 'Close', { duration: 2000 });
+          },
+          error: () => this.snack.open('Failed to delete server', 'Close', { duration: 3000 }),
+        });
+      });
   }
 
   // ======================== CATEGORIES ========================
@@ -1497,15 +1526,24 @@ export class SettingsViewComponent implements OnInit {
   }
 
   deleteCategory(name: string): void {
-    if (!confirm(`Delete category "${name}"?`)) return;
-    const encoded = encodeURIComponent(name);
-    this.api.delete(`/config/categories/${encoded}`).subscribe({
-      next: () => {
-        this.loadCategories();
-        this.snack.open('Category removed', 'Close', { duration: 2000 });
-      },
-      error: () => this.snack.open('Failed to delete category', 'Close', { duration: 3000 }),
-    });
+    this.confirmSvc
+      .confirm({
+        title: `Delete category "${name}"?`,
+        message: 'Jobs already assigned to this category keep their setting; new jobs can no longer use it.',
+        confirmLabel: 'Delete',
+        danger: true,
+      })
+      .subscribe((ok) => {
+        if (!ok) return;
+        const encoded = encodeURIComponent(name);
+        this.api.delete(`/config/categories/${encoded}`).subscribe({
+          next: () => {
+            this.loadCategories();
+            this.snack.open('Category removed', 'Close', { duration: 2000 });
+          },
+          error: () => this.snack.open('Failed to delete category', 'Close', { duration: 3000 }),
+        });
+      });
   }
 
   ppLabel(level: number): string {
@@ -1648,10 +1686,28 @@ export class SettingsViewComponent implements OnInit {
   }
 
   generateDavApiKey(): void {
-    const bytes = new Uint8Array(32);
-    crypto.getRandomValues(bytes);
-    this.davConfig.api_key = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-    this.showDavApiKey = true;
+    const regenerating = !!this.davConfig.api_key?.trim();
+    const doGenerate = () => {
+      const bytes = new Uint8Array(32);
+      crypto.getRandomValues(bytes);
+      this.davConfig.api_key = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+      this.showDavApiKey = true;
+    };
+    if (!regenerating) {
+      doGenerate();
+      return;
+    }
+    this.confirmSvc
+      .confirm({
+        title: 'Generate a new API key?',
+        message:
+          'This replaces the current key once you save. Any WebDAV client using the old key will stop working until you update it.',
+        confirmLabel: 'Generate new key',
+        danger: true,
+      })
+      .subscribe((ok) => {
+        if (ok) doGenerate();
+      });
   }
 
   copy(text: string): void {
