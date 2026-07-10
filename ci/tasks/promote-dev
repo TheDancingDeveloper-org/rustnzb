@@ -27,4 +27,3 @@ for ref in "$ghcr:$sha" "$ghcr:dev"; do
     test "$(skopeo inspect --creds "$dst_creds" --format '{{.Digest}}' "docker://$ref")" = "$candidate"
 done
 printf 'promoted verified candidate %s to Forgejo :dev and GHCR\n' "$candidate"
-

@@ -21,4 +21,3 @@ setup_cargo_auth() {
 cleanup_cargo_auth() {
     unset CARGO_REGISTRIES_FORGEJO_TOKEN GIT_AUTH_TOKEN
 }
-

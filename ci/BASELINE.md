@@ -23,4 +23,3 @@ Runtime metrics are written under `.ci-output/metrics` by image-build and cold
 build tasks. Fill the cold/warm comparison in the final migration record from
 the first successful production-runner pipelines; local timings are not a
 substitute for runner metrics.
-

@@ -37,4 +37,3 @@ CARGO_TARGET_DIR=$(dirname "$(dirname "$(dirname "$arm64")")") \
 
 (cd "$out" && sha256sum rustnzb-* >"SHA256SUMS-$tag.txt")
 ls -lh "$out"/rustnzb-* "$out/SHA256SUMS-$tag.txt"
-
