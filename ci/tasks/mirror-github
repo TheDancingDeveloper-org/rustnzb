@@ -2,6 +2,7 @@
 set -eu
 
 : "${GH_TOKEN:?GH_TOKEN is required}"
+: "${GIT_AUTH_TOKEN:?GIT_AUTH_TOKEN is required}"
 
 kind=${1:?usage: mirror-github branch|tag}
 repo_url=https://github.com/AusAgentSmith-org/rustnzb.git
@@ -11,8 +12,10 @@ trap 'rm -f "$askpass"' EXIT
 cat >"$askpass" <<'EOF'
 #!/bin/sh
 case "$1" in
-    *Username*) printf '%s\n' x-access-token ;;
-    *Password*) printf '%s\n' "$GH_TOKEN" ;;
+    *repo.indexarr.net*Username*) printf '%s\n' x-access-token ;;
+    *repo.indexarr.net*Password*) printf '%s\n' "$GIT_AUTH_TOKEN" ;;
+    *github.com*Username*) printf '%s\n' x-access-token ;;
+    *github.com*Password*) printf '%s\n' "$GH_TOKEN" ;;
     *) exit 1 ;;
 esac
 EOF

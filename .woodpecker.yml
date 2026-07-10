@@ -331,6 +331,8 @@ steps:
     environment:
       GH_TOKEN:
         from_secret: gh_release_token
+      GIT_AUTH_TOKEN:
+        from_secret: git_auth_token
     commands:
       - ci/tasks/mirror-github branch
 
@@ -465,6 +467,8 @@ steps:
     environment:
       GH_TOKEN:
         from_secret: gh_release_token
+      GIT_AUTH_TOKEN:
+        from_secret: git_auth_token
     commands:
       - ci/tasks/mirror-github tag
 
