@@ -12,10 +12,18 @@ trap 'rm -f "$askpass"' EXIT
 cat >"$askpass" <<'EOF'
 #!/bin/sh
 case "$1" in
-    *repo.indexarr.net*Username*) printf '%s\n' x-access-token ;;
-    *repo.indexarr.net*Password*) printf '%s\n' "$GIT_AUTH_TOKEN" ;;
-    *github.com*Username*) printf '%s\n' x-access-token ;;
-    *github.com*Password*) printf '%s\n' "$GH_TOKEN" ;;
+    *Username*repo.indexarr.net*|*repo.indexarr.net*Username*)
+        printf '%s\n' x-access-token
+        ;;
+    *Password*repo.indexarr.net*|*repo.indexarr.net*Password*)
+        printf '%s\n' "$GIT_AUTH_TOKEN"
+        ;;
+    *Username*github.com*|*github.com*Username*)
+        printf '%s\n' x-access-token
+        ;;
+    *Password*github.com*|*github.com*Password*)
+        printf '%s\n' "$GH_TOKEN"
+        ;;
     *) exit 1 ;;
 esac
 EOF
