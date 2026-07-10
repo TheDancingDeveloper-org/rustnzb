@@ -1,97 +1,78 @@
-FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
+# syntax=docker/dockerfile:1.7
+
+ARG CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:89f1f570acb0f8e6514ffcca39bd9f26305263d95274e4c170eedf867d113ad9
+
+FROM --platform=$BUILDPLATFORM ${CROSS_IMAGE} AS builder
 
 ARG TARGETPLATFORM
-ARG BUILDPLATFORM
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        protobuf-compiler \
-        curl \
-        pkg-config \
-        ca-certificates \
-        git \
-        xz-utils \
-        make \
-        perl && \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
-    rm -rf /var/lib/apt/lists/*
-
-# zig + cargo-zigbuild: cross-compile Rust (incl. C deps) to musl targets
-ENV ZIG_VERSION=0.13.0
-RUN BUILD_ARCH=$(uname -m) && \
-    curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${BUILD_ARCH}-${ZIG_VERSION}.tar.xz" | tar -xJ -C /opt && \
-    mv "/opt/zig-linux-${BUILD_ARCH}-${ZIG_VERSION}" /opt/zig && \
-    ln -s /opt/zig/zig /usr/local/bin/zig
-RUN cargo install cargo-zigbuild --version 0.20.0 --locked
-
-# Map TARGETPLATFORM → Rust triple (musl, matches alpine runtime)
-RUN case "$TARGETPLATFORM" in \
-      "linux/amd64") echo "x86_64-unknown-linux-musl" > /tmp/rust_target ;; \
-      "linux/arm64") echo "aarch64-unknown-linux-musl" > /tmp/rust_target ;; \
-      *) echo "Unsupported TARGETPLATFORM: $TARGETPLATFORM" >&2 && exit 1 ;; \
-    esac && \
-    rustup target add "$(cat /tmp/rust_target)"
+ARG RUSTNZB_BUILD_REF
+ARG RELEASE_OPTIMIZED=false
 
 WORKDIR /build
 
-# Frontend deps cached layer
+# Install and build the frontend only from its declared source and lockfile.
+# Host node_modules, Angular output, and stale dist trees are excluded by
+# .dockerignore and therefore cannot affect the runtime image.
 COPY apps/rustnzb/frontend/package.json apps/rustnzb/frontend/package-lock.json apps/rustnzb/frontend/
-RUN cd apps/rustnzb/frontend && npm ci
-
-# Frontend build
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    npm --prefix apps/rustnzb/frontend ci --no-audit --no-fund
 COPY apps/rustnzb/frontend apps/rustnzb/frontend
-RUN if [ -f apps/rustnzb/frontend/dist/frontend/browser/index.html ]; then \
-      echo "Using prebuilt frontend dist from workspace"; \
-    else \
-      cd apps/rustnzb/frontend && npx ng build --configuration=production; \
-    fi
+RUN npm --prefix apps/rustnzb/frontend run build -- --configuration=production \
+    && test -s apps/rustnzb/frontend/dist/frontend/browser/index.html
 
-# Rust source
+# Cargo manifests and sources are copied only after the frontend dependency
+# layer so ordinary application edits do not invalidate npm downloads.
 COPY Cargo.toml Cargo.lock ./
-COPY apps/rustnzb/Cargo.toml apps/rustnzb/build.rs /build/apps/rustnzb/
-COPY apps/rustnzb/src /build/apps/rustnzb/src
+COPY apps apps
 COPY crates crates
 
-# Forgejo cargo registry auth (needed for private nzbdav-* crates)
-ARG GIT_AUTH_TOKEN
-ARG PLUGIN_PASSWORD
+# The Forgejo credential exists only in this BuildKit secret-mounted RUN. It
+# is never a Docker ARG, image ENV value, Cargo file, or cache layer.
+RUN --mount=type=secret,id=forgejo_token,required=true \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    set -eu; \
+    case "$TARGETPLATFORM" in \
+        linux/amd64) rust_target=x86_64-unknown-linux-musl ;; \
+        linux/arm64) rust_target=aarch64-unknown-linux-musl ;; \
+        *) printf 'unsupported target platform: %s\n' "$TARGETPLATFORM" >&2; exit 1 ;; \
+    esac; \
+    token=$(cat /run/secrets/forgejo_token); \
+    if [ "$RELEASE_OPTIMIZED" = true ]; then \
+        export CARGO_PROFILE_RELEASE_LTO=thin \
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+            CARGO_PROFILE_RELEASE_STRIP=symbols; \
+    fi; \
+    CARGO_REGISTRIES_FORGEJO_INDEX='sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/' \
+    CARGO_REGISTRIES_FORGEJO_CREDENTIAL_PROVIDER='cargo:token' \
+    CARGO_REGISTRIES_FORGEJO_TOKEN="Bearer $token" \
+    CARGO_TARGET_DIR=/build/target \
+    RUSTNZB_BUILD_REF="$RUSTNZB_BUILD_REF" \
+        cargo zigbuild --release --locked -p rustnzb \
+            --features webdav,vendored-openssl --target "$rust_target"; \
+    mkdir -p /out; \
+    cp "/build/target/$rust_target/release/rustnzb" /out/rustnzb; \
+    unset token CARGO_REGISTRIES_FORGEJO_TOKEN
+
+
+FROM lscr.io/linuxserver/baseimage-alpine:3.23@sha256:46d690858431e262d574274bb2863e1fbaf8de61c6f7677150dd79c2cc65cdcf AS runtime
+
 ARG RUSTNZB_BUILD_REF
-ARG CI_COMMIT_SHA
-ARG CI_COMMIT_TAG
-ENV RUSTNZB_BUILD_REF=${RUSTNZB_BUILD_REF}
-ENV CI_COMMIT_SHA=${CI_COMMIT_SHA}
-ENV CI_COMMIT_TAG=${CI_COMMIT_TAG}
-RUN TOKEN="${GIT_AUTH_TOKEN:-$PLUGIN_PASSWORD}" && \
-    git config --global url."http://x-access-token:${TOKEN}@100.92.54.45:3002/".insteadOf "http://100.92.54.45:3002/" && \
-    printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n\n[registry]\ndefault = "forgejo"\n' > $CARGO_HOME/config.toml && \
-    printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$TOKEN" > $CARGO_HOME/credentials.toml
-
-ARG RELEASE_OPTIMIZED=false
-
-RUN RUST_TARGET=$(cat /tmp/rust_target) && \
-    if [ "$RELEASE_OPTIMIZED" = "true" ]; then \
-      export CARGO_PROFILE_RELEASE_LTO=thin \
-             CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
-             CARGO_PROFILE_RELEASE_STRIP=symbols; \
-    fi && \
-    CARGO_INCREMENTAL=0 \
-    cargo zigbuild --release -p rustnzb --features webdav,vendored-openssl --target "$RUST_TARGET" && \
-    cp "target/$RUST_TARGET/release/rustnzb" /build/rustnzb-out && \
-    rm -rf target
-
-
-FROM lscr.io/linuxserver/baseimage-alpine:3.21
 
 RUN apk add --no-cache \
+        7zip \
         ca-certificates \
-        curl \
-        7zip
+        curl
 
-COPY --from=builder /build/rustnzb-out /usr/local/bin/rustnzb
-
-# s6 init: create directories and fix permissions
+COPY --from=builder /out/rustnzb /usr/local/bin/rustnzb
 COPY apps/rustnzb/root/ /
 
-EXPOSE 9090
+LABEL org.opencontainers.image.title="rustnzb" \
+      org.opencontainers.image.source="https://repo.indexarr.net/indexarr/rustnzb" \
+      org.opencontainers.image.revision="$RUSTNZB_BUILD_REF"
 
+EXPOSE 9090
 VOLUME ["/config", "/data", "/downloads"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:9090/api/health || exit 1

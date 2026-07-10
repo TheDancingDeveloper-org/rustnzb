@@ -11,88 +11,88 @@ labels:
 steps:
   # ─── Quality checks (run on all events) ──────────────────────────────────
 
+  - name: verify-image-pins
+    image: repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:63a6ecb9f4897f223419c69bdc1bbae3d930f028955fdaa480fac156daedfb47
+    commands:
+      - ci/tasks/verify-image-pins
+
   - name: fmt
-    image: rust:1.88-bookworm
+    image: repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:63a6ecb9f4897f223419c69bdc1bbae3d930f028955fdaa480fac156daedfb47
     environment:
       GIT_AUTH_TOKEN:
         from_secret: git_auth_token
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
-      - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - rustup component add rustfmt
-      - cargo fmt --all -- --check
+      - ci/tasks/fmt
+    depends_on:
+      - verify-image-pins
 
   - name: check
-    image: rust:1.88-bookworm
+    image: repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:63a6ecb9f4897f223419c69bdc1bbae3d930f028955fdaa480fac156daedfb47
     environment:
       GIT_AUTH_TOKEN:
         from_secret: git_auth_token
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
-      - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - cargo check --workspace
-      - sccache --show-stats
+      - ci/tasks/check
+    depends_on:
+      - fmt
 
   - name: test
-    image: rust:1.88-bookworm
+    image: repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:63a6ecb9f4897f223419c69bdc1bbae3d930f028955fdaa480fac156daedfb47
     environment:
       GIT_AUTH_TOKEN:
         from_secret: git_auth_token
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
-      - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - cargo test --workspace --all-targets
-      - cargo test -p rustnzb --features webdav --lib
-      - cargo test --manifest-path benchnzb/Cargo.toml --all-targets --locked
+      - ci/tasks/test
+    depends_on:
+      - check
 
-  - name: frontend-unit
-    image: node:22-bookworm-slim
+  - name: frontend-test
+    image: repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:63a6ecb9f4897f223419c69bdc1bbae3d930f028955fdaa480fac156daedfb47
     commands:
-      - cd apps/rustnzb/frontend
-      - npm ci
-      - npm audit --audit-level=high
-      - npm test -- --coverage --coverage-reporters=text-summary
+      - ci/tasks/frontend-test
+    depends_on:
+      - test
+
+  - name: frontend-audit
+    image: repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:63a6ecb9f4897f223419c69bdc1bbae3d930f028955fdaa480fac156daedfb47
+    commands:
+      - ci/tasks/frontend-audit
+    depends_on:
+      - frontend-test
 
   - name: desktop-test
-    image: rust:1.88-bookworm
+    image: repo.indexarr.net/indexarr/rustnzb-ci-desktop@sha256:8c5b1fdee2c79a48b555a246e0804547488ba46e9b69d2094d6b033862bde2ae
     environment:
       GIT_AUTH_TOKEN:
         from_secret: git_auth_token
     commands:
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - apt-get update
-      - apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - cargo test --manifest-path desktop/src-tauri/Cargo.toml --all-targets --locked
+      - ci/tasks/desktop-test
+    depends_on:
+      - frontend-audit
 
   - name: clippy
-    image: rust:1.88-bookworm
+    image: repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:63a6ecb9f4897f223419c69bdc1bbae3d930f028955fdaa480fac156daedfb47
     environment:
       GIT_AUTH_TOKEN:
         from_secret: git_auth_token
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
-      - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - rustup component add clippy
-      - cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - ci/tasks/clippy
+    depends_on:
+      - desktop-test
 
   # ─── Playwright E2E (push, PR, manual) ───────────────────────────────────
   # Builds the frontend + debug binary, then runs every deterministic
   # Playwright project (seeded, first-boot/auth, and mock-download).
   - name: e2e
-    image: rust:1.88-bookworm
+    image: repo.indexarr.net/indexarr/rustnzb-ci-e2e@sha256:76cdc92ce89bd37dc9d5b533fc63562b5a76f2c25885f7fb73a40ddbd75e1623
     environment:
       GIT_AUTH_TOKEN:
         from_secret: git_auth_token
@@ -104,60 +104,23 @@ steps:
       - event: pull_request
       - event: manual
     commands:
-      - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && apt-get clean && rm -rf /var/lib/apt/lists/*
-      - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-      - apt-get install -y --no-install-recommends nodejs && apt-get clean && rm -rf /var/lib/apt/lists/*
-      # Frontend deps + production build (build.rs expects dist to exist)
-      - cd apps/rustnzb/frontend && npm ci && npx ng build --configuration=production && cd ../../..
-      # Debug binaries are enough for E2E (release takes too long for every PR)
-      - cargo build --workspace --bins
-      # Install Playwright (browsers + system deps)
-      - cd e2e && npm ci && npx playwright install --with-deps chromium
-      - npm audit --audit-level=high
-      - npx playwright test --reporter=list
+      - ci/tasks/e2e
+    depends_on:
+      - clippy
 
   # ─── Build (push to main + tags only) ────────────────────────────────────
 
-  - name: build-frontend
-    image: node:22-bookworm-slim
-    commands:
-      - cd apps/rustnzb/frontend && npm ci && npx ng build --configuration=production
-    when:
-      - event: push
-        branch: main
-      - event: tag
-      - event: manual
-
   - name: build-linux
-    image: rust:1.88-bookworm
+    image: repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:63a6ecb9f4897f223419c69bdc1bbae3d930f028955fdaa480fac156daedfb47
     environment:
       GIT_AUTH_TOKEN:
         from_secret: git_auth_token
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
-      - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - if [ -n "$CI_COMMIT_TAG" ]; then export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols; fi
-      - cargo build --release -p rustnzb --features webdav
-      - ls -lh target/release/rustnzb
-      - |
-        if [ -n "$CI_COMMIT_TAG" ]; then
-          TAG="$CI_COMMIT_TAG"
-          mkdir -p dist-linux/rustnzb-$TAG
-          cp target/release/rustnzb dist-linux/rustnzb-$TAG/
-          cp apps/rustnzb/config.example.toml dist-linux/rustnzb-$TAG/
-          cp README.md dist-linux/rustnzb-$TAG/
-          tar -czf "rustnzb-$TAG-linux-x86_64.tar.gz" -C dist-linux "rustnzb-$TAG"
-          ls -lh "rustnzb-$TAG-linux-x86_64.tar.gz"
-          cargo install cargo-deb --registry crates-io
-          cargo deb --manifest-path apps/rustnzb/Cargo.toml --no-build --no-strip -o "rustnzb-$TAG-amd64.deb"
-          ls -lh "rustnzb-$TAG-amd64.deb"
-        fi
+      - ci/tasks/build-linux
+    depends_on:
+      - clippy
     when:
       - event: push
         branch: main
@@ -165,35 +128,16 @@ steps:
       - event: manual
 
   - name: build-linux-arm64
-    image: rust:1.88-bookworm
+    image: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:89f1f570acb0f8e6514ffcca39bd9f26305263d95274e4c170eedf867d113ad9
     environment:
       GIT_AUTH_TOKEN:
         from_secret: git_auth_token
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
-      - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - curl -fsSL "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz" | tar -xJ -C /opt && mv /opt/zig-linux-x86_64-0.13.0 /opt/zig && ln -s /opt/zig/zig /usr/local/bin/zig
-      - cargo install cargo-zigbuild --version 0.20.0 --locked
-      - rustup target add aarch64-unknown-linux-gnu
-      - if [ -n "$CI_COMMIT_TAG" ]; then export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols; fi
-      - cargo zigbuild --release -p rustnzb --target aarch64-unknown-linux-gnu.2.17 --features webdav,vendored-openssl
-      - ls -lh target/aarch64-unknown-linux-gnu/release/rustnzb
-      - |
-        if [ -n "$CI_COMMIT_TAG" ]; then
-          TAG="$CI_COMMIT_TAG"
-          mkdir -p dist-arm64/rustnzb-$TAG
-          cp target/aarch64-unknown-linux-gnu/release/rustnzb dist-arm64/rustnzb-$TAG/
-          cp apps/rustnzb/config.example.toml dist-arm64/rustnzb-$TAG/
-          cp README.md dist-arm64/rustnzb-$TAG/
-          tar -czf "rustnzb-$TAG-linux-aarch64.tar.gz" -C dist-arm64 "rustnzb-$TAG"
-          ls -lh "rustnzb-$TAG-linux-aarch64.tar.gz"
-          cargo install cargo-deb --registry crates-io
-          cargo deb --manifest-path apps/rustnzb/Cargo.toml --no-build --no-strip --target aarch64-unknown-linux-gnu -o "rustnzb-$TAG-arm64.deb"
-          ls -lh "rustnzb-$TAG-arm64.deb"
-        fi
+      - ci/tasks/build-linux-arm64
+    depends_on:
+      - build-linux
     when:
       - event: push
         branch: main
@@ -201,51 +145,47 @@ steps:
       - event: manual
 
   - name: build-windows
-    image: rust:1.88-bookworm
+    image: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:89f1f570acb0f8e6514ffcca39bd9f26305263d95274e4c170eedf867d113ad9
     environment:
       GIT_AUTH_TOKEN:
         from_secret: git_auth_token
       RUSTC_WRAPPER: sccache
       SCCACHE_REDIS: "redis://100.92.54.45:6380"
     commands:
-      - curl -sSfL "https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /tmp && mv /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-      - printf '[registries.forgejo]\nindex = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"\ncredential-provider = "cargo:token"\n' > $CARGO_HOME/config.toml
-      - printf '[registries.forgejo]\ntoken = "Bearer %s"\n' "$GIT_AUTH_TOKEN" > $CARGO_HOME/credentials.toml
-      - apt-get update && apt-get install -y --no-install-recommends clang llvm lld
-      - cargo install cargo-xwin@0.18.6 --index https://github.com/rust-lang/crates.io-index
-      - rustup target add x86_64-pc-windows-msvc
-      - rm -rf ~/.cache/cargo-xwin
-      - if [ -n "$CI_COMMIT_TAG" ]; then export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols; fi
-      - cargo xwin build --release --target x86_64-pc-windows-msvc --features webdav
-      - ls -lh target/x86_64-pc-windows-msvc/release/rustnzb.exe
+      - ci/tasks/build-windows
+    depends_on:
+      - build-linux-arm64
     when:
       - event: push
         branch: main
       - event: tag
       - event: manual
 
-  - name: package-nsis
-    image: debian:bookworm-slim
+  - name: package-release
+    image: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:89f1f570acb0f8e6514ffcca39bd9f26305263d95274e4c170eedf867d113ad9
+    depends_on:
+      - build-linux
+      - build-linux-arm64
+      - build-windows
     commands:
-      - apt-get update && apt-get install -y --no-install-recommends nsis
-      - TAG="$CI_COMMIT_TAG"
-      - cp target/x86_64-pc-windows-msvc/release/rustnzb.exe installer/
-      - cd installer && makensis -DVERSION="$TAG" windows.nsi
-      - ls -lh "../rustnzb-$TAG-windows-x86_64-setup.exe"
+      - ci/tasks/package-release
     when:
       - event: tag
 
   # ─── Publish artifacts (tags only) ───────────────────────────────────────
 
   - name: publish-release
-    image: alpine:3.23
+    image: alpine@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
     when:
       - event: tag
+    depends_on:
+      - verify-release-images
     environment:
       DEPLOY_SSH_KEY:
         from_secret: deploy_ssh_key
     commands:
       - apk add --no-cache openssh-client coreutils
+      - cd .ci-output/packages
       - mkdir -p ~/.ssh && chmod 700 ~/.ssh
       - printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
       - chmod 600 ~/.ssh/id_ed25519
@@ -265,14 +205,17 @@ steps:
         echo "Published https://dl.rustnzb.dev/latest/"
 
   - name: forgejo-release
-    image: alpine:3.23
+    image: alpine@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
     when:
       - event: tag
+    depends_on:
+      - verify-release-images
     environment:
       FORGEJO_TOKEN:
         from_secret: git_auth_token
     commands:
       - apk add --no-cache curl jq
+      - cd .ci-output/packages
       - |
         TAG="$CI_COMMIT_TAG"
         API="https://repo.indexarr.net/api/v1"
@@ -332,117 +275,141 @@ steps:
   # publish) — until that's reworked to use prebuilt binaries, main pushes
   # only produce :dev / :sha for amd64.
   - name: build-and-push-dev
-    image: woodpeckerci/plugin-docker-buildx
+    image: woodpeckerci/plugin-docker-buildx@sha256:9a22c00b4952e405d11e66d29772edbeb1f7b24f27f71cda251ecb838e725e86
     when:
       - event: push
         branch: main
     depends_on:
-      - build-frontend
+      - build-linux
+      - e2e
+    environment:
+      GIT_AUTH_TOKEN:
+        from_secret: git_auth_token
     settings:
       repo: repo.indexarr.net/indexarr/rustnzbd
       registry: repo.indexarr.net
-      username:
-        from_secret: git_auth_token
+      username: x-access-token
       password:
         from_secret: git_auth_token
       platforms: linux/amd64
+      target: runtime
+      provenance: false
+      secrets:
+        - id=forgejo_token,env=GIT_AUTH_TOKEN
+      cache_images:
+        - repo.indexarr.net/indexarr/rustnzbd:buildcache-amd64
       tags:
-        - dev
         - ${CI_COMMIT_SHA}
       build_args:
         - RUSTNZB_BUILD_REF=${CI_COMMIT_SHA}
-      build_args_from_env:
-        - PLUGIN_PASSWORD
 
-  - name: push-ghcr-dev
-    image: quay.io/skopeo/stable
+  - name: smoke-dev-image
+    image: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:89f1f570acb0f8e6514ffcca39bd9f26305263d95274e4c170eedf867d113ad9
     when:
       - event: push
         branch: main
     depends_on:
       - build-and-push-dev
     environment:
-      GH_TOKEN:
-        from_secret: gh_release_token
-      FORGEJO_TOKEN:
+      GIT_AUTH_TOKEN:
         from_secret: git_auth_token
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     commands:
-      - SRC_CREDS="--src-creds=$FORGEJO_TOKEN:$FORGEJO_TOKEN"
-      - DST_CREDS="--dest-creds=AusAgentSmith:$GH_TOKEN"
-      - skopeo copy $SRC_CREDS $DST_CREDS "docker://repo.indexarr.net/indexarr/rustnzbd:dev" "docker://ghcr.io/ausagentsmith-org/rustnzb:dev"
-      - skopeo copy $SRC_CREDS $DST_CREDS "docker://repo.indexarr.net/indexarr/rustnzbd:${CI_COMMIT_SHA}" "docker://ghcr.io/ausagentsmith-org/rustnzb:${CI_COMMIT_SHA}"
+      - ci/tasks/smoke-runtime "repo.indexarr.net/indexarr/rustnzbd:${CI_COMMIT_SHA}" "${CI_COMMIT_SHA}"
 
-  - name: verify-dev-images
-    image: quay.io/skopeo/stable
+  - name: promote-dev
+    image: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:89f1f570acb0f8e6514ffcca39bd9f26305263d95274e4c170eedf867d113ad9
     when:
       - event: push
         branch: main
     depends_on:
-      - push-ghcr-dev
+      - smoke-dev-image
     environment:
       GH_TOKEN:
         from_secret: gh_release_token
       FORGEJO_TOKEN:
         from_secret: git_auth_token
     commands:
-      - skopeo inspect --creds "$FORGEJO_TOKEN:$FORGEJO_TOKEN" --override-arch amd64 "docker://repo.indexarr.net/indexarr/rustnzbd:dev" > /dev/null
-      - skopeo inspect --creds "$FORGEJO_TOKEN:$FORGEJO_TOKEN" --override-arch amd64 "docker://repo.indexarr.net/indexarr/rustnzbd:${CI_COMMIT_SHA}" > /dev/null
-      - skopeo inspect --creds "AusAgentSmith:$GH_TOKEN" --override-arch amd64 "docker://ghcr.io/ausagentsmith-org/rustnzb:dev" > /dev/null
-      - skopeo inspect --creds "AusAgentSmith:$GH_TOKEN" --override-arch amd64 "docker://ghcr.io/ausagentsmith-org/rustnzb:${CI_COMMIT_SHA}" > /dev/null
+      - ci/tasks/promote-dev
 
   - name: build-and-push-release-amd64
-    image: woodpeckerci/plugin-docker-buildx
+    image: woodpeckerci/plugin-docker-buildx@sha256:9a22c00b4952e405d11e66d29772edbeb1f7b24f27f71cda251ecb838e725e86
     when:
       - event: tag
     depends_on:
-      - build-frontend
+      - package-release
+    environment:
+      GIT_AUTH_TOKEN:
+        from_secret: git_auth_token
     settings:
       repo: repo.indexarr.net/indexarr/rustnzbd
       registry: repo.indexarr.net
-      username:
-        from_secret: git_auth_token
+      username: x-access-token
       password:
         from_secret: git_auth_token
       platforms: linux/amd64
+      target: runtime
+      provenance: false
+      secrets:
+        - id=forgejo_token,env=GIT_AUTH_TOKEN
+      cache_images:
+        - repo.indexarr.net/indexarr/rustnzbd:buildcache-amd64
       tags:
         - ${CI_COMMIT_TAG}-amd64
-        - latest-amd64
       build_args:
         - RELEASE_OPTIMIZED=true
         - RUSTNZB_BUILD_REF=${CI_COMMIT_TAG}
-      build_args_from_env:
-        - PLUGIN_PASSWORD
 
   - name: build-and-push-release-arm64
-    image: woodpeckerci/plugin-docker-buildx
+    image: woodpeckerci/plugin-docker-buildx@sha256:9a22c00b4952e405d11e66d29772edbeb1f7b24f27f71cda251ecb838e725e86
     when:
       - event: tag
     depends_on:
-      - build-frontend
+      - package-release
+    environment:
+      GIT_AUTH_TOKEN:
+        from_secret: git_auth_token
     settings:
       repo: repo.indexarr.net/indexarr/rustnzbd
       registry: repo.indexarr.net
-      username:
-        from_secret: git_auth_token
+      username: x-access-token
       password:
         from_secret: git_auth_token
       platforms: linux/arm64
+      target: runtime
+      provenance: false
+      secrets:
+        - id=forgejo_token,env=GIT_AUTH_TOKEN
+      cache_images:
+        - repo.indexarr.net/indexarr/rustnzbd:buildcache-arm64
       tags:
         - ${CI_COMMIT_TAG}-arm64
-        - latest-arm64
       build_args:
         - RELEASE_OPTIMIZED=true
         - RUSTNZB_BUILD_REF=${CI_COMMIT_TAG}
-      build_args_from_env:
-        - PLUGIN_PASSWORD
 
-  - name: manifest-release
-    image: mplatform/manifest-tool:alpine
+  - name: smoke-release-amd64
+    image: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:89f1f570acb0f8e6514ffcca39bd9f26305263d95274e4c170eedf867d113ad9
     when:
       - event: tag
     depends_on:
       - build-and-push-release-amd64
       - build-and-push-release-arm64
+    environment:
+      GIT_AUTH_TOKEN:
+        from_secret: git_auth_token
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - ci/tasks/smoke-runtime "repo.indexarr.net/indexarr/rustnzbd:${CI_COMMIT_TAG}-amd64" "${CI_COMMIT_TAG}"
+
+  - name: manifest-release
+    image: mplatform/manifest-tool@sha256:566f66687564e125c43bb86e2d035ad9b7fb4449f38814535b691d1a7f8d20db
+    when:
+      - event: tag
+    depends_on:
+      - smoke-release-amd64
     environment:
       REGISTRY_TOKEN:
         from_secret: git_auth_token
@@ -453,15 +420,9 @@ steps:
           --platforms linux/amd64,linux/arm64 \
           --template repo.indexarr.net/indexarr/rustnzbd:${CI_COMMIT_TAG}-ARCH \
           --target repo.indexarr.net/indexarr/rustnzbd:${CI_COMMIT_TAG}
-      - |
-        manifest-tool --username x-access-token --password "$REGISTRY_TOKEN" \
-          push from-args \
-          --platforms linux/amd64,linux/arm64 \
-          --template repo.indexarr.net/indexarr/rustnzbd:latest-ARCH \
-          --target repo.indexarr.net/indexarr/rustnzbd:latest
 
   - name: push-ghcr
-    image: quay.io/skopeo/stable
+    image: quay.io/skopeo/stable@sha256:c7d3c512612f52805023cd38351081dad7e2729fc13d14b701e47c7c8bdd6615
     when:
       - event: tag
     depends_on:
@@ -475,11 +436,12 @@ steps:
       - SRC="docker://repo.indexarr.net/indexarr/rustnzbd:$CI_COMMIT_TAG"
       - SRC_CREDS="--src-creds=$FORGEJO_TOKEN:$FORGEJO_TOKEN"
       - DST_CREDS="--dest-creds=AusAgentSmith:$GH_TOKEN"
+      - skopeo copy --multi-arch all $SRC_CREDS --dest-creds "$FORGEJO_TOKEN:$FORGEJO_TOKEN" $SRC "docker://repo.indexarr.net/indexarr/rustnzbd:latest"
       - skopeo copy --multi-arch all $SRC_CREDS $DST_CREDS $SRC "docker://ghcr.io/ausagentsmith-org/rustnzb:$CI_COMMIT_TAG"
       - skopeo copy --multi-arch all $SRC_CREDS $DST_CREDS $SRC "docker://ghcr.io/ausagentsmith-org/rustnzb:latest"
 
   - name: verify-release-images
-    image: quay.io/skopeo/stable
+    image: quay.io/skopeo/stable@sha256:c7d3c512612f52805023cd38351081dad7e2729fc13d14b701e47c7c8bdd6615
     when:
       - event: tag
     depends_on:
@@ -500,14 +462,17 @@ steps:
       - skopeo inspect --creds "AusAgentSmith:$GH_TOKEN" --override-arch arm64 "docker://ghcr.io/ausagentsmith-org/rustnzb:latest" > /dev/null
 
   - name: github-release
-    image: alpine:3.23
+    image: alpine@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
     when:
       - event: tag
+    depends_on:
+      - verify-release-images
     environment:
       GH_TOKEN:
         from_secret: gh_release_token
     commands:
       - apk add --no-cache curl jq
+      - cd .ci-output/packages
       - |
         TAG="$CI_COMMIT_TAG"
         REPO="AusAgentSmith-org/rustnzb"
@@ -561,7 +526,7 @@ steps:
   # ─── Discord notifications ────────────────────────────────────────────────
 
   - name: discord-success
-    image: alpine/curl
+    image: alpine/curl@sha256:71597a4f6ac6c7515c77084d2a216aa2f302cd6f9ec311d2f55eb9320f161ce2
     environment:
       DISCORD_WEBHOOK_URL:
         from_secret: discord_webhook_url
@@ -581,7 +546,7 @@ steps:
       - status: [success]
 
   - name: discord-failure
-    image: alpine/curl
+    image: alpine/curl@sha256:71597a4f6ac6c7515c77084d2a216aa2f302cd6f9ec311d2f55eb9320f161ce2
     environment:
       DISCORD_WEBHOOK_URL:
         from_secret: discord_webhook_url

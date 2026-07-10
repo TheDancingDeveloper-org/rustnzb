@@ -79,7 +79,8 @@ if command -v jq >/dev/null 2>&1; then
     mount_json=$(docker inspect "${HOSTNAME:-$(hostname)}" --format '{{json .Mounts}}' 2>/dev/null || true)
     if [ -n "$mount_json" ]; then
         mapping=$(printf '%s' "$mount_json" | jq -r --arg root "$ROOT" '
-            map(select(($root == .Destination) or ($root | startswith(.Destination + "/"))))
+            map(select(.Destination as $destination
+                | ($root == $destination) or ($root | startswith($destination + "/"))))
             | sort_by(.Destination | length) | last
             | if . == null then empty else [.Source, .Destination] | @tsv end')
         if [ -n "$mapping" ]; then

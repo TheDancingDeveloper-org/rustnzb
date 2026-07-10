@@ -10,7 +10,7 @@ build_frontend
 if [ -n "${CI_COMMIT_TAG:-}" ]; then
     export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols
 fi
-cargo xwin build --release --target x86_64-pc-windows-msvc --features webdav --locked --accept-license
+XWIN_ACCEPT_LICENSE=1 cargo xwin build --release --target x86_64-pc-windows-msvc --features webdav --locked
 binary=$CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/rustnzb.exe
 test -f "$binary"
 file "$binary"

@@ -28,20 +28,39 @@ fi
 
 docker pull "$image" >/dev/null 2>&1 || true
 docker run --rm --entrypoint /usr/local/bin/rustnzb "$image" --smoke-test
-docker run -d --name "$name" \
-    -e PUID="$(id -u)" -e PGID="$(id -g)" \
-    -p 127.0.0.1::9090 \
-    --tmpfs /config \
-    --tmpfs /data \
-    --tmpfs /downloads \
-    "$image" >/dev/null
+caller=${HOSTNAME:-$(hostname)}
+caller_network=$(docker inspect "$caller" \
+    --format '{{range $name, $network := .NetworkSettings.Networks}}{{if $network.IPAddress}}{{println $name}}{{end}}{{end}}' \
+    2>/dev/null | sed -n '1p' || true)
+if [ -n "$caller_network" ]; then
+    docker run -d --name "$name" \
+        -e PUID="$(id -u)" -e PGID="$(id -g)" \
+        --network "$caller_network" \
+        --tmpfs /config \
+        --tmpfs /data \
+        --tmpfs /downloads \
+        "$image" >/dev/null
+    address=$(docker inspect "$name" \
+        --format "{{with index .NetworkSettings.Networks \"$caller_network\"}}{{.IPAddress}}{{end}}")
+    [ -n "$address" ]
+    base_url=http://$address:9090
+else
+    docker run -d --name "$name" \
+        -e PUID="$(id -u)" -e PGID="$(id -g)" \
+        -p 127.0.0.1::9090 \
+        --tmpfs /config \
+        --tmpfs /data \
+        --tmpfs /downloads \
+        "$image" >/dev/null
+    port=$(docker port "$name" 9090/tcp | sed -n 's/.*://p' | head -n 1)
+    [ -n "$port" ]
+    base_url=http://127.0.0.1:$port
+fi
 
-port=$(docker port "$name" 9090/tcp | sed -n 's/.*://p' | head -n 1)
-[ -n "$port" ]
 ready=false
 i=0
 while [ "$i" -lt 60 ]; do
-    if curl -fsS "http://127.0.0.1:$port/api/health" >"$work/health.json"; then
+    if curl -fsS "$base_url/api/health" >"$work/health.json"; then
         ready=true
         break
     fi
@@ -54,9 +73,9 @@ if [ "$ready" != true ]; then
     exit 1
 fi
 grep -q '"status":"ok"' "$work/health.json"
-curl -fsS "http://127.0.0.1:$port/" >"$work/frontend.html"
+curl -fsS "$base_url/" >"$work/frontend.html"
 grep -Eq '<app-root|<html' "$work/frontend.html"
-setup=$(curl -fsS "http://127.0.0.1:$port/api/setup/status")
+setup=$(curl -fsS "$base_url/api/setup/status")
 if [ -n "$expected_ref" ]; then
     printf '%s' "$setup" | grep -Fq "$expected_ref"
 fi
