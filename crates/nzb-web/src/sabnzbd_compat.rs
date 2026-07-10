@@ -827,12 +827,7 @@ impl SabQueueSlot {
             nzo_id: format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())]),
             filename: job.name.clone(),
             cat: job.category.clone(),
-            status: match job.status {
-                JobStatus::Downloading => "Downloading".into(),
-                JobStatus::Paused => "Paused".into(),
-                JobStatus::Queued => "Queued".into(),
-                _ => job.status.to_string(),
-            },
+            status: sab_queue_status(job.status).into(),
             priority: match job.priority {
                 Priority::Force => "Force".into(),
                 Priority::High => "High".into(),
@@ -848,6 +843,23 @@ impl SabQueueSlot {
             size: format_size_human(job.total_bytes),
             sizeleft: format_size_human(job.total_bytes.saturating_sub(job.downloaded_bytes)),
         }
+    }
+}
+
+/// Map internal lifecycle states to the status vocabulary accepted by the
+/// SABnzbd clients in Sonarr and Radarr. In particular, `PostProcessing` is an
+/// internal rustnzb state; SABnzbd reports custom post-processing as `Running`.
+fn sab_queue_status(status: JobStatus) -> &'static str {
+    match status {
+        JobStatus::Queued => "Queued",
+        JobStatus::Downloading => "Downloading",
+        JobStatus::Paused => "Paused",
+        JobStatus::Verifying => "Verifying",
+        JobStatus::Repairing => "Repairing",
+        JobStatus::Extracting => "Extracting",
+        JobStatus::PostProcessing => "Running",
+        JobStatus::Completed => "Completed",
+        JobStatus::Failed => "Failed",
     }
 }
 
@@ -934,5 +946,29 @@ fn format_speed(bps: u64) -> String {
         format!("{:.1} KB/s", bps as f64 / 1024.0)
     } else {
         format!("{bps} B/s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_statuses_use_sabnzbd_vocabulary() {
+        let cases = [
+            (JobStatus::Queued, "Queued"),
+            (JobStatus::Downloading, "Downloading"),
+            (JobStatus::Paused, "Paused"),
+            (JobStatus::Verifying, "Verifying"),
+            (JobStatus::Repairing, "Repairing"),
+            (JobStatus::Extracting, "Extracting"),
+            (JobStatus::PostProcessing, "Running"),
+            (JobStatus::Completed, "Completed"),
+            (JobStatus::Failed, "Failed"),
+        ];
+
+        for (status, expected) in cases {
+            assert_eq!(sab_queue_status(status), expected);
+        }
     }
 }
