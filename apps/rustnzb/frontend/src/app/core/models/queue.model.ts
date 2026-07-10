@@ -39,6 +39,8 @@ export interface StatusResponse {
   speed_limit_bps: number;
   queue_size: number;
   disk_space_free: number;
+  /** Total filesystem capacity in bytes; 0 means unknown (platform doesn't report it). */
+  disk_space_total: number;
   min_free_space_bytes: number;
   paused: boolean;
   pause_remaining_secs: number | null;

@@ -4,11 +4,13 @@ import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router, RouterModule } from '@angular/router';
 import { HttpClient } from '@angular/common/http';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
-import { Observable, Subscription, combineLatest, finalize } from 'rxjs';
+import { Observable, Subscription, finalize } from 'rxjs';
 import { ApiService } from '../../core/services/api.service';
 import { AddNzbService } from '../../core/services/add-nzb.service';
 import { NzbJob, QueueResponse, StatusResponse } from '../../core/models/queue.model';
 import { HistoryViewComponent } from '../history/history-view.component';
+import { ConfirmService } from '../../shared/confirm.service';
+import { IconComponent } from '../../shared/icon.component';
 
 interface CategoryConfig {
   name: string;
@@ -36,33 +38,19 @@ interface PipelineStep {
 @Component({
   selector: 'app-queue-view',
   standalone: true,
-  imports: [CommonModule, FormsModule, RouterModule, MatSnackBarModule, HistoryViewComponent],
+  imports: [
+    CommonModule,
+    FormsModule,
+    RouterModule,
+    MatSnackBarModule,
+    HistoryViewComponent,
+    IconComponent,
+  ],
   template: `
     <div class="downloads-head">
       <h2>Downloads</h2>
-      <div class="view-tabs" role="tablist" aria-label="Downloads sections">
-        <button
-          type="button"
-          role="tab"
-          [class.active]="activeTab() === 'queue'"
-          [attr.aria-selected]="activeTab() === 'queue'"
-          (click)="openTab('queue')"
-        >
-          Queue
-        </button>
-        <button
-          type="button"
-          role="tab"
-          [class.active]="activeTab() === 'history'"
-          [attr.aria-selected]="activeTab() === 'history'"
-          (click)="openTab('history')"
-        >
-          History
-        </button>
-      </div>
     </div>
 
-    @if (activeTab() === 'queue') {
     <!-- ============ Stat cards ============ -->
     <div class="cards4">
       <div class="card">
@@ -93,8 +81,12 @@ interface PipelineStep {
         <div class="val">
           {{ diskFreeValue() }} <span class="unit">{{ diskFreeUnit() }}</span>
         </div>
-        <div class="bar green"><div [style.width.%]="diskUsedPct()"></div></div>
-        <div class="sub">Downloads volume</div>
+        @if (diskTotalKnown()) {
+          <div class="bar green"><div [style.width.%]="diskUsedPct()"></div></div>
+          <div class="sub">{{ diskUsedPct() }}% used of {{ formatBytes(status()?.disk_space_total ?? 0) }}</div>
+        } @else {
+          <div class="sub">Downloads volume</div>
+        }
       </div>
     </div>
 
@@ -108,7 +100,7 @@ interface PipelineStep {
           (click)="togglePool()"
           [title]="poolCollapsed() ? 'Expand' : 'Collapse'"
         >
-          {{ poolCollapsed() ? '▸' : '▾' }}
+          <app-icon [name]="poolCollapsed() ? 'chevron-right' : 'chevron-down'" [size]="12" />
         </button>
       </h3>
       @if (!poolCollapsed()) {
@@ -123,43 +115,33 @@ interface PipelineStep {
             </div>
           }
           @for (s of visibleServersWithConns(); track s.id) {
-            <div class="srv-block">
-              <div class="srv-head">
-                <div>
-                  <span class="srv-name" [class.dim]="!s.enabled">{{ s.name || s.host }}</span>
-                  <span class="prio">
-                    priority {{ s.priority }} · {{ s.connections }} slots
-                    @if (!s.enabled) {
-                      · disabled
-                    }
-                  </span>
-                </div>
-                <div class="srv-meta">
-                  @if (s.enabled) {
-                    {{ s.active }} active · {{ s.idle }} idle
-                  } @else {
-                    off
-                  }
-                </div>
-              </div>
-              <div class="conn-grid">
-                @for (i of gridRange(s.connections); track i) {
-                  <div
-                    class="c"
-                    [class.active]="s.enabled && i < s.active"
-                    [class.idle]="s.enabled && i >= s.active && i < s.active + s.idle"
-                    [class.err]="!s.enabled"
-                  ></div>
+            <div class="srv-row">
+              <span class="srv-name" [class.dim]="!s.enabled" [title]="s.name || s.host">{{
+                s.name || s.host
+              }}</span>
+              <span class="srv-prio">P{{ s.priority }}</span>
+              <div class="srv-bar" [class.disabled]="!s.enabled">
+                @if (s.enabled) {
+                  <div class="seg active" [style.width.%]="pct(s.active, s.connections)"></div>
+                  <div class="seg idle" [style.width.%]="pct(s.idle, s.connections)"></div>
                 }
               </div>
+              <span class="srv-count">
+                @if (s.enabled) {
+                  {{ s.active }} active · {{ s.idle }} idle · {{
+                    s.connections - s.active - s.idle
+                  }}
+                  free
+                } @else {
+                  disabled
+                }
+              </span>
             </div>
           }
           <div class="legend">
-            <span class="sw a">Active transfer</span>
-            <span class="sw i">Idle (pooled)</span>
-            <span class="sw f">Free slot</span>
-            <span class="sw e">Disabled / error</span>
-            <span style="margin-left:auto">Transport: NNTPS · rustls (ring)</span>
+            <span class="sw a">Active</span>
+            <span class="sw i">Idle</span>
+            <span style="margin-left:auto">NNTPS · rustls (ring)</span>
           </div>
         </div>
       }
@@ -193,7 +175,9 @@ interface PipelineStep {
         <h3>
           Add NZB
           <span class="hint">upload .nzb files or paste a URL</span>
-          <button class="row-action" (click)="showAddPanel = false" title="close">✕</button>
+          <button class="row-action" (click)="showAddPanel = false" title="close" aria-label="Close">
+            <app-icon name="close" [size]="12" />
+          </button>
         </h3>
         <div class="body">
           <div class="add-tabs">
@@ -228,7 +212,7 @@ interface PipelineStep {
                 @for (f of selectedFiles; track f.name) {
                   <div class="file-chip">
                     <span>{{ f.name }}</span>
-                    <span class="chip-x" (click)="removeFile(f)">✕</span>
+                    <span class="chip-x" (click)="removeFile(f)"><app-icon name="close" [size]="11" /></span>
                   </div>
                 }
               </div>
@@ -319,10 +303,12 @@ interface PipelineStep {
 
       @if (selectedIds().size > 0) {
         <span class="bulk-count">{{ selectedIds().size }} selected</span>
-        <button class="btn sm" (click)="bulkResume()">▶ Start</button>
-        <button class="btn sm" (click)="bulkPause()">❚❚ Pause</button>
+        <button class="btn sm" (click)="bulkResume()"><app-icon name="play" [size]="11" /> Start</button>
+        <button class="btn sm" (click)="bulkPause()"><app-icon name="pause" [size]="11" /> Pause</button>
         <button class="btn sm danger" (click)="bulkDelete()">Delete</button>
-        <button class="btn sm ghost" (click)="clearSelection()">✕</button>
+        <button class="btn sm ghost" (click)="clearSelection()" aria-label="Clear selection">
+          <app-icon name="close" [size]="11" />
+        </button>
       }
     </div>
 
@@ -386,7 +372,7 @@ interface PipelineStep {
                     }}"
                     aria-label="Drag to reorder queue"
                   >
-                    ⋮⋮
+                    <app-icon name="drag-handle" [size]="14" />
                   </button>
                 </td>
                 <td>
@@ -446,8 +432,9 @@ interface PipelineStep {
                       [disabled]="isActionPending(job.id)"
                       (click)="resumeJob(job.id)"
                       title="resume"
+                      aria-label="Resume"
                     >
-                      ▶
+                      <app-icon name="play" [size]="12" />
                     </button>
                   } @else {
                     <button
@@ -455,8 +442,9 @@ interface PipelineStep {
                       [disabled]="isActionPending(job.id)"
                       (click)="pauseJob(job.id)"
                       title="pause"
+                      aria-label="Pause"
                     >
-                      ❚❚
+                      <app-icon name="pause" [size]="12" />
                     </button>
                   }
                 </td>
@@ -464,16 +452,21 @@ interface PipelineStep {
                   <button
                     class="row-action danger"
                     [disabled]="isActionPending(job.id)"
-                    (click)="deleteJob(job.id)"
+                    (click)="deleteJob(job)"
                     title="remove"
+                    aria-label="Remove"
                   >
-                    ✕
+                    <app-icon name="close" [size]="12" />
                   </button>
                 </td>
               </tr>
             }
 
-            @if (filteredJobs().length === 0) {
+            @if (loading()) {
+              <tr>
+                <td colspan="11" class="empty-cell">Loading…</td>
+              </tr>
+            } @else if (filteredJobs().length === 0) {
               <tr>
                 <td colspan="11" class="empty-cell">
                   @if (jobs().length === 0) {
@@ -488,7 +481,24 @@ interface PipelineStep {
         </table>
       </div>
     </div>
-    } @else {
+
+    <!-- ============ History (collapsible) ============ -->
+    <div
+      class="history-toggle"
+      role="button"
+      tabindex="0"
+      [attr.aria-expanded]="!historyCollapsed()"
+      (click)="toggleHistory()"
+      (keydown.enter)="toggleHistory()"
+      (keydown.space)="toggleHistory(); $event.preventDefault()"
+    >
+      <span class="chevron">
+        <app-icon [name]="historyCollapsed() ? 'chevron-right' : 'chevron-down'" [size]="12" />
+      </span>
+      <h2>History</h2>
+      <span class="hint">completed &amp; failed downloads</span>
+    </div>
+    @if (!historyCollapsed()) {
       <app-history-view />
     }
   `,
@@ -511,27 +521,40 @@ interface PipelineStep {
         font-size: 20px;
         font-weight: 600;
       }
-      .view-tabs {
-        display: inline-flex;
+      .history-toggle {
+        display: flex;
         align-items: center;
-        gap: 4px;
-        padding: 4px;
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        background: var(--panel);
-      }
-      .view-tabs button {
-        border: none;
-        background: transparent;
-        color: var(--mute);
-        font: inherit;
-        padding: 7px 12px;
-        border-radius: 6px;
+        gap: 8px;
+        margin: 22px 0 14px;
         cursor: pointer;
+        user-select: none;
       }
-      .view-tabs button.active {
-        background: color-mix(in srgb, var(--accent) 18%, transparent);
+      .history-toggle:hover h2,
+      .history-toggle:hover .chevron {
         color: var(--text);
+      }
+      .history-toggle:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 3px;
+        border-radius: 4px;
+      }
+      .history-toggle .chevron {
+        color: var(--mute);
+        font-size: 12px;
+        width: 12px;
+        display: inline-block;
+        transition: color 0.15s;
+      }
+      .history-toggle h2 {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 600;
+        color: var(--mute);
+        transition: color 0.15s;
+      }
+      .history-toggle .hint {
+        color: var(--mute);
+        font-size: 12px;
       }
       :host ::ng-deep .cards4 {
         gap: 12px;
@@ -619,59 +642,62 @@ interface PipelineStep {
       .collapse-btn:hover {
         color: var(--text);
       }
-      .srv-block {
-        padding: 6px 0;
+      .srv-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 4px 0;
         border-bottom: 1px solid var(--line);
       }
-      .srv-block:last-of-type {
+      .srv-row:last-of-type {
         border: none;
         padding-bottom: 0;
       }
-      .srv-block:first-of-type {
+      .srv-row:first-of-type {
         padding-top: 0;
       }
-      .srv-head {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        margin-bottom: 4px;
-      }
       .srv-name {
+        flex: 0 0 150px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
         font-weight: 600;
         font-size: 11px;
       }
       .srv-name.dim {
         color: var(--mute);
-      }
-      .prio {
-        color: var(--mute);
         font-weight: 400;
-        font-size: 10px;
-        margin-left: 6px;
       }
-      .srv-meta {
+      .srv-prio {
+        flex: 0 0 auto;
         color: var(--mute);
         font-size: 10px;
       }
-      .conn-grid {
-        display: grid;
-        grid-template-columns: repeat(40, 1fr);
-        gap: 2px;
-      }
-      .conn-grid .c {
+      .srv-bar {
+        flex: 1 1 auto;
+        min-width: 50px;
         height: 8px;
-        border-radius: 1px;
         background: var(--panel2);
+        border-radius: 4px;
+        overflow: hidden;
+        display: flex;
       }
-      .conn-grid .c.active {
+      .srv-bar.disabled {
+        opacity: 0.35;
+      }
+      .srv-bar .seg.active {
         background: var(--accent2);
       }
-      .conn-grid .c.idle {
+      .srv-bar .seg.idle {
         background: var(--accent);
       }
-      .conn-grid .c.err {
-        background: var(--danger);
-        opacity: 0.6;
+      .srv-count {
+        flex: 0 0 auto;
+        min-width: 150px;
+        text-align: right;
+        color: var(--mute);
+        font-size: 10px;
+        white-space: nowrap;
       }
       .legend {
         display: flex;
@@ -698,14 +724,6 @@ interface PipelineStep {
       }
       .legend .i::before {
         background: var(--accent);
-      }
-      .legend .f::before {
-        background: var(--panel2);
-        border: 1px solid var(--line);
-      }
-      .legend .e::before {
-        background: var(--danger);
-        opacity: 0.6;
       }
       .empty {
         color: var(--mute);
@@ -992,7 +1010,7 @@ interface PipelineStep {
         margin: 0 auto;
       }
       .pri-select {
-        background: var(--surface, #1e2533);
+        background: var(--panel2);
         border: 1px solid var(--line);
         border-radius: 4px;
         color: var(--text);
@@ -1043,7 +1061,7 @@ interface PipelineStep {
   ],
 })
 export class QueueViewComponent implements OnInit, OnDestroy {
-  activeTab = signal<'queue' | 'history'>('queue');
+  loading = signal(true);
   jobs = signal<NzbJob[]>([]);
   remainingBytes = signal(0);
   categories = signal<CategoryConfig[]>([]);
@@ -1064,6 +1082,16 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     const next = !this.poolCollapsed();
     this.poolCollapsed.set(next);
     localStorage.setItem(this.POOL_KEY, String(next));
+  }
+
+  // Visible by default; collapse state persists across visits like the pool panel.
+  readonly HISTORY_KEY = 'rustnzb.historyPanelCollapsed';
+  historyCollapsed = signal(localStorage.getItem('rustnzb.historyPanelCollapsed') === 'true');
+
+  toggleHistory(): void {
+    const next = !this.historyCollapsed();
+    this.historyCollapsed.set(next);
+    localStorage.setItem(this.HISTORY_KEY, String(next));
   }
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -1090,23 +1118,20 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     private addNzbService: AddNzbService,
     private route: ActivatedRoute,
     private router: Router,
+    private confirmSvc: ConfirmService,
   ) {}
 
   ngOnInit(): void {
-    this.routeSub = combineLatest([this.route.data, this.route.queryParamMap]).subscribe(
-      ([data, queryParamMap]) => {
-        const legacyTab = data['legacyTab'] as 'queue' | 'history' | undefined;
-        if (legacyTab) {
-          void this.router.navigate(['/downloads'], {
-            replaceUrl: true,
-            queryParams: legacyTab === 'history' ? { tab: 'history' } : {},
-          });
-          return;
-        }
-
-        this.activeTab.set(queryParamMap.get('tab') === 'history' ? 'history' : 'queue');
-      },
-    );
+    this.routeSub = this.route.data.subscribe((data) => {
+      // /queue and /history are legacy bookmarks — both now live on one
+      // page. A /history bookmark should land with the panel expanded,
+      // without overriding the user's saved collapse preference going forward.
+      const legacyTab = data['legacyTab'] as 'queue' | 'history' | undefined;
+      if (legacyTab) {
+        if (legacyTab === 'history') this.historyCollapsed.set(false);
+        void this.router.navigate(['/downloads'], { replaceUrl: true });
+      }
+    });
     this.loadAll();
     this.pollTimer = setInterval(() => this.loadQueue(), 2000);
     this.toggleSub = this.addNzbService.panelToggle$.subscribe(() => {
@@ -1118,12 +1143,6 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.routeSub?.unsubscribe();
     this.toggleSub?.unsubscribe();
-  }
-
-  openTab(tab: 'queue' | 'history'): void {
-    void this.router.navigate(['/downloads'], {
-      queryParams: tab === 'history' ? { tab: 'history' } : {},
-    });
   }
 
   private loadAll(): void {
@@ -1146,8 +1165,9 @@ export class QueueViewComponent implements OnInit, OnDestroy {
         const next = new Set<string>();
         for (const id of cur) if (liveIds.has(id)) next.add(id);
         if (next.size !== cur.size) this.selectedIds.set(next);
+        this.loading.set(false);
       },
-      error: () => {},
+      error: () => this.loading.set(false),
     });
     this.api.get<StatusResponse>('/status').subscribe({
       next: (s) => this.status.set(s),
@@ -1175,7 +1195,14 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   speedUnit = computed(() => this.formatSpeedUnit(this.status()?.speed_bps ?? 0));
   diskFreeValue = computed(() => this.formatBytesValue(this.status()?.disk_space_free ?? 0));
   diskFreeUnit = computed(() => this.formatBytesUnit(this.status()?.disk_space_free ?? 0));
-  diskUsedPct = computed(() => 28); // No total-disk endpoint; placeholder bar.
+  diskTotalKnown = computed(() => (this.status()?.disk_space_total ?? 0) > 0);
+  diskUsedPct = computed(() => {
+    const total = this.status()?.disk_space_total ?? 0;
+    if (total <= 0) return 0;
+    const free = this.status()?.disk_space_free ?? 0;
+    const used = Math.max(0, total - free);
+    return Math.min(100, Math.round((100 * used) / total));
+  });
 
   serversEnabled = computed(() => this.servers().filter((s) => s.enabled).length);
   connsTotal = computed(() =>
@@ -1220,8 +1247,8 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     });
   });
 
-  gridRange(n: number): number[] {
-    return Array.from({ length: n }, (_, i) => i);
+  pct(part: number, total: number): number {
+    return total > 0 ? (100 * part) / total : 0;
   }
 
   etaTotal(): string {
@@ -1423,8 +1450,21 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     });
   }
 
-  deleteJob(id: string): void {
-    this.withPendingJobAction(id, () => this.api.delete(`/queue/${id}`));
+  deleteJob(job: NzbJob): void {
+    this.confirmSvc
+      .confirm({
+        title: `Remove "${job.name}"?`,
+        message:
+          job.status === 'completed' || job.status === 'failed'
+            ? 'This removes it from the queue view.'
+            : 'This stops the download and removes it from the queue. Progress is lost.',
+        confirmLabel: 'Remove',
+        danger: true,
+      })
+      .subscribe((ok) => {
+        if (!ok) return;
+        this.withPendingJobAction(job.id, () => this.api.delete(`/queue/${job.id}`));
+      });
   }
 
   onReorderStart(event: DragEvent, jobId: string): void {
@@ -1561,10 +1601,19 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   bulkDelete(): void {
     const ids = Array.from(this.selectedIds());
     if (ids.length === 0) return;
-    if (!confirm(`Delete ${ids.length} job(s)?`)) return;
-    ids.forEach((id) => this.api.delete(`/queue/${id}`).subscribe());
-    this.clearSelection();
-    setTimeout(() => this.loadQueue(), 300);
+    this.confirmSvc
+      .confirm({
+        title: `Remove ${ids.length} job(s)?`,
+        message: 'Downloads in progress among the selection will be stopped. Progress is lost.',
+        confirmLabel: 'Remove',
+        danger: true,
+      })
+      .subscribe((ok) => {
+        if (!ok) return;
+        ids.forEach((id) => this.api.delete(`/queue/${id}`).subscribe());
+        this.clearSelection();
+        setTimeout(() => this.loadQueue(), 300);
+      });
   }
 
   // ---- Formatting ----
