@@ -3,6 +3,7 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { ApiService } from '../../core/services/api.service';
+import { ConfirmService } from '../../shared/confirm.service';
 
 interface RssFeed {
   name: string; url: string; poll_interval_secs: number; category: string | null;
@@ -303,7 +304,11 @@ export class RssViewComponent implements OnInit {
     return Math.round(avg) + 's';
   });
 
-  constructor(private api: ApiService, private snack: MatSnackBar) {}
+  constructor(
+    private api: ApiService,
+    private snack: MatSnackBar,
+    private confirmSvc: ConfirmService,
+  ) {}
 
   ngOnInit(): void { this.loadAll(); }
 
@@ -378,14 +383,23 @@ export class RssViewComponent implements OnInit {
   }
 
   deleteFeed(name: string): void {
-    if (!confirm(`Delete feed "${name}"?`)) return;
-    this.api.delete(`/config/rss-feeds/${encodeURIComponent(name)}`).subscribe({
-      next: () => {
-        this.snack.open('Feed deleted', 'Close', { duration: 2000 });
-        this.loadAll();
-      },
-      error: () => this.snack.open('Failed to delete feed', 'Close', { duration: 3000 }),
-    });
+    this.confirmSvc
+      .confirm({
+        title: `Delete feed "${name}"?`,
+        message: 'This removes the feed from RSS monitoring. Existing download rules are kept but will no longer match items from it.',
+        confirmLabel: 'Delete',
+        danger: true,
+      })
+      .subscribe((ok) => {
+        if (!ok) return;
+        this.api.delete(`/config/rss-feeds/${encodeURIComponent(name)}`).subscribe({
+          next: () => {
+            this.snack.open('Feed deleted', 'Close', { duration: 2000 });
+            this.loadAll();
+          },
+          error: () => this.snack.open('Failed to delete feed', 'Close', { duration: 3000 }),
+        });
+      });
   }
 
   // -- Rule CRUD --
@@ -446,14 +460,23 @@ export class RssViewComponent implements OnInit {
   }
 
   deleteRule(id: string): void {
-    if (!confirm('Delete this rule?')) return;
-    this.api.delete(`/rss/rules/${id}`).subscribe({
-      next: () => {
-        this.snack.open('Rule deleted', 'Close', { duration: 2000 });
-        this.loadAll();
-      },
-      error: () => this.snack.open('Failed to delete rule', 'Close', { duration: 3000 }),
-    });
+    this.confirmSvc
+      .confirm({
+        title: 'Delete this rule?',
+        message: 'Matching items will no longer be auto-downloaded once removed.',
+        confirmLabel: 'Delete',
+        danger: true,
+      })
+      .subscribe((ok) => {
+        if (!ok) return;
+        this.api.delete(`/rss/rules/${id}`).subscribe({
+          next: () => {
+            this.snack.open('Rule deleted', 'Close', { duration: 2000 });
+            this.loadAll();
+          },
+          error: () => this.snack.open('Failed to delete rule', 'Close', { duration: 3000 }),
+        });
+      });
   }
 
   // -- Items --
