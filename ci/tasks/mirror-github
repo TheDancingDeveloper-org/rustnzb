@@ -41,6 +41,9 @@ case "$kind" in
         ;;
     tag)
         tag=${CI_COMMIT_TAG:?CI_COMMIT_TAG is required}
+        if ! git show-ref --verify --quiet "refs/tags/$tag"; then
+            git fetch origin "refs/tags/$tag:refs/tags/$tag"
+        fi
         git show-ref --verify --quiet "refs/tags/$tag"
         git push "$repo_url" "refs/tags/$tag:refs/tags/$tag"
         ;;

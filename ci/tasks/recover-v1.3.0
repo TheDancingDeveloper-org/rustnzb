@@ -1,0 +1,101 @@
+#!/bin/sh
+set -eu
+
+: "${GH_TOKEN:?GH_TOKEN is required}"
+: "${GIT_AUTH_TOKEN:?GIT_AUTH_TOKEN is required}"
+: "${DEPLOY_SSH_KEY:?DEPLOY_SSH_KEY is required}"
+
+tag=v1.3.0
+expected_commit=58dae729699a95800d8562df239b1176d9fc34fc
+forgejo_api=https://repo.indexarr.net/api/v1
+forgejo_repo=indexarr/rustnzb
+github_repo=AusAgentSmith-org/rustnzb
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+
+# The immutable tag and Forgejo release are prepared before this recovery runs.
+release=$(curl -fsS -H "Authorization: token $GIT_AUTH_TOKEN" \
+    "$forgejo_api/repos/$forgejo_repo/releases/tags/$tag")
+release_id=$(printf '%s' "$release" | jq -r .id)
+test -n "$release_id"
+
+files="
+rustnzb-$tag-linux-x86_64.tar.gz
+rustnzb-$tag-linux-aarch64.tar.gz
+rustnzb-$tag-windows-x86_64-setup.exe
+rustnzb-$tag-amd64.deb
+rustnzb-$tag-arm64.deb
+SHA256SUMS-$tag.txt
+"
+
+for file in $files; do
+    url=$(printf '%s' "$release" | jq -r --arg name "$file" \
+        '.assets[] | select(.name == $name) | .browser_download_url')
+    test -n "$url"
+    curl -fsSL -H "Authorization: token $GIT_AUTH_TOKEN" \
+        "$url" -o "$stage/$file"
+done
+(cd "$stage" && sha256sum -c "SHA256SUMS-$tag.txt")
+
+# Promote the verified Forgejo manifest, then mirror it intact to GHCR.
+src="docker://repo.indexarr.net/indexarr/rustnzbd:$tag"
+src_creds="--src-creds=$GIT_AUTH_TOKEN:$GIT_AUTH_TOKEN"
+dst_creds="--dest-creds=AusAgentSmith:$GH_TOKEN"
+skopeo copy --multi-arch all $src_creds \
+    --dest-creds "$GIT_AUTH_TOKEN:$GIT_AUTH_TOKEN" \
+    "$src" "docker://repo.indexarr.net/indexarr/rustnzbd:latest"
+skopeo copy --multi-arch all $src_creds $dst_creds \
+    "$src" "docker://ghcr.io/ausagentsmith-org/rustnzb:$tag"
+skopeo copy --multi-arch all $src_creds $dst_creds \
+    "$src" "docker://ghcr.io/ausagentsmith-org/rustnzb:latest"
+
+# Mirror the immutable tag after main has already been reconciled and mirrored.
+CI_COMMIT_TAG=$tag ci/tasks/mirror-github tag
+test "$(git rev-parse "refs/tags/$tag^{commit}")" = "$expected_commit"
+
+# Recreate the GitHub release from the checked-in notes and identical artifacts.
+existing_id=$(curl -sS -H "Authorization: token $GH_TOKEN" \
+    "https://api.github.com/repos/$github_repo/releases/tags/$tag" | \
+    jq -r '.id // empty')
+if test -n "$existing_id"; then
+    curl -fsS -X DELETE -H "Authorization: token $GH_TOKEN" \
+        "https://api.github.com/repos/$github_repo/releases/$existing_id" >/dev/null
+fi
+jq -n \
+    --arg tag "$tag" \
+    --arg name "rustnzb $tag" \
+    --rawfile body "RELEASE_NOTES_$tag.md" \
+    '{tag_name:$tag,target_commitish:"main",name:$name,body:$body,draft:false,prerelease:false}' \
+    > "$stage/github-release.json"
+github_release_id=$(curl -fsS -X POST \
+    -H "Authorization: token $GH_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data-binary @"$stage/github-release.json" \
+    "https://api.github.com/repos/$github_repo/releases" | jq -r .id)
+test -n "$github_release_id"
+for file in $files; do
+    curl -fsS -X POST \
+        -H "Authorization: token $GH_TOKEN" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@$stage/$file" \
+        "https://uploads.github.com/repos/$github_repo/releases/$github_release_id/assets?name=$file" \
+        >/dev/null
+done
+
+# Publish the identical artifact set and atomically advance the download alias.
+mkdir -p "$stage/ssh"
+printf '%s\n' "$DEPLOY_SSH_KEY" > "$stage/ssh/id_ed25519"
+chmod 600 "$stage/ssh/id_ed25519"
+printf '%s\n' \
+    'StrictHostKeyChecking no' \
+    'UserKnownHostsFile /dev/null' \
+    'LogLevel ERROR' > "$stage/ssh/config"
+ssh -i "$stage/ssh/id_ed25519" -F "$stage/ssh/config" root@100.92.4.57 \
+    "mkdir -p /root/downloads/rustnzb/$tag"
+scp -O -i "$stage/ssh/id_ed25519" -F "$stage/ssh/config" \
+    $(for file in $files; do printf '%s ' "$stage/$file"; done) \
+    "root@100.92.4.57:/root/downloads/rustnzb/$tag/"
+ssh -i "$stage/ssh/id_ed25519" -F "$stage/ssh/config" root@100.92.4.57 \
+    "ln -sfn $tag /root/downloads/rustnzb/latest"
+
+echo "Recovered rustnzb $tag release publication"

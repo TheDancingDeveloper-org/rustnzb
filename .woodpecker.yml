@@ -342,24 +342,13 @@ steps:
       - event: tag
     depends_on:
       - package-release
-    settings:
-      repo: repo.indexarr.net/indexarr/rustnzbd
-      registry: repo.indexarr.net
-      username: x-access-token
-      password:
+    environment:
+      GIT_AUTH_TOKEN:
         from_secret: git_auth_token
-      platforms: linux/amd64
-      target: runtime
-      provenance: false
-      secrets:
-        - id=forgejo_token,env=PLUGIN_PASSWORD
-      cache_images:
-        - repo.indexarr.net/indexarr/rustnzbd:buildcache-amd64
-      tags:
-        - ${CI_COMMIT_TAG}-amd64
-      build_args:
-        - RELEASE_OPTIMIZED=true
-        - RUSTNZB_BUILD_REF=${CI_COMMIT_TAG}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - RUSTNZB_BUILD_REF="${CI_COMMIT_TAG}" RUSTNZB_PLATFORM=linux/amd64 RUSTNZB_PUSH=true RUSTNZB_CACHE_IMAGE=repo.indexarr.net/indexarr/rustnzbd:buildcache-amd64 ci/tasks/build-image "repo.indexarr.net/indexarr/rustnzbd:${CI_COMMIT_TAG}-amd64"
 
   - name: build-and-push-release-arm64
     image: woodpeckerci/plugin-docker-buildx@sha256:9a22c00b4952e405d11e66d29772edbeb1f7b24f27f71cda251ecb838e725e86
@@ -367,24 +356,31 @@ steps:
       - event: tag
     depends_on:
       - package-release
-    settings:
-      repo: repo.indexarr.net/indexarr/rustnzbd
-      registry: repo.indexarr.net
-      username: x-access-token
-      password:
+    environment:
+      GIT_AUTH_TOKEN:
         from_secret: git_auth_token
-      platforms: linux/arm64
-      target: runtime
-      provenance: false
-      secrets:
-        - id=forgejo_token,env=PLUGIN_PASSWORD
-      cache_images:
-        - repo.indexarr.net/indexarr/rustnzbd:buildcache-arm64
-      tags:
-        - ${CI_COMMIT_TAG}-arm64
-      build_args:
-        - RELEASE_OPTIMIZED=true
-        - RUSTNZB_BUILD_REF=${CI_COMMIT_TAG}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - RUSTNZB_BUILD_REF="${CI_COMMIT_TAG}" RUSTNZB_PLATFORM=linux/arm64 RUSTNZB_PUSH=true RUSTNZB_CACHE_IMAGE=repo.indexarr.net/indexarr/rustnzbd:buildcache-arm64 ci/tasks/build-image "repo.indexarr.net/indexarr/rustnzbd:${CI_COMMIT_TAG}-arm64"
+
+  # One-shot recovery for v1.3.0 after the original tag pipeline packaged all
+  # native artifacts but the legacy Docker plugin secret syntax failed. Remove
+  # after pipeline 222 has been fully recovered and verified.
+  - name: recover-v1.3.0
+    image: alpine@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
+    when:
+      - event: manual
+    environment:
+      GH_TOKEN:
+        from_secret: gh_release_token
+      GIT_AUTH_TOKEN:
+        from_secret: git_auth_token
+      DEPLOY_SSH_KEY:
+        from_secret: deploy_ssh_key
+    commands:
+      - apk add --no-cache curl git jq openssh-client skopeo coreutils
+      - ci/tasks/recover-v1.3.0
 
   - name: smoke-release-amd64
     image: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:89f1f570acb0f8e6514ffcca39bd9f26305263d95274e4c170eedf867d113ad9
