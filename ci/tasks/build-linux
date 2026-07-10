@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/cargo-auth"
+trap 'cleanup_cargo_auth; cleanup_frontend' EXIT
+task_start build-linux cargo npm
+setup_cargo_auth
+task_target_dir build-linux
+build_frontend
+if [ -n "${CI_COMMIT_TAG:-}" ]; then
+    export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols
+fi
+cargo build --release -p rustnzb --features webdav --locked
+test -x "$CARGO_TARGET_DIR/release/rustnzb"
+ls -lh "$CARGO_TARGET_DIR/release/rustnzb"
+show_sccache_stats

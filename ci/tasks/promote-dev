@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+task_start promote-dev skopeo
+
+: "${FORGEJO_TOKEN:?FORGEJO_TOKEN is required}"
+: "${GH_TOKEN:?GH_TOKEN is required}"
+sha=${CI_COMMIT_SHA:?CI_COMMIT_SHA is required}
+forgejo=repo.indexarr.net/indexarr/rustnzbd
+ghcr=ghcr.io/ausagentsmith-org/rustnzb
+src_creds=$FORGEJO_TOKEN:$FORGEJO_TOKEN
+dst_creds=AusAgentSmith:$GH_TOKEN
+
+candidate=$(skopeo inspect --creds "$src_creds" --format '{{.Digest}}' "docker://$forgejo:$sha")
+test -n "$candidate"
+skopeo copy --src-creds "$src_creds" --dest-creds "$src_creds" \
+    "docker://$forgejo@$candidate" "docker://$forgejo:dev"
+skopeo copy --src-creds "$src_creds" --dest-creds "$dst_creds" \
+    "docker://$forgejo@$candidate" "docker://$ghcr:$sha"
+skopeo copy --src-creds "$src_creds" --dest-creds "$dst_creds" \
+    "docker://$forgejo@$candidate" "docker://$ghcr:dev"
+
+for ref in "$forgejo:$sha" "$forgejo:dev"; do
+    test "$(skopeo inspect --creds "$src_creds" --format '{{.Digest}}' "docker://$ref")" = "$candidate"
+done
+for ref in "$ghcr:$sha" "$ghcr:dev"; do
+    test "$(skopeo inspect --creds "$dst_creds" --format '{{.Digest}}' "docker://$ref")" = "$candidate"
+done
+printf 'promoted verified candidate %s to Forgejo :dev and GHCR\n' "$candidate"
+

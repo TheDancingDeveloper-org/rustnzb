@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+task_start verify-image-pins awk sed
+
+lock=$REPO_ROOT/ci/images.lock
+pipeline=$REPO_ROOT/.woodpecker.yml
+test -f "$lock"
+test -f "$pipeline"
+
+for key in CORE_IMAGE CROSS_IMAGE E2E_IMAGE DESKTOP_IMAGE; do
+    value=$(sed -n "s/^${key}=//p" "$lock")
+    case "$value" in
+        *@sha256:????????????????????????????????????????????????????????????????) ;;
+        *) printf '%s is not pinned by sha256 digest: %s\n' "$key" "$value" >&2; exit 1 ;;
+    esac
+    count=$(grep -F -c "image: $value" "$pipeline" || true)
+    [ "$count" -gt 0 ] || {
+        printf '%s is absent from .woodpecker.yml: %s\n' "$key" "$value" >&2
+        exit 1
+    }
+done
+
+grep -Fq 'ci/images.lock' "$REPO_ROOT/ci/run"
+grep -Fq 'CORE_IMAGE' "$REPO_ROOT/ci/run"
+grep -Fq 'CROSS_IMAGE' "$REPO_ROOT/ci/run"
+grep -Fq 'E2E_IMAGE' "$REPO_ROOT/ci/run"
+grep -Fq 'DESKTOP_IMAGE' "$REPO_ROOT/ci/run"
+
+if grep -Eq 'image: [^[:space:]]+:(latest|[0-9]+\.[0-9]+(-[^@[:space:]]*)?)[[:space:]]*$' "$pipeline"; then
+    printf 'Woodpecker contains a mutable image reference\n' >&2
+    exit 1
+fi
+
+printf 'image pins match ci/images.lock, ci/run, and .woodpecker.yml\n'
+

@@ -80,15 +80,22 @@ export async function startBackend(opts: {
 }
 
 function spawnBackend(name: string, port: number, config: string): ChildProcess {
-  const binary = path.join(PROJECT_ROOT, 'target/debug/rustnzb');
+  const binary = process.env.RUSTNZB_E2E_BINARY ?? path.join(PROJECT_ROOT, 'target/debug/rustnzb');
   const proc = spawn(binary, ['--config', config], {
     cwd: PROJECT_ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  const logDir = process.env.RUSTNZB_E2E_LOG_DIR;
+  const log = logDir
+    ? fs.createWriteStream(path.join(logDir, `backend-${name}.log`), { flags: 'a' })
+    : null;
+  proc.stdout?.on('data', (data: Buffer) => log?.write(data));
   proc.stderr?.on('data', (data: Buffer) => {
     const msg = data.toString();
+    log?.write(data);
     if (msg.includes('ERROR')) process.stderr.write(`[backend:${name}] ${msg}`);
   });
+  proc.once('exit', () => log?.end());
   return proc;
 }
 

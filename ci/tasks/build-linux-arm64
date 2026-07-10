@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/cargo-auth"
+trap 'cleanup_cargo_auth; cleanup_frontend' EXIT
+task_start build-linux-arm64 cargo zig
+setup_cargo_auth
+task_target_dir build-linux-arm64
+build_frontend
+if [ -n "${CI_COMMIT_TAG:-}" ]; then
+    export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols
+fi
+cargo zigbuild --release -p rustnzb \
+    --target aarch64-unknown-linux-gnu.2.17 \
+    --features webdav,vendored-openssl --locked
+binary=$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/rustnzb
+test -x "$binary"
+file "$binary"
+ls -lh "$binary"
+show_sccache_stats

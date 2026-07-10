@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/cargo-auth"
+trap 'cleanup_cargo_auth; cleanup_frontend' EXIT
+task_start clippy cargo
+setup_cargo_auth
+task_target_dir clippy
+prepare_placeholder_frontend
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+show_sccache_stats

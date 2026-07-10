@@ -1,0 +1,67 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+task_start smoke-runtime docker curl
+
+image=${1:?usage: ci/tasks/smoke-runtime IMAGE [EXPECTED_REF]}
+expected_ref=${2:-${RUSTNZB_EXPECTED_REF:-}}
+name="rustnzb-smoke-$$"
+work=$(mktemp -d)
+logs=$REPO_ROOT/.ci-artifacts/runtime-smoke
+docker_config=
+rm -rf "$logs"
+mkdir -p "$logs"
+
+cleanup() {
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    rm -rf "$work"
+    [ -z "$docker_config" ] || rm -rf "$docker_config"
+}
+trap cleanup EXIT
+
+if [ -n "${GIT_AUTH_TOKEN:-}" ]; then
+    docker_config=$(mktemp -d)
+    export DOCKER_CONFIG=$docker_config
+    printf '%s' "$GIT_AUTH_TOKEN" | docker login repo.indexarr.net \
+        --username x-access-token --password-stdin >/dev/null
+fi
+
+docker pull "$image" >/dev/null 2>&1 || true
+docker run --rm --entrypoint /usr/local/bin/rustnzb "$image" --smoke-test
+docker run -d --name "$name" \
+    -e PUID="$(id -u)" -e PGID="$(id -g)" \
+    -p 127.0.0.1::9090 \
+    --tmpfs /config \
+    --tmpfs /data \
+    --tmpfs /downloads \
+    "$image" >/dev/null
+
+port=$(docker port "$name" 9090/tcp | sed -n 's/.*://p' | head -n 1)
+[ -n "$port" ]
+ready=false
+i=0
+while [ "$i" -lt 60 ]; do
+    if curl -fsS "http://127.0.0.1:$port/api/health" >"$work/health.json"; then
+        ready=true
+        break
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+if [ "$ready" != true ]; then
+    docker logs "$name" >"$logs/container.log" 2>&1 || true
+    printf 'runtime did not become healthy; logs retained in %s\n' "$logs" >&2
+    exit 1
+fi
+grep -q '"status":"ok"' "$work/health.json"
+curl -fsS "http://127.0.0.1:$port/" >"$work/frontend.html"
+grep -Eq '<app-root|<html' "$work/frontend.html"
+setup=$(curl -fsS "http://127.0.0.1:$port/api/setup/status")
+if [ -n "$expected_ref" ]; then
+    printf '%s' "$setup" | grep -Fq "$expected_ref"
+fi
+docker exec "$name" 7z i >/dev/null
+docker stop --time 15 "$name" >/dev/null
+docker wait "$name" >/dev/null 2>&1 || true
+rm -rf "$logs"
+printf 'runtime smoke test passed for %s\n' "$image"

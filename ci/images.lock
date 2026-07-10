@@ -1,0 +1,15 @@
+# Generated from registry manifests after ci/tasks/build-ci-images succeeds.
+# The first custom-image bootstrap deliberately starts with pending entries;
+# ci/verify-image-pins rejects this file until real digests replace them.
+CORE_IMAGE=PENDING
+CROSS_IMAGE=PENDING
+E2E_IMAGE=PENDING
+DESKTOP_IMAGE=PENDING
+
+# Initial bootstrap has no custom-image predecessor. After the next toolchain
+# update, retain the replaced values here for immediate rollback.
+PREVIOUS_CORE_IMAGE=
+PREVIOUS_CROSS_IMAGE=
+PREVIOUS_E2E_IMAGE=
+PREVIOUS_DESKTOP_IMAGE=
+

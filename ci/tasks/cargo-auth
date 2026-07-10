@@ -1,0 +1,24 @@
+#!/bin/sh
+
+# Source this file from Cargo tasks. The token remains in an environment
+# variable and is never written to CARGO_HOME, the checkout, or a command line.
+setup_cargo_auth() {
+    if [ -n "${GIT_AUTH_TOKEN:-}" ]; then
+        cargo_auth_token=$GIT_AUTH_TOKEN
+    elif [ -n "${FORGEJO_TOKEN_FILE:-}" ] && [ -r "$FORGEJO_TOKEN_FILE" ]; then
+        cargo_auth_token=$(cat "$FORGEJO_TOKEN_FILE")
+    else
+        printf 'Forgejo Cargo access requires GIT_AUTH_TOKEN or FORGEJO_TOKEN_FILE\n' >&2
+        return 1
+    fi
+
+    export CARGO_REGISTRIES_FORGEJO_INDEX="sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"
+    export CARGO_REGISTRIES_FORGEJO_CREDENTIAL_PROVIDER="cargo:token"
+    export CARGO_REGISTRIES_FORGEJO_TOKEN="Bearer $cargo_auth_token"
+    unset cargo_auth_token
+}
+
+cleanup_cargo_auth() {
+    unset CARGO_REGISTRIES_FORGEJO_TOKEN GIT_AUTH_TOKEN
+}
+

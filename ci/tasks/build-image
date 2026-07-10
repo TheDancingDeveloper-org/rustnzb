@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+task_start build-image docker
+
+: "${GIT_AUTH_TOKEN:?GIT_AUTH_TOKEN is required for the private WebDAV crates}"
+image=${1:-rustnzb:local}
+build_ref=${RUSTNZB_BUILD_REF:-$(git rev-parse --short=12 HEAD)}
+docker_config=$(mktemp -d)
+mkdir -p "$docker_config/cli-plugins"
+if [ -x "$HOME/.docker/cli-plugins/docker-buildx" ]; then
+    ln -s "$HOME/.docker/cli-plugins/docker-buildx" "$docker_config/cli-plugins/docker-buildx"
+fi
+trap 'rm -rf "$docker_config"; unset GIT_AUTH_TOKEN' EXIT
+export DOCKER_CONFIG=$docker_config
+printf '%s' "$GIT_AUTH_TOKEN" | docker login repo.indexarr.net \
+    --username x-access-token --password-stdin >/dev/null
+
+set -- \
+    --file Dockerfile \
+    --target runtime \
+    --platform "${RUSTNZB_PLATFORM:-linux/amd64}" \
+    --provenance=false \
+    --secret id=forgejo_token,env=GIT_AUTH_TOKEN \
+    --build-arg "RUSTNZB_BUILD_REF=$build_ref" \
+    --tag "$image" \
+    --load
+if [ "${CI_COLD_CACHE:-false}" = true ]; then
+    set -- "$@" --no-cache
+fi
+docker buildx build "$@" .

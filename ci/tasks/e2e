@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/cargo-auth"
+trap 'cleanup_cargo_auth; cleanup_frontend' EXIT
+task_start e2e cargo node npm
+setup_cargo_auth
+task_target_dir e2e
+build_frontend
+
+cargo build --workspace --bins --locked
+
+artifact_dir=${CI_ARTIFACT_DIR:-$REPO_ROOT/.ci-artifacts/e2e}
+rm -rf "$artifact_dir"
+mkdir -p "$artifact_dir/logs"
+export RUSTNZB_E2E_BINARY="$CARGO_TARGET_DIR/debug/rustnzb"
+export RUSTNZB_E2E_MOCK_BINARY="$CARGO_TARGET_DIR/debug/mock-nntp-server"
+export RUSTNZB_E2E_LOG_DIR="$artifact_dir/logs"
+
+e2e_dir=$REPO_ROOT/e2e
+rm -rf "$e2e_dir/test-results" "$e2e_dir/playwright-report"
+npm --prefix "$e2e_dir" ci --no-audit --no-fund
+
+status=0
+(cd "$e2e_dir" && npx playwright test --reporter=list,html) || status=$?
+if [ "$status" -ne 0 ]; then
+    [ ! -d "$e2e_dir/test-results" ] || cp -a "$e2e_dir/test-results" "$artifact_dir/"
+    [ ! -d "$e2e_dir/playwright-report" ] || cp -a "$e2e_dir/playwright-report" "$artifact_dir/"
+    printf 'E2E failure artifacts: %s\n' "$artifact_dir" >&2
+    exit "$status"
+fi
+rm -rf "$artifact_dir" "$e2e_dir/test-results" "$e2e_dir/playwright-report"
+show_sccache_stats

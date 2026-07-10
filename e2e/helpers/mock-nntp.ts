@@ -9,7 +9,8 @@ let instance: ChildProcess | null = null;
 export async function startMockNntp(listen = '127.0.0.1:19119'): Promise<void> {
   if (instance) return;
 
-  const binary = path.join(PROJECT_ROOT, 'target/debug/mock-nntp-server');
+  const binary = process.env.RUSTNZB_E2E_MOCK_BINARY
+    ?? path.join(PROJECT_ROOT, 'target/debug/mock-nntp-server');
   if (!fs.existsSync(binary)) {
     throw new Error(`mock NNTP binary not found: ${binary}. Build it with cargo build --bin mock-nntp-server.`);
   }
@@ -19,9 +20,17 @@ export async function startMockNntp(listen = '127.0.0.1:19119'): Promise<void> {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
+  const logDir = process.env.RUSTNZB_E2E_LOG_DIR;
+  const log = logDir
+    ? fs.createWriteStream(path.join(logDir, 'mock-nntp.log'), { flags: 'a' })
+    : null;
+  instance.stdout?.on('data', (data: Buffer) => log?.write(data));
+
   instance.stderr?.on('data', (data: Buffer) => {
+    log?.write(data);
     process.stderr.write(`[mock-nntp] ${data.toString()}`);
   });
+  instance.once('exit', () => log?.end());
 
   const [host, portString] = listen.split(':');
   await waitForPort(host, Number(portString), 10000);

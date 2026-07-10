@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+LOCK=$ROOT/ci/images.lock
+cold=false
+
+usage() {
+    printf '%s\n' 'usage: ./ci/run [--cold-cache] TASK [TASK_ARGS...]' >&2
+    printf '%s\n' 'tasks: fmt check test clippy frontend-test frontend-audit e2e desktop-test' >&2
+    printf '%s\n' '       build-linux build-linux-arm64 build-windows package-release' >&2
+    printf '%s\n' '       verify-image-pins build-ci-images build-image smoke-image' >&2
+    exit 2
+}
+
+if [ "${1:-}" = --cold-cache ]; then
+    cold=true
+    shift
+fi
+task=${1:-}
+[ -n "$task" ] || usage
+shift
+task_args=("$@")
+
+lock_value() {
+    sed -n "s/^$1=//p" "$LOCK"
+}
+
+case "$task" in
+    fmt|check|test|clippy|frontend-test|frontend-audit|verify-image-pins) image_key=CORE_IMAGE ;;
+    e2e) image_key=E2E_IMAGE ;;
+    desktop-test) image_key=DESKTOP_IMAGE ;;
+    build-linux|build-linux-arm64|build-windows|package-release) image_key=CROSS_IMAGE ;;
+    build-ci-images|build-image|smoke-image) image_key=host ;;
+    *) usage ;;
+esac
+
+needs_cargo_auth=false
+case "$task" in
+    fmt|check|test|clippy|e2e|desktop-test|build-linux|build-linux-arm64|build-windows|build-image|build-ci-images)
+        needs_cargo_auth=true
+        ;;
+esac
+needs_registry_auth=false
+if [ "$image_key" != host ] || [ "$task" = smoke-image ]; then
+    needs_registry_auth=true
+fi
+
+# The authenticated wrapper fetches secrets into this process only. Docker is
+# given environment variable names, never token values in argv.
+if { [ "$needs_cargo_auth" = true ] || [ "$needs_registry_auth" = true ]; } \
+    && [ -z "${GIT_AUTH_TOKEN:-}" ] && [ -z "${FORGEJO_TOKEN_FILE:-}" ]; then
+    if [ -z "${RUSTNZB_CI_AUTH_ACTIVE:-}" ] && command -v mydevenv2-agent-auth >/dev/null 2>&1; then
+        export RUSTNZB_CI_AUTH_ACTIVE=1
+        if [ "$cold" = true ]; then
+            exec mydevenv2-agent-auth run -- "$0" --cold-cache "$task" "${task_args[@]}"
+        fi
+        exec mydevenv2-agent-auth run -- "$0" "$task" "${task_args[@]}"
+    fi
+    printf 'task %s requires GIT_AUTH_TOKEN or FORGEJO_TOKEN_FILE\n' "$task" >&2
+    exit 1
+fi
+
+if [ "$image_key" = host ]; then
+    [ "$cold" != true ] || export CI_COLD_CACHE=true
+    exec "$ROOT/ci/tasks/$task" "${task_args[@]}"
+fi
+
+image=$(lock_value "$image_key")
+case "$image" in
+    *@sha256:*) ;;
+    *) printf '%s is not ready in ci/images.lock: %s\n' "$image_key" "$image" >&2; exit 1 ;;
+esac
+
+# When this wrapper itself runs in a development container connected to the
+# host Docker socket, translate the checkout to the daemon-visible bind path.
+docker_root=$ROOT
+if command -v jq >/dev/null 2>&1; then
+    mount_json=$(docker inspect "${HOSTNAME:-$(hostname)}" --format '{{json .Mounts}}' 2>/dev/null || true)
+    if [ -n "$mount_json" ]; then
+        mapping=$(printf '%s' "$mount_json" | jq -r --arg root "$ROOT" '
+            map(select(($root == .Destination) or ($root | startswith(.Destination + "/"))))
+            | sort_by(.Destination | length) | last
+            | if . == null then empty else [.Source, .Destination] | @tsv end')
+        if [ -n "$mapping" ]; then
+            source_path=${mapping%%$'\t'*}
+            destination_path=${mapping#*$'\t'}
+            docker_root=$source_path${ROOT#"$destination_path"}
+        fi
+    fi
+fi
+
+docker_config=$(mktemp -d)
+cleanup() {
+    rm -rf "$docker_config"
+}
+trap cleanup EXIT
+export DOCKER_CONFIG=$docker_config
+if [ -n "${GIT_AUTH_TOKEN:-}" ]; then
+    printf '%s' "$GIT_AUTH_TOKEN" | docker login repo.indexarr.net \
+        --username x-access-token --password-stdin >/dev/null
+elif [ -n "${FORGEJO_TOKEN_FILE:-}" ]; then
+    docker login repo.indexarr.net --username x-access-token \
+        --password-stdin <"$FORGEJO_TOKEN_FILE" >/dev/null
+fi
+
+docker_args=(
+    run --rm
+    --workdir /woodpecker/src
+    --mount "type=bind,src=$docker_root,dst=/woodpecker/src"
+    --user "$(id -u):$(id -g)"
+    --env HOME=/tmp/ci-home
+    --env CI=true
+    --env RUSTC_WRAPPER=sccache
+    --env "SCCACHE_REDIS=${SCCACHE_REDIS:-redis://100.92.54.45:6380}"
+    --env "SCCACHE_REDIS_KEY_PREFIX=rustnzb-rust-1.88-$task"
+)
+
+if [ "$cold" = true ]; then
+    docker_args+=(
+        --env CARGO_HOME=/tmp/cargo-home
+        --env npm_config_cache=/tmp/npm-cache
+        --env SCCACHE_RECACHE=1
+        --env CI_COLD_CACHE=true
+    )
+else
+    cargo_volume=rustnzb-ci-cargo-rust-1.88
+    npm_volume=rustnzb-ci-npm-node-22
+    docker volume create "$cargo_volume" >/dev/null
+    docker volume create "$npm_volume" >/dev/null
+    docker run --rm \
+        --mount "type=volume,src=$cargo_volume,dst=/cache/cargo" \
+        --mount "type=volume,src=$npm_volume,dst=/cache/npm" \
+        "$image" sh -c "chown -R $(id -u):$(id -g) /cache/cargo /cache/npm" >/dev/null
+    docker_args+=(
+        --mount "type=volume,src=$cargo_volume,dst=/ci-cache/cargo-home"
+        --mount "type=volume,src=$npm_volume,dst=/ci-cache/npm"
+        --env CARGO_HOME=/ci-cache/cargo-home
+        --env npm_config_cache=/ci-cache/npm
+    )
+fi
+
+if [ "$needs_cargo_auth" = true ]; then
+    if [ -n "${GIT_AUTH_TOKEN:-}" ]; then
+        docker_args+=(--env GIT_AUTH_TOKEN)
+    else
+        docker_args+=(
+            --mount "type=bind,src=$FORGEJO_TOKEN_FILE,dst=/run/secrets/forgejo_token,readonly"
+            --env FORGEJO_TOKEN_FILE=/run/secrets/forgejo_token
+        )
+    fi
+fi
+
+for name in CI_COMMIT_SHA CI_COMMIT_TAG RUSTNZB_BUILD_REF CI_ARTIFACT_DIR CI_PACKAGE_DIR; do
+    [ -z "${!name:-}" ] || docker_args+=(--env "$name")
+done
+
+exec docker "${docker_args[@]}" "$image" "/woodpecker/src/ci/tasks/$task" "${task_args[@]}"

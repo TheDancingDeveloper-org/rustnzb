@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+trap cleanup_frontend EXIT
+task_start frontend-test node npm
+frontend_dir=$REPO_ROOT/apps/rustnzb/frontend
+npm --prefix "$frontend_dir" ci --no-audit --no-fund
+npm --prefix "$frontend_dir" test -- --coverage --coverage-reporters=text-summary

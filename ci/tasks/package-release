@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+task_start package-release cargo makensis sha256sum tar
+
+tag=${CI_COMMIT_TAG:?CI_COMMIT_TAG is required for release packaging}
+out=${CI_PACKAGE_DIR:-$REPO_ROOT/.ci-output/packages}
+amd64=${LINUX_AMD64_BINARY:-$REPO_ROOT/.ci-output/targets/build-linux/release/rustnzb}
+arm64=${LINUX_ARM64_BINARY:-$REPO_ROOT/.ci-output/targets/build-linux-arm64/aarch64-unknown-linux-gnu/release/rustnzb}
+windows=${WINDOWS_AMD64_BINARY:-$REPO_ROOT/.ci-output/targets/build-windows/x86_64-pc-windows-msvc/release/rustnzb.exe}
+test -x "$amd64"
+test -x "$arm64"
+test -f "$windows"
+rm -rf "$out"
+mkdir -p "$out/linux-amd64/rustnzb-$tag" "$out/linux-arm64/rustnzb-$tag" "$out/nsis"
+
+for arch in linux-amd64 linux-arm64; do
+    cp apps/rustnzb/config.example.toml "$out/$arch/rustnzb-$tag/"
+    cp README.md "$out/$arch/rustnzb-$tag/"
+done
+cp "$amd64" "$out/linux-amd64/rustnzb-$tag/rustnzb"
+cp "$arm64" "$out/linux-arm64/rustnzb-$tag/rustnzb"
+tar -czf "$out/rustnzb-$tag-linux-x86_64.tar.gz" -C "$out/linux-amd64" "rustnzb-$tag"
+tar -czf "$out/rustnzb-$tag-linux-aarch64.tar.gz" -C "$out/linux-arm64" "rustnzb-$tag"
+
+cp "$windows" installer/rustnzb.exe
+(cd installer && makensis -DVERSION="$tag" windows.nsi)
+mv "rustnzb-$tag-windows-x86_64-setup.exe" "$out/"
+rm -f installer/rustnzb.exe
+
+CARGO_TARGET_DIR=$(dirname "$(dirname "$amd64")") \
+    cargo deb --manifest-path apps/rustnzb/Cargo.toml --no-build --no-strip \
+    -o "$out/rustnzb-$tag-amd64.deb"
+CARGO_TARGET_DIR=$(dirname "$(dirname "$(dirname "$arm64")")") \
+    cargo deb --manifest-path apps/rustnzb/Cargo.toml --no-build --no-strip \
+    --target aarch64-unknown-linux-gnu -o "$out/rustnzb-$tag-arm64.deb"
+
+(cd "$out" && sha256sum rustnzb-* >"SHA256SUMS-$tag.txt")
+ls -lh "$out"/rustnzb-* "$out/SHA256SUMS-$tag.txt"
+

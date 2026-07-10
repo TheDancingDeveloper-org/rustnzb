@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/cargo-auth"
+trap cleanup_cargo_auth EXIT
+task_start fmt cargo rustfmt
+setup_cargo_auth
+cargo fmt --all -- --check

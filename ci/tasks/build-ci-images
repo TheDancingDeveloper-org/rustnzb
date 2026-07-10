@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+task_start build-ci-images docker
+
+: "${GIT_AUTH_TOKEN:?GIT_AUTH_TOKEN is required to publish CI images}"
+source_sha=${CI_COMMIT_SHA:-$(git rev-parse HEAD)}
+toolchain_tag=${CI_TOOLCHAIN_TAG:-rust-1.88-node-22-v1}
+registry=${CI_IMAGE_REGISTRY:-repo.indexarr.net/indexarr}
+builder=${CI_BUILDX_BUILDER:-rustnzb-release-builder}
+docker_config=$(mktemp -d)
+metrics_dir=$REPO_ROOT/.ci-output/metrics
+mkdir -p "$metrics_dir"
+mkdir -p "$docker_config/cli-plugins"
+if [ -x "$HOME/.docker/cli-plugins/docker-buildx" ]; then
+    ln -s "$HOME/.docker/cli-plugins/docker-buildx" "$docker_config/cli-plugins/docker-buildx"
+fi
+trap 'rm -rf "$docker_config"; unset GIT_AUTH_TOKEN' EXIT
+export BUILDX_CONFIG=${CI_BUILDX_CONFIG:-$HOME/.docker/buildx}
+export DOCKER_CONFIG=$docker_config
+printf '%s' "$GIT_AUTH_TOKEN" | docker login repo.indexarr.net \
+    --username x-access-token --password-stdin >/dev/null
+
+df -Pk "$REPO_ROOT" >"$metrics_dir/ci-image-disk-before.txt"
+docker buildx du >"$metrics_dir/ci-image-buildx-before.txt" 2>&1 || true
+
+for target in core cross e2e desktop; do
+    repo=$registry/rustnzb-ci-$target
+    BUILDX_BUILDER=$builder docker buildx build \
+        --file Dockerfile.ci \
+        --target "$target" \
+        --platform linux/amd64 \
+        --provenance=false \
+        --cache-from "type=registry,ref=$repo:buildcache" \
+        --cache-to "type=registry,ref=$repo:buildcache,mode=max,image-manifest=true,oci-mediatypes=true" \
+        --tag "$repo:$source_sha" \
+        --tag "$repo:$toolchain_tag" \
+        --push .
+
+    docker pull "$repo:$source_sha" >/dev/null
+    docker run --rm "$repo:$source_sha" sh -ec '
+        rustc --version
+        node --version
+        tmp=$(mktemp -d)
+        cargo new --quiet --bin "$tmp/self-test"
+        cargo run --quiet --manifest-path "$tmp/self-test/Cargo.toml"
+        rm -rf "$tmp"
+    '
+done
+
+docker buildx du >"$metrics_dir/ci-image-buildx-after.txt" 2>&1 || true
+df -Pk "$REPO_ROOT" >"$metrics_dir/ci-image-disk-after.txt"
+
+for target in core cross e2e desktop; do
+    repo=$registry/rustnzb-ci-$target
+    digest=$(docker buildx imagetools inspect "$repo:$source_sha" --format '{{json .Manifest.Digest}}' | tr -d '"')
+    printf '%s_IMAGE=%s@%s\n' "$(printf '%s' "$target" | tr '[:lower:]' '[:upper:]')" "$repo" "$digest"
+done
