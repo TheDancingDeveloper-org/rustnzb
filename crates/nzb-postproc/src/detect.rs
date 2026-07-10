@@ -439,8 +439,7 @@ mod tests {
         assert_eq!(
             results.len(),
             6,
-            "Expected 6 cleanup files, got: {:?}",
-            results
+            "Expected 6 cleanup files, got: {results:?}"
         );
         // .mkv and .txt should NOT be present
         for path in &results {
@@ -529,8 +528,7 @@ mod tests {
         assert_eq!(
             results.len(),
             3,
-            "Expected 3 split 7z cleanup files, got: {:?}",
-            results
+            "Expected 3 split 7z cleanup files, got: {results:?}"
         );
         for path in &results {
             let name = path.file_name().unwrap().to_str().unwrap();

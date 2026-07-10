@@ -321,6 +321,8 @@ steps:
     when:
       - event: push
         branch: main
+    depends_on:
+      - build-frontend
     settings:
       repo: repo.indexarr.net/indexarr/rustnzbd
       registry: repo.indexarr.net
@@ -377,6 +379,8 @@ steps:
     image: woodpeckerci/plugin-docker-buildx
     when:
       - event: tag
+    depends_on:
+      - build-frontend
     settings:
       repo: repo.indexarr.net/indexarr/rustnzbd
       registry: repo.indexarr.net
@@ -398,6 +402,8 @@ steps:
     image: woodpeckerci/plugin-docker-buildx
     when:
       - event: tag
+    depends_on:
+      - build-frontend
     settings:
       repo: repo.indexarr.net/indexarr/rustnzbd
       registry: repo.indexarr.net

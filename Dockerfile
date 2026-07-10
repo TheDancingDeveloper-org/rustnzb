@@ -40,7 +40,11 @@ RUN cd apps/rustnzb/frontend && npm ci
 
 # Frontend build
 COPY apps/rustnzb/frontend apps/rustnzb/frontend
-RUN cd apps/rustnzb/frontend && npx ng build --configuration=production
+RUN if [ -f apps/rustnzb/frontend/dist/frontend/browser/index.html ]; then \
+      echo "Using prebuilt frontend dist from workspace"; \
+    else \
+      cd apps/rustnzb/frontend && npx ng build --configuration=production; \
+    fi
 
 # Rust source
 COPY Cargo.toml Cargo.lock ./
