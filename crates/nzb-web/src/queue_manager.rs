@@ -1201,6 +1201,12 @@ impl QueueManager {
                         "Job download finished"
                     );
 
+                    // The final article has resolved, so no worker can write
+                    // another segment for this job. Release the worker-pool
+                    // context now to close its persistent assembler handles
+                    // before PAR2/unpack opens the completed files.
+                    self.worker_pool.release_completed_job(&job_id);
+
                     // Mark as PostProcessing immediately so the slot is freed
                     // for the next queued job. This lets the next download ramp
                     // up while post-processing (par2/unpack) runs concurrently.

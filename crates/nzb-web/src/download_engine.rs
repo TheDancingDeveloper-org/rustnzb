@@ -1027,6 +1027,23 @@ impl WorkerPool {
         debug!(job_id = %job_id, queue_len = self.work_queue.len(), "Job submitted to worker pool");
     }
 
+    /// Unregister a normally completed job and close its assembler files.
+    ///
+    /// This must only be called after `JobFinished` is received, which means
+    /// every article has reached a definitive result and no worker can write
+    /// another segment for this job. Abort and cancellation paths unregister
+    /// their contexts separately because they may still have in-flight work.
+    pub(crate) fn release_completed_job(&self, job_id: &str) {
+        let ctx = self.job_contexts.lock().remove(job_id);
+        if let Some(ctx) = ctx {
+            // Workers can briefly retain an Arc<JobContext> after resolving
+            // the final article. Clear the assembler explicitly so those
+            // transient references do not keep every output file open during
+            // post-processing.
+            ctx.assembler.clear_job(job_id);
+        }
+    }
+
     /// Pause a job: workers stop pulling its items, and any item currently
     /// being held while paused is returned to the queue.
     pub fn pause_job(&self, job_id: &str) {
@@ -2624,6 +2641,57 @@ fn decode_and_assemble(
 mod tests {
     use super::*;
 
+    fn worker_pool_without_servers() -> Arc<WorkerPool> {
+        WorkerPool::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(BandwidthLimiter::new(Default::default())),
+            Arc::new(ConnectionTracker::new()),
+            0,
+        )
+    }
+
+    fn test_job(job_id: &str, root: &std::path::Path) -> NzbJob {
+        NzbJob {
+            id: job_id.to_string(),
+            name: job_id.to_string(),
+            category: "Default".to_string(),
+            status: crate::nzb_core::models::JobStatus::Downloading,
+            priority: crate::nzb_core::models::Priority::Normal,
+            total_bytes: 1,
+            downloaded_bytes: 0,
+            file_count: 1,
+            files_completed: 0,
+            article_count: 1,
+            articles_downloaded: 0,
+            articles_failed: 0,
+            added_at: chrono::Utc::now(),
+            completed_at: None,
+            work_dir: root.to_path_buf(),
+            output_dir: root.join("complete"),
+            password: None,
+            error_message: None,
+            speed_bps: 0,
+            server_stats: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+
+    fn insert_test_context(pool: &WorkerPool, job: &NzbJob, assembler: Arc<FileAssembler>) {
+        let (progress_tx, _progress_rx) = mpsc::channel(1);
+        let ctx = Arc::new(JobContext::new(job, assembler, progress_tx, 1));
+        pool.job_contexts.lock().insert(job.id.clone(), ctx);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_fd_count_under(root: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("read /proc/self/fd")
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| target.starts_with(root))
+            .count()
+    }
+
     #[test]
     fn has_known_extension_recognizes_archives() {
         assert!(has_known_extension("movie.rar"));
@@ -2794,6 +2862,68 @@ mod tests {
         assert_eq!(q.len(), 1);
         let remaining = q.pop_workable("srv1", &[]).unwrap();
         assert_eq!(remaining.job_id, "j2");
+    }
+
+    #[test]
+    fn release_completed_job_drops_context_and_closes_assembler_files() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let assembler = Arc::new(FileAssembler::new());
+        let job_id = "completed-job";
+        assembler
+            .register_file(job_id, "file-1", tempdir.path().join("file.rar"), 1)
+            .expect("register file");
+        assert_eq!(assembler.get_file_progress(job_id, "file-1"), (0, 1));
+
+        let job = test_job(job_id, tempdir.path());
+        let pool = worker_pool_without_servers();
+        insert_test_context(&pool, &job, Arc::clone(&assembler));
+        assert!(pool.has_job(job_id));
+
+        pool.release_completed_job(job_id);
+
+        assert!(!pool.has_job(job_id));
+        assert_eq!(assembler.get_file_progress(job_id, "file-1"), (0, 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repeated_completed_jobs_do_not_accumulate_file_descriptors() {
+        const JOBS: usize = 64;
+        const FILES_PER_JOB: usize = 8;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let pool = worker_pool_without_servers();
+        assert_eq!(open_fd_count_under(tempdir.path()), 0);
+
+        for job_index in 0..JOBS {
+            let job_id = format!("job-{job_index}");
+            let job_dir = tempdir.path().join(&job_id);
+            let assembler = Arc::new(FileAssembler::new());
+            for file_index in 0..FILES_PER_JOB {
+                assembler
+                    .register_file(
+                        &job_id,
+                        &format!("file-{file_index}"),
+                        job_dir.join(format!("file-{file_index}.rar")),
+                        1,
+                    )
+                    .expect("register file");
+            }
+            assert_eq!(open_fd_count_under(tempdir.path()), FILES_PER_JOB);
+
+            let job = test_job(&job_id, &job_dir);
+            insert_test_context(&pool, &job, assembler);
+            pool.release_completed_job(&job_id);
+
+            assert!(!pool.has_job(&job_id));
+            assert_eq!(
+                open_fd_count_under(tempdir.path()),
+                0,
+                "completed job {job_index} retained output file descriptors"
+            );
+        }
+
+        assert!(pool.job_contexts.lock().is_empty());
     }
 
     // -----------------------------------------------------------------------
