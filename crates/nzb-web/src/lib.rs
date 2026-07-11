@@ -19,6 +19,8 @@ pub mod util;
 
 pub use article_failure::{ArticleFailure, ArticleFailureKind};
 pub use log_buffer::{LogBuffer, LogBufferLayer};
-pub use queue_manager::{QueueManager, ServerStatsData};
+pub use queue_manager::{
+    DailyStatisticsData, GlobalStatisticsData, QueueManager, ServerStatsData, StatisticsPeriodData,
+};
 pub use startup::{StartupConfig, StartupResult};
 pub use state::AppState;

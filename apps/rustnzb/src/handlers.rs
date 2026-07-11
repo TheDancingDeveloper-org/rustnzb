@@ -253,11 +253,23 @@ pub struct HistoryResponseEntry {
     pub error_message: Option<String>,
     pub server_stats: Vec<ServerArticleStats>,
     pub has_nzb_data: bool,
+    pub duration_secs: f64,
+    pub average_speed_bps: u64,
+    pub articles_served: usize,
+    pub articles_missing: usize,
 }
 
 impl From<HistoryEntry> for HistoryResponseEntry {
     fn from(e: HistoryEntry) -> Self {
         let has_nzb = e.nzb_data.is_some();
+        let duration_secs = (e.completed_at - e.added_at).num_milliseconds().max(0) as f64 / 1000.0;
+        let average_speed_bps = if duration_secs > 0.0 {
+            (e.downloaded_bytes as f64 / duration_secs) as u64
+        } else {
+            0
+        };
+        let articles_served = e.server_stats.iter().map(|s| s.articles_downloaded).sum();
+        let articles_missing = e.server_stats.iter().map(|s| s.articles_failed).sum();
         Self {
             id: e.id,
             name: e.name,
@@ -272,6 +284,10 @@ impl From<HistoryEntry> for HistoryResponseEntry {
             error_message: e.error_message,
             server_stats: e.server_stats,
             has_nzb_data: has_nzb,
+            duration_secs,
+            average_speed_bps,
+            articles_served,
+            articles_missing,
         }
     }
 }
@@ -692,6 +708,19 @@ pub async fn h_history_list(
     let total = entries.len();
     let entries: Vec<HistoryResponseEntry> = entries.into_iter().map(Into::into).collect();
     Ok(Json(HistoryResponse { entries, total }))
+}
+
+/// GET /api/history/{id} -- Detailed information for one completed/failed job.
+pub async fn h_history_get(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<HistoryResponseEntry>, ApiError> {
+    let entry = state
+        .queue_manager
+        .history_get(&id)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("History entry not found"))?;
+    Ok(Json(entry.into()))
 }
 
 /// DELETE /api/history/{id} -- Remove a history entry.
@@ -1616,6 +1645,14 @@ pub async fn h_server_stats(
     let servers = state.config().servers.clone();
     let stats = state.queue_manager.server_stats_get_all(&servers);
     Ok(Json(stats))
+}
+
+/// GET /api/statistics -- Persistent global download and NNTP statistics.
+pub async fn h_global_statistics(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<nzb_web::GlobalStatisticsData>, ApiError> {
+    let servers = state.config().servers.clone();
+    Ok(Json(state.queue_manager.global_statistics(&servers)))
 }
 
 // ---------------------------------------------------------------------------

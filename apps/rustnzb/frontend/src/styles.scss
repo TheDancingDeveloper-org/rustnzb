@@ -26,6 +26,50 @@ html {
   --warn:   #f59e0b;
   --danger: #ef4444;
   --purple: #a78bfa;
+  --row-hover: rgba(255,255,255,.02);
+  --ok-bg: #0f3a2a;
+  --ok-text: #4ade80;
+  --fail-bg: #3a1515;
+  --fail-text: #fca5a5;
+}
+
+body[data-theme='midnight'] {
+  --bg: #080d1a;
+  --panel: #10182a;
+  --panel2: #17223a;
+  --line: #263552;
+  --text: #edf1ff;
+  --mute: #93a1bd;
+  --accent: #8b7cf6;
+  --accent2: #22d3a6;
+  --warn: #f7b955;
+  --danger: #fb7185;
+  --purple: #c4b5fd;
+  --row-hover: rgba(139,124,246,.06);
+  --ok-bg: #103b35;
+  --ok-text: #5eead4;
+  --fail-bg: #461b2a;
+  --fail-text: #fda4af;
+}
+
+body[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f3f6fa;
+  --panel: #ffffff;
+  --panel2: #eef2f7;
+  --line: #d2d9e3;
+  --text: #172033;
+  --mute: #667085;
+  --accent: #2563eb;
+  --accent2: #07875f;
+  --warn: #b45309;
+  --danger: #c6283d;
+  --purple: #7c3aed;
+  --row-hover: rgba(37,99,235,.045);
+  --ok-bg: #dff7ec;
+  --ok-text: #08724f;
+  --fail-bg: #fde7ea;
+  --fail-text: #b42336;
 }
 
 body {
@@ -138,7 +182,7 @@ table.data th {
   letter-spacing: .4px;
 }
 table.data tr:last-child td { border-bottom: none; }
-table.data tr:hover td { background: rgba(255,255,255,.02); }
+table.data tr:hover td { background: var(--row-hover); }
 
 /* Pills (header status) */
 .pill {
@@ -166,10 +210,10 @@ table.data tr:hover td { background: rgba(255,255,255,.02); }
   display: inline-block;
 }
 .s-dl     { background: #1e3a5f; color: #7ab8ff; }
-.s-ok     { background: #0f3a2a; color: #4ade80; }
+.s-ok     { background: var(--ok-bg); color: var(--ok-text); }
 .s-q      { background: #3a3a1e; color: #fbbf24; }
 .s-pp     { background: #3a1e3a; color: #d8b4fe; }
-.s-fail   { background: #3a1515; color: #fca5a5; }
+.s-fail   { background: var(--fail-bg); color: var(--fail-text); }
 .s-paused { background: #2a3441; color: var(--mute); }
 
 /* Progress */

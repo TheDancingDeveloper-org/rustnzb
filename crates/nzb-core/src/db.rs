@@ -259,6 +259,45 @@ impl Database {
             )?;
         }
 
+        if version < 7 {
+            info!("Applying database migration v7: persistent download statistics");
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS download_statistics (
+                    job_id TEXT PRIMARY KEY,
+                    completed_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    total_bytes INTEGER NOT NULL DEFAULT 0,
+                    downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                    duration_secs REAL NOT NULL DEFAULT 0,
+                    average_speed_bps INTEGER NOT NULL DEFAULT 0,
+                    server_stats TEXT NOT NULL DEFAULT '[]'
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_download_statistics_completed
+                    ON download_statistics(completed_at DESC);
+
+                INSERT OR IGNORE INTO download_statistics (
+                    job_id, completed_at, status, total_bytes, downloaded_bytes,
+                    duration_secs, average_speed_bps, server_stats
+                )
+                SELECT id, completed_at, status, total_bytes, downloaded_bytes,
+                    MAX(0, (julianday(completed_at) - julianday(added_at)) * 86400.0),
+                    CASE
+                        WHEN julianday(completed_at) > julianday(added_at)
+                        THEN CAST(downloaded_bytes /
+                            ((julianday(completed_at) - julianday(added_at)) * 86400.0) AS INTEGER)
+                        ELSE 0
+                    END,
+                    COALESCE(server_stats, '[]')
+                FROM history;
+
+                DELETE FROM schema_version;
+                INSERT INTO schema_version (version) VALUES (7);
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -424,7 +463,59 @@ impl Database {
                 server_stats_json,
             ],
         )?;
+
+        let duration_secs = (entry.completed_at - entry.added_at)
+            .num_milliseconds()
+            .max(0) as f64
+            / 1000.0;
+        let average_speed_bps = if duration_secs > 0.0 {
+            (entry.downloaded_bytes as f64 / duration_secs) as u64
+        } else {
+            0
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO download_statistics (
+                job_id, completed_at, status, total_bytes, downloaded_bytes,
+                duration_secs, average_speed_bps, server_stats
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                entry.id,
+                entry.completed_at.to_rfc3339(),
+                entry.status.to_string(),
+                entry.total_bytes as i64,
+                entry.downloaded_bytes as i64,
+                duration_secs,
+                average_speed_bps as i64,
+                server_stats_json,
+            ],
+        )?;
         Ok(())
+    }
+
+    /// Return the compact, permanent download statistics ledger.
+    pub fn download_statistics_list(&self) -> Result<Vec<DownloadStatistic>, NzbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT job_id, completed_at, status, total_bytes, downloaded_bytes,
+                    duration_secs, average_speed_bps, server_stats
+             FROM download_statistics ORDER BY completed_at DESC",
+        )?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let stats_json: String = row.get(7)?;
+                Ok(DownloadStatistic {
+                    job_id: row.get(0)?,
+                    completed_at: parse_datetime(&row.get::<_, String>(1)?),
+                    status: parse_status(&row.get::<_, String>(2)?),
+                    total_bytes: row.get::<_, i64>(3)? as u64,
+                    downloaded_bytes: row.get::<_, i64>(4)? as u64,
+                    duration_secs: row.get(5)?,
+                    average_speed_bps: row.get::<_, i64>(6)? as u64,
+                    server_stats: serde_json::from_str(&stats_json).unwrap_or_default(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// List history entries, most recent first.
@@ -1221,6 +1312,31 @@ mod tests {
         assert_eq!(loaded[0].server_stats.len(), 1);
         assert_eq!(loaded[0].server_stats[0].server_id, "srv-1");
         assert_eq!(loaded[0].server_stats[0].articles_downloaded, 100);
+    }
+
+    #[test]
+    fn test_download_statistics_survive_history_deletion() {
+        let db = Database::open_memory().unwrap();
+        let mut entry = make_history("stats-1", "Statistics Job");
+        entry.completed_at = Utc::now();
+        entry.added_at = entry.completed_at - chrono::Duration::seconds(10);
+        entry.downloaded_bytes = 10_000;
+        entry.server_stats = vec![ServerArticleStats {
+            server_id: "server-1".into(),
+            server_name: "Primary".into(),
+            articles_downloaded: 9,
+            articles_failed: 1,
+            bytes_downloaded: 10_000,
+        }];
+
+        db.history_insert(&entry).unwrap();
+        db.history_clear().unwrap();
+
+        let statistics = db.download_statistics_list().unwrap();
+        assert_eq!(statistics.len(), 1);
+        assert_eq!(statistics[0].job_id, "stats-1");
+        assert_eq!(statistics[0].average_speed_bps, 1_000);
+        assert_eq!(statistics[0].server_stats[0].articles_failed, 1);
     }
 
     // -----------------------------------------------------------------------

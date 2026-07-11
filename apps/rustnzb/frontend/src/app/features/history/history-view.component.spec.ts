@@ -129,4 +129,34 @@ describe('HistoryViewComponent', () => {
     expect(component.relativeTime('2026-07-09T23:59:30Z')).toBe('just now');
     expect(component.relativeTime('2026-07-09T23:00:00Z')).toBe('1 h ago');
   });
+
+  it('calculates average speed and article availability for history details', () => {
+    const detailed = entry({
+      downloaded_bytes: 9_000,
+      added_at: '2026-07-09T10:00:00Z',
+      completed_at: '2026-07-09T10:00:10Z',
+      server_stats: [{
+        server_id: 'primary',
+        server_name: 'Primary',
+        articles_downloaded: 9,
+        articles_failed: 1,
+        bytes_downloaded: 9_000,
+      }],
+    });
+    expect(component.averageSpeed(detailed)).toBe(900);
+    expect(component.articleServed(detailed)).toBe(9);
+    expect(component.articleMissing(detailed)).toBe(1);
+    expect(component.availability(detailed)).toBe('90.00%');
+  });
+
+  it('loads and closes selected history details', () => {
+    const detailed = entry({ id: 'detail-id', average_speed_bps: 1234 });
+    api.get.mockImplementation(() => of(detailed));
+    component.selectEntry(detailed);
+    expect(api.get).toHaveBeenCalledWith('/history/detail-id');
+    expect(component.selectedEntry()?.average_speed_bps).toBe(1234);
+    expect(component.detailLoading()).toBe(false);
+    component.closeDetails();
+    expect(component.selectedId()).toBeNull();
+  });
 });

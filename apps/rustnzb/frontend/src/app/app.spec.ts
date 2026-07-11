@@ -24,6 +24,7 @@ function makeApp(postResult = new Subject<unknown>()) {
     router as never,
     new AddNzbService(),
     {} as never,
+    {} as never,
     pauseState,
   );
   return { app, api, pauseState, postResult };

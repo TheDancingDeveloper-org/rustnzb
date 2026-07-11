@@ -195,4 +195,18 @@ test.describe('5. Download History', () => {
     const rateCard = history.locator('.cards4 .card', { hasText: 'Success rate' });
     await expect(rateCard).toBeVisible();
   });
+
+  test('5.7 average speed is shown and selecting a job opens detailed information', async ({ page }) => {
+    const history = await openAllHistory(page);
+    const row = history.locator('tbody tr.history-row', { hasText: 'Completed.Movie.2025.mkv' });
+    await expect(row).toContainText('/s');
+    await row.click();
+
+    const details = history.locator('.detail-panel');
+    await expect(details).toBeVisible();
+    await expect(details).toContainText('Average speed');
+    await expect(details).toContainText('Articles served');
+    await expect(details).toContainText('News server usage');
+    await expect(details).toContainText('Seed News');
+  });
 });

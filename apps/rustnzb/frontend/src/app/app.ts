@@ -16,6 +16,7 @@ import { StatusResponse } from './core/models/queue.model';
 import { AddNzbService } from './core/services/add-nzb.service';
 import { WidthModeService } from './core/services/width-mode.service';
 import { PauseStateService } from './core/services/pause-state.service';
+import { ThemeService } from './core/services/theme.service';
 import { IconComponent } from './shared/icon.component';
 
 @Component({
@@ -40,6 +41,7 @@ import { IconComponent } from './shared/icon.component';
               <a routerLink="/media" routerLinkActive="active">Media</a>
             }
             <a routerLink="/logs" routerLinkActive="active">Logs</a>
+            <a routerLink="/statistics" routerLinkActive="active">Statistics</a>
             <a routerLink="/settings" routerLinkActive="active">Settings</a>
             <div class="spacer"></div>
             <div class="status">
@@ -411,6 +413,7 @@ export class App implements OnInit, OnDestroy {
     private router: Router,
     private addNzbService: AddNzbService,
     public widthMode: WidthModeService,
+    readonly theme: ThemeService,
     pauseState: PauseStateService,
   ) {
     this.paused = pauseState.paused;

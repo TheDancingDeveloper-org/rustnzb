@@ -33,6 +33,20 @@ async function navigateToGeneral(page: import('@playwright/test').Page): Promise
 // Use CSS adjacent sibling selector to reach each field's input and button.
 
 test.describe('8. Settings — General', () => {
+  test('8.0 theme picker applies and persists two additional themes with standard fonts', async ({ page }) => {
+    await page.goto('/settings');
+    await page.getByRole('button', { name: 'General' }).click();
+
+    await page.getByRole('radio', { name: /Midnight/ }).click();
+    await expect(page.locator('body')).toHaveAttribute('data-theme', 'midnight');
+    await page.getByRole('radio', { name: /Daylight/ }).click();
+    await expect(page.locator('body')).toHaveAttribute('data-theme', 'light');
+
+    const description = page.locator('.setting-description').first();
+    await expect(description).toHaveCSS('font-family', /Inter|Segoe UI|Roboto/);
+    await page.reload();
+    await expect(page.locator('body')).toHaveAttribute('data-theme', 'light');
+  });
   test('8.1 change global speed limit', async ({ page }) => {
     const token = readToken();
     await navigateToGeneral(page);

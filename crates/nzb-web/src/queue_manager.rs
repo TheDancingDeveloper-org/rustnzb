@@ -45,6 +45,38 @@ pub struct ServerStatsData {
     pub last_active: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StatisticsPeriodData {
+    pub downloads: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub bytes_downloaded: u64,
+    pub total_duration_secs: f64,
+    pub average_speed_bps: u64,
+    pub fastest_download_bps: u64,
+    pub news_server_hits: usize,
+    pub articles_served: usize,
+    pub articles_missing: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyStatisticsData {
+    pub date: String,
+    #[serde(flatten)]
+    pub totals: StatisticsPeriodData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalStatisticsData {
+    pub generated_at: DateTime<Utc>,
+    pub lifetime: StatisticsPeriodData,
+    pub today: StatisticsPeriodData,
+    pub week: StatisticsPeriodData,
+    pub month: StatisticsPeriodData,
+    pub servers: Vec<ServerStatsData>,
+    pub daily: Vec<DailyStatisticsData>,
+}
+
 /// Get free disk space for a path (returns 0 on error).
 fn get_disk_free(path: &std::path::Path) -> u64 {
     #[cfg(unix)]
@@ -2340,8 +2372,11 @@ impl QueueManager {
             }
         }
 
-        let history = self.history_list(10_000).unwrap_or_default();
-        for entry in history {
+        let ledger = {
+            let db = self.db.lock();
+            db.download_statistics_list().unwrap_or_default()
+        };
+        for entry in ledger {
             apply(entry.completed_at, &entry.server_stats, false);
         }
 
@@ -2352,6 +2387,96 @@ impl QueueManager {
                 .then(a.server_id.cmp(&b.server_id))
         });
         stats
+    }
+
+    /// Return permanent global download, speed and NNTP article statistics.
+    /// Completed jobs come from the compact statistics ledger, which is not
+    /// affected by history retention or user-initiated history deletion.
+    pub fn global_statistics(&self, servers: &[ServerConfig]) -> GlobalStatisticsData {
+        let generated_at = Utc::now();
+        let today_cutoff = generated_at - chrono::Duration::days(1);
+        let week_cutoff = generated_at - chrono::Duration::days(7);
+        let month_cutoff = generated_at - chrono::Duration::days(30);
+        let records = {
+            let db = self.db.lock();
+            db.download_statistics_list().unwrap_or_default()
+        };
+
+        let aggregate = |items: &[&DownloadStatistic]| {
+            let mut totals = StatisticsPeriodData::default();
+            for item in items {
+                totals.downloads += 1;
+                match item.status {
+                    JobStatus::Completed => totals.completed += 1,
+                    JobStatus::Failed => totals.failed += 1,
+                    _ => {}
+                }
+                totals.bytes_downloaded = totals
+                    .bytes_downloaded
+                    .saturating_add(item.downloaded_bytes);
+                totals.total_duration_secs += item.duration_secs;
+                totals.fastest_download_bps =
+                    totals.fastest_download_bps.max(item.average_speed_bps);
+                for server in &item.server_stats {
+                    totals.articles_served = totals
+                        .articles_served
+                        .saturating_add(server.articles_downloaded);
+                    totals.articles_missing = totals
+                        .articles_missing
+                        .saturating_add(server.articles_failed);
+                }
+            }
+            totals.news_server_hits = totals
+                .articles_served
+                .saturating_add(totals.articles_missing);
+            if totals.total_duration_secs > 0.0 {
+                totals.average_speed_bps =
+                    (totals.bytes_downloaded as f64 / totals.total_duration_secs) as u64;
+            }
+            totals
+        };
+
+        let all: Vec<_> = records.iter().collect();
+        let today: Vec<_> = records
+            .iter()
+            .filter(|item| item.completed_at >= today_cutoff)
+            .collect();
+        let week: Vec<_> = records
+            .iter()
+            .filter(|item| item.completed_at >= week_cutoff)
+            .collect();
+        let month: Vec<_> = records
+            .iter()
+            .filter(|item| item.completed_at >= month_cutoff)
+            .collect();
+
+        let mut by_day: HashMap<String, Vec<&DownloadStatistic>> = HashMap::new();
+        for item in &records {
+            if item.completed_at >= month_cutoff {
+                by_day
+                    .entry(item.completed_at.format("%Y-%m-%d").to_string())
+                    .or_default()
+                    .push(item);
+            }
+        }
+        let mut daily: Vec<_> = by_day
+            .into_iter()
+            .map(|(date, items)| DailyStatisticsData {
+                date,
+                totals: aggregate(&items),
+            })
+            .collect();
+        daily.sort_by(|a, b| a.date.cmp(&b.date));
+
+        GlobalStatisticsData {
+            generated_at,
+            lifetime: aggregate(&all),
+            today: aggregate(&today),
+            week: aggregate(&week),
+            month: aggregate(&month),
+            servers: self.server_stats_get_all(servers),
+            daily,
+        }
     }
 
     /// Get a single history entry.

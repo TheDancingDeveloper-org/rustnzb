@@ -169,10 +169,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/queue/{id}", delete(handlers::h_queue_delete))
         // History
         .route("/history", get(handlers::h_history_list))
-        .route("/history/{id}", delete(handlers::h_history_delete))
+        .route(
+            "/history/{id}",
+            get(handlers::h_history_get).delete(handlers::h_history_delete),
+        )
         .route("/history/{id}/retry", post(handlers::h_history_retry))
         .route("/history/{id}/logs", get(handlers::h_history_logs))
         .route("/history", delete(handlers::h_history_clear))
+        .route("/statistics", get(handlers::h_global_statistics))
         // Config
         .route("/config", get(handlers::h_config_get))
         .route("/config/general", put(handlers::h_general_update))

@@ -62,6 +62,10 @@ export interface HistoryEntry {
   error_message: string | null;
   server_stats: ServerArticleStats[];
   has_nzb_data: boolean;
+  duration_secs?: number;
+  average_speed_bps?: number;
+  articles_served?: number;
+  articles_missing?: number;
 }
 
 export interface LogEntry {

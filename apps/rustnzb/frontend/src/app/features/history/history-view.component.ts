@@ -75,6 +75,7 @@ type TimeFilter = '7d' | '30d' | 'all';
               <th class="name-column">Name</th>
               <th>Category</th>
               <th>Size</th>
+              <th>Avg speed</th>
               <th>Duration</th>
               <th>Completed</th>
               <th>Status</th>
@@ -83,7 +84,15 @@ type TimeFilter = '7d' | '30d' | 'all';
           </thead>
           <tbody>
             @for (e of filteredEntries(); track e.id) {
-              <tr>
+              <tr
+                class="history-row"
+                [class.selected]="selectedId() === e.id"
+                tabindex="0"
+                [attr.aria-expanded]="selectedId() === e.id"
+                (click)="selectEntry(e)"
+                (keydown.enter)="selectEntry(e)"
+                (keydown.space)="$event.preventDefault(); selectEntry(e)"
+              >
                 <td class="name-cell">
                   <div class="e-name" [class.dim]="e.status === 'failed'" [title]="e.name">{{ e.name }}</div>
                   @if (e.error_message) {
@@ -94,6 +103,7 @@ type TimeFilter = '7d' | '30d' | 'all';
                   @if (e.category) { <span class="tag cat">{{ e.category }}</span> }
                 </td>
                 <td>{{ formatBytes(e.total_bytes) }}</td>
+                <td>{{ formatSpeed(averageSpeed(e)) }}</td>
                 <td>{{ formatDuration(e.added_at, e.completed_at) }}</td>
                 <td>{{ relativeTime(e.completed_at) }}</td>
                 <td>
@@ -104,31 +114,94 @@ type TimeFilter = '7d' | '30d' | 'all';
                 <td class="actions-cell">
                   <div class="actions">
                     @if (e.status === 'failed') {
-                      <button class="row-action warn" (click)="retry(e.id)">
+                      <button class="row-action warn" (click)="$event.stopPropagation(); retry(e.id)">
                         <app-icon name="retry" [size]="11" /> retry
                       </button>
                     }
                     @if (e.status === 'completed' && webdavEnabled()) {
-                      <button class="row-action media" (click)="addToMedia(e.id)" title="Add to Media Library">
+                      <button class="row-action media" (click)="$event.stopPropagation(); addToMedia(e.id)" title="Add to Media Library">
                         <app-icon name="play" [size]="11" /> media
                       </button>
                     }
-                    <button class="row-action" (click)="openOutput(e)">open</button>
-                    <button class="row-action danger" (click)="remove(e.id)" aria-label="Delete">
+                    <button class="row-action" (click)="$event.stopPropagation(); openOutput(e)">open</button>
+                    <button class="row-action danger" (click)="$event.stopPropagation(); remove(e.id)" aria-label="Delete">
                       <app-icon name="close" [size]="11" />
                     </button>
                   </div>
                 </td>
               </tr>
+              @if (selectedId() === e.id) {
+                @let detail = selectedEntry() || e;
+                <tr class="detail-row">
+                  <td colspan="8">
+                    @if (detailLoading()) {
+                      <div class="detail-loading">Loading download details…</div>
+                    } @else {
+                      <div class="detail-panel">
+                        <div class="detail-head">
+                          <div>
+                            <div class="detail-title">{{ detail.name }}</div>
+                            <div class="detail-path">{{ detail.output_dir || 'No output path recorded' }}</div>
+                          </div>
+                          <button class="row-action" (click)="closeDetails()" aria-label="Close details">close</button>
+                        </div>
+                        <div class="detail-metrics">
+                          <div><span>Downloaded</span><b>{{ formatBytes(detail.downloaded_bytes) }} / {{ formatBytes(detail.total_bytes) }}</b></div>
+                          <div><span>Average speed</span><b>{{ formatSpeed(averageSpeed(detail)) }}</b></div>
+                          <div><span>Total duration</span><b>{{ formatDuration(detail.added_at, detail.completed_at) }}</b></div>
+                          <div><span>Articles served</span><b>{{ articleServed(detail) }}</b></div>
+                          <div><span>Articles missing</span><b>{{ articleMissing(detail) }}</b></div>
+                          <div><span>Availability</span><b>{{ availability(detail) }}</b></div>
+                        </div>
+
+                        @if (detail.server_stats.length > 0) {
+                          <h4>News server usage</h4>
+                          <table class="detail-table">
+                            <thead><tr><th>Server</th><th>Hits</th><th>Served</th><th>Missing</th><th>Downloaded</th></tr></thead>
+                            <tbody>
+                              @for (server of detail.server_stats; track server.server_id) {
+                                <tr>
+                                  <td>{{ server.server_name || server.server_id }}</td>
+                                  <td>{{ server.articles_downloaded + server.articles_failed }}</td>
+                                  <td>{{ server.articles_downloaded }}</td>
+                                  <td>{{ server.articles_failed }}</td>
+                                  <td>{{ formatBytes(server.bytes_downloaded) }}</td>
+                                </tr>
+                              }
+                            </tbody>
+                          </table>
+                        }
+
+                        @if (detail.stages.length > 0) {
+                          <h4>Processing stages</h4>
+                          <div class="stages">
+                            @for (stage of detail.stages; track stage.name) {
+                              <div class="stage">
+                                <span class="status-pill" [class]="stage.status === 'success' ? 's-ok' : stage.status === 'failed' ? 's-fail' : 's-paused'">{{ stage.status }}</span>
+                                <b>{{ stage.name }}</b>
+                                <span>{{ formatStageDuration(stage.duration_secs) }}</span>
+                                @if (stage.message) { <span class="stage-message">{{ stage.message }}</span> }
+                              </div>
+                            }
+                          </div>
+                        }
+                        @if (detail.error_message) {
+                          <div class="detail-error">{{ detail.error_message }}</div>
+                        }
+                      </div>
+                    }
+                  </td>
+                </tr>
+              }
             }
 
             @if (loading()) {
               <tr>
-                <td colspan="7" class="empty-cell">Loading…</td>
+                <td colspan="8" class="empty-cell">Loading…</td>
               </tr>
             } @else if (filteredEntries().length === 0) {
               <tr>
-                <td colspan="7" class="empty-cell">
+                <td colspan="8" class="empty-cell">
                   @if (entries().length === 0) {
                     No download history yet. Finished jobs will show up here.
                   } @else {
@@ -168,11 +241,39 @@ type TimeFilter = '7d' | '30d' | 'all';
       justify-content: flex-end;
       gap: 2px;
     }
+    .history-row { cursor: pointer; }
+    .history-row:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+    .history-row.selected td { background: var(--row-hover); border-bottom-color: transparent; }
+    .detail-row > td { padding: 0 !important; background: var(--panel2); }
+    .detail-loading { padding: 22px; color: var(--mute); }
+    .detail-panel { padding: 16px 18px 18px; border-bottom: 1px solid var(--line); }
+    .detail-head { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+    .detail-title { font-weight: 600; font-size: 14px; }
+    .detail-path { color: var(--mute); font-size: 11px; margin-top: 3px; word-break: break-all; }
+    .detail-metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
+    .detail-metrics > div { padding: 9px; background: var(--panel); border: 1px solid var(--line); border-radius: 5px; }
+    .detail-metrics span { display: block; color: var(--mute); font-size: 10px; text-transform: uppercase; letter-spacing: .3px; }
+    .detail-metrics b { display: block; margin-top: 3px; font-size: 12px; }
+    h4 { margin: 16px 0 7px; color: var(--mute); font-size: 11px; text-transform: uppercase; letter-spacing: .4px; }
+    .detail-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .detail-table th, .detail-table td { padding: 6px 8px; border: 1px solid var(--line); text-align: left; }
+    .detail-table th { color: var(--mute); font-weight: 500; }
+    .stages { display: flex; flex-direction: column; gap: 5px; }
+    .stage { display: grid; grid-template-columns: 72px 150px 70px 1fr; gap: 8px; align-items: center; font-size: 12px; }
+    .stage > span:not(.status-pill) { color: var(--mute); }
+    .stage-message { overflow-wrap: anywhere; }
+    .detail-error { margin-top: 14px; padding: 9px 11px; color: var(--danger); background: var(--fail-bg); border-radius: 5px; font-size: 12px; }
+    @media (max-width: 1000px) {
+      .detail-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
   `],
 })
 export class HistoryViewComponent implements OnInit, OnDestroy {
   loading = signal(true);
   entries = signal<HistoryEntry[]>([]);
+  selectedId = signal<string | null>(null);
+  selectedEntry = signal<HistoryEntry | null>(null);
+  detailLoading = signal(false);
   webdavEnabled = signal(false);
   filterStatus: StatusFilter = 'all';
   filterCategory = '';
@@ -205,6 +306,29 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
       next: r => { this.entries.set(r.entries || []); this.loading.set(false); },
       error: () => this.loading.set(false),
     });
+  }
+
+  selectEntry(entry: HistoryEntry): void {
+    if (this.selectedId() === entry.id) {
+      this.closeDetails();
+      return;
+    }
+    this.selectedId.set(entry.id);
+    this.selectedEntry.set(entry);
+    this.detailLoading.set(true);
+    this.api.get<HistoryEntry>(`/history/${encodeURIComponent(entry.id)}`).subscribe({
+      next: detail => {
+        this.selectedEntry.set(detail);
+        this.detailLoading.set(false);
+      },
+      error: () => this.detailLoading.set(false),
+    });
+  }
+
+  closeDetails(): void {
+    this.selectedId.set(null);
+    this.selectedEntry.set(null);
+    this.detailLoading.set(false);
   }
 
   categoryOptions = computed(() =>
@@ -323,10 +447,10 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
   }
 
   exportCsv(): void {
-    const rows = [['name', 'category', 'size_bytes', 'status', 'added_at', 'completed_at', 'error']];
+    const rows = [['name', 'category', 'size_bytes', 'average_speed_bps', 'status', 'added_at', 'completed_at', 'error']];
     for (const e of this.filteredEntries()) {
       rows.push([
-        e.name, e.category || '', String(e.total_bytes), e.status,
+        e.name, e.category || '', String(e.total_bytes), String(this.averageSpeed(e)), e.status,
         e.added_at, e.completed_at, e.error_message || '',
       ]);
     }
@@ -348,6 +472,34 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
     const s = ['B', 'KB', 'MB', 'GB', 'TB'];
     const i = Math.min(4, Math.floor(Math.log(b) / Math.log(k)));
     return (b / Math.pow(k, i)).toFixed(1) + ' ' + s[i];
+  }
+
+  averageSpeed(entry: HistoryEntry): number {
+    if (entry.average_speed_bps != null) return entry.average_speed_bps;
+    const seconds = (new Date(entry.completed_at).getTime() - new Date(entry.added_at).getTime()) / 1000;
+    return seconds > 0 ? Math.round(entry.downloaded_bytes / seconds) : 0;
+  }
+
+  formatSpeed(bps: number): string {
+    return `${this.formatBytes(bps)}/s`;
+  }
+
+  articleServed(entry: HistoryEntry): number {
+    return entry.articles_served ?? entry.server_stats.reduce((total, server) => total + server.articles_downloaded, 0);
+  }
+
+  articleMissing(entry: HistoryEntry): number {
+    return entry.articles_missing ?? entry.server_stats.reduce((total, server) => total + server.articles_failed, 0);
+  }
+
+  availability(entry: HistoryEntry): string {
+    const served = this.articleServed(entry);
+    const total = served + this.articleMissing(entry);
+    return total > 0 ? `${((served / total) * 100).toFixed(2)}%` : '—';
+  }
+
+  formatStageDuration(seconds: number | undefined): string {
+    return seconds != null && Number.isFinite(seconds) ? this.formatShortDuration(seconds) : '—';
   }
 
   formatDuration(start: string, end: string): string {

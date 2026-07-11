@@ -7,6 +7,7 @@ import { ApiService } from '../../core/services/api.service';
 import { StatusResponse } from '../../core/models/queue.model';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
+import { AppTheme, ThemeService } from '../../core/services/theme.service';
 
 interface ServerConfig {
   id: string;
@@ -855,6 +856,32 @@ function emptyCategory(): CategoryConfig {
           </div>
 
           <div class="panel">
+            <h3>Appearance</h3>
+            <div class="body">
+              <div class="theme-grid" role="radiogroup" aria-label="Application theme">
+                @for (option of theme.options; track option.id) {
+                  <button
+                    type="button"
+                    class="theme-option"
+                    [class.active]="theme.current() === option.id"
+                    role="radio"
+                    [attr.aria-checked]="theme.current() === option.id"
+                    (click)="setTheme(option.id)"
+                  >
+                    <span class="theme-swatch" [attr.data-preview-theme]="option.id">
+                      <i></i><i></i><i></i>
+                    </span>
+                    <span class="theme-copy">
+                      <b>{{ option.name }}</b>
+                      <span class="setting-description">{{ option.description }}</span>
+                    </span>
+                  </button>
+                }
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
             <h3>Speed &amp; concurrency</h3>
             <div class="body">
               <div class="form">
@@ -1236,6 +1263,62 @@ function emptyCategory(): CategoryConfig {
         font-size: 11px;
         margin-top: -2px;
       }
+      .settings-main .sub,
+      .settings-main .host,
+      .settings-main .meters span,
+      .settings-main .setting-description,
+      .settings-main .form .inline > span {
+        font-family: inherit;
+        font-style: normal;
+      }
+      .theme-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .theme-option {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+        padding: 10px;
+        text-align: left;
+        color: var(--text);
+        background: var(--panel2);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        font: inherit;
+        cursor: pointer;
+      }
+      .theme-option:hover,
+      .theme-option.active { border-color: var(--accent); }
+      .theme-option.active { box-shadow: inset 0 0 0 1px var(--accent); }
+      .theme-swatch {
+        width: 42px;
+        height: 32px;
+        border-radius: 5px;
+        padding: 5px;
+        flex: 0 0 auto;
+        display: flex;
+        gap: 3px;
+        align-items: flex-end;
+        background: #0f1419;
+        border: 1px solid #2a3441;
+      }
+      .theme-swatch[data-preview-theme='midnight'] { background: #080d1a; border-color: #263552; }
+      .theme-swatch[data-preview-theme='light'] { background: #f3f6fa; border-color: #d2d9e3; }
+      .theme-swatch i { display: block; width: 8px; background: #3b82f6; border-radius: 2px; }
+      .theme-swatch i:nth-child(1) { height: 11px; }
+      .theme-swatch i:nth-child(2) { height: 20px; }
+      .theme-swatch i:nth-child(3) { height: 15px; }
+      .theme-swatch[data-preview-theme='midnight'] i { background: #8b7cf6; }
+      .theme-swatch[data-preview-theme='light'] i { background: #2563eb; }
+      .theme-copy { min-width: 0; display: flex; flex-direction: column; }
+      .theme-copy b { font-size: 12px; }
+      .setting-description { color: var(--mute); font-size: 11px; margin-top: 2px; }
+      @media (max-width: 850px) {
+        .theme-grid { grid-template-columns: 1fr; }
+      }
     `,
   ],
 })
@@ -1289,6 +1372,7 @@ export class SettingsViewComponent implements OnInit {
     private api: ApiService,
     private snack: MatSnackBar,
     private confirmSvc: ConfirmService,
+    public readonly theme: ThemeService,
   ) {}
 
   ngOnInit(): void {
@@ -1562,6 +1646,10 @@ export class SettingsViewComponent implements OnInit {
   }
 
   // ======================== GENERAL ========================
+
+  setTheme(theme: AppTheme): void {
+    this.theme.set(theme);
+  }
 
   loadGeneralSettings(): void {
     this.api.get<{ speed_limit_bps: number }>('/config/speed-limit').subscribe({
