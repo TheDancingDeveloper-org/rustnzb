@@ -268,6 +268,7 @@ impl NewsWrapper {
             | NntpError::Connection(_)
             | NntpError::Tls(_)
             | NntpError::AuthRequired(_)
+            | NntpError::PermissionDenied(_)
             | NntpError::ServiceUnavailable(_)
             | NntpError::Protocol(_)
             | NntpError::Timeout(_) => {

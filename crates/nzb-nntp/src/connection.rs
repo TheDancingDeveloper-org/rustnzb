@@ -940,6 +940,10 @@ impl NntpConnection {
                 self.state = ConnectionState::Ready;
                 Err(NntpError::NoArticleSelected(status.message))
             }
+            403 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::PermissionDenied(status.message))
+            }
             480 => {
                 warn!(
                     server = %self.server_id,
@@ -985,10 +989,10 @@ impl NntpConnection {
                     "NNTP unexpected ARTICLE response"
                 );
                 self.state = ConnectionState::Error;
-                Err(NntpError::Protocol(format!(
-                    "Unexpected ARTICLE response {}: {}",
-                    status.code, status.message
-                )))
+                Err(crate::error::unexpected_article_response(
+                    status.code,
+                    status.message,
+                ))
             }
         }
     }

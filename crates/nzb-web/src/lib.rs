@@ -24,3 +24,11 @@ pub use queue_manager::{
 };
 pub use startup::{StartupConfig, StartupResult};
 pub use state::AppState;
+
+pub(crate) fn increment_counter(name: &'static str) {
+    opentelemetry::global::meter_provider()
+        .meter("rustnzb")
+        .u64_counter(name)
+        .build()
+        .add(1, &[]);
+}

@@ -102,6 +102,7 @@ impl ArticleFailure {
             NntpError::ArticleNotFound(_) => ArticleFailureKind::NotFound,
             NntpError::ServiceUnavailable(_) => ArticleFailureKind::ServerDown,
             NntpError::Auth(_) | NntpError::AuthRequired(_) => ArticleFailureKind::AuthFailed,
+            NntpError::PermissionDenied(_) => ArticleFailureKind::PermissionDenied,
             NntpError::Connection(_) => ArticleFailureKind::ConnectionClosed,
             NntpError::Io(_) => ArticleFailureKind::ConnectionClosed,
             NntpError::Timeout(_) => ArticleFailureKind::Timeout,
@@ -132,11 +133,17 @@ impl ArticleFailure {
 
     /// Article is present nowhere — emitted when every enabled server has
     /// already been tried for this article and the last attempt failed.
-    pub fn not_found_anywhere(server_id: impl Into<String>) -> Self {
+    pub fn not_found_anywhere(
+        server_id: impl Into<String>,
+        provider_outcomes: impl Into<String>,
+    ) -> Self {
         Self {
             kind: ArticleFailureKind::NotFound,
             server_id: server_id.into(),
-            message: "Article not found on any server".to_string(),
+            message: format!(
+                "Article explicitly not found on every eligible provider; outcomes: {}",
+                provider_outcomes.into()
+            ),
         }
     }
 

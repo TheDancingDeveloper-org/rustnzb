@@ -86,6 +86,11 @@ pub enum FetchOutcome {
     Failed {
         tag: WorkTag,
         last_error: Option<String>,
+        /// True only when every enabled provider explicitly returned NNTP
+        /// 430 for this article. Callers must not infer this from text.
+        explicit_global_absence: bool,
+        /// Sorted provider IDs that supplied the explicit 430 evidence.
+        explicit_not_found_servers: Vec<String>,
     },
     /// The driver is shutting down and this article will not be attempted
     /// further. Emitted during graceful shutdown; caller should treat as
@@ -1211,6 +1216,8 @@ async fn dispatch_pending(
             .send(FetchOutcome::Failed {
                 tag: item.tag,
                 last_error: Some(err_msg),
+                explicit_global_absence: true,
+                explicit_not_found_servers: item.article.explicit_not_found_servers(),
             })
             .await;
     }
@@ -1391,10 +1398,11 @@ async fn handle_scheduler_msg(
                         .await;
                 }
                 Err(err) => {
-                    item.article.mark_server_tried(server.id());
                     if matches!(err, NntpError::ArticleNotFound(_)) {
+                        item.article.mark_server_not_found(server.id());
                         server.record_attempt_not_found();
                     } else {
+                        item.article.mark_server_tried(server.id());
                         item.article.mark_transient_failure();
                         server.record_attempt_transient_failed();
                     }
@@ -1426,6 +1434,10 @@ async fn handle_scheduler_msg(
                                 .send(FetchOutcome::Failed {
                                     tag: item.tag,
                                     last_error: Some(format!("{err}")),
+                                    explicit_global_absence: true,
+                                    explicit_not_found_servers: item
+                                        .article
+                                        .explicit_not_found_servers(),
                                 })
                                 .await;
                         }
@@ -1526,6 +1538,7 @@ async fn wrapper_worker(
                         e,
                         NntpError::Auth(_)
                             | NntpError::AuthRequired(_)
+                            | NntpError::PermissionDenied(_)
                             | NntpError::ServiceUnavailable(_)
                     );
                     let err_str = format!("{e}");
@@ -1821,6 +1834,7 @@ fn clone_err(err: &NntpError) -> NntpError {
         NntpError::Tls(m) => NntpError::Tls(m.clone()),
         NntpError::Auth(m) => NntpError::Auth(m.clone()),
         NntpError::AuthRequired(m) => NntpError::AuthRequired(m.clone()),
+        NntpError::PermissionDenied(m) => NntpError::PermissionDenied(m.clone()),
         NntpError::ServiceUnavailable(m) => NntpError::ServiceUnavailable(m.clone()),
         NntpError::ArticleNotFound(m) => NntpError::ArticleNotFound(m.clone()),
         NntpError::NoSuchGroup(m) => NntpError::NoSuchGroup(m.clone()),

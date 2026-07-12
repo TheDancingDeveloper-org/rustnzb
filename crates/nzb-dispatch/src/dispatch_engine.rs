@@ -49,7 +49,8 @@ pub trait DispatchEngine: Send + Sync {
 
     /// Abort `job_id` with a human-readable reason. Emits
     /// [`ProgressUpdate::JobAborted`] once outstanding articles drain.
-    fn abort_job(&self, job_id: &str, reason: String);
+    /// Returns `true` only for the caller that won terminal ownership.
+    fn abort_job(&self, job_id: &str, reason: String) -> bool;
 
     /// Is `job_id` currently known to the dispatcher?
     fn has_job(&self, job_id: &str) -> bool;
@@ -142,8 +143,8 @@ impl DispatchEngine for DispatchHandle {
         self.0.cancel_job(job_id);
     }
 
-    fn abort_job(&self, job_id: &str, reason: String) {
-        self.0.abort_job(job_id, reason);
+    fn abort_job(&self, job_id: &str, reason: String) -> bool {
+        self.0.abort_job(job_id, reason)
     }
 
     fn has_job(&self, job_id: &str) -> bool {

@@ -221,6 +221,7 @@ impl Downloader {
                             let is_fatal = matches!(
                                 &e,
                                 NntpError::AuthRequired(_)
+                                    | NntpError::PermissionDenied(_)
                                     | NntpError::ServiceUnavailable(_)
                                     | NntpError::Connection(_)
                                     | NntpError::Io(_)

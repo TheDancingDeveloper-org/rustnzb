@@ -430,6 +430,7 @@ pub enum ProgressUpdate {
     JobAborted {
         job_id: String,
         reason: String,
+        articles_failed: usize,
     },
 }
 
@@ -446,6 +447,9 @@ pub(crate) struct WorkItem {
     pub(crate) segment_number: u32,
     /// Servers already tried for this article (by server ID).
     pub(crate) tried_servers: Vec<String>,
+    /// Definitive per-provider outcomes. Transient failures are not recorded
+    /// because they provide no evidence about article availability.
+    pub(crate) provider_outcomes: HashMap<String, crate::article_failure::ArticleFailureKind>,
     /// Number of attempts on the current server.
     pub(crate) tries_on_current: u32,
 }
@@ -579,12 +583,14 @@ impl JobContext {
 
         let abort_reason = self.abort_reason.lock().clone();
         if let Some(reason) = abort_reason {
+            let failed = self.articles_failed.load(Ordering::Relaxed);
             try_send_progress(
                 &self.progress_tx,
                 &self.job_id,
                 ProgressUpdate::JobAborted {
                     job_id: self.job_id.clone(),
                     reason,
+                    articles_failed: failed,
                 },
             );
             return;
@@ -847,6 +853,25 @@ impl SharedWorkQueue {
     pub fn len(&self) -> usize {
         self.inner.lock().items.len()
     }
+
+    /// For one job, return `(queued_items, any_healthy_candidate)`. This is
+    /// used only by the supervisor after all in-flight work has settled.
+    fn job_workability(
+        &self,
+        job_id: &str,
+        healthy_server_ids: &std::collections::HashSet<String>,
+    ) -> (usize, bool) {
+        let state = self.inner.lock();
+        let mut queued = 0;
+        let mut any_candidate = false;
+        for item in state.items.iter().filter(|item| item.job_id == job_id) {
+            queued += 1;
+            any_candidate |= healthy_server_ids
+                .iter()
+                .any(|server_id| !item.tried_servers.contains(server_id));
+        }
+        (queued, any_candidate)
+    }
 }
 
 impl Default for SharedWorkQueue {
@@ -1095,12 +1120,18 @@ impl WorkerPool {
 
     /// Abort a job with a reason. Drains queued items, sets the abort flag,
     /// and emits JobAborted via the job's progress channel.
-    pub fn abort_job(&self, job_id: &str, reason: String) {
+    pub fn abort_job(&self, job_id: &str, reason: String) -> bool {
         let ctx = self.job_contexts.lock().get(job_id).cloned();
         let Some(ctx) = ctx else {
-            return;
+            return false;
         };
-        *ctx.abort_reason.lock() = Some(reason);
+        {
+            let mut abort_reason = ctx.abort_reason.lock();
+            if abort_reason.is_some() {
+                return false;
+            }
+            *abort_reason = Some(reason);
+        }
         ctx.cancelled.store(true, Ordering::Relaxed);
         let drained = self.work_queue.drain_job(job_id);
         // Decrement the remaining counter for drained items so the terminal
@@ -1108,8 +1139,10 @@ impl WorkerPool {
         for _ in drained {
             ctx.resolve_one();
         }
-        ctx.emit_terminal();
-        self.job_contexts.lock().remove(job_id);
+        if ctx.articles_remaining.load(Ordering::Relaxed) == 0 {
+            ctx.emit_terminal();
+        }
+        true
     }
 
     /// Cancel a job silently (no JobFinished / JobAborted emission).
@@ -1274,6 +1307,7 @@ impl WorkerPool {
                     .collect()
             };
             let all_broken = healthy_servers.is_empty();
+            let healthy_server_ids = healthy_servers.iter().cloned().collect();
 
             let ctxs: Vec<Arc<JobContext>> = self.job_contexts.lock().values().cloned().collect();
             for ctx in ctxs {
@@ -1283,7 +1317,13 @@ impl WorkerPool {
                 if ctx.cancelled.load(Ordering::Relaxed) {
                     continue;
                 }
-                if all_broken {
+                let remaining = ctx.articles_remaining.load(Ordering::Relaxed);
+                let (queued, any_healthy_candidate) = self
+                    .work_queue
+                    .job_workability(&ctx.job_id, &healthy_server_ids);
+                let unresolved_providers =
+                    queued == remaining && queued > 0 && !any_healthy_candidate;
+                if all_broken || unresolved_providers {
                     let reason = {
                         let health = self.server_health.lock();
                         health
@@ -1294,8 +1334,10 @@ impl WorkerPool {
                     };
                     warn!(
                         job_id = %ctx.job_id,
-                        remaining = ctx.articles_remaining.load(Ordering::Relaxed),
-                        "All servers circuit-broken — pausing job for user intervention"
+                        remaining,
+                        queued,
+                        all_servers_broken = all_broken,
+                        "No healthy untried provider remains — pausing job for retry"
                     );
                     self.mark_no_servers(&ctx.job_id, reason);
                 }
@@ -1559,6 +1601,7 @@ async fn next_work_item(
                 continue;
             };
             if ctx.cancelled.load(Ordering::Relaxed) {
+                ctx.resolve_one();
                 continue;
             }
             // Respect per-job pause: return the item and wait.
@@ -1704,6 +1747,7 @@ async fn run_worker_serial(
                     &pool.server_health,
                     &ctx,
                     &pool.work_queue,
+                    worker_id,
                     crate::article_failure::ArticleFailureKind::NotFound,
                     "Article not found on any server",
                 ) {
@@ -1734,6 +1778,30 @@ async fn run_worker_serial(
                 }
                 return WorkerExit::Reconnect;
             }
+            Err(ArticleError::ProviderUnavailable { kind, message }) => {
+                let is_auth = matches!(
+                    kind,
+                    crate::article_failure::ArticleFailureKind::AuthFailed
+                        | crate::article_failure::ArticleFailureKind::PermissionDenied
+                );
+                warn!(
+                    job_id = %item.job_id,
+                    file_id = %item.file_id,
+                    segment_number = item.segment_number,
+                    message_id = %item.message_id,
+                    server_id = %primary_server.id,
+                    worker_id = %worker_id,
+                    original_failure_kind = kind.as_str(),
+                    "Provider unavailable during article fetch: {message}"
+                );
+                pool.server_health
+                    .lock()
+                    .entry(primary_server.id.clone())
+                    .or_default()
+                    .record_failure(is_auth, &message);
+                pool.work_queue.push_front(item);
+                return WorkerExit::Reconnect;
+            }
             Err(ArticleError::DecodeError(msg)) => {
                 if handle_article_not_available(
                     &mut item,
@@ -1742,6 +1810,7 @@ async fn run_worker_serial(
                     &pool.server_health,
                     &ctx,
                     &pool.work_queue,
+                    worker_id,
                     crate::article_failure::ArticleFailureKind::DecodeError,
                     &format!("Decode error: {msg}"),
                 ) {
@@ -1749,7 +1818,7 @@ async fn run_worker_serial(
                 }
             }
             Err(ArticleError::AssemblyError(msg)) => {
-                error!(article = %item.message_id, "Assembly error: {msg}");
+                error!(job_id = %item.job_id, file_id = %item.file_id, segment_number = item.segment_number, message_id = %item.message_id, server_id = %primary_server.id, worker_id = %worker_id, original_failure_kind = "decode_error", terminal_failure_kind = "decode_error", "Assembly error: {msg}");
                 try_send_progress(
                     &ctx.progress_tx,
                     &item.job_id,
@@ -1861,6 +1930,7 @@ async fn run_worker_pipelined(
                 continue;
             };
             if ctx.cancelled.load(Ordering::Relaxed) {
+                ctx.resolve_one();
                 continue;
             }
             if ctx.paused.load(Ordering::Relaxed) {
@@ -1959,6 +2029,7 @@ async fn run_worker_pipelined(
                     continue;
                 };
                 if ctx.cancelled.load(Ordering::Relaxed) {
+                    ctx.resolve_one();
                     continue;
                 }
 
@@ -2045,6 +2116,7 @@ async fn run_worker_pipelined(
                                     &pool.server_health,
                                     &ctx,
                                     &pool.work_queue,
+                                    worker_id,
                                     crate::article_failure::ArticleFailureKind::DecodeError,
                                     &format!("Decode error: {msg}"),
                                 ) {
@@ -2052,7 +2124,7 @@ async fn run_worker_pipelined(
                                 }
                             }
                             Err(ArticleError::AssemblyError(msg)) => {
-                                error!(article = %item.message_id, "Assembly error: {msg}");
+                                error!(job_id = %item.job_id, file_id = %item.file_id, segment_number = item.segment_number, message_id = %item.message_id, server_id = %primary_server.id, worker_id = %worker_id, original_failure_kind = "decode_error", terminal_failure_kind = "decode_error", "Assembly error: {msg}");
                                 try_send_progress(
                                     &ctx.progress_tx,
                                     &item.job_id,
@@ -2082,6 +2154,7 @@ async fn run_worker_pipelined(
                             &pool.server_health,
                             &ctx,
                             &pool.work_queue,
+                            worker_id,
                             crate::article_failure::ArticleFailureKind::NotFound,
                             "Article not found on any server",
                         ) {
@@ -2108,24 +2181,34 @@ async fn run_worker_pipelined(
                         return WorkerExit::Reconnect;
                     }
                     Err(e) => {
-                        warn!(worker = %worker_id, article = %item.message_id, "Pipeline error: {e}");
-                        let kind = crate::article_failure::ArticleFailure::from_nntp(
+                        let failure = crate::article_failure::ArticleFailure::from_nntp(
                             &e,
                             &primary_server.id,
-                        )
-                        .kind;
-                        if handle_article_not_available(
-                            &mut item,
-                            primary_server,
-                            &pool.servers,
-                            &pool.server_health,
-                            &ctx,
-                            &pool.work_queue,
-                            kind,
-                            &format!("Pipeline error: {e}"),
-                        ) {
-                            last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
-                        }
+                        );
+                        warn!(
+                            job_id = %item.job_id,
+                            file_id = %item.file_id,
+                            segment_number = item.segment_number,
+                            message_id = %item.message_id,
+                            server_id = %primary_server.id,
+                            worker_id = %worker_id,
+                            original_failure_kind = failure.kind.as_str(),
+                            attempt = item.tries_on_current + 1,
+                            "Transient pipeline error — re-queuing in-flight work and reconnecting: {e}"
+                        );
+                        let is_auth = matches!(
+                            failure.kind,
+                            crate::article_failure::ArticleFailureKind::AuthFailed
+                                | crate::article_failure::ArticleFailureKind::PermissionDenied
+                        );
+                        pool.server_health
+                            .lock()
+                            .entry(primary_server.id.clone())
+                            .or_default()
+                            .record_failure(is_auth, &e.to_string());
+                        pool.work_queue.push_front(item);
+                        requeue_all(&mut in_flight_items, &pool.work_queue);
+                        return WorkerExit::Reconnect;
                     }
                 }
             }
@@ -2280,22 +2363,26 @@ fn handle_article_not_available(
     item: &mut WorkItem,
     primary_server: &ServerConfig,
     all_servers: &Arc<Mutex<Vec<ServerConfig>>>,
-    server_health: &ServerHealthMap,
+    _server_health: &ServerHealthMap,
     ctx: &Arc<JobContext>,
     work_queue: &Arc<SharedWorkQueue>,
+    worker_id: &str,
     kind: crate::article_failure::ArticleFailureKind,
     error_msg: &str,
 ) -> bool {
-    item.tried_servers.push(primary_server.id.clone());
+    item.provider_outcomes
+        .insert(primary_server.id.clone(), kind);
+    if !item.tried_servers.contains(&primary_server.id) {
+        item.tried_servers.push(primary_server.id.clone());
+    }
     item.tries_on_current = 0;
 
-    let all_tried = {
+    let all_definitive = {
         let servers = all_servers.lock();
-        let health = server_health.lock();
-        servers.iter().filter(|s| s.enabled).all(|s| {
-            item.tried_servers.contains(&s.id)
-                || health.get(&s.id).is_some_and(|h| !h.is_available())
-        })
+        servers
+            .iter()
+            .filter(|s| s.enabled)
+            .all(|s| item.provider_outcomes.contains_key(&s.id))
     };
 
     debug!(
@@ -2303,22 +2390,49 @@ fn handle_article_not_available(
         server = %primary_server.id,
         kind = kind.as_str(),
         tried_count = item.tried_servers.len(),
-        all_tried,
+        all_definitive,
         "Article returned error on this server"
     );
 
     // (debug log immediately below was added for observability)
-    if all_tried {
-        warn!(article = %item.message_id, kind = kind.as_str(), "{error_msg}");
-        // Promote a per-server NotFound to a definitive NotFound now that
-        // every server has been exhausted. DecodeError keeps its kind.
-        let final_failure = if kind == crate::article_failure::ArticleFailureKind::DecodeError {
+    if all_definitive {
+        let mut provider_outcomes = item
+            .provider_outcomes
+            .iter()
+            .map(|(server, outcome)| format!("{server}={}", outcome.as_str()))
+            .collect::<Vec<_>>();
+        provider_outcomes.sort_unstable();
+        let outcomes = provider_outcomes.join(",");
+        let all_not_found = item
+            .provider_outcomes
+            .values()
+            .all(|outcome| *outcome == crate::article_failure::ArticleFailureKind::NotFound);
+        let final_kind = if all_not_found {
+            crate::article_failure::ArticleFailureKind::NotFound
+        } else {
+            crate::article_failure::ArticleFailureKind::DecodeError
+        };
+        warn!(
+            job_id = %item.job_id,
+            file_id = %item.file_id,
+            segment_number = item.segment_number,
+        message_id = %item.message_id,
+        server_id = %primary_server.id,
+        worker_id = %worker_id,
+        original_failure_kind = kind.as_str(),
+        terminal_failure_kind = final_kind.as_str(),
+        attempt = item.tried_servers.len(),
+            provider_outcomes = %outcomes,
+            "{error_msg}"
+        );
+        let final_failure = if final_kind == crate::article_failure::ArticleFailureKind::DecodeError
+        {
             crate::article_failure::ArticleFailure::decode_error(
                 &primary_server.id,
-                error_msg.to_string(),
+                format!("{error_msg}; provider outcomes: {outcomes}"),
             )
         } else {
-            crate::article_failure::ArticleFailure::not_found_anywhere(&primary_server.id)
+            crate::article_failure::ArticleFailure::not_found_anywhere(&primary_server.id, outcomes)
         };
         try_send_progress(
             &ctx.progress_tx,
@@ -2449,15 +2563,15 @@ pub(crate) fn build_job_submission(
         .flat_map(|file| {
             file.articles
                 .iter()
-                .enumerate()
-                .filter(|(_, a)| !a.downloaded)
-                .map(move |(idx, article)| WorkItem {
+                .filter(|article| !article.downloaded)
+                .map(move |article| WorkItem {
                     job_id: job.id.clone(),
                     file_id: file.id.clone(),
                     filename: file.filename.clone(),
                     message_id: article.message_id.clone(),
-                    segment_number: (idx as u32) + 1,
+                    segment_number: article.segment_number,
                     tried_servers: Vec::new(),
+                    provider_outcomes: HashMap::new(),
                     tries_on_current: 0,
                 })
         })
@@ -2540,11 +2654,12 @@ async fn fetch_article_with_retry(
                     error = %e,
                     "Service unavailable (502) during article fetch — likely rate limited or blocked"
                 );
-                return Err(ArticleError::ConnectionLost(format!(
-                    "Service unavailable: {e}"
-                )));
+                return Err(ArticleError::ProviderUnavailable {
+                    kind: crate::article_failure::ArticleFailureKind::ServerDown,
+                    message: e.to_string(),
+                });
             }
-            Err(e @ NntpError::AuthRequired(_)) => {
+            Err(e @ (NntpError::AuthRequired(_) | NntpError::Auth(_))) => {
                 warn!(
                     worker = %worker_id,
                     article = %item.message_id,
@@ -2552,9 +2667,16 @@ async fn fetch_article_with_retry(
                     error = %e,
                     "Auth required (480) during article fetch — session expired or rate limited"
                 );
-                return Err(ArticleError::ConnectionLost(format!(
-                    "Auth required mid-session: {e}"
-                )));
+                return Err(ArticleError::ProviderUnavailable {
+                    kind: crate::article_failure::ArticleFailureKind::AuthFailed,
+                    message: e.to_string(),
+                });
+            }
+            Err(e @ NntpError::PermissionDenied(_)) => {
+                return Err(ArticleError::ProviderUnavailable {
+                    kind: crate::article_failure::ArticleFailureKind::PermissionDenied,
+                    message: e.to_string(),
+                });
             }
             Err(e) => {
                 last_error = Some(format!("{e}"));
@@ -2581,7 +2703,7 @@ async fn fetch_article_with_retry(
         }
     }
 
-    Err(ArticleError::DecodeError(
+    Err(ArticleError::ConnectionLost(
         last_error.unwrap_or_else(|| "Unknown error after retries".into()),
     ))
 }
@@ -2605,6 +2727,11 @@ enum ArticleError {
     ArticleNotFound,
     #[error("Connection lost: {0}")]
     ConnectionLost(String),
+    #[error("Provider unavailable ({kind:?}): {message}")]
+    ProviderUnavailable {
+        kind: crate::article_failure::ArticleFailureKind,
+        message: String,
+    },
     #[error("Decode error: {0}")]
     DecodeError(String),
     #[error("Assembly error: {0}")]
@@ -2736,6 +2863,7 @@ mod tests {
             message_id: msg_id.to_string(),
             segment_number: 1,
             tried_servers: Vec::new(),
+            provider_outcomes: HashMap::new(),
             tries_on_current: 0,
         }
     }

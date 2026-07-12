@@ -12,9 +12,9 @@
 //!    temporarily unavailable (e.g. ramp-up throttled), either wait for it
 //!    or defer the article back to the queue so a lower-priority dispatch
 //!    doesn't pre-empt it.
-//! 4. If every server has been tried and the article has remaining total
-//!    attempts under [`MAX_ARTICLE_TRIES`], cascade-reset the try-lists on
-//!    the article (and possibly its file/job) and retry from the top.
+//! 4. Give up only after every enabled provider explicitly returns NNTP 430.
+//!    Transiently unavailable providers remain unresolved; their articles
+//!    wait or cascade-retry after provider recovery.
 //!
 //! This mirrors a classic priority-aware news-retrieval dispatcher: lower
 //! priority numbers represent higher-priority (preferred) servers, and an
@@ -27,15 +27,6 @@ use tracing::{debug, trace};
 
 use crate::article::{Article, NzbFile, NzbObject};
 use crate::server::Server;
-
-/// Maximum full dispatch rounds (try every enabled server once per round)
-/// before an article is given up on. Each round corresponds to one
-/// cascade-reset of the try-list; within a round the article may be
-/// dispatched to up to N different servers where N is the number of
-/// currently-usable servers. With the default of 3 and 6 servers, an
-/// article can attempt up to ~18 fetches across 3 cascade passes before
-/// being marked permanently failed and deferred to par2 repair.
-pub const MAX_ARTICLE_TRIES: u8 = 3;
 
 /// Outcome of a single selection pass.
 #[derive(Debug)]
@@ -149,14 +140,27 @@ pub fn select_server<'a>(
     }
 
     if !any_candidate {
-        // Cascade-retry is only useful if there's reason to believe a
-        // retry might succeed — i.e. at least one past failure was
-        // transient. If every failure observed so far was a confirmed
-        // `Article not found` from every active server, the article is
-        // permanently absent and no amount of retrying will recover it.
-        // Give up immediately in that case, matching classic downloader
-        // behaviour (no cascade for missing articles).
-        if !article.confirmed_absent_only() && article.tries() < MAX_ARTICLE_TRIES {
+        let eligible_servers = servers.iter().filter(|server| server.is_active());
+        let eligible_count = eligible_servers.clone().count();
+        let explicit_global_absence = eligible_count > 0
+            && eligible_servers
+                .clone()
+                .all(|server| article.server_explicitly_not_found(server.id()));
+
+        // Only explicit 430 responses from every enabled provider establish
+        // global absence. A provider with no live wrappers, an active
+        // penalty, or only transient failures is unresolved and must not
+        // turn into permanent content damage.
+        if explicit_global_absence {
+            debug!(
+                article = %article.message_id,
+                providers = eligible_count,
+                "every eligible provider explicitly returned 430 — giving up"
+            );
+            return Selection::GiveUp;
+        }
+
+        if !article.confirmed_absent_only() {
             debug!(
                 article = %article.message_id,
                 tries = article.tries(),
@@ -164,13 +168,17 @@ pub fn select_server<'a>(
             );
             return Selection::CascadeReset;
         }
+
+        // At least one eligible provider has not supplied availability
+        // evidence and is currently unable to accept work. Wait for worker
+        // recovery instead of treating its absence as an article attempt.
         debug!(
             article = %article.message_id,
             tries = article.tries(),
             confirmed_absent_only = article.confirmed_absent_only(),
-            "no candidate servers remain — giving up"
+            "no candidate servers remain, but global absence is unproven — waiting"
         );
-        return Selection::GiveUp;
+        return Selection::WaitRampup(std::time::Duration::from_millis(100));
     }
 
     // Every candidate is temporarily unavailable (penalty/ramp-up/saturation).
@@ -343,8 +351,8 @@ mod tests {
         let servers = vec![primary.clone(), backup.clone()];
 
         let art = mkarticle();
-        art.mark_server_tried("p");
-        art.mark_server_tried("b");
+        art.mark_server_not_found("p");
+        art.mark_server_not_found("b");
         // Note: no mark_transient_failure — flag stays true by default.
         let file = mkfile();
         let job = mkjob();
@@ -357,20 +365,42 @@ mod tests {
     }
 
     #[test]
-    fn gives_up_when_all_tried_and_budget_exhausted() {
+    fn transient_failures_do_not_become_absence_after_many_rounds() {
         let primary = mkserver("p", 1, 5);
         let servers = vec![primary.clone()];
 
         let art = mkarticle();
         art.mark_server_tried("p");
-        for _ in 0..MAX_ARTICLE_TRIES {
+        art.mark_transient_failure();
+        for _ in 0..10 {
             art.increment_tries();
         }
         let file = mkfile();
         let job = mkjob();
 
         let sel = select_server(&art, &file, &job, &servers);
-        assert!(matches!(sel, Selection::GiveUp));
+        assert!(matches!(sel, Selection::CascadeReset));
+    }
+
+    #[test]
+    fn unavailable_untried_provider_prevents_global_absence() {
+        let primary = mkserver("p", 1, 5);
+        let backup = mkserver("b", 5, 5);
+        backup.set_active(true);
+        for _ in 0..backup.active_wrappers() {
+            backup.unregister_wrapper();
+        }
+        let servers = vec![primary, backup];
+
+        let art = mkarticle();
+        art.mark_server_not_found("p");
+        let file = mkfile();
+        let job = mkjob();
+
+        assert!(matches!(
+            select_server(&art, &file, &job, &servers),
+            Selection::WaitRampup(_)
+        ));
     }
 
     #[test]

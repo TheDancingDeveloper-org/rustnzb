@@ -82,11 +82,10 @@ pub struct GeneralConfig {
     /// Requires `abort_hopeless` to also be enabled. Default: true.
     #[serde(default = "default_true")]
     pub early_failure_check: bool,
-    /// Minimum completion percentage required to keep downloading (excluding
-    /// par2 repair files). If the ratio of available content bytes to total
-    /// content bytes drops below this value, the job is aborted.
-    /// Range: 100.0–200.0. Default: 100.2 (par2 overhead means slight
-    /// over-completion is normal).
+    /// Minimum effective completion percentage required to keep downloading.
+    /// Effective completion includes available content plus usable PAR2
+    /// recovery capacity; values above 100 reserve a repair safety margin.
+    /// Range: 100.0–200.0. Default: 100.2.
     #[serde(default = "default_required_completion_pct")]
     pub required_completion_pct: f64,
     /// Maximum time in seconds to wait for a single NNTP article response

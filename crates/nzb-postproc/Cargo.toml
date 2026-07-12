@@ -15,6 +15,7 @@ groups-db = ["nzb-core/groups-db"]
 nzb-core = { version = "0.2.16", path = "../nzb-core" }
 tokio = { version = "1", features = ["rt", "sync", "process"] }
 tracing = "0.1"
+opentelemetry.workspace = true
 anyhow = "1"
 thiserror = "2"
 rust-par2 = "0.1"

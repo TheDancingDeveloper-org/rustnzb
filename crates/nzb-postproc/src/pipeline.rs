@@ -16,6 +16,14 @@ use crate::detect::{ArchiveType, find_archives, find_cleanup_files, find_par2_fi
 use crate::par2::par2_repair;
 use crate::unpack::{extract_7z, extract_rar, extract_zip};
 
+fn increment_counter(name: &'static str) {
+    opentelemetry::global::meter_provider()
+        .meter("rustnzb")
+        .u64_counter(name)
+        .build()
+        .add(1, &[]);
+}
+
 /// Outcome of the combined verify+repair spawn_blocking task.
 /// Keeps VerifyResult (which is !Send) on the blocking thread, then returns
 /// only Send-safe data back to the async context.
@@ -57,6 +65,9 @@ pub struct PostProcConfig {
     /// When > 0, `par2 repair` is run directly (which verifies + repairs
     /// in a single pass), avoiding the redundant verify-then-repair double-scan.
     pub articles_failed: usize,
+    /// Failed articles belonging to source/content files. PAR2 volume
+    /// failures do not make an otherwise intact archive unextractable.
+    pub content_articles_failed: usize,
     /// When true, the extract stage is skipped because direct unpack already
     /// handled RAR extraction during the download phase.
     pub skip_extract: bool,
@@ -70,6 +81,7 @@ impl Default for PostProcConfig {
             cleanup_after_extract: true,
             output_dir: None,
             articles_failed: 0,
+            content_articles_failed: 0,
             skip_extract: false,
             password: None,
         }
@@ -103,12 +115,25 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
     let par2_files = find_par2_files(job_dir);
 
     if par2_files.is_empty() {
-        stages.push(StageResult {
-            name: "Verify".to_string(),
-            status: StageStatus::Skipped,
-            message: Some("No par2 files found".to_string()),
-            duration_secs: 0.0,
-        });
+        if config.content_articles_failed > 0 {
+            pipeline_ok = false;
+            stages.push(StageResult {
+                name: "Verify".to_string(),
+                status: StageStatus::Failed,
+                message: Some(format!(
+                    "{} content article(s) missing and no PAR2 recovery set is available",
+                    config.content_articles_failed
+                )),
+                duration_secs: 0.0,
+            });
+        } else {
+            stages.push(StageResult {
+                name: "Verify".to_string(),
+                status: StageStatus::Skipped,
+                message: Some("No par2 files found".to_string()),
+                duration_secs: 0.0,
+            });
+        }
     } else if config.articles_failed == 0 {
         info!("Skipping PAR2 verification — zero article failures (CRC-verified)");
         stages.push(StageResult {
@@ -179,6 +204,7 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
 
                 match verify_repair_result {
                     Ok(VerifyRepairOutcome::AllCorrect { intact_count }) => {
+                        increment_counter("par2.verify_success");
                         info!(
                             files = intact_count,
                             duration_secs = verify_duration,
@@ -214,6 +240,11 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
                         // Push the repair stage result
                         match repair_result {
                             Ok(result) => {
+                                increment_counter(if result.success {
+                                    "par2.repair_success"
+                                } else {
+                                    "par2.repair_failure"
+                                });
                                 info!(
                                     blocks_repaired = result.blocks_repaired,
                                     files_repaired = result.files_repaired,
@@ -234,6 +265,7 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
                                 });
                             }
                             Err(e) => {
+                                increment_counter("par2.repair_failure");
                                 error!(
                                     error = %e,
                                     blocks_needed,
@@ -289,6 +321,11 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
                     });
 
                     let repair_result = run_repair_stage(job_dir).await;
+                    increment_counter(if repair_result.status == StageStatus::Failed {
+                        "par2.repair_failure"
+                    } else {
+                        "par2.repair_success"
+                    });
                     if repair_result.status == StageStatus::Failed {
                         pipeline_ok = false;
                     }
@@ -301,10 +338,10 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
     // ------------------------------------------------------------------
     // Stage 3: Extract
     // ------------------------------------------------------------------
-    // Attempt extraction even if verify/repair failed when only a few articles
-    // were missing — the failed articles may have been PAR2 files rather than
-    // data files, so the RAR archive could still be intact.
-    let should_extract = pipeline_ok || config.articles_failed <= 5;
+    // Extraction is safe only after verification/repair succeeded (or source
+    // content was already known-good). Confirmed unrepaired content damage
+    // must not be mistaken for a successful archive.
+    let should_extract = pipeline_ok;
     if config.skip_extract {
         info!("Skipping extraction — completed by direct unpack");
         stages.push(StageResult {
@@ -753,31 +790,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pipeline_no_par2_files_skips_regardless() {
-        // No par2 files — should skip even if articles_failed > 0
+    async fn test_pipeline_no_par2_with_content_failures_is_terminal() {
+        // Confirmed source damage without PAR2 cannot be repaired and must
+        // not continue into extraction.
         let dir = make_test_dir(&["movie.mkv"]);
         let config = PostProcConfig {
             cleanup_after_extract: false,
             articles_failed: 5,
+            content_articles_failed: 5,
             ..Default::default()
         };
         let result = run_pipeline(dir.path(), &config).await;
-        assert!(result.success);
+        assert!(!result.success);
 
         let verify_stage = result.stages.iter().find(|s| s.name == "Verify").unwrap();
         assert_eq!(
             verify_stage.status,
-            StageStatus::Skipped,
-            "Verify should be skipped when no par2 files exist"
+            StageStatus::Failed,
+            "No-PAR content damage is unrecoverable"
         );
         assert!(
             verify_stage
                 .message
                 .as_deref()
                 .unwrap_or("")
-                .contains("No par2 files"),
-            "Skip message should indicate no par2 files"
+                .contains("no PAR2 recovery set"),
+            "Failure should explain that recovery data is unavailable"
         );
+        assert!(result.stages.iter().all(|stage| stage.name != "Extract"));
     }
 
     #[tokio::test]

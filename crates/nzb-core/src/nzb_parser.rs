@@ -320,7 +320,7 @@ fn extract_filename(subject: &str) -> String {
 
 /// Parse par2 filename for volume/block info.
 /// Pattern: `setname.vol00+01.par2`
-fn parse_par2_filename(filename: &str) -> (Option<String>, Option<u32>, Option<u32>) {
+pub fn parse_par2_filename(filename: &str) -> (Option<String>, Option<u32>, Option<u32>) {
     let lower = filename.to_lowercase();
     if !lower.ends_with(".par2") {
         return (None, None, None);

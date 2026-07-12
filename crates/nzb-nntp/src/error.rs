@@ -21,6 +21,12 @@ pub enum NntpError {
     #[error("Authentication required: {0}")]
     AuthRequired(String),
 
+    /// The provider explicitly denied access to the requested operation or
+    /// article (for example NNTP 403). This is an account/provider policy
+    /// failure, not evidence that the article is absent.
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
     /// Service permanently unavailable (502).
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
@@ -63,3 +69,55 @@ pub enum NntpError {
 }
 
 pub type NntpResult<T> = std::result::Result<T, NntpError>;
+
+/// Classify an unexpected response to an article command.
+///
+/// A `400` response that says the session or idle timer expired is a dead
+/// connection, not an article-level protocol failure.  Keeping this
+/// classification in the NNTP layer lets every dispatcher invalidate the
+/// socket and replay its in-flight commands without consuming provider
+/// availability attempts.
+pub(crate) fn unexpected_article_response(code: u16, message: String) -> NntpError {
+    let normalized = message.to_ascii_lowercase();
+    let expired_session = code == 400
+        && ((normalized.contains("idle") && normalized.contains("timeout"))
+            || (normalized.contains("session")
+                && (normalized.contains("timeout")
+                    || normalized.contains("expired")
+                    || normalized.contains("closed"))));
+
+    if expired_session {
+        NntpError::Connection(format!("NNTP session expired ({code}): {message}"))
+    } else {
+        NntpError::Protocol(format!("Unexpected ARTICLE response {code}: {message}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_timeout_is_a_connection_failure() {
+        assert!(matches!(
+            unexpected_article_response(400, "Idle timeout.".into()),
+            NntpError::Connection(_)
+        ));
+        assert!(matches!(
+            unexpected_article_response(400, "Session expired".into()),
+            NntpError::Connection(_)
+        ));
+    }
+
+    #[test]
+    fn unrelated_unexpected_response_remains_protocol_failure() {
+        assert!(matches!(
+            unexpected_article_response(400, "Bad command".into()),
+            NntpError::Protocol(_)
+        ));
+        assert!(matches!(
+            unexpected_article_response(499, "Idle timeout".into()),
+            NntpError::Protocol(_)
+        ));
+    }
+}

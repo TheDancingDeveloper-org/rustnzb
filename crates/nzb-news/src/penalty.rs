@@ -66,7 +66,7 @@ pub fn penalty_for_error(err: &NntpError) -> PenaltyAction {
         ArticleNotFound(_) | NoSuchGroup(_) | NoArticleSelected(_) => PenaltyAction::None,
 
         // Auth failure: apply the long cooldown immediately.
-        AuthRequired(_) | Auth(_) => PenaltyAction::Cooldown(PENALTY_AUTH),
+        AuthRequired(_) | Auth(_) | PermissionDenied(_) => PenaltyAction::Cooldown(PENALTY_AUTH),
 
         // Service permanently unavailable (welcome 502, etc.): medium.
         ServiceUnavailable(_) => PenaltyAction::Cooldown(PENALTY_502),

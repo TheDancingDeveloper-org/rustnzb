@@ -159,6 +159,7 @@ async fn normal_subjects_pipeline_finds_files() {
         cleanup_after_extract: false,
         output_dir: None,
         articles_failed: 0,
+        content_articles_failed: 0,
         skip_extract: false,
         password: None,
     };
@@ -184,6 +185,7 @@ async fn normal_subjects_pipeline_finds_files() {
         cleanup_after_extract: false,
         output_dir: None,
         articles_failed: 1,
+        content_articles_failed: 1,
         skip_extract: false,
         password: None,
     };
@@ -317,6 +319,7 @@ async fn obfuscated_pipeline_skips_everything() {
         cleanup_after_extract: false,
         output_dir: None,
         articles_failed: 0,
+        content_articles_failed: 0,
         skip_extract: false,
         password: None,
     };
@@ -508,6 +511,7 @@ async fn deobfuscation_enables_full_pipeline() {
         cleanup_after_extract: false,
         output_dir: None,
         articles_failed: 0,
+        content_articles_failed: 0,
         skip_extract: false,
         password: None,
     };
@@ -529,6 +533,7 @@ async fn deobfuscation_enables_full_pipeline() {
         cleanup_after_extract: false,
         output_dir: None,
         articles_failed: 1,
+        content_articles_failed: 1,
         skip_extract: false,
         password: None,
     };
@@ -693,6 +698,7 @@ async fn pipeline_with_only_archives_no_par2() {
         cleanup_after_extract: false,
         output_dir: Some(output_dir.path().to_path_buf()),
         articles_failed: 0,
+        content_articles_failed: 0,
         skip_extract: false,
         password: None,
     };

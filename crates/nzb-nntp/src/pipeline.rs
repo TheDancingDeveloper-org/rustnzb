@@ -143,6 +143,10 @@ impl Pipeline {
             430 => Err(NntpError::ArticleNotFound(request.message_id.clone())),
             411 => Err(NntpError::NoSuchGroup(status.message)),
             412 | 420 => Err(NntpError::NoArticleSelected(status.message)),
+            403 => {
+                conn.state = ConnectionState::Error;
+                Err(NntpError::PermissionDenied(status.message))
+            }
             480 => {
                 conn.state = ConnectionState::Error;
                 Err(NntpError::AuthRequired(status.message))
@@ -160,10 +164,10 @@ impl Pipeline {
             }
             _ => {
                 conn.state = ConnectionState::Error;
-                Err(NntpError::Protocol(format!(
-                    "Unexpected ARTICLE response {}: {}",
-                    status.code, status.message
-                )))
+                Err(crate::error::unexpected_article_response(
+                    status.code,
+                    status.message,
+                ))
             }
         };
 
@@ -194,6 +198,7 @@ impl Pipeline {
                     &result.result,
                     Err(NntpError::Auth(_))
                         | Err(NntpError::AuthRequired(_))
+                        | Err(NntpError::PermissionDenied(_))
                         | Err(NntpError::ServiceUnavailable(_))
                         | Err(NntpError::Connection(_))
                         | Err(NntpError::Io(_))

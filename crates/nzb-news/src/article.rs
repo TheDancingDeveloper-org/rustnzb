@@ -62,6 +62,10 @@ pub struct Article {
     /// cascade-retry behaviour so a one-off network blip doesn't mark the
     /// article permanently missing.
     confirmed_absent_only: AtomicBool,
+    /// Providers that explicitly returned NNTP 430 for this message-id.
+    /// Unlike `try_list`, this is availability evidence: connection,
+    /// authentication, timeout, and protocol failures never enter it.
+    explicit_not_found: TryList,
 }
 
 impl Article {
@@ -88,6 +92,7 @@ impl Article {
             fetcher_priority: AtomicU8::new(u8::MAX),
             serial,
             confirmed_absent_only: AtomicBool::new(true),
+            explicit_not_found: TryList::new(),
         }
     }
 
@@ -103,6 +108,28 @@ impl Article {
     /// a transient failure isn't treated as permanent absence.
     pub fn mark_transient_failure(&self) {
         self.confirmed_absent_only.store(false, Ordering::Relaxed);
+    }
+
+    /// Record an explicit NNTP 430 from `server_id`.
+    pub fn mark_server_not_found(&self, server_id: &str) {
+        self.try_list.add(server_id);
+        self.explicit_not_found.add(server_id);
+    }
+
+    /// Whether `server_id` explicitly established article absence.
+    pub fn server_explicitly_not_found(&self, server_id: &str) -> bool {
+        self.explicit_not_found.contains(server_id)
+    }
+
+    /// Sorted provider IDs that explicitly returned NNTP 430.
+    pub fn explicit_not_found_servers(&self) -> Vec<String> {
+        let mut servers = self
+            .explicit_not_found
+            .snapshot()
+            .into_iter()
+            .collect::<Vec<_>>();
+        servers.sort_unstable();
+        servers
     }
 
     /// Total attempts made so far.

@@ -358,16 +358,38 @@ impl DispatchEngine for NewsDispatchEngine {
         }
     }
 
-    fn abort_job(&self, job_id: &str, reason: String) {
-        // Emit terminal via the existing JobContext machinery — same path
-        // the old engine uses. `emit_terminal` is idempotent; cancel_job
-        // later is safe.
+    fn abort_job(&self, job_id: &str, reason: String) -> bool {
         let entry = self.inner.jobs.read().get(job_id).cloned();
-        if let Some(entry) = entry {
-            *entry.context.abort_reason.lock() = Some(reason);
+        let Some(entry) = entry else {
+            return false;
+        };
+        {
+            let mut abort_reason = entry.context.abort_reason.lock();
+            if abort_reason.is_some() {
+                return false;
+            }
+            *abort_reason = Some(reason);
+        }
+        entry.cancelled.store(true, Ordering::SeqCst);
+        entry.context.cancelled.store(true, Ordering::SeqCst);
+        entry.pump_wake.notify_waiters();
+
+        // Pending items have never reached the downloader and can settle
+        // immediately. Already-submitted items are purged below and settle
+        // through Cancelled/success/failure outcomes. The final resolution
+        // owns terminal emission, so assemblers cannot race post-processing.
+        let pending: Vec<_> = entry.pending.lock().drain(..).collect();
+        for item in pending {
+            self.inner.in_flight.write().remove(&item.tag);
+            entry.context.resolve_one_public();
+        }
+        if let Some(h) = self.inner.handle.read().as_ref() {
+            h.purge_job(job_id);
+        }
+        if entry.context.articles_remaining.load(Ordering::SeqCst) == 0 {
             entry.context.emit_terminal_public();
         }
-        self.cancel_job(job_id);
+        true
     }
 
     fn has_job(&self, job_id: &str) -> bool {
@@ -487,13 +509,26 @@ async fn outcome_dispatcher(
                     process_success(inner2, tag, server_id, bytes).await;
                 });
             }
-            nzb_news::FetchOutcome::Failed { tag, last_error } => {
-                process_failure(&inner, tag, last_error);
+            nzb_news::FetchOutcome::Failed {
+                tag,
+                last_error,
+                explicit_global_absence,
+                explicit_not_found_servers,
+            } => {
+                process_failure(
+                    &inner,
+                    tag,
+                    last_error,
+                    explicit_global_absence,
+                    explicit_not_found_servers,
+                );
             }
             nzb_news::FetchOutcome::Cancelled { tag } => {
-                // Treat as benign discard — caller (queue manager) will
-                // observe JobAborted separately via abort_job.
-                inner.in_flight.write().remove(&tag);
+                if let Some(meta) = inner.in_flight.write().remove(&tag)
+                    && let Some(entry) = inner.jobs.read().get(&meta.job_id).cloned()
+                {
+                    entry.context.resolve_one_public();
+                }
             }
         }
     }
@@ -511,6 +546,10 @@ async fn process_success(inner: Arc<Inner>, tag: u64, server_id: String, raw: Ve
         return; // job cancelled after submit
     };
     let ctx = &entry.context;
+    if entry.cancelled.load(Ordering::SeqCst) {
+        ctx.resolve_one_public();
+        return;
+    }
 
     // Decode (CPU-bound; SIMD is fast but not free).
     let decode_start = Instant::now();
@@ -573,7 +612,13 @@ async fn process_success(inner: Arc<Inner>, tag: u64, server_id: String, raw: Ve
     ctx.resolve_one_public();
 }
 
-fn process_failure(inner: &Inner, tag: u64, last_error: Option<String>) {
+fn process_failure(
+    inner: &Inner,
+    tag: u64,
+    last_error: Option<String>,
+    explicit_global_absence: bool,
+    explicit_not_found_servers: Vec<String>,
+) {
     let meta = inner.in_flight.write().remove(&tag);
     let Some(meta) = meta else {
         return;
@@ -582,7 +627,21 @@ fn process_failure(inner: &Inner, tag: u64, last_error: Option<String>) {
     let Some(entry) = entry else {
         return;
     };
-    let msg = last_error.unwrap_or_else(|| "all servers exhausted".into());
+    if entry.cancelled.load(Ordering::SeqCst) {
+        entry.context.resolve_one_public();
+        return;
+    }
+    let mut msg = last_error.unwrap_or_else(|| "all servers exhausted".into());
+    if explicit_global_absence {
+        msg = format!(
+            "{msg}; explicit provider outcomes: {}",
+            explicit_not_found_servers
+                .iter()
+                .map(|server| format!("{server}=not_found"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
     // nzb-news doesn't carry structured error info at the outcome layer —
     // only the last attempt's error string. Pattern-match common causes
     // so the hopeless-tracker and queue_manager can distinguish "server
@@ -591,7 +650,11 @@ fn process_failure(inner: &Inner, tag: u64, last_error: Option<String>) {
     // hopeless). Without this, an auth/quota failure trickles through as
     // NotFound and aborts the job with "articles confirmed missing" —
     // confusing diagnostics that blame the content instead of the server.
-    let kind = classify_error_message(&msg);
+    let kind = if explicit_global_absence {
+        ArticleFailureKind::NotFound
+    } else {
+        classify_error_message(&msg)
+    };
     let failure = ArticleFailure {
         kind,
         server_id: String::new(),
@@ -628,10 +691,8 @@ fn classify_error_message(msg: &str) -> ArticleFailureKind {
     {
         return ArticleFailureKind::ConnectionClosed;
     }
-    // Default: treat unknown cascade exhaustion as NotFound — same as the
-    // old behaviour — so genuinely-missing articles still abort hopeless
-    // NZBs promptly.
-    ArticleFailureKind::NotFound
+    // Opaque/unknown errors carry no proof of article absence.
+    ArticleFailureKind::Other
 }
 
 #[cfg(test)]
@@ -664,10 +725,10 @@ mod classify_tests {
     }
 
     #[test]
-    fn unknown_defaults_to_not_found() {
+    fn unknown_defaults_to_other() {
         assert_eq!(
             classify_error_message("all servers exhausted"),
-            ArticleFailureKind::NotFound
+            ArticleFailureKind::Other
         );
     }
 }

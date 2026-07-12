@@ -125,6 +125,7 @@ impl Server {
     /// [`Server::prime_wrapper_pool`] call.
     pub fn new(config: ServerConfig) -> Self {
         let now_epoch = Instant::now();
+        let enabled = config.enabled;
         Self {
             config,
             idle_wrappers: Mutex::new(VecDeque::new()),
@@ -133,7 +134,7 @@ impl Server {
             bad_cons: AtomicU32::new(0),
             penalty_until_ms: AtomicU64::new(0),
             penalty_epoch: now_epoch,
-            active: AtomicBool::new(true),
+            active: AtomicBool::new(enabled),
             last_connect_ms: AtomicU64::new(0),
             connect_epoch: now_epoch,
             active_wrappers: AtomicU32::new(0),
@@ -561,6 +562,15 @@ mod tests {
         assert_eq!(s.idle_count(), 5);
         assert_eq!(s.busy_count(), 0);
         assert_eq!(s.wrapper_count(), 5);
+    }
+
+    #[test]
+    fn disabled_config_starts_inactive() {
+        let mut config = cfg("disabled", 1, 1);
+        config.enabled = false;
+        let server = Server::new(config);
+        assert!(!server.is_active());
+        assert!(!server.is_usable());
     }
 
     #[test]

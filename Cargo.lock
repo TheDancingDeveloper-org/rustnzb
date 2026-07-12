@@ -1936,6 +1936,7 @@ version = "0.2.6"
 dependencies = [
  "anyhow",
  "nzb-core",
+ "opentelemetry",
  "rust-par2",
  "tempfile",
  "thiserror 2.0.18",
@@ -1965,6 +1966,7 @@ dependencies = [
  "nzb-dispatch",
  "nzb-nntp",
  "nzb-postproc",
+ "opentelemetry",
  "parking_lot",
  "rand 0.9.4",
  "regex",

@@ -173,7 +173,7 @@ impl SpeedTracker {
 /// 2. **Early failure check** — if most articles fail, abort fast (Phase 6:
 ///    no longer capped to the first 25% of articles; the check runs
 ///    continuously while the job is downloading)
-/// 3. **Ongoing availability** — track bytes missing vs total (excluding par2)
+/// 3. **Ongoing availability** — compare missing content with usable PAR2 capacity
 /// 4. **No-progress timeout** — abort when the job stops emitting article
 ///    progress for longer than `no_progress_timeout`, even after partial
 ///    success. This catches both startup zombies and late-stage stalls.
@@ -185,9 +185,23 @@ struct HopelessTracker {
     last_progress_at: Instant,
     /// Total content bytes (excluding par2 files).
     content_bytes: u64,
-    /// Total par2 bytes (tracked for diagnostics, not used in ratio calculation).
-    #[expect(dead_code)]
-    par2_bytes: u64,
+    /// Recovery capacity declared by PAR2 volume files. Index files do not
+    /// contribute capacity. The block count is retained for diagnostics and
+    /// future source-block mapping; bytes are the conservative interim unit
+    /// used before the assembled index can be parsed.
+    recovery_capacity_bytes: u64,
+    recovery_blocks_total: u64,
+    /// Declared recovery data lost to definitive volume-segment failures.
+    recovery_bytes_unavailable: u64,
+    recovery_blocks_unavailable: u64,
+    /// Per-set accounting prevents recovery blocks from one PAR2 set from
+    /// masking damage in another set.
+    recovery_capacity_by_set: HashMap<String, u64>,
+    recovery_unavailable_by_set: HashMap<String, u64>,
+    missing_content_by_set: HashMap<String, u64>,
+    unassociated_missing_bytes: u64,
+    content_file_sets: HashMap<String, Option<String>>,
+    pending_file_classifications: std::collections::HashSet<String>,
     /// Content bytes confirmed missing (failed articles in non-par2 files).
     content_bytes_missing: u64,
     /// Articles checked so far (downloaded + failed, not par2).
@@ -208,15 +222,56 @@ const EARLY_CHECK_FAILURE_RATE: f64 = 0.80;
 impl HopelessTracker {
     fn new(job: &NzbJob) -> Self {
         let mut content_bytes: u64 = 0;
-        let mut par2_bytes: u64 = 0;
+        let mut recovery_capacity_bytes: u64 = 0;
+        let mut recovery_blocks_total: u64 = 0;
         let mut content_articles_total: usize = 0;
+        let recovery_set_names = job
+            .files
+            .iter()
+            .filter(|file| file.is_par2)
+            .filter_map(|file| file.par2_setname.as_deref())
+            .map(str::to_ascii_lowercase)
+            .collect::<std::collections::HashSet<_>>();
+        let mut recovery_capacity_by_set = HashMap::new();
+        let mut content_file_sets = HashMap::new();
+        let mut pending_file_classifications = std::collections::HashSet::new();
 
         for file in &job.files {
             if file.is_par2 {
-                par2_bytes += file.bytes;
+                // A plain .par2 is the index. Only .volNN+MM.par2 recovery
+                // volumes declare usable Reed-Solomon blocks.
+                if file.par2_vol.is_some() && file.par2_blocks.is_some_and(|blocks| blocks > 0) {
+                    recovery_capacity_bytes = recovery_capacity_bytes.saturating_add(file.bytes);
+                    recovery_blocks_total = recovery_blocks_total
+                        .saturating_add(u64::from(file.par2_blocks.unwrap_or_default()));
+                    if let Some(set_name) = file.par2_setname.as_deref() {
+                        let capacity = recovery_capacity_by_set
+                            .entry(set_name.to_ascii_lowercase())
+                            .or_insert(0u64);
+                        *capacity = capacity.saturating_add(file.bytes);
+                    }
+                }
+                content_file_sets.insert(
+                    file.id.clone(),
+                    file.par2_setname.as_deref().map(str::to_ascii_lowercase),
+                );
             } else {
                 content_bytes += file.bytes;
                 content_articles_total += file.articles.len();
+                let filename = file.filename.to_ascii_lowercase();
+                let associated_set = if recovery_set_names.len() == 1 {
+                    recovery_set_names.iter().next().cloned()
+                } else {
+                    recovery_set_names
+                        .iter()
+                        .filter(|set_name| filename.starts_with(set_name.as_str()))
+                        .max_by_key(|set_name| set_name.len())
+                        .cloned()
+                };
+                content_file_sets.insert(file.id.clone(), associated_set);
+                if !crate::download_engine::has_known_extension(&file.filename) {
+                    pending_file_classifications.insert(file.id.clone());
+                }
             }
         }
 
@@ -224,7 +279,16 @@ impl HopelessTracker {
             created_at: Instant::now(),
             last_progress_at: Instant::now(),
             content_bytes,
-            par2_bytes,
+            recovery_capacity_bytes,
+            recovery_blocks_total,
+            recovery_bytes_unavailable: 0,
+            recovery_blocks_unavailable: 0,
+            recovery_capacity_by_set,
+            recovery_unavailable_by_set: HashMap::new(),
+            missing_content_by_set: HashMap::new(),
+            unassociated_missing_bytes: 0,
+            content_file_sets,
+            pending_file_classifications,
             content_bytes_missing: 0,
             content_articles_checked: 0,
             content_articles_failed: 0,
@@ -240,6 +304,41 @@ impl HopelessTracker {
         }
     }
 
+    /// Correct an obfuscated NZB subject after a yEnc header reveals that the
+    /// file is PAR2. The file must leave the content denominator and only a
+    /// recovery volume (never the index) may add capacity.
+    fn reclassify_as_par2(
+        &mut self,
+        file_id: &str,
+        file_bytes: u64,
+        article_count: usize,
+        volume: Option<u32>,
+        blocks: Option<u32>,
+        set_name: Option<&str>,
+    ) {
+        self.content_bytes = self.content_bytes.saturating_sub(file_bytes);
+        self.content_articles_total = self.content_articles_total.saturating_sub(article_count);
+        if volume.is_some() && blocks.is_some_and(|count| count > 0) {
+            self.recovery_capacity_bytes = self.recovery_capacity_bytes.saturating_add(file_bytes);
+            self.recovery_blocks_total = self
+                .recovery_blocks_total
+                .saturating_add(u64::from(blocks.unwrap_or_default()));
+            if let Some(set_name) = set_name {
+                *self
+                    .recovery_capacity_by_set
+                    .entry(set_name.to_ascii_lowercase())
+                    .or_insert(0) += file_bytes;
+            }
+        }
+        self.content_file_sets
+            .insert(file_id.to_string(), set_name.map(str::to_ascii_lowercase));
+        self.pending_file_classifications.remove(file_id);
+    }
+
+    fn mark_file_classified(&mut self, file_id: &str) {
+        self.pending_file_classifications.remove(file_id);
+    }
+
     /// Record a failed content article. Returns the estimated byte size
     /// of the missing article.
     ///
@@ -247,14 +346,42 @@ impl HopelessTracker {
     /// ignore failures that are likely transient (server-down, auth, etc.)
     /// and only count failures that genuinely indicate the article cannot
     /// be retrieved (NotFound, DecodeError).
+    #[cfg(test)]
     fn record_failure(
         &mut self,
         is_par2: bool,
         estimated_bytes: u64,
         kind: crate::article_failure::ArticleFailureKind,
     ) {
+        self.record_file_failure(None, is_par2, estimated_bytes, kind);
+    }
+
+    fn record_file_failure(
+        &mut self,
+        file_id: Option<&str>,
+        is_par2: bool,
+        estimated_bytes: u64,
+        kind: crate::article_failure::ArticleFailureKind,
+    ) {
         self.last_progress_at = Instant::now();
         if is_par2 {
+            self.recovery_bytes_unavailable = self
+                .recovery_bytes_unavailable
+                .saturating_add(estimated_bytes)
+                .min(self.recovery_capacity_bytes);
+            if self.recovery_capacity_bytes > 0 && self.recovery_blocks_total > 0 {
+                self.recovery_blocks_unavailable = ((u128::from(self.recovery_bytes_unavailable)
+                    * u128::from(self.recovery_blocks_total))
+                .div_ceil(u128::from(self.recovery_capacity_bytes)))
+                .min(u128::from(self.recovery_blocks_total))
+                    as u64;
+            }
+            if let Some(Some(set_name)) = file_id.and_then(|id| self.content_file_sets.get(id)) {
+                *self
+                    .recovery_unavailable_by_set
+                    .entry(set_name.clone())
+                    .or_insert(0) += estimated_bytes;
+            }
             return;
         }
         self.content_articles_checked += 1;
@@ -264,6 +391,19 @@ impl HopelessTracker {
         if kind.counts_toward_hopeless() {
             self.content_articles_failed += 1;
             self.content_bytes_missing += estimated_bytes;
+            match file_id.and_then(|id| self.content_file_sets.get(id)) {
+                Some(Some(set_name)) => {
+                    *self
+                        .missing_content_by_set
+                        .entry(set_name.clone())
+                        .or_insert(0) += estimated_bytes;
+                }
+                _ => {
+                    self.unassociated_missing_bytes = self
+                        .unassociated_missing_bytes
+                        .saturating_add(estimated_bytes);
+                }
+            }
         }
     }
 
@@ -287,6 +427,24 @@ impl HopelessTracker {
             return None;
         }
 
+        // Unknown/obfuscated NZB subjects may still reveal PAR2 volumes in
+        // their yEnc headers. Do not declare content damage hopeless until
+        // those files have been classified or the normal no-progress path
+        // takes over.
+        if !self.pending_file_classifications.is_empty() {
+            return None;
+        }
+
+        let usable_recovery_bytes = self
+            .recovery_capacity_bytes
+            .saturating_sub(self.recovery_bytes_unavailable);
+        let available_content_bytes = self
+            .content_bytes
+            .saturating_sub(self.content_bytes_missing);
+        let effective_bytes = available_content_bytes.saturating_add(usable_recovery_bytes);
+        let required_bytes =
+            ((self.content_bytes as f64) * required_completion_pct / 100.0).ceil() as u64;
+
         // Tier 2: early failure check — catch completely dead NZBs fast.
         // Phase 6: removed the `<= total/4` window upper bound. The check
         // now fires whenever the failure rate is above the threshold AND
@@ -297,34 +455,85 @@ impl HopelessTracker {
         if early_failure_check && self.content_articles_checked >= EARLY_CHECK_MIN_ARTICLES {
             let failure_rate =
                 self.content_articles_failed as f64 / self.content_articles_checked as f64;
-            if failure_rate >= EARLY_CHECK_FAILURE_RATE {
+            let projected_missing_bytes = (self.content_bytes as f64 * failure_rate).ceil() as u64;
+            let safety_reserve = required_bytes.saturating_sub(self.content_bytes);
+            if failure_rate >= EARLY_CHECK_FAILURE_RATE
+                && projected_missing_bytes.saturating_add(safety_reserve) > usable_recovery_bytes
+            {
                 return Some(HopelessAbort {
                     tier: "early_failure",
                     reason: format!(
-                        "Aborted: {:.0}% of {} checked articles missing ({} of {} failed)",
+                        "Aborted: {:.0}% of {} checked articles missing ({} of {} failed); \
+                         projected damage {} bytes exceeds {} usable recovery bytes plus reserve",
                         failure_rate * 100.0,
                         self.content_articles_checked,
                         self.content_articles_failed,
                         self.content_articles_checked,
+                        projected_missing_bytes,
+                        usable_recovery_bytes,
                     ),
                 });
             }
         }
 
-        // Tier 3: ongoing availability ratio (excluding par2)
+        let safety_reserve = required_bytes.saturating_sub(self.content_bytes);
+        let set_repairable = (!self.recovery_capacity_by_set.is_empty()).then(|| {
+            if self.unassociated_missing_bytes > 0 {
+                // Multiple PAR2 sets with an ambiguous content filename need
+                // the assembled index for authoritative association. Defer
+                // to post-processing instead of borrowing blocks from the
+                // wrong set or aborting prematurely.
+                return true;
+            }
+            let mut remaining_reserve = 0u64;
+            for (set_name, capacity) in &self.recovery_capacity_by_set {
+                let usable = capacity.saturating_sub(
+                    self.recovery_unavailable_by_set
+                        .get(set_name)
+                        .copied()
+                        .unwrap_or(0),
+                );
+                let missing = self
+                    .missing_content_by_set
+                    .get(set_name)
+                    .copied()
+                    .unwrap_or(0);
+                if missing > usable {
+                    return false;
+                }
+                remaining_reserve =
+                    remaining_reserve.saturating_add(usable.saturating_sub(missing));
+            }
+            self.missing_content_by_set
+                .keys()
+                .all(|set_name| self.recovery_capacity_by_set.contains_key(set_name))
+                && remaining_reserve >= safety_reserve
+        });
+
+        // Recovery capacity and the configured safety reserve are the
+        // primary ongoing completion model. Prefer per-set proof when set
+        // associations are available; otherwise retain the conservative
+        // aggregate estimate for older/ambiguous NZBs.
+        if set_repairable.unwrap_or(effective_bytes >= required_bytes) {
+            return None;
+        }
+
+        // Tier 3: effective completion, including usable PAR2 recovery.
         if self.content_bytes > 0 {
-            let available_bytes = self
-                .content_bytes
-                .saturating_sub(self.content_bytes_missing);
-            let availability_pct = 100.0 * available_bytes as f64 / self.content_bytes as f64;
-            if availability_pct < required_completion_pct {
+            let availability_pct = 100.0 * effective_bytes as f64 / self.content_bytes as f64;
+            if availability_pct < required_completion_pct || set_repairable == Some(false) {
                 return Some(HopelessAbort {
                     tier: "ongoing_availability",
                     reason: format!(
-                        "Aborted: only {availability_pct:.1}% of content available \
-                         (need {required_completion_pct:.1}%), \
-                         {} of {} content articles missing",
-                        self.content_articles_failed, self.content_articles_total,
+                        "Aborted: effective completion {availability_pct:.3}% is below \
+                         {required_completion_pct:.3}%: {} missing content bytes in {} of {} \
+                         articles, {} usable recovery bytes ({} of {} recovery blocks unavailable)",
+                        self.content_bytes_missing,
+                        self.content_articles_failed,
+                        self.content_articles_total,
+                        usable_recovery_bytes,
+                        self.recovery_blocks_unavailable,
+                        self.recovery_blocks_total,
                     ),
                 });
             }
@@ -460,7 +669,7 @@ pub struct QueueManager {
     conn_tracker: Arc<ConnectionTracker>,
     /// Shared worker pool that services all active download jobs.
     worker_pool: Arc<WorkerPool>,
-    /// Minimum completion percentage required (excluding par2).
+    /// Minimum effective completion percentage, including usable PAR2 capacity.
     required_completion_pct: f64,
 }
 
@@ -646,7 +855,10 @@ impl QueueManager {
                     state.job.error_message = Some(abort.reason.clone());
                 }
             }
-            self.worker_pool.abort_job(&job_id, abort.reason);
+            if !self.worker_pool.abort_job(&job_id, abort.reason) {
+                crate::increment_counter("jobs.duplicate_terminal_attempts");
+                debug!(job_id = %job_id, "Duplicate terminal abort request ignored");
+            }
         }
     }
 
@@ -977,6 +1189,7 @@ impl QueueManager {
                     decoded_bytes,
                     file_complete,
                     server_id,
+                    yenc_filename,
                     ..
                 } => {
                     self.speed.record(decoded_bytes);
@@ -986,6 +1199,58 @@ impl QueueManager {
                     {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(&job_id) {
+                            if let Some(yenc_name) = yenc_filename.as_deref() {
+                                let clean_name = std::path::Path::new(yenc_name)
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or(yenc_name);
+                                let revealed_par2 =
+                                    clean_name.to_ascii_lowercase().ends_with(".par2");
+                                if !revealed_par2
+                                    && crate::download_engine::has_known_extension(clean_name)
+                                    && let Some(tracker) = state.hopeless_tracker.as_mut()
+                                {
+                                    tracker.mark_file_classified(&file_id);
+                                }
+                                let file_info = state
+                                    .job
+                                    .files
+                                    .iter()
+                                    .find(|file| file.id == file_id)
+                                    .filter(|file| revealed_par2 && !file.is_par2)
+                                    .map(|file| (file.bytes, file.articles.len()));
+                                if let Some((file_bytes, article_count)) = file_info {
+                                    let (set_name, volume, blocks) =
+                                        crate::nzb_core::nzb_parser::parse_par2_filename(
+                                            clean_name,
+                                        );
+                                    if let Some(tracker) = state.hopeless_tracker.as_mut() {
+                                        tracker.reclassify_as_par2(
+                                            &file_id,
+                                            file_bytes,
+                                            article_count,
+                                            volume,
+                                            blocks,
+                                            set_name.as_deref(),
+                                        );
+                                    }
+                                    if let Some(file) =
+                                        state.job.files.iter_mut().find(|file| file.id == file_id)
+                                    {
+                                        file.is_par2 = true;
+                                        file.par2_setname = set_name;
+                                        file.par2_vol = volume;
+                                        file.par2_blocks = blocks;
+                                    }
+                                    info!(
+                                        job_id = %job_id,
+                                        file_id = %file_id,
+                                        yenc_filename = %clean_name,
+                                        recovery_blocks = blocks.unwrap_or_default(),
+                                        "Obfuscated file reclassified as PAR2 from yEnc header"
+                                    );
+                                }
+                            }
                             state.job.downloaded_bytes += decoded_bytes;
                             state.job.articles_downloaded += 1;
 
@@ -1086,7 +1351,10 @@ impl QueueManager {
                     }
                 }
                 ProgressUpdate::ArticleFailed {
-                    file_id, failure, ..
+                    file_id,
+                    segment_number,
+                    failure,
+                    ..
                 } => {
                     let _ = &failure.message; // forwarded into logs below
                     let should_abort = {
@@ -1135,21 +1403,27 @@ impl QueueManager {
                                     .iter()
                                     .find(|f| f.id == file_id)
                                     .is_some_and(|f| f.is_par2);
-                                // Estimate article size from total file bytes / article count
-                                let estimated_bytes = state
+                                // Use the NZB's declared segment size. Averaging
+                                // a file across articles distorts the last segment
+                                // and can flip decisions close to the reserve.
+                                let declared_bytes = state
                                     .job
                                     .files
                                     .iter()
                                     .find(|f| f.id == file_id)
-                                    .map(|f| {
-                                        if f.articles.is_empty() {
-                                            0
-                                        } else {
-                                            f.bytes / f.articles.len() as u64
-                                        }
+                                    .and_then(|f| {
+                                        f.articles.iter().find(|article| {
+                                            article.segment_number == segment_number
+                                        })
                                     })
+                                    .map(|article| article.bytes)
                                     .unwrap_or(0);
-                                tracker.record_failure(file_is_par2, estimated_bytes, failure.kind);
+                                tracker.record_file_failure(
+                                    Some(&file_id),
+                                    file_is_par2,
+                                    declared_bytes,
+                                    failure.kind,
+                                );
                                 // Observability: dump tracker state on every
                                 // failure so operators can see the ratio
                                 // evolving towards hopeless-abort thresholds.
@@ -1157,10 +1431,15 @@ impl QueueManager {
                                 // minutes to fail" — exposes grace period,
                                 // early_failure, and ongoing_availability
                                 // check progress in real time.
-                                let avail_bytes_pct = if tracker.content_bytes > 0 {
+                                let effective_pct = if tracker.content_bytes > 0 {
                                     let avail: u64 = tracker
                                         .content_bytes
-                                        .saturating_sub(tracker.content_bytes_missing);
+                                        .saturating_sub(tracker.content_bytes_missing)
+                                        .saturating_add(
+                                            tracker
+                                                .recovery_capacity_bytes
+                                                .saturating_sub(tracker.recovery_bytes_unavailable),
+                                        );
                                     100.0 * (avail as f64 / tracker.content_bytes as f64)
                                 } else {
                                     100.0
@@ -1177,7 +1456,11 @@ impl QueueManager {
                                     failed = tracker.content_articles_failed,
                                     total = tracker.content_articles_total,
                                     failure_rate = format!("{fail_rate:.3}"),
-                                    availability_pct = format!("{avail_bytes_pct:.2}"),
+                                    effective_completion_pct = format!("{effective_pct:.3}"),
+                                    missing_content_bytes = tracker.content_bytes_missing,
+                                    usable_recovery_bytes = tracker.recovery_capacity_bytes.saturating_sub(tracker.recovery_bytes_unavailable),
+                                    recovery_blocks_total = tracker.recovery_blocks_total,
+                                    recovery_blocks_unavailable = tracker.recovery_blocks_unavailable,
                                     required_pct = format!("{:.1}", self.required_completion_pct),
                                     kind = failure.kind.as_str(),
                                     "Hopeless tracker updated after article failure"
@@ -1211,7 +1494,10 @@ impl QueueManager {
                         // Tell the worker pool to drain the job and emit
                         // JobAborted — the JobAborted arm below handles the
                         // rest of the teardown.
-                        self.worker_pool.abort_job(&job_id, abort.reason);
+                        if !self.worker_pool.abort_job(&job_id, abort.reason) {
+                            crate::increment_counter("jobs.duplicate_terminal_attempts");
+                            debug!(job_id = %job_id, "Duplicate terminal abort request ignored");
+                        }
                     } else {
                         warn!(
                             job_id = %job_id,
@@ -1226,6 +1512,18 @@ impl QueueManager {
                     articles_failed,
                     ..
                 } => {
+                    let repairable_damage = self.jobs.lock().get(&job_id).is_some_and(|state| {
+                        state.hopeless_tracker.as_ref().is_some_and(|tracker| {
+                            let usable = tracker
+                                .recovery_capacity_bytes
+                                .saturating_sub(tracker.recovery_bytes_unavailable);
+                            usable >= tracker.content_bytes_missing
+                                && tracker.content_articles_failed > 0
+                        })
+                    });
+                    if repairable_damage {
+                        crate::increment_counter("jobs.repairable_damage");
+                    }
                     info!(
                         job_id = %job_id,
                         success,
@@ -1273,22 +1571,56 @@ impl QueueManager {
                     self.start_next_queued();
                     break;
                 }
-                ProgressUpdate::JobAborted { reason, .. } => {
+                ProgressUpdate::JobAborted {
+                    reason,
+                    articles_failed,
+                    ..
+                } => {
+                    crate::increment_counter("jobs.hopeless_aborts");
                     warn!(
                         job_id = %job_id,
                         reason = %reason,
+                        articles_failed,
                         "Job aborted by download engine"
                     );
+                    // The terminal update is emitted only after queued and
+                    // in-flight articles drain. Dropping this context closes
+                    // all assembler handles before history or any later stage
+                    // can inspect the work directory.
+                    self.worker_pool.release_completed_job(&job_id);
                     {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(&job_id) {
                             state.job.status = JobStatus::Failed;
-                            state.job.error_message = Some(reason);
+                            state.job.error_message = Some(reason.clone());
+                            state.job.articles_failed =
+                                state.job.articles_failed.max(articles_failed);
                             state.job.completed_at = Some(chrono::Utc::now());
+                            let tracker = state.hopeless_tracker.as_ref();
+                            warn!(
+                                job_id = %job_id,
+                                terminal_reason = %reason,
+                                missing_content_bytes = tracker.map_or(0, |t| t.content_bytes_missing),
+                                usable_recovery_bytes = tracker.map_or(0, |t| t.recovery_capacity_bytes.saturating_sub(t.recovery_bytes_unavailable)),
+                                recovery_blocks_total = tracker.map_or(0, |t| t.recovery_blocks_total),
+                                recovery_blocks_unavailable = tracker.map_or(0, |t| t.recovery_blocks_unavailable),
+                                "Terminal job summary"
+                            );
+                            // Confirmed hopeless damage must not enter PAR2,
+                            // extraction, or cleanup. Persist the original
+                            // reason directly as a failed history row.
+                            self.move_to_history(state, Vec::new());
                         }
                     }
+                    self.persist_job_progress(&job_id);
                     self.start_next_queued();
-                    self.on_job_finished(&job_id, false, 0).await;
+                    let jid = job_id.clone();
+                    let qm = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(8)).await;
+                        qm.jobs.lock().remove(&jid);
+                        qm.job_order.lock().retain(|id| id != &jid);
+                    });
                     break;
                 }
             }
@@ -1309,7 +1641,15 @@ impl QueueManager {
         let pipeline_start = Instant::now();
 
         // Extract info needed for post-processing and take the direct unpacker.
-        let (work_dir, output_dir, category, pp_level, direct_unpacker, password) = {
+        let (
+            work_dir,
+            output_dir,
+            category,
+            pp_level,
+            direct_unpacker,
+            password,
+            content_articles_failed,
+        ) = {
             let mut jobs = self.jobs.lock();
             let Some(state) = jobs.get_mut(job_id) else {
                 return;
@@ -1335,6 +1675,10 @@ impl QueueManager {
                 .unwrap_or(3); // default: repair+unpack
             let du = state.direct_unpacker.take();
             let pw = state.job.password.clone();
+            let content_failed = state
+                .hopeless_tracker
+                .as_ref()
+                .map_or(articles_failed, |tracker| tracker.content_articles_failed);
             (
                 state.job.work_dir.clone(),
                 state.job.output_dir.clone(),
@@ -1342,6 +1686,7 @@ impl QueueManager {
                 pp,
                 du,
                 pw,
+                content_failed,
             )
         };
 
@@ -1386,6 +1731,7 @@ impl QueueManager {
                 cleanup_after_extract: true,
                 output_dir: Some(output_dir.clone()),
                 articles_failed,
+                content_articles_failed,
                 skip_extract: direct_unpack_success,
                 password: password.clone(),
             };
@@ -1518,8 +1864,23 @@ impl QueueManager {
         };
 
         let db = self.db.lock();
-        if let Err(e) = db.history_insert(&history_entry) {
-            error!(job_id = %state.job.id, "Failed to insert history: {e}");
+        match db.history_get(&state.job.id) {
+            Ok(Some(existing)) => {
+                warn!(
+                    job_id = %state.job.id,
+                    existing_status = %existing.status,
+                    attempted_status = %final_status,
+                    "History row already exists; terminal persistence is idempotent"
+                );
+            }
+            Ok(None) => {
+                if let Err(e) = db.history_insert(&history_entry) {
+                    error!(job_id = %state.job.id, "Failed to insert history: {e}");
+                }
+            }
+            Err(e) => {
+                error!(job_id = %state.job.id, "Failed to check existing history row: {e}");
+            }
         }
 
         // Capture and persist per-job logs from the ring buffer
@@ -1868,6 +2229,23 @@ impl QueueManager {
     /// A job removed with no error (the user simply doesn't want it) is
     /// just deleted, matching prior behavior.
     pub fn remove_job(&self, id: &str) -> crate::nzb_core::Result<()> {
+        // Post-processing owns the work directory and JobState until its
+        // terminal history transaction completes. Treat an external queue
+        // cleanup request during this window as deferred view cleanup; do
+        // not cancel the task or delete files beneath PAR2/extraction.
+        if self.jobs.lock().get(id).is_some_and(|state| {
+            matches!(
+                state.job.status,
+                JobStatus::PostProcessing
+                    | JobStatus::Verifying
+                    | JobStatus::Repairing
+                    | JobStatus::Extracting
+            )
+        }) {
+            info!(job_id = %id, "Queue removal deferred while post-processing is active");
+            return Ok(());
+        }
+
         // Silently cancel in the pool — drains queued items and unregisters.
         self.worker_pool.cancel_job(id);
         let removed = self.jobs.lock().remove(id);
@@ -1879,8 +2257,9 @@ impl QueueManager {
             }
 
             let db = self.db.lock();
+            let history_already_persisted = db.history_get(id)?.is_some();
 
-            if state.job.error_message.is_some() {
+            if state.job.error_message.is_some() && !history_already_persisted {
                 let history_entry = HistoryEntry {
                     id: state.job.id.clone(),
                     name: state.job.name.clone(),
@@ -1903,6 +2282,8 @@ impl QueueManager {
                 {
                     warn!("Failed to enforce history retention: {e}");
                 }
+            } else if history_already_persisted {
+                debug!(job_id = %id, "Removing terminal queue view; history already persisted");
             }
 
             // Remove from DB
@@ -2861,6 +3242,7 @@ impl QueueManager {
                                     tracker_idle_secs,
                                     tracker_content_bytes,
                                     tracker_content_missing,
+                                    tracker_usable_recovery,
                                 ) = s
                                     .hopeless_tracker
                                     .as_ref()
@@ -2873,9 +3255,11 @@ impl QueueManager {
                                             t.last_progress_at.elapsed().as_secs(),
                                             t.content_bytes,
                                             t.content_bytes_missing,
+                                            t.recovery_capacity_bytes
+                                                .saturating_sub(t.recovery_bytes_unavailable),
                                         )
                                     })
-                                    .unwrap_or((0, 0, 0, 0, 0, 0, 0));
+                                    .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0));
                                 (
                                     id.clone(),
                                     s.job.name.clone(),
@@ -2893,6 +3277,7 @@ impl QueueManager {
                                     tracker_idle_secs,
                                     tracker_content_bytes,
                                     tracker_content_missing,
+                                    tracker_usable_recovery,
                                 )
                             })
                             .collect()
@@ -2914,6 +3299,7 @@ impl QueueManager {
                         t_idle,
                         t_bytes_total,
                         t_bytes_missing,
+                        t_usable_recovery,
                     ) in snapshots
                     {
                         let pct_bytes = if total_bytes > 0 {
@@ -2922,7 +3308,9 @@ impl QueueManager {
                             0.0
                         };
                         let avail_pct = if t_bytes_total > 0 {
-                            let avail: u64 = t_bytes_total.saturating_sub(t_bytes_missing);
+                            let avail: u64 = t_bytes_total
+                                .saturating_sub(t_bytes_missing)
+                                .saturating_add(t_usable_recovery);
                             100.0 * (avail as f64 / t_bytes_total as f64)
                         } else {
                             100.0
@@ -2943,7 +3331,9 @@ impl QueueManager {
                             tracker_checked = t_checked,
                             tracker_failed = t_failed,
                             tracker_total = t_total,
-                            availability_pct = format!("{avail_pct:.1}"),
+                            effective_completion_pct = format!("{avail_pct:.3}"),
+                            missing_content_bytes = t_bytes_missing,
+                            usable_recovery_bytes = t_usable_recovery,
                             "Job status snapshot"
                         );
                     }
@@ -3124,6 +3514,102 @@ mod global_pause_tests {
         assert_eq!(manager.get_job("new").unwrap().status, JobStatus::Paused);
         assert!(manager.globally_paused_jobs.lock().contains("new"));
     }
+
+    #[tokio::test]
+    async fn removing_terminal_queue_view_does_not_insert_history_twice() {
+        let (manager, tempdir) = manager();
+        let mut terminal = job("terminal", JobStatus::Failed, tempdir.path());
+        terminal.error_message = Some("original failure".into());
+        insert_job(&manager, terminal);
+        {
+            let mut jobs = manager.jobs.lock();
+            let state = jobs.get_mut("terminal").unwrap();
+            manager.move_to_history(state, Vec::new());
+        }
+
+        manager.remove_job("terminal").unwrap();
+        let db = manager.db.lock();
+        let persisted = db.history_get("terminal").unwrap().unwrap();
+        assert_eq!(persisted.error_message.as_deref(), Some("original failure"));
+        assert_eq!(
+            db.history_list(100)
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.id == "terminal")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_terminal_persistence_keeps_one_history_row() {
+        let (manager, tempdir) = manager();
+        let mut terminal = job("idempotent-terminal", JobStatus::Failed, tempdir.path());
+        terminal.error_message = Some("original failure".into());
+        insert_job(&manager, terminal);
+
+        let mut jobs = manager.jobs.lock();
+        let state = jobs.get_mut("idempotent-terminal").unwrap();
+        manager.move_to_history(state, Vec::new());
+        manager.move_to_history(state, Vec::new());
+        drop(jobs);
+
+        let db = manager.db.lock();
+        assert_eq!(
+            db.history_list(100)
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.id == "idempotent-terminal")
+                .count(),
+            1
+        );
+        assert_eq!(
+            db.history_get("idempotent-terminal")
+                .unwrap()
+                .unwrap()
+                .error_message
+                .as_deref(),
+            Some("original failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_active_failed_job_creates_one_history_row() {
+        let (manager, tempdir) = manager();
+        let mut failed = job("active-failed", JobStatus::Paused, tempdir.path());
+        failed.error_message = Some("providers unavailable".into());
+        insert_job(&manager, failed);
+
+        manager.remove_job("active-failed").unwrap();
+        assert!(
+            manager
+                .db
+                .lock()
+                .history_get("active-failed")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn removal_during_post_processing_is_deferred() {
+        let (manager, tempdir) = manager();
+        insert_job(
+            &manager,
+            job("post-processing", JobStatus::PostProcessing, tempdir.path()),
+        );
+
+        manager.remove_job("post-processing").unwrap();
+        assert!(manager.get_job("post-processing").is_some());
+        assert!(
+            manager
+                .db
+                .lock()
+                .history_get("post-processing")
+                .unwrap()
+                .is_none()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3137,7 +3623,16 @@ mod hopeless_tests {
             created_at: Instant::now(),
             last_progress_at: Instant::now(),
             content_bytes: content_articles as u64 * article_bytes,
-            par2_bytes: par2_articles as u64 * article_bytes,
+            recovery_capacity_bytes: par2_articles as u64 * article_bytes,
+            recovery_blocks_total: par2_articles as u64,
+            recovery_bytes_unavailable: 0,
+            recovery_blocks_unavailable: 0,
+            recovery_capacity_by_set: HashMap::new(),
+            recovery_unavailable_by_set: HashMap::new(),
+            missing_content_by_set: HashMap::new(),
+            unassociated_missing_bytes: 0,
+            content_file_sets: HashMap::new(),
+            pending_file_classifications: std::collections::HashSet::new(),
             content_bytes_missing: 0,
             content_articles_checked: 0,
             content_articles_failed: 0,
@@ -3250,11 +3745,11 @@ mod hopeless_tests {
         );
         let abort = result.unwrap();
         assert_eq!(abort.tier, "ongoing_availability");
-        assert!(abort.reason.contains("0.0%"));
+        assert!(abort.reason.contains("effective completion 10.000%"));
     }
 
     #[test]
-    fn par2_failures_do_not_count() {
+    fn par2_failures_reduce_recovery_without_counting_as_content_damage() {
         let mut t = make_tracker(100, 50);
         // Fail 20 par2 articles — should not affect content tracking
         for _ in 0..20 {
@@ -3266,15 +3761,16 @@ mod hopeless_tests {
         }
         assert_eq!(t.content_articles_failed, 0);
         assert_eq!(t.content_bytes_missing, 0);
-        assert!(t.check(true, true, 100.2).is_none());
+        assert_eq!(t.recovery_bytes_unavailable, 15_000_000);
+        assert_eq!(t.recovery_blocks_unavailable, 20);
     }
 
     #[test]
     fn ongoing_ratio_triggers_when_too_many_missing() {
         let mut t = make_tracker(100, 10);
-        // Fail 10 out of 100 articles (10% missing)
-        // availability = 90% < 100.2% → should abort
-        for _ in 0..10 {
+        // Fail 11 out of 100 articles with only 10 articles worth of
+        // recovery. Effective completion is 99%, so this is hopeless.
+        for _ in 0..11 {
             t.record_failure(
                 false,
                 750_000,
@@ -3287,8 +3783,76 @@ mod hopeless_tests {
         let result = t.check(true, true, 100.0);
         assert!(
             result.is_some(),
-            "10% missing should fail at 100% threshold"
+            "damage beyond recovery capacity should fail"
         );
+    }
+
+    #[test]
+    fn recovery_capacity_covers_more_than_five_missing_articles() {
+        let mut t = make_tracker(100, 12);
+        for _ in 0..10 {
+            t.record_failure(
+                false,
+                750_000,
+                crate::article_failure::ArticleFailureKind::NotFound,
+            );
+        }
+        assert!(t.check(true, false, 100.2).is_none());
+    }
+
+    #[test]
+    fn damage_exactly_at_capacity_still_requires_safety_reserve() {
+        let mut t = make_tracker(100, 10);
+        for _ in 0..10 {
+            t.record_failure(
+                false,
+                750_000,
+                crate::article_failure::ArticleFailureKind::NotFound,
+            );
+        }
+        let abort = t
+            .check(true, false, 100.2)
+            .expect("reserve must be available");
+        assert_eq!(abort.tier, "ongoing_availability");
+        assert!(t.check(true, false, 100.0).is_none());
+    }
+
+    #[test]
+    fn recovery_from_another_par2_set_cannot_mask_damage() {
+        let mut t = make_tracker(100, 22);
+        t.recovery_capacity_by_set = HashMap::from([
+            ("set-a".to_string(), 20 * 750_000),
+            ("set-b".to_string(), 2 * 750_000),
+        ]);
+        t.content_file_sets
+            .insert("file-b".to_string(), Some("set-b".to_string()));
+        for _ in 0..6 {
+            t.record_file_failure(
+                Some("file-b"),
+                false,
+                750_000,
+                crate::article_failure::ArticleFailureKind::NotFound,
+            );
+        }
+
+        let abort = t
+            .check(true, false, 100.0)
+            .expect("set A blocks cannot repair set B content");
+        assert_eq!(abort.tier, "ongoing_availability");
+    }
+
+    #[test]
+    fn obfuscated_par2_reclassification_excludes_index_capacity() {
+        let mut index = make_tracker(10, 0);
+        index.reclassify_as_par2("index", 750_000, 1, None, None, Some("set"));
+        assert_eq!(index.content_bytes, 9 * 750_000);
+        assert_eq!(index.recovery_capacity_bytes, 0);
+
+        let mut volume = make_tracker(10, 0);
+        volume.reclassify_as_par2("volume", 3 * 750_000, 3, Some(0), Some(3), Some("set"));
+        assert_eq!(volume.content_bytes, 7 * 750_000);
+        assert_eq!(volume.recovery_capacity_bytes, 3 * 750_000);
+        assert_eq!(volume.recovery_blocks_total, 3);
     }
 
     #[test]

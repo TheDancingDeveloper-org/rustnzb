@@ -36,6 +36,8 @@ use tokio::net::TcpListener;
 
 use crate::config::ServerConfig;
 
+pub type ArticleResponseSequences = Arc<Mutex<HashMap<String, VecDeque<(u16, String)>>>>;
+
 // ---------------------------------------------------------------------------
 // Auth rate limiter (cross-connection state)
 // ---------------------------------------------------------------------------
@@ -142,6 +144,11 @@ pub struct MockConfig {
     /// body. Use to inject 430 (not found), 502 (server down), 403
     /// (forbidden) etc. for individual articles.
     pub article_response_overrides: HashMap<String, u16>,
+    /// Shared one-shot responses for ARTICLE requests. Each request pops the
+    /// next `(code, message)` for its message-id; once exhausted, normal
+    /// article lookup resumes. This models a stale session returning `400`
+    /// followed by a successful fetch on a replacement connection.
+    pub article_response_sequences: Option<ArticleResponseSequences>,
     /// Cross-connection auth rate limiter. After `max_attempts` AUTHINFO PASS
     /// attempts within the `window`, all subsequent auths return 481.
     pub auth_rate_limit: Option<AuthRateLimit>,
@@ -177,6 +184,7 @@ impl Default for MockConfig {
             close_after_n_commands: None,
             response_delay: None,
             article_response_overrides: HashMap::new(),
+            article_response_sequences: None,
             auth_rate_limit: None,
             capabilities_unsupported: false,
             capabilities_mode_reader: false,
@@ -562,7 +570,14 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                         .get(1)
                         .unwrap_or(&"")
                         .trim_matches(|c| c == '<' || c == '>');
-                    if let Some(&code) = config.article_response_overrides.get(mid) {
+                    let sequenced = config
+                        .article_response_sequences
+                        .as_ref()
+                        .and_then(|state| state.lock().get_mut(mid).and_then(VecDeque::pop_front));
+                    if let Some((code, message)) = sequenced {
+                        let resp = format!("{code} {message}\r\n");
+                        mwrite!(conn, resp.as_bytes());
+                    } else if let Some(&code) = config.article_response_overrides.get(mid) {
                         let resp = format!("{code} <{mid}>\r\n");
                         mwrite!(conn, resp.as_bytes());
                     } else if let Some(data) = config.articles.get(mid) {
