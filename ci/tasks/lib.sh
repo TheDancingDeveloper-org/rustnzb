@@ -31,6 +31,10 @@ task_target_dir() {
 
 prepare_placeholder_frontend() {
     rm -rf "$REPO_ROOT/apps/rustnzb/frontend/dist"
+    placeholder_dir=$REPO_ROOT/apps/rustnzb/frontend/dist/frontend/browser
+    mkdir -p "$placeholder_dir"
+    printf '%s\n' '<!DOCTYPE html><html><body><h1>rustnzb</h1></body></html>' \
+        > "$placeholder_dir/index.html"
     export RUSTNZB_SKIP_FRONTEND_BUILD=1
 }
 
