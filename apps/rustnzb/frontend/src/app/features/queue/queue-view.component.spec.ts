@@ -148,6 +148,13 @@ describe('QueueViewComponent', () => {
     );
   });
 
+  it('formats the live failed article count', () => {
+    const { component } = makeComponent();
+
+    expect(component.failedArticlesLabel(1)).toBe('1 failed article');
+    expect(component.failedArticlesLabel(37)).toBe('37 failed articles');
+  });
+
   it('ignores a duplicate row action while the first request is pending', () => {
     const action$ = new Subject<unknown>();
     const { component, api } = makeComponent({

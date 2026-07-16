@@ -402,6 +402,15 @@ interface PipelineStep {
                       {{ formatBytes(job.downloaded_bytes) }} / {{ formatBytes(job.total_bytes) }}
                     }
                   </div>
+                  @if (job.articles_failed > 0) {
+                    <div
+                      class="article-failures"
+                      title="Articles missing or otherwise failed after all download attempts"
+                      role="status"
+                    >
+                      {{ failedArticlesLabel(job.articles_failed) }}
+                    </div>
+                  }
                 </td>
                 <td>{{ job.speed_bps > 0 ? formatSpeed(job.speed_bps) : '—' }}</td>
                 <td>{{ job.speed_bps > 0 ? eta(job) : '—' }}</td>
@@ -1653,6 +1662,11 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     if (h > 0) return `${h}h ${m}m`;
     if (m > 0) return `${m}m ${s}s`;
     return `${s}s`;
+  }
+
+  failedArticlesLabel(count: number): string {
+    const failed = Math.max(0, Math.floor(this.normalizeNonNegative(count)));
+    return `${failed} failed article${failed === 1 ? '' : 's'}`;
   }
 
   private remainingForJob(job: { total_bytes: number; downloaded_bytes: number }): number {

@@ -40,6 +40,13 @@ test('4.3 paused job shows paused status pill', async ({ page }) => {
   await expect(jobRow.locator('.s-paused')).toBeVisible();
 });
 
+test('4.13 active download row shows the failed article count', async ({ page }) => {
+  await page.goto('/downloads');
+
+  const jobRow = page.locator('.data').locator('tr', { hasText: 'Test.Movie.2025.mkv' });
+  await expect(jobRow.locator('.article-failures')).toHaveText('7 failed articles');
+});
+
 // ── 4.4 Global pause owns "Another.Show.S01E01" ──────────────────────────────
 
 test('4.4 global pause overrides queued job controls', async ({ page }) => {

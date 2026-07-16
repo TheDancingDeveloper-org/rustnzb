@@ -216,6 +216,15 @@ table.data tr:hover td { background: var(--row-hover); }
 .s-fail   { background: var(--fail-bg); color: var(--fail-text); }
 .s-paused { background: #2a3441; color: var(--mute); }
 
+.article-failures {
+  color: var(--danger);
+  font-size: 10px;
+  font-weight: 600;
+  margin-top: 3px;
+  text-align: center;
+  white-space: nowrap;
+}
+
 /* Progress */
 .progress {
   width: 140px;

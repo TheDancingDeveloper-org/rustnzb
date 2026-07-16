@@ -19,15 +19,15 @@ VALUES
 INSERT INTO settings (key, value) VALUES ('globally_paused', 'true');
 
 INSERT INTO queue (id, name, category, status, priority, total_bytes, downloaded_bytes,
-                   file_count, article_count, added_at, work_dir, output_dir)
+                   file_count, article_count, articles_failed, added_at, work_dir, output_dir)
 VALUES
   ('queue-job-1', 'Test.Movie.2025.mkv', 'movies', 'paused', 1,
-   1073741824, 536870912, 3, 300,
+   1073741824, 536870912, 3, 300, 7,
    '2026-03-01T10:00:00Z',
    'e2e/test-data/incomplete/queue-job-1',
    'e2e/test-data/complete/movies/Test.Movie.2025.mkv'),
   ('queue-job-2', 'Another.Show.S01E01', 'tv', 'queued', 2,
-   524288000, 0, 2, 150,
+   524288000, 0, 2, 150, 0,
    '2026-03-01T11:00:00Z',
    'e2e/test-data/incomplete/queue-job-2',
    'e2e/test-data/complete/tv/Another.Show.S01E01');
