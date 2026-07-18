@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "mock-nntp-server"
-version = "1.3.3"
+version = "1.3.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -2849,7 +2849,7 @@ dependencies = [
 
 [[package]]
 name = "rustnzb"
-version = "1.3.3"
+version = "1.3.4"
 dependencies = [
  "anyhow",
  "arc-swap",
