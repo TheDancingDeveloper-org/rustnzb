@@ -192,6 +192,9 @@ pub struct HistoryEntry {
     pub downloaded_bytes: u64,
     pub added_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
+    /// Active download duration, excluding queue wait and pauses.
+    #[serde(default)]
+    pub download_time_secs: Option<f64>,
     pub output_dir: PathBuf,
     /// Post-processing stages with results
     pub stages: Vec<StageResult>,

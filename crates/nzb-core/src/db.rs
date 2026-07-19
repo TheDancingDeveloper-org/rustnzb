@@ -298,6 +298,17 @@ impl Database {
             )?;
         }
 
+        if version < 8 {
+            info!("Applying database migration v8: active download duration");
+            self.conn.execute_batch(
+                "
+                ALTER TABLE history ADD COLUMN download_time_secs REAL;
+                DELETE FROM schema_version;
+                INSERT INTO schema_version (version) VALUES (8);
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -445,8 +456,8 @@ impl Database {
         let server_stats_json = serde_json::to_string(&entry.server_stats).unwrap_or_default();
         self.conn.execute(
             "INSERT INTO history (id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, output_dir, stages, error_message, nzb_data, server_stats)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             added_at, completed_at, download_time_secs, output_dir, stages, error_message, nzb_data, server_stats)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 entry.id,
                 entry.name,
@@ -456,6 +467,7 @@ impl Database {
                 entry.downloaded_bytes as i64,
                 entry.added_at.to_rfc3339(),
                 entry.completed_at.to_rfc3339(),
+                entry.download_time_secs,
                 entry.output_dir.to_string_lossy().to_string(),
                 stages_json,
                 entry.error_message,
@@ -464,10 +476,12 @@ impl Database {
             ],
         )?;
 
-        let duration_secs = (entry.completed_at - entry.added_at)
-            .num_milliseconds()
-            .max(0) as f64
-            / 1000.0;
+        let duration_secs = entry.download_time_secs.unwrap_or_else(|| {
+            (entry.completed_at - entry.added_at)
+                .num_milliseconds()
+                .max(0) as f64
+                / 1000.0
+        });
         let average_speed_bps = if duration_secs > 0.0 {
             (entry.downloaded_bytes as f64 / duration_secs) as u64
         } else {
@@ -522,20 +536,20 @@ impl Database {
     pub fn history_list(&self, limit: usize) -> Result<Vec<HistoryEntry>, NzbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, output_dir, stages, error_message, server_stats,
+             added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
              CASE WHEN nzb_data IS NOT NULL THEN 1 ELSE 0 END as has_nzb
              FROM history ORDER BY completed_at DESC LIMIT ?1",
         )?;
 
         let entries = stmt
             .query_map(params![limit as i64], |row| {
-                let stages_json: String = row.get::<_, Option<String>>(9)?.unwrap_or_default();
+                let stages_json: String = row.get::<_, Option<String>>(10)?.unwrap_or_default();
                 let stages: Vec<StageResult> =
                     serde_json::from_str(&stages_json).unwrap_or_default();
-                let stats_json: String = row.get::<_, Option<String>>(11)?.unwrap_or_default();
+                let stats_json: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
                 let server_stats: Vec<ServerArticleStats> =
                     serde_json::from_str(&stats_json).unwrap_or_default();
-                let has_nzb: i64 = row.get(12)?;
+                let has_nzb: i64 = row.get(13)?;
 
                 Ok(HistoryEntry {
                     id: row.get(0)?,
@@ -546,9 +560,10 @@ impl Database {
                     downloaded_bytes: row.get::<_, i64>(5)? as u64,
                     added_at: parse_datetime(&row.get::<_, String>(6)?),
                     completed_at: parse_datetime(&row.get::<_, String>(7)?),
-                    output_dir: row.get::<_, String>(8)?.into(),
+                    download_time_secs: row.get(8)?,
+                    output_dir: row.get::<_, String>(9)?.into(),
                     stages,
-                    error_message: row.get(10)?,
+                    error_message: row.get(11)?,
                     server_stats,
                     // Don't load actual blob in list - just note if it exists
                     nzb_data: if has_nzb != 0 { Some(Vec::new()) } else { None },
@@ -588,14 +603,14 @@ impl Database {
     pub fn history_get(&self, id: &str) -> Result<Option<HistoryEntry>, NzbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, output_dir, stages, error_message, server_stats
+             added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats
              FROM history WHERE id = ?1",
         )?;
 
         let result = stmt.query_row(params![id], |row| {
-            let stages_json: String = row.get::<_, Option<String>>(9)?.unwrap_or_default();
+            let stages_json: String = row.get::<_, Option<String>>(10)?.unwrap_or_default();
             let stages: Vec<StageResult> = serde_json::from_str(&stages_json).unwrap_or_default();
-            let stats_json: String = row.get::<_, Option<String>>(11)?.unwrap_or_default();
+            let stats_json: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
             let server_stats: Vec<ServerArticleStats> =
                 serde_json::from_str(&stats_json).unwrap_or_default();
 
@@ -608,9 +623,10 @@ impl Database {
                 downloaded_bytes: row.get::<_, i64>(5)? as u64,
                 added_at: parse_datetime(&row.get::<_, String>(6)?),
                 completed_at: parse_datetime(&row.get::<_, String>(7)?),
-                output_dir: row.get::<_, String>(8)?.into(),
+                download_time_secs: row.get(8)?,
+                output_dir: row.get::<_, String>(9)?.into(),
                 stages,
-                error_message: row.get(10)?,
+                error_message: row.get(11)?,
                 server_stats,
                 nzb_data: None,
             })
@@ -1026,6 +1042,7 @@ mod tests {
             added_at: Utc::now(),
             completed_at: Utc::now(),
             output_dir: "/downloads/complete".into(),
+            download_time_secs: None,
             stages: vec![StageResult {
                 name: "Verify".into(),
                 status: StageStatus::Success,

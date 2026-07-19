@@ -909,7 +909,13 @@ impl SabHistorySlot {
             storage: entry.output_dir.to_string_lossy().to_string(),
             completed: entry.completed_at.timestamp(),
             fail_message: entry.error_message.clone().unwrap_or_default(),
-            download_time: (entry.completed_at - entry.added_at).num_seconds().max(0) as u64,
+            download_time: entry
+                .download_time_secs
+                .unwrap_or_else(|| {
+                    (entry.completed_at - entry.added_at).num_seconds().max(0) as f64
+                })
+                .round()
+                .max(0.0) as u64,
             pp: "D".into(),
             nzb_name: format!("{}.nzb", entry.name),
             stage_log,
@@ -970,5 +976,28 @@ mod tests {
         for (status, expected) in cases {
             assert_eq!(sab_queue_status(status), expected);
         }
+    }
+
+    #[test]
+    fn history_reports_active_download_time_to_arr_clients() {
+        let now = chrono::Utc::now();
+        let entry = HistoryEntry {
+            id: "history-active-time".into(),
+            name: "queued item".into(),
+            category: "sonarr".into(),
+            status: JobStatus::Completed,
+            total_bytes: 10_000,
+            downloaded_bytes: 10_000,
+            added_at: now - chrono::Duration::hours(4),
+            completed_at: now,
+            download_time_secs: Some(2.4),
+            output_dir: "/downloads/complete".into(),
+            stages: Vec::new(),
+            error_message: None,
+            server_stats: Vec::new(),
+            nzb_data: None,
+        };
+
+        assert_eq!(SabHistorySlot::from_entry(&entry).download_time, 2);
     }
 }

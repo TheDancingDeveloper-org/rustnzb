@@ -467,6 +467,7 @@ pub enum ProgressUpdate {
         job_id: String,
         success: bool,
         articles_failed: usize,
+        download_time_secs: f64,
     },
     NoServersAvailable {
         job_id: String,
@@ -476,6 +477,7 @@ pub enum ProgressUpdate {
         job_id: String,
         reason: String,
         articles_failed: usize,
+        download_time_secs: f64,
     },
 }
 
@@ -529,6 +531,8 @@ pub(crate) struct JobContext {
     pub total_assemble_us: Arc<AtomicU64>,
     pub total_articles_decoded: Arc<AtomicU64>,
     pub engine_start: Instant,
+    active_started: Mutex<Option<Instant>>,
+    active_elapsed: Mutex<Duration>,
     /// Total bytes across all files (for perf summary throughput).
     pub total_bytes: u64,
     /// Ensures JobFinished/JobAborted is only emitted once.
@@ -565,9 +569,34 @@ impl JobContext {
             total_assemble_us: Arc::new(AtomicU64::new(0)),
             total_articles_decoded: Arc::new(AtomicU64::new(0)),
             engine_start: Instant::now(),
+            active_started: Mutex::new(Some(Instant::now())),
+            active_elapsed: Mutex::new(Duration::ZERO),
             total_bytes: job.total_bytes,
             finished: AtomicBool::new(false),
         }
+    }
+
+    fn pause_clock(&self) {
+        let mut started = self.active_started.lock();
+        if let Some(at) = started.take() {
+            *self.active_elapsed.lock() += at.elapsed();
+        }
+    }
+
+    fn resume_clock(&self) {
+        let mut started = self.active_started.lock();
+        if started.is_none() {
+            *started = Some(Instant::now());
+        }
+    }
+
+    fn active_elapsed(&self) -> Duration {
+        let elapsed = *self.active_elapsed.lock();
+        elapsed
+            + self
+                .active_started
+                .lock()
+                .map_or(Duration::ZERO, |at| at.elapsed())
     }
 
     /// Decrement articles_remaining. If it reaches zero, run deobfuscation
@@ -592,6 +621,7 @@ impl JobContext {
         self.deobfuscate_files();
 
         let download_elapsed = self.engine_start.elapsed();
+        let active_elapsed = self.active_elapsed();
         let decode_total_us = self.total_decode_us.load(Ordering::Relaxed);
         let assemble_total_us = self.total_assemble_us.load(Ordering::Relaxed);
         let articles_decoded = self.total_articles_decoded.load(Ordering::Relaxed);
@@ -625,6 +655,7 @@ impl JobContext {
                     job_id: self.job_id.clone(),
                     reason,
                     articles_failed: failed,
+                    download_time_secs: active_elapsed.as_secs_f64(),
                 },
             );
             return;
@@ -638,6 +669,7 @@ impl JobContext {
                 job_id: self.job_id.clone(),
                 success: failed == 0,
                 articles_failed: failed,
+                download_time_secs: active_elapsed.as_secs_f64(),
             },
         );
     }
@@ -1118,6 +1150,7 @@ impl WorkerPool {
     /// being held while paused is returned to the queue.
     pub fn pause_job(&self, job_id: &str) {
         if let Some(ctx) = self.job_contexts.lock().get(job_id) {
+            ctx.pause_clock();
             ctx.paused.store(true, Ordering::Relaxed);
         }
     }
@@ -1125,6 +1158,7 @@ impl WorkerPool {
     /// Resume a paused job.
     pub fn resume_job(&self, job_id: &str) {
         if let Some(ctx) = self.job_contexts.lock().get(job_id) {
+            ctx.resume_clock();
             ctx.paused.store(false, Ordering::Relaxed);
             // Wake any workers that were idle waiting for work.
             self.work_queue.notify.notify_waiters();
@@ -3072,10 +3106,12 @@ mod tests {
             ProgressUpdate::JobAborted {
                 reason,
                 articles_failed,
+                download_time_secs,
                 ..
             } => {
                 assert_eq!(reason, "original reason");
                 assert_eq!(articles_failed, 2);
+                assert!(download_time_secs >= 0.0);
             }
             other => panic!("unexpected terminal event: {other:?}"),
         }

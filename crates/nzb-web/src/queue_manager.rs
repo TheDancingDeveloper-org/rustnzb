@@ -596,6 +596,8 @@ struct JobState {
     direct_unpacker: Option<DirectUnpacker>,
     /// Hopeless job tracker (None until download starts).
     hopeless_tracker: Option<HopelessTracker>,
+    /// Active worker-pool duration captured at terminal download resolution.
+    download_time_secs: Option<f64>,
 }
 
 /// Notification fired immediately when a job is accepted into the queue.
@@ -1010,6 +1012,7 @@ impl QueueManager {
                 nzb_data,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                download_time_secs: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.globally_paused_jobs.lock().insert(job_id.clone());
@@ -1028,6 +1031,7 @@ impl QueueManager {
             nzb_data,
             direct_unpacker: None,
             hopeless_tracker: None,
+            download_time_secs: None,
         };
         self.jobs.lock().insert(job_id.clone(), state);
         self.job_order.lock().push(job_id);
@@ -1525,6 +1529,7 @@ impl QueueManager {
                 ProgressUpdate::JobFinished {
                     success,
                     articles_failed,
+                    download_time_secs,
                     ..
                 } => {
                     let repairable_damage = self.jobs.lock().get(&job_id).is_some_and(|state| {
@@ -1558,6 +1563,7 @@ impl QueueManager {
                     {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(&job_id) {
+                            state.download_time_secs = Some(download_time_secs);
                             state.job.status = JobStatus::PostProcessing;
                             state.job.completed_at = Some(chrono::Utc::now());
                         }
@@ -1589,6 +1595,7 @@ impl QueueManager {
                 ProgressUpdate::JobAborted {
                     reason,
                     articles_failed,
+                    download_time_secs,
                     ..
                 } => {
                     crate::increment_counter("jobs.hopeless_aborts");
@@ -1606,6 +1613,7 @@ impl QueueManager {
                     {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(&job_id) {
+                            state.download_time_secs = Some(download_time_secs);
                             state.job.status = JobStatus::Failed;
                             state.job.error_message = Some(reason.clone());
                             state.job.articles_failed =
@@ -1871,6 +1879,7 @@ impl QueueManager {
             downloaded_bytes: state.job.downloaded_bytes,
             added_at: state.job.added_at,
             completed_at: state.job.completed_at.unwrap_or_else(chrono::Utc::now),
+            download_time_secs: state.download_time_secs,
             output_dir: state.job.output_dir.clone(),
             stages,
             error_message: state.job.error_message.clone(),
@@ -2284,6 +2293,7 @@ impl QueueManager {
                     downloaded_bytes: state.job.downloaded_bytes,
                     added_at: state.job.added_at,
                     completed_at: state.job.completed_at.unwrap_or_else(chrono::Utc::now),
+                    download_time_secs: state.download_time_secs,
                     output_dir: state.job.output_dir.clone(),
                     stages: Vec::new(),
                     error_message: state.job.error_message.clone(),
@@ -3133,6 +3143,7 @@ impl QueueManager {
                 nzb_data,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                download_time_secs: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);
@@ -3472,6 +3483,7 @@ mod global_pause_tests {
                 nzb_data: None,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                download_time_secs: None,
             },
         );
         manager.job_order.lock().push(id);

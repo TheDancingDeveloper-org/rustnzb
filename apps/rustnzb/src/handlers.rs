@@ -262,7 +262,9 @@ pub struct HistoryResponseEntry {
 impl From<HistoryEntry> for HistoryResponseEntry {
     fn from(e: HistoryEntry) -> Self {
         let has_nzb = e.nzb_data.is_some();
-        let duration_secs = (e.completed_at - e.added_at).num_milliseconds().max(0) as f64 / 1000.0;
+        let duration_secs = e.download_time_secs.unwrap_or_else(|| {
+            (e.completed_at - e.added_at).num_milliseconds().max(0) as f64 / 1000.0
+        });
         let average_speed_bps = if duration_secs > 0.0 {
             (e.downloaded_bytes as f64 / duration_secs) as u64
         } else {
