@@ -39,7 +39,7 @@ pub struct ServerConfig {
     pub compress: bool,
     /// Delay in milliseconds between opening new connections (0 = no delay).
     /// Prevents connection bursts that trigger server-side rate limiting.
-    #[serde(default)]
+    #[serde(default = "default_ramp_up_delay_ms")]
     pub ramp_up_delay_ms: u32,
     /// TCP receive buffer size in bytes (SO_RCVBUF). 0 = OS default.
     #[serde(default = "default_recv_buffer_size")]
@@ -62,6 +62,11 @@ pub struct ServerConfig {
 /// Default TCP receive buffer: 2 MiB.
 fn default_recv_buffer_size() -> u32 {
     2 * 1024 * 1024
+}
+
+/// Default delay between opening NNTP connections: 50ms.
+fn default_ramp_up_delay_ms() -> u32 {
+    50
 }
 
 /// Default connection timeout: 30s.
@@ -98,7 +103,7 @@ impl Default for ServerConfig {
             pipelining: 1,
             optional: false,
             compress: false,
-            ramp_up_delay_ms: 250,
+            ramp_up_delay_ms: default_ramp_up_delay_ms(),
             recv_buffer_size: default_recv_buffer_size(),
             proxy_url: None,
             trusted_fingerprint: None,
@@ -234,9 +239,23 @@ mod tests {
         assert_eq!(config.pipelining, 1);
         assert!(!config.optional);
         assert!(!config.compress);
-        assert_eq!(config.ramp_up_delay_ms, 250);
+        assert_eq!(config.ramp_up_delay_ms, 50);
         assert!(config.proxy_url.is_none());
         assert_eq!(config.connect_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_server_config_missing_ramp_up_uses_default() {
+        let serialized = toml::to_string(&ServerConfig::default()).unwrap();
+        let without_ramp_up = serialized
+            .lines()
+            .filter(|line| !line.starts_with("ramp_up_delay_ms ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config: ServerConfig = toml::from_str(&without_ramp_up).unwrap();
+
+        assert_eq!(config.ramp_up_delay_ms, 50);
     }
 
     #[test]

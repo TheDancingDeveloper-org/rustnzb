@@ -29,6 +29,7 @@ log_level = "info"
 # retention = 3000  # days
 # pipelining = 1
 # optional = false
+# ramp_up_delay_ms = 50
 #
 # [[servers]]
 # id = "backup"

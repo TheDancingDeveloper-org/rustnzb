@@ -99,7 +99,7 @@ function emptyServer(): ServerConfig {
     pipelining: 16,
     optional: false,
     compress: false,
-    ramp_up_delay_ms: 250,
+    ramp_up_delay_ms: 50,
     proxy_url: null,
     connect_timeout_secs: 30,
   };
