@@ -10,7 +10,7 @@ permissions:
 jobs:
   create-linear-issue:
     if: github.actor == 'dependabot[bot]'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, node-b, linux, x64]
     steps:
       - name: Create Linear Issue
         env:
