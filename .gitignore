@@ -3,6 +3,8 @@
 /data
 /downloads
 config.toml
+!.cargo/
+!.cargo/config.toml
 DEPLOY.local.md
 .env
 tests/sonarr-e2e/data/

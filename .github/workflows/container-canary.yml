@@ -1,0 +1,55 @@
+name: Container publication canary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: rustnzb-container-canary
+  cancel-in-progress: false
+
+jobs:
+  publish-canary:
+    # This privileged runner is selected only for this repository.  This
+    # workflow intentionally has no pull_request trigger.
+    runs-on: [self-hosted, node-b, linux, x64, publish, docker]
+    env:
+      IMAGE: ghcr.io/thedancingdeveloper-org/rustnzbd
+      CANARY_TAG: migration-canary-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish immutable amd64 canary
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ env.CANARY_TAG }}
+          build-args: |
+            RUSTNZB_BUILD_REF=${{ github.sha }}
+          secrets: |
+            forgejo_token=${{ secrets.FORGEJO_CARGO_TOKEN }}
+          cache-from: ''
+          cache-to: ''
+      - name: Smoke-test the exact published candidate
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
+        run: ci/tasks/smoke-runtime "$IMAGE:$CANARY_TAG" "${GITHUB_SHA}"
+      - name: Record immutable candidate digest
+        run: |
+          docker buildx imagetools inspect "$IMAGE:$CANARY_TAG" --raw > manifest.json
+          digest=$(sha256sum manifest.json | awk '{print "sha256:" $1}')
+          test -n "$digest"
+          printf 'Published and smoke-tested %s@%s\n' "$IMAGE" "$digest"
