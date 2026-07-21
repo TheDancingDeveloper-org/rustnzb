@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    runs-on: [self-hosted, node-b, linux, x64]
+    runs-on: [self-hosted, node-b, linux, x64, rust]
     env:
       FORGEJO_CARGO_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
       CARGO_BUILD_JOBS: 1
@@ -37,7 +37,7 @@ jobs:
       - run: cargo test --workspace
 
   frontend:
-    runs-on: [self-hosted, node-b, linux, x64]
+    runs-on: [self-hosted, node-b, linux, x64, rust]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
