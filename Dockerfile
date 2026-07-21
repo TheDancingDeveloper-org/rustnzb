@@ -69,7 +69,7 @@ COPY --from=builder /out/rustnzb /usr/local/bin/rustnzb
 COPY apps/rustnzb/root/ /
 
 LABEL org.opencontainers.image.title="rustnzb" \
-      org.opencontainers.image.source="https://repo.indexarr.net/indexarr/rustnzb" \
+      org.opencontainers.image.source="https://github.com/TheDancingDeveloper-org/rustnzb" \
       org.opencontainers.image.revision="$RUSTNZB_BUILD_REF"
 
 EXPOSE 9090
