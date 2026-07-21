@@ -6,6 +6,8 @@ task_start smoke-runtime docker curl
 image=${1:?usage: ci/tasks/smoke-runtime IMAGE [EXPECTED_REF]}
 expected_ref=${2:-${RUSTNZB_EXPECTED_REF:-}}
 name="rustnzb-smoke-$$"
+network=
+probe_image=curlimages/curl:8.17.0
 work=$(mktemp -d)
 logs=$REPO_ROOT/.ci-artifacts/runtime-smoke
 docker_config=
@@ -14,6 +16,7 @@ mkdir -p "$logs"
 
 cleanup() {
     docker rm -f "$name" >/dev/null 2>&1 || true
+    [ -z "$network" ] || docker network rm "$network" >/dev/null 2>&1 || true
     rm -rf "$work"
     [ -z "$docker_config" ] || rm -rf "$docker_config"
 }
@@ -32,6 +35,10 @@ caller=${HOSTNAME:-$(hostname)}
 caller_network=$(docker inspect "$caller" \
     --format '{{range $name, $network := .NetworkSettings.Networks}}{{if $network.IPAddress}}{{println $name}}{{end}}{{end}}' \
     2>/dev/null | sed -n '1p' || true)
+remote_docker=false
+case "${DOCKER_HOST:-}" in
+    tcp://*) remote_docker=true ;;
+esac
 if [ -n "$caller_network" ]; then
     docker run -d --name "$name" \
         -e PUID="$(id -u)" -e PGID="$(id -g)" \
@@ -44,6 +51,17 @@ if [ -n "$caller_network" ]; then
         --format "{{with index .NetworkSettings.Networks \"$caller_network\"}}{{.IPAddress}}{{end}}")
     [ -n "$address" ]
     base_url=http://$address:9090
+elif [ "$remote_docker" = true ]; then
+    network="rustnzb-smoke-net-$$"
+    docker network create "$network" >/dev/null
+    docker run -d --name "$name" \
+        -e PUID="$(id -u)" -e PGID="$(id -g)" \
+        --network "$network" \
+        --tmpfs /config \
+        --tmpfs /data \
+        --tmpfs /downloads \
+        "$image" >/dev/null
+    base_url=http://$name:9090
 else
     docker run -d --name "$name" \
         -e PUID="$(id -u)" -e PGID="$(id -g)" \
@@ -57,10 +75,18 @@ else
     base_url=http://127.0.0.1:$port
 fi
 
+http_get() {
+    if [ "$remote_docker" = true ] && [ -z "$caller_network" ]; then
+        docker run --rm --network "$network" "$probe_image" -fsS "$1"
+    else
+        curl -fsS "$1"
+    fi
+}
+
 ready=false
 i=0
 while [ "$i" -lt 60 ]; do
-    if curl -fsS "$base_url/api/health" >"$work/health.json"; then
+    if http_get "$base_url/api/health" >"$work/health.json"; then
         ready=true
         break
     fi
@@ -73,9 +99,9 @@ if [ "$ready" != true ]; then
     exit 1
 fi
 grep -q '"status":"ok"' "$work/health.json"
-curl -fsS "$base_url/" >"$work/frontend.html"
+http_get "$base_url/" >"$work/frontend.html"
 grep -Eq '<app-root|<html' "$work/frontend.html"
-setup=$(curl -fsS "$base_url/api/setup/status")
+setup=$(http_get "$base_url/api/setup/status")
 if [ -n "$expected_ref" ]; then
     printf '%s' "$setup" | grep -Fq "$expected_ref"
 fi
