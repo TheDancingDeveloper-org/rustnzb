@@ -49,8 +49,6 @@ jobs:
           cache-from: ''
           cache-to: ''
       - name: Smoke-test the exact published candidate
-        env:
-          GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
         run: ci/tasks/smoke-runtime "$IMAGE:$CANARY_TAG" "${GITHUB_SHA}"
       - name: Record immutable candidate digest
         run: |

@@ -68,8 +68,6 @@ jobs:
           cache-from: ''
           cache-to: ''
       - name: Smoke-test the exact amd64 release image
-        env:
-          GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
         run: ci/tasks/smoke-runtime "$IMAGE:${GITHUB_REF_NAME}" "${GITHUB_REF_NAME}"
       - name: Make the end-user package public
         env:
