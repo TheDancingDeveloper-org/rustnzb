@@ -54,10 +54,10 @@ tokio-util = { version = "0.7", features = ["rt"] }
 openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 
 # WebDAV feature (opt-in: cargo build --features webdav)
-nzbdav-core = { version = "0.4.0", optional = true }
-nzbdav-stream = { version = "0.4.0", optional = true }
-nzbdav-dav = { version = "0.4.0", optional = true }
-nzbdav-pipeline = { version = "0.4.0", optional = true, default-features = false }
+nzbdav-core = { version = "0.5.7", optional = true }
+nzbdav-stream = { version = "0.5.7", optional = true }
+nzbdav-dav = { version = "0.5.7", optional = true }
+nzbdav-pipeline = { version = "0.5.7", optional = true, default-features = false }
 
 [package.metadata.deb]
 maintainer = "AusAgentSmith <admin@rustnzb.dev>"

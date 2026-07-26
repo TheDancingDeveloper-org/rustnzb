@@ -34,6 +34,14 @@ artifacts are now recorded as Failed with an explicit `Output` stage rather
 than being moved into the completed library. Paired tests cover the negative
 raw-artifact case and the positive usable-payload case.
 
+## Public WebDAV dependency chain — 2026-07-26
+
+The optional WebDAV feature now resolves `nzbdav-core`, `nzbdav-stream`,
+`nzbdav-pipeline`, and `nzbdav-dav` from public crates.io release `0.5.7`.
+Their public source is https://github.com/TheDancingDeveloper-org/nzbdav-rs;
+the release declares Rust 1.88 compatibility. `cargo check` and the complete
+rustnzb WebDAV feature test suite pass against the public dependency chain.
+
 Historical Node B incomplete-download directories are intentionally not
 deleted by this change. They require a separately approved operator cleanup
 after inventory and retention review.
