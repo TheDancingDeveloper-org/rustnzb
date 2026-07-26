@@ -4,7 +4,7 @@ version = "0.2.6"
 edition = "2024"
 description = "Post-processing pipeline: PAR2 verify/repair, archive extraction"
 license = "MIT"
-repository = "https://github.com/AusAgentSmith-org/nzb-postproc"
+repository = "https://github.com/TheDancingDeveloper-org/nzb-postproc"
 readme = "README.md"
 
 [features]

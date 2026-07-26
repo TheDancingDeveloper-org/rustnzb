@@ -4,7 +4,7 @@ version = "0.2.22"
 edition = "2024"
 description = "Async NNTP client with TLS, pipelining, connection pooling, and multi-server support"
 license = "MIT"
-repository = "https://github.com/AusAgentSmith-org/nzb-nntp"
+repository = "https://github.com/TheDancingDeveloper-org/nzb-nntp"
 readme = "README.md"
 
 [dependencies]
