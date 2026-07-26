@@ -42,6 +42,9 @@ The stress test runs three concurrent loops for the configured duration:
 The benchmark starts rustnzb through its image-provided service definition;
 the compose file must not override it with a second process, because both
 instances would contend for the same SQLite state.
+Each run stops any previous fixture before replacing bind-mounted configuration
+state, preventing an older service from overwriting the next run's server
+configuration during shutdown.
 
 ## Correctness fixture and fault attribution
 

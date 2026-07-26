@@ -39,6 +39,11 @@ done
 
 export SCENARIOS
 
+# Stop any prior fixture before replacing bind-mounted state. Otherwise a
+# previous rustnzb process can still write its in-memory default config after
+# this script has seeded the next run's config.
+docker compose down -v 2>/dev/null || true
+
 mkdir -p results
 
 # Clean state directories for fresh run (removes stale databases/history)
@@ -50,8 +55,6 @@ cp configs/sabnzbd.ini state/sabnzbd/sabnzbd.ini
 cp configs/rustnzb.toml state/rustnzb/config.toml
 
 LOGFILE="results/run_$(date +%Y%m%d_%H%M%S).log"
-
-docker compose down -v 2>/dev/null || true
 
 echo "[*] Scenarios:   $SCENARIOS"
 echo "[*] Log file:    $LOGFILE"
