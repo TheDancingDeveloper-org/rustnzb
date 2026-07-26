@@ -174,6 +174,7 @@ pub async fn run(scenario_selector: String, data_dir: PathBuf, results_dir: Path
         120,
     )
     .await?;
+    bootstrap_rustnzb_mock_server().await?;
 
     let sab = SabnzbdClient::new(config::SABNZBD_API);
     let rnzb = RustnzbClient::new(config::RUSTNZB_API);
@@ -568,6 +569,74 @@ async fn reset_fixture_stats() -> Result<()> {
         .send()
         .await?
         .error_for_status()?;
+    Ok(())
+}
+
+/// Provision the generated NNTP fixture through the public rustnzb API after
+/// the service is ready. This avoids relying on image/bootstrap timing for a
+/// bind-mounted TOML file and verifies the workload has a real server before
+/// timing any job.
+async fn bootstrap_rustnzb_mock_server() -> Result<()> {
+    let http = reqwest::Client::new();
+    let endpoint = format!("{}/api/config/servers", config::RUSTNZB_API);
+    let existing: Vec<serde_json::Value> = http
+        .get(&endpoint)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if !existing
+        .iter()
+        .any(|server| server["id"].as_str() == Some("benchmark-mock"))
+    {
+        let server = serde_json::json!({
+            "id": "benchmark-mock",
+            "name": "Benchmark mock NNTP",
+            "host": "mock-nntp",
+            "port": 119,
+            "ssl": false,
+            "ssl_verify": false,
+            "username": "bench",
+            "password": "bench",
+            "connections": 20,
+            "priority": 0,
+            "enabled": true,
+            "retention": 0,
+            "pipelining": 1,
+            "optional": false,
+            "compress": false,
+            "ramp_up_delay_ms": 0,
+            "recv_buffer_size": 0,
+            "proxy_url": null,
+            "trusted_fingerprint": null,
+            "connect_timeout_secs": 30,
+        });
+        http.post(&endpoint)
+            .json(&server)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+
+    let configured: Vec<serde_json::Value> = http
+        .get(&endpoint)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if !configured.iter().any(|server| {
+        server["id"].as_str() == Some("benchmark-mock")
+            && server["host"].as_str() == Some("mock-nntp")
+            && server["enabled"].as_bool() == Some(true)
+    }) {
+        anyhow::bail!("rustnzb benchmark mock NNTP server was not configured");
+    }
+    tracing::info!("rustnzb mock NNTP server configured");
     Ok(())
 }
 
