@@ -19,7 +19,7 @@ use crate::nzb_core::config::{CategoryConfig, ServerConfig};
 use crate::nzb_core::db::Database;
 use crate::nzb_core::models::*;
 use crate::nzb_core::nzb_parser;
-use nzb_postproc::{PostProcConfig, parse_rar_volume, run_pipeline};
+use nzb_postproc::{PostProcConfig, has_usable_output, parse_rar_volume, run_pipeline};
 
 use crate::direct_unpack::DirectUnpacker;
 use crate::log_buffer::LogBuffer;
@@ -1842,10 +1842,10 @@ impl QueueManager {
     }
 
     /// Move a job's files to output and insert a history entry.
-    fn move_to_history(&self, state: &mut JobState, stages: Vec<StageResult>) {
+    fn move_to_history(&self, state: &mut JobState, mut stages: Vec<StageResult>) {
         let move_start = Instant::now();
 
-        let final_status = if state.job.status == JobStatus::Failed {
+        let mut final_status = if state.job.status == JobStatus::Failed {
             // Already marked failed (by pipeline or download with pp disabled)
             JobStatus::Failed
         } else {
@@ -1854,7 +1854,27 @@ impl QueueManager {
             JobStatus::Completed
         };
 
-        // Move files from work_dir to output_dir (if not already done by pipeline extract)
+        // A post-processing job that contains only raw archive/PAR2 artifacts
+        // is not a usable completion. Check before moving residual work files
+        // so a bad job cannot pollute the completed directory.
+        if final_status == JobStatus::Completed && !stages.is_empty() {
+            let output_has_payload = has_usable_output(&state.job.output_dir).unwrap_or(false);
+            let work_has_payload = has_usable_output(&state.job.work_dir).unwrap_or(false);
+            if !output_has_payload && !work_has_payload {
+                let message = "No usable output produced; only archive or PAR2 artifacts remain";
+                warn!(job_id = %state.job.id, output_dir = %state.job.output_dir.display(), "{message}");
+                final_status = JobStatus::Failed;
+                state.job.error_message = Some(message.to_string());
+                stages.push(StageResult {
+                    name: "Output".to_string(),
+                    status: StageStatus::Failed,
+                    message: Some(message.to_string()),
+                    duration_secs: 0.0,
+                });
+            }
+        }
+
+        // Move files from work_dir to output_dir (if not already done by pipeline extract).
         if final_status == JobStatus::Completed {
             if let Err(e) = std::fs::create_dir_all(&state.job.output_dir) {
                 warn!(job_id = %state.job.id, "Failed to create output dir: {e}");
@@ -3663,6 +3683,74 @@ mod global_pause_tests {
                 .is_some()
         );
         assert!(work_dir.join("unmoved.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn post_processing_with_only_raw_artifacts_is_failed_not_completed() {
+        let (manager, tempdir) = manager();
+        let raw = job("raw-artifacts", JobStatus::PostProcessing, tempdir.path());
+        std::fs::create_dir_all(&raw.work_dir).unwrap();
+        std::fs::write(raw.work_dir.join("release.part001.rar"), b"raw").unwrap();
+        std::fs::write(raw.work_dir.join("release.part002.rar"), b"raw").unwrap();
+        std::fs::write(raw.work_dir.join("release.par2"), b"par2").unwrap();
+        let work_dir = raw.work_dir.clone();
+        insert_job(&manager, raw);
+
+        let stages = vec![StageResult {
+            name: "Extract".to_string(),
+            status: StageStatus::Skipped,
+            message: Some("No archives found".to_string()),
+            duration_secs: 0.0,
+        }];
+        let mut jobs = manager.jobs.lock();
+        manager.move_to_history(jobs.get_mut("raw-artifacts").unwrap(), stages);
+        drop(jobs);
+
+        let entry = manager
+            .db
+            .lock()
+            .history_get("raw-artifacts")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.status, JobStatus::Failed);
+        assert_eq!(
+            entry.error_message.as_deref(),
+            Some("No usable output produced; only archive or PAR2 artifacts remain")
+        );
+        assert!(
+            entry
+                .stages
+                .iter()
+                .any(|stage| { stage.name == "Output" && stage.status == StageStatus::Failed })
+        );
+        assert!(
+            !work_dir.exists(),
+            "failed raw artifacts are cleaned after history persists"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_processing_with_payload_is_completed() {
+        let (manager, tempdir) = manager();
+        let payload = job("payload", JobStatus::PostProcessing, tempdir.path());
+        std::fs::create_dir_all(&payload.work_dir).unwrap();
+        std::fs::write(payload.work_dir.join("Movie.2024.mkv"), b"media").unwrap();
+        let output = payload.output_dir.clone();
+        insert_job(&manager, payload);
+
+        let stages = vec![StageResult {
+            name: "Extract".to_string(),
+            status: StageStatus::Skipped,
+            message: Some("No archives found".to_string()),
+            duration_secs: 0.0,
+        }];
+        let mut jobs = manager.jobs.lock();
+        manager.move_to_history(jobs.get_mut("payload").unwrap(), stages);
+        drop(jobs);
+
+        let entry = manager.db.lock().history_get("payload").unwrap().unwrap();
+        assert_eq!(entry.status, JobStatus::Completed);
+        assert!(output.join("Movie.2024.mkv").exists());
     }
 
     #[tokio::test]

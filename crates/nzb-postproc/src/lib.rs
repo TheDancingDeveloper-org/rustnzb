@@ -15,7 +15,7 @@ pub mod unpack;
 // need nzb-postproc as a single dependency.
 pub use nzb_core;
 
-pub use detect::{ArchiveType, RarVolumeInfo, parse_rar_volume};
+pub use detect::{ArchiveType, RarVolumeInfo, has_usable_output, parse_rar_volume};
 pub use par2::recovery_can_cover;
 pub use pipeline::{PostProcConfig, PostProcResult, run_pipeline};
 pub use unpack::find_unrar;
