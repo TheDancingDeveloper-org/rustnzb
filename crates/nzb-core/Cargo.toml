@@ -4,7 +4,7 @@ version = "0.2.16"
 edition = "2024"
 description = "Shared models, config, NZB parser, and SQLite database for NZB clients"
 license = "MIT"
-repository = "https://github.com/AusAgentSmith-org/nzb-core"
+repository = "https://github.com/TheDancingDeveloper-org/nzb-core"
 readme = "README.md"
 
 [features]

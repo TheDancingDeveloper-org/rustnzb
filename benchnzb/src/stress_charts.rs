@@ -22,7 +22,7 @@ pub fn generate_all(result: &StressResult, dir: &Path) -> Result<()> {
 
     let count = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |x| x == "svg"))
+        .filter(|e| e.path().extension().is_some_and(|x| x == "svg"))
         .count();
     tracing::info!("  Generated {count} chart(s)");
     Ok(())
@@ -34,23 +34,17 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+type StressMetricExtractor = Box<dyn Fn(&crate::stress::StressSample) -> f64>;
+
 /// Multi-panel time-series chart: Speed, Memory, CPU over time with trend lines.
 fn write_timeseries_chart(result: &StressResult, dir: &Path) -> Result<()> {
-    let panels: Vec<(
-        &str,
-        &str,
-        Box<dyn Fn(&crate::stress::StressSample) -> f64>,
-    )> = vec![
+    let panels: Vec<(&str, &str, StressMetricExtractor)> = vec![
         (
             "Download Speed",
             "Mbps",
             Box::new(|s| s.speed_bps as f64 * 8.0 / 1_000_000.0),
         ),
-        (
-            "Memory",
-            "MB",
-            Box::new(|s| s.mem_bytes as f64 / MB as f64),
-        ),
+        ("Memory", "MB", Box::new(|s| s.mem_bytes as f64 / MB as f64)),
         ("CPU", "%", Box::new(|s| s.cpu_pct)),
         (
             "Disk Write",
@@ -93,7 +87,7 @@ fn write_timeseries_chart(result: &StressResult, dir: &Path) -> Result<()> {
     for (pi, (label, unit, extractor)) in panels.iter().enumerate() {
         let py = 85 + pi * (panel_h + panel_gap);
 
-        let values: Vec<f64> = samples.iter().map(|s| extractor(s)).collect();
+        let values: Vec<f64> = samples.iter().map(extractor).collect();
         let max_v = values.iter().cloned().fold(0.01f64, f64::max);
 
         // Panel background
@@ -116,9 +110,9 @@ fn write_timeseries_chart(result: &StressResult, dir: &Path) -> Result<()> {
                 px + pw,
             ));
             let lbl = if max_v >= 100.0 {
-                format!("{:.0}", val)
+                format!("{val:.0}")
             } else {
-                format!("{:.1}", val)
+                format!("{val:.1}")
             };
             svg.push_str(&format!(
                 r#"<text x="{}" y="{}" fill="{MUTED_TEXT}" font-size="8" text-anchor="end" font-family="monospace">{lbl}</text>"#,
@@ -217,8 +211,7 @@ fn write_window_bars(result: &StressResult, dir: &Path) -> Result<()> {
         .map(|w| w.avg_speed_mbps)
         .fold(0.01f64, f64::max);
 
-    let avg_speed: f64 =
-        windows.iter().map(|w| w.avg_speed_mbps).sum::<f64>() / n as f64;
+    let avg_speed: f64 = windows.iter().map(|w| w.avg_speed_mbps).sum::<f64>() / n as f64;
 
     let mut svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" style="background:{BG_COLOR}">
@@ -317,10 +310,7 @@ fn write_dashboard(result: &StressResult, dir: &Path) -> Result<()> {
             "Total Downloaded",
             crate::config::format_size(result.total_bytes_downloaded),
         ),
-        (
-            "NZBs Completed",
-            result.total_nzbs_completed.to_string(),
-        ),
+        ("NZBs Completed", result.total_nzbs_completed.to_string()),
         (
             "Avg Speed",
             format!("{:.1} Mbps", result.overall_avg_speed_mbps),

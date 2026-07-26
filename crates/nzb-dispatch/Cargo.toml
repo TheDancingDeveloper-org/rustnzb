@@ -4,7 +4,7 @@ version = "0.2.6"
 edition = "2024"
 description = "Article-level dispatcher: per-server worker pool, priority gating, retry + hopeless tracking. Part of the nzb-* layered usenet engine."
 license = "MIT"
-repository = "https://github.com/AusAgentSmith-org/nzb-dispatch"
+repository = "https://github.com/TheDancingDeveloper-org/nzb-dispatch"
 readme = "README.md"
 
 [dependencies]

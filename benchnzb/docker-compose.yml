@@ -12,6 +12,12 @@ services:
       - benchdata:/data
     networks: [bench]
 
+  sab-downloads-init:
+    image: alpine:3.23
+    command: ["sh", "-c", "mkdir -p /downloads/complete /downloads/incomplete && chown -R 1000:1000 /downloads"]
+    volumes:
+      - downloads-sab:/downloads
+
   sabnzbd:
     image: lscr.io/linuxserver/sabnzbd:latest
     environment:
@@ -20,15 +26,18 @@ services:
       - TZ=UTC
     volumes:
       - ./state/sabnzbd:/config
-      - downloads-sab:/downloads
+      - downloads-sab:/config/Downloads
     networks: [bench]
-    depends_on: [mock-nntp]
+    depends_on:
+      mock-nntp:
+        condition: service_started
+      sab-downloads-init:
+        condition: service_completed_successfully
 
   rustnzb:
     build:
       context: ${RUSTNZB_DIR:-..}
       dockerfile: Dockerfile
-    command: ["rustnzb", "--config", "/config/config.toml"]
     environment:
       - RUST_LOG=${RUST_LOG:-info}
     volumes:

@@ -106,9 +106,9 @@ impl MetricsCollector {
                         let mem_bytes = stat.memory_stats.usage.unwrap_or(0)
                             - stat.memory_stats.stats
                                 .as_ref()
-                                .and_then(|s| match s {
-                                    bollard::container::MemoryStatsStats::V1(v1) => Some(v1.total_inactive_file),
-                                    bollard::container::MemoryStatsStats::V2(v2) => Some(v2.inactive_file),
+                                .map(|s| match s {
+                                    bollard::container::MemoryStatsStats::V1(v1) => v1.total_inactive_file,
+                                    bollard::container::MemoryStatsStats::V2(v2) => v2.inactive_file,
                                 })
                                 .unwrap_or(0);
 
@@ -187,6 +187,10 @@ impl MetricsCollector {
             task,
             samples,
         })
+    }
+
+    pub fn container_id(&self, service: &str) -> Option<&str> {
+        self.container_ids.get(service).map(String::as_str)
     }
 }
 

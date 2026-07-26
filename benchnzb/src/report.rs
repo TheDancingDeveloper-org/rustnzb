@@ -34,19 +34,24 @@ pub fn write_csv(
          avg_speed_mbps,peak_speed_mbps,cpu_avg,cpu_peak,mem_avg_mb,mem_peak_mb,\
          net_rx_avg_mbps,net_rx_peak_mbps,disk_write_avg_mbps,disk_write_peak_mbps,\
          iowait_avg,iowait_peak,\
-         int_dl_throughput_mbps,int_articles_downloaded,int_articles_failed\n",
+         int_dl_throughput_mbps,int_articles_downloaded,int_articles_failed,outcome,payload_verified,\
+         peak_work_dir_bytes,fixture_payload_bytes,fixture_wire_bytes,fixture_article_requests,fixture_articles_served,fixture_article_not_found\n",
     );
     for (sab, rnzb) in results {
         for r in [sab, rnzb] {
             let (int_dl, int_art_ok, int_art_fail) = if let Some(ref im) = r.internal_metrics {
-                (im.download_throughput_mbps, im.articles_downloaded, im.articles_failed)
+                (
+                    im.download_throughput_mbps,
+                    im.articles_downloaded,
+                    im.articles_failed,
+                )
             } else {
                 (0.0, 0, 0)
             };
             out.push_str(&format!(
                 "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},\
                  {:.2},{:.2},{:.2},{:.2},{:.4},{:.4},\
-                 {:.2},{},{}\n",
+                 {:.2},{},{},{:?},{},{},{},{},{},{},{}\n",
                 r.scenario,
                 r.test_type,
                 r.client,
@@ -70,6 +75,14 @@ pub fn write_csv(
                 int_dl,
                 int_art_ok,
                 int_art_fail,
+                r.outcome,
+                r.payload_verified,
+                r.peak_work_dir_bytes,
+                r.fixture_metrics.payload_bytes_served,
+                r.fixture_metrics.wire_bytes_served,
+                r.fixture_metrics.article_requests,
+                r.fixture_metrics.articles_served,
+                r.fixture_metrics.article_not_found,
             ));
         }
     }
@@ -79,11 +92,12 @@ pub fn write_csv(
 }
 
 pub fn build_summary(results: &[(ClientResult, ClientResult)]) -> String {
-    let mut lines = Vec::new();
-    lines.push(String::new());
-    lines.push("=".repeat(84));
-    lines.push("  BENCHMARK RESULTS: SABnzbd vs rustnzb".into());
-    lines.push("=".repeat(84));
+    let mut lines = vec![
+        String::new(),
+        "=".repeat(84),
+        "  BENCHMARK RESULTS: SABnzbd vs rustnzb".into(),
+        "=".repeat(84),
+    ];
 
     for (sab, rnzb) in results {
         lines.push(String::new());
@@ -195,8 +209,7 @@ pub fn build_summary(results: &[(ClientResult, ClientResult)]) -> String {
             }
             let delta = delta_str(*sab_v, *rnzb_v, *lower_better);
             lines.push(format!(
-                "  {:<24} {:>15} {:>15} {:>14}",
-                label, sab_s, rnzb_s, delta
+                "  {label:<24} {sab_s:>15} {rnzb_s:>15} {delta:>14}"
             ));
         }
         lines.push("-".repeat(84));

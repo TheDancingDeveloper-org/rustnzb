@@ -12,7 +12,7 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  --scenarios GROUP   quick|medium|speed|postproc|full"
+    echo "  --scenarios GROUP   verify|verify-fault|quick|medium|speed|postproc|full"
     echo "  --no-cleanup        Keep containers after run"
     echo "  --help              Show this help"
     echo ""
@@ -39,6 +39,11 @@ done
 
 export SCENARIOS
 
+# Stop any prior fixture before replacing bind-mounted state. Otherwise a
+# previous rustnzb process can still write its in-memory default config after
+# this script has seeded the next run's config.
+docker compose down -v 2>/dev/null || true
+
 mkdir -p results
 
 # Clean state directories for fresh run (removes stale databases/history)
@@ -51,15 +56,17 @@ cp configs/rustnzb.toml state/rustnzb/config.toml
 
 LOGFILE="results/run_$(date +%Y%m%d_%H%M%S).log"
 
-docker compose down -v 2>/dev/null || true
-
 echo "[*] Scenarios:   $SCENARIOS"
 echo "[*] Log file:    $LOGFILE"
 echo "[*] Building (first run compiles Rust — takes a few minutes)..."
 echo ""
 
-docker compose up --build --abort-on-container-exit --exit-code-from orchestrator 2>&1 | tee "$LOGFILE"
-EXIT_CODE=${PIPESTATUS[0]}
+docker compose up --build -d
+set +e
+docker compose wait orchestrator
+EXIT_CODE=$?
+set -e
+docker compose logs --no-color | tee "$LOGFILE"
 
 [[ "$CLEANUP" == "1" ]] && docker compose down -v 2>/dev/null || true
 

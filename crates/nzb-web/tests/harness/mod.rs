@@ -156,6 +156,7 @@ impl HarnessBuilder {
             0,          // min_free_space
             self.speed_limit_bps,
             false, // direct_unpack
+            5,     // max_nested_archive_depth
             self.abort_hopeless,
             self.early_failure_check,
             self.required_completion_pct,

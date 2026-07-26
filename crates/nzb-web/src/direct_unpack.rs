@@ -6,11 +6,13 @@
 //! normal PAR2 repair + extract pipeline.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write as _};
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -34,6 +36,10 @@ const UNRAR_ERROR_PATTERNS: &[&str] = &[
     "start extraction from a previous volume",
     "Unexpected end of archive",
 ];
+
+/// A healthy extraction can wait for volumes, but a process that neither exits
+/// nor emits output is stuck (for example, waiting on an unrecognised prompt).
+const DIRECT_UNPACK_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Result of direct unpack for one RAR set.
 #[derive(Debug, Clone)]
@@ -316,54 +322,30 @@ fn drive_unrar(
     killed: &AtomicBool,
     rt: &tokio::runtime::Handle,
 ) -> DirectUnpackResult {
-    let stdin = child.stdin.take().expect("stdin was piped");
+    let mut stdin = child.stdin.take().expect("stdin was piped");
     let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let (output_tx, output_rx) = mpsc::channel();
+    spawn_output_reader(stdout, output_tx.clone());
+    spawn_output_reader(stderr, output_tx);
 
-    let stdin = Arc::new(Mutex::new(stdin));
-    let mut reader = BufReader::new(stdout);
     let mut next_volume: u32 = 1; // Volume 0 is already being processed.
-    let mut extracted_files: Vec<String> = Vec::new();
-
-    // Read stdout byte-by-byte to detect interactive prompts that don't end
-    // with newline. We accumulate into a line buffer and check after each byte.
-    let mut line_buf = Vec::with_capacity(1024);
+    let mut output_buf = String::with_capacity(1024);
+    let mut last_output = Instant::now();
 
     loop {
         if killed.load(Ordering::Acquire) {
-            return DirectUnpackResult {
-                set_name: set_name.to_string(),
-                success: false,
-                error: Some("Aborted".to_string()),
-            };
+            return failed_result(set_name, "Aborted");
         }
 
-        // Try to read a full line first (more efficient for normal output).
-        line_buf.clear();
-        match reader.read_until(b'\n', &mut line_buf) {
-            Ok(0) => {
-                // EOF — unrar exited.
-                break;
-            }
-            Ok(_) => {
-                let line = String::from_utf8_lossy(&line_buf);
-                let line_trimmed = line.trim();
+        match output_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(bytes) => {
+                last_output = Instant::now();
+                output_buf.push_str(&String::from_utf8_lossy(&bytes));
 
-                // Track extracted files for cleanup on abort.
-                if let Some(filename) = line_trimmed.strip_prefix("Extracting  ") {
-                    let filename = filename.trim();
-                    if !filename.is_empty() {
-                        extracted_files.push(filename.to_string());
-                    }
-                } else if let Some(filename) = line_trimmed.strip_prefix("...         ") {
-                    // Continuation of extraction (long filenames).
-                    let filename = filename.trim();
-                    if !filename.is_empty() {
-                        extracted_files.push(filename.to_string());
-                    }
-                }
-
-                // Check for success.
-                if line_trimmed == "All OK" {
+                // Prompts are not consistently newline-terminated and, in newer
+                // unrar releases, can arrive on stderr. Inspect every chunk.
+                if output_buf.contains("All OK") {
                     info!(set = %set_name, "Direct unpack complete — All OK");
                     return DirectUnpackResult {
                         set_name: set_name.to_string(),
@@ -372,106 +354,108 @@ fn drive_unrar(
                     };
                 }
 
-                // Check for errors.
-                for pattern in UNRAR_ERROR_PATTERNS {
-                    if line_trimmed.contains(pattern) {
-                        error!(
-                            set = %set_name,
-                            error = %line_trimmed,
-                            "Direct unpack error detected"
-                        );
-                        return DirectUnpackResult {
-                            set_name: set_name.to_string(),
-                            success: false,
-                            error: Some(line_trimmed.to_string()),
-                        };
-                    }
+                if let Some(pattern) = UNRAR_ERROR_PATTERNS
+                    .iter()
+                    .find(|pattern| output_buf.contains(**pattern))
+                {
+                    error!(set = %set_name, error = %output_buf.trim(), "Direct unpack error detected");
+                    return failed_result(set_name, &format!("unrar reported {pattern}"));
                 }
 
-                // Check for volume prompt. unrar -vp outputs a line like:
-                //   "Insert disk with <filename> [C]ontinue, [Q]uit "
-                // This may or may not end with a newline depending on the
-                // unrar version, but read_until will return when it hits \n
-                // or when the child exits. For the no-newline case, we also
-                // check in the partial-read path below.
-                if line_trimmed.contains("[C]ontinue, [Q]uit")
-                    || line_trimmed.contains("[C]ontinue, [Q]uit")
-                {
-                    debug!(
-                        set = %set_name,
-                        next_volume,
-                        "Unrar requesting next volume"
-                    );
+                if is_volume_prompt(&output_buf) {
+                    debug!(set = %set_name, next_volume, "Unrar requesting next volume");
                     match wait_for_volume(set_name, next_volume, state, volume_ready, killed, rt) {
                         Ok(()) => {
-                            // Volume is available — send continue.
-                            let mut sin = stdin.lock();
-                            if let Err(e) = sin.write_all(b"C\n") {
+                            if let Err(e) = stdin.write_all(b"C\n") {
                                 error!(error = %e, "Failed to write to unrar stdin");
-                                return DirectUnpackResult {
-                                    set_name: set_name.to_string(),
-                                    success: false,
-                                    error: Some(format!("stdin write error: {e}")),
-                                };
+                                return failed_result(set_name, &format!("stdin write error: {e}"));
                             }
-                            let _ = sin.flush();
+                            let _ = stdin.flush();
                             next_volume += 1;
+                            output_buf.clear();
                         }
                         Err(e) => {
-                            // Volume not available — abort.
-                            let mut sin = stdin.lock();
-                            let _ = sin.write_all(b"Q\n");
-                            let _ = sin.flush();
-                            return DirectUnpackResult {
-                                set_name: set_name.to_string(),
-                                success: false,
-                                error: Some(e),
-                            };
+                            let _ = stdin.write_all(b"Q\n");
+                            let _ = stdin.flush();
+                            return failed_result(set_name, &e);
                         }
                     }
-                }
-
-                // Check for retry prompt.
-                if line_trimmed.contains("[R]etry, [A]bort") {
+                } else if output_buf.contains("[R]etry, [A]bort") {
                     warn!(set = %set_name, "Unrar retry prompt — aborting");
-                    let mut sin = stdin.lock();
-                    let _ = sin.write_all(b"A\n");
-                    let _ = sin.flush();
-                    return DirectUnpackResult {
-                        set_name: set_name.to_string(),
-                        success: false,
-                        error: Some("Unrar requested retry — aborted".to_string()),
-                    };
+                    let _ = stdin.write_all(b"A\n");
+                    let _ = stdin.flush();
+                    return failed_result(set_name, "Unrar requested retry — aborted");
+                } else if output_buf.len() > 8192 {
+                    // Keep enough trailing output for a prompt split across reads
+                    // without allowing noisy tool output to grow unbounded.
+                    output_buf.drain(..4096);
                 }
             }
-            Err(e) => {
-                error!(error = %e, "Error reading unrar stdout");
-                return DirectUnpackResult {
-                    set_name: set_name.to_string(),
-                    success: false,
-                    error: Some(format!("stdout read error: {e}")),
-                };
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return result_from_exit_status(set_name, status);
+                }
+                if last_output.elapsed() >= DIRECT_UNPACK_IDLE_TIMEOUT {
+                    let _ = child.kill();
+                    return failed_result(
+                        set_name,
+                        "unrar stopped producing output and was terminated after five minutes",
+                    );
+                }
             }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
     // Process exited without "All OK". Check exit status.
     match child.wait() {
-        Ok(status) if status.success() => DirectUnpackResult {
+        Ok(status) => result_from_exit_status(set_name, status),
+        Err(e) => failed_result(set_name, &format!("Failed to wait on unrar: {e}")),
+    }
+}
+
+fn spawn_output_reader<R>(mut reader: R, sender: mpsc::Sender<Vec<u8>>)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) if sender.send(buffer[..count].to_vec()).is_err() => break,
+                Ok(_) => {}
+            }
+        }
+    });
+}
+
+fn is_volume_prompt(output: &str) -> bool {
+    let output = output.to_ascii_lowercase();
+    (output.contains("[c]ontinue") && output.contains("[q]uit"))
+        || (output.contains("insert disk")
+            && (output.contains("continue") || output.contains("press c")))
+        || (output.contains("next volume")
+            && (output.contains("continue") || output.contains("press c")))
+}
+
+fn failed_result(set_name: &str, error: &str) -> DirectUnpackResult {
+    DirectUnpackResult {
+        set_name: set_name.to_string(),
+        success: false,
+        error: Some(error.to_string()),
+    }
+}
+
+fn result_from_exit_status(set_name: &str, status: std::process::ExitStatus) -> DirectUnpackResult {
+    if status.success() {
+        DirectUnpackResult {
             set_name: set_name.to_string(),
             success: true,
             error: None,
-        },
-        Ok(status) => DirectUnpackResult {
-            set_name: set_name.to_string(),
-            success: false,
-            error: Some(format!("unrar exited with status {status}")),
-        },
-        Err(e) => DirectUnpackResult {
-            set_name: set_name.to_string(),
-            success: false,
-            error: Some(format!("Failed to wait on unrar: {e}")),
-        },
+        }
+    } else {
+        failed_result(set_name, &format!("unrar exited with status {status}"))
     }
 }
 
@@ -533,6 +517,111 @@ mod tests {
         for pattern in UNRAR_ERROR_PATTERNS {
             assert!(!pattern.is_empty());
         }
+    }
+
+    #[test]
+    fn volume_prompts_are_recognised_across_unrar_versions() {
+        assert!(is_volume_prompt(
+            "Insert disk with part002.rar [C]ontinue, [Q]uit"
+        ));
+        assert!(is_volume_prompt(
+            "Insert disk with next volume. Press C to continue or Q to quit"
+        ));
+        assert!(is_volume_prompt(
+            "Next volume is required; press C to continue"
+        ));
+    }
+
+    #[test]
+    fn normal_output_is_not_mistaken_for_a_volume_prompt() {
+        assert!(!is_volume_prompt("Extracting video.mkv"));
+        assert!(!is_volume_prompt("Continue downloading articles"));
+        assert!(!is_volume_prompt("Press C to cancel"));
+    }
+
+    #[cfg(unix)]
+    fn fake_unrar(script: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unrar");
+        std::fs::write(&path, script).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_unpack_continues_when_modern_prompt_is_written_to_stderr() {
+        let (script_dir, unrar) = fake_unrar(
+            "#!/bin/sh\nprintf 'Insert disk with next volume. Press C to continue or Q to quit' >&2\nIFS= read -r answer\n[ \"$answer\" = C ] || exit 9\nprintf 'All OK\\n'\n",
+        );
+        let output_dir = tempfile::tempdir().unwrap();
+        let first_volume = script_dir.path().join("movie.part001.rar");
+        std::fs::write(&first_volume, b"first").unwrap();
+        let second_volume = script_dir.path().join("movie.part002.rar");
+        std::fs::write(&second_volume, b"second").unwrap();
+        let state = Mutex::new(DirectUnpackState {
+            sets: BTreeMap::from([(
+                "movie".to_string(),
+                RarSetState {
+                    set_name: "movie".to_string(),
+                    volumes: BTreeMap::from([(0, first_volume.clone()), (1, second_volume)]),
+                },
+            )]),
+            download_finished: false,
+        });
+        let notify = Notify::new();
+        let killed = AtomicBool::new(false);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let result = unpack_set(
+            unrar.to_str().unwrap(),
+            "movie",
+            &first_volume,
+            output_dir.path(),
+            None,
+            &state,
+            &notify,
+            &killed,
+            runtime.handle(),
+        );
+
+        assert!(result.success, "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_unpack_fails_on_error_written_to_stderr() {
+        let (script_dir, unrar) =
+            fake_unrar("#!/bin/sh\nprintf 'Cannot open archive\\n' >&2\nexit 2\n");
+        let output_dir = tempfile::tempdir().unwrap();
+        let first_volume = script_dir.path().join("movie.part001.rar");
+        std::fs::write(&first_volume, b"first").unwrap();
+        let state = Mutex::new(DirectUnpackState {
+            sets: BTreeMap::new(),
+            download_finished: true,
+        });
+        let notify = Notify::new();
+        let killed = AtomicBool::new(false);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let result = unpack_set(
+            unrar.to_str().unwrap(),
+            "movie",
+            &first_volume,
+            output_dir.path(),
+            None,
+            &state,
+            &notify,
+            &killed,
+            runtime.handle(),
+        );
+
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("unrar reported Cannot open"));
     }
 
     #[test]

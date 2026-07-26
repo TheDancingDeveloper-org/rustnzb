@@ -63,7 +63,7 @@ fn xml_escape(s: &str) -> String {
 
 /// Build segments for a file of given size using the standard article size.
 pub fn build_segments(msg_prefix: &str, file_size: u64) -> Vec<NzbSegment> {
-    let total_parts = ((file_size + ARTICLE_SIZE - 1) / ARTICLE_SIZE) as u32;
+    let total_parts = file_size.div_ceil(ARTICLE_SIZE) as u32;
     let mut segments = Vec::with_capacity(total_parts as usize);
 
     for part in 1..=total_parts {

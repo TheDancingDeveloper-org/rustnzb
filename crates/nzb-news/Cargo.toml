@@ -4,7 +4,7 @@ version = "0.1.12"
 edition = "2024"
 description = "Layered NNTP download engine: persistent per-connection workers, priority-aware dispatch with cascade-retry, pipelined batch fetching. Pure fetch layer — no decode, no assembly."
 license = "MIT"
-repository = "https://github.com/AusAgentSmith-org/nzb-news"
+repository = "https://github.com/TheDancingDeveloper-org/nzb-news"
 readme = "README.md"
 
 [dependencies]

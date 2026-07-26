@@ -5,6 +5,7 @@ use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
@@ -40,6 +41,31 @@ struct ServerState {
     mapped_files: Vec<Arc<MappedFile>>,
     missing: HashSet<String>,
     data_dir: PathBuf,
+    stats: Arc<ServerStats>,
+}
+
+#[derive(Default)]
+struct ServerStats {
+    /// BODY / ARTICLE requests, including deterministic 430 responses. This
+    /// makes duplicate fetches and retries visible without client-side speed
+    /// inference.
+    article_requests: AtomicU64,
+    articles_served: AtomicU64,
+    payload_bytes_served: AtomicU64,
+    /// Bytes in generated yEnc bodies. This excludes NNTP response headers,
+    /// so it is reproducible while still exposing encoding overhead.
+    wire_bytes_served: AtomicU64,
+    article_not_found: AtomicU64,
+}
+
+impl ServerStats {
+    fn reset(&self) {
+        self.article_requests.store(0, Ordering::Relaxed);
+        self.articles_served.store(0, Ordering::Relaxed);
+        self.payload_bytes_served.store(0, Ordering::Relaxed);
+        self.wire_bytes_served.store(0, Ordering::Relaxed);
+        self.article_not_found.store(0, Ordering::Relaxed);
+    }
 }
 
 impl ServerState {
@@ -98,6 +124,7 @@ impl ServerState {
             mapped_files,
             missing,
             data_dir: data_dir.to_path_buf(),
+            stats: Arc::new(ServerStats::default()),
         })
     }
 
@@ -109,10 +136,7 @@ impl ServerState {
 
     /// Lookup article by message-id.
     /// Returns (mapped_file, offset, length, part, total_parts) — all from mmap, no I/O.
-    fn lookup(
-        &self,
-        message_id: &str,
-    ) -> Option<(Arc<MappedFile>, u64, u64, u32, u32)> {
+    fn lookup(&self, message_id: &str) -> Option<(Arc<MappedFile>, u64, u64, u32, u32)> {
         let stripped = message_id.trim_matches(|c| c == '<' || c == '>');
         let without_domain = stripped.strip_suffix(&format!("@{MSG_ID_DOMAIN}"))?;
         let (prefix, part_str) = without_domain.rsplit_once("-p")?;
@@ -121,9 +145,7 @@ impl ServerState {
         let entry_idx = self.prefix_map.get(prefix)?;
         let mf = &self.mapped_files[*entry_idx];
 
-        if mf.mmap.is_none() {
-            return None; // file not available
-        }
+        mf.mmap.as_ref()?;
 
         let article_size = self.index.article_size;
         let offset = (part as u64 - 1) * article_size;
@@ -131,7 +153,7 @@ impl ServerState {
             return None;
         }
         let length = std::cmp::min(article_size, mf.total_size - offset);
-        let total_parts = ((mf.total_size + article_size - 1) / article_size) as u32;
+        let total_parts = mf.total_size.div_ceil(article_size) as u32;
 
         Some((mf.clone(), offset, length, part, total_parts))
     }
@@ -184,9 +206,7 @@ async fn handle_connection_inner(
         if upper.starts_with("AUTHINFO USER") {
             writer.write_all(b"381 PASS required\r\n").await?;
         } else if upper.starts_with("AUTHINFO PASS") {
-            writer
-                .write_all(b"281 Authentication accepted\r\n")
-                .await?;
+            writer.write_all(b"281 Authentication accepted\r\n").await?;
         } else if upper.starts_with("GROUP") {
             writer
                 .write_all(b"211 1000000 1 1000000 alt.binaries.test\r\n")
@@ -196,10 +216,17 @@ async fn handle_connection_inner(
             let msg_id = extract_message_id(cmd);
 
             let st = state.read().await;
+            let stats = st.stats.clone();
+            stats.article_requests.fetch_add(1, Ordering::Relaxed);
             if st.is_missing(&msg_id) {
+                stats.article_not_found.fetch_add(1, Ordering::Relaxed);
                 drop(st);
                 writer.write_all(b"430 No Such Article\r\n").await?;
             } else if let Some((mf, offset, length, part, total_parts)) = st.lookup(&msg_id) {
+                stats.articles_served.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .payload_bytes_served
+                    .fetch_add(length, Ordering::Relaxed);
                 drop(st);
 
                 // Slice directly from mmap — no file open, seek, or read syscalls
@@ -228,8 +255,17 @@ async fn handle_connection_inner(
                 }
 
                 // yEnc encode from mmap slice and write
-                let (encoded, _crc) =
-                    yenc::encode_article(data, &mf.filename, part, total_parts, offset, mf.total_size);
+                let (encoded, _crc) = yenc::encode_article(
+                    data,
+                    &mf.filename,
+                    part,
+                    total_parts,
+                    offset,
+                    mf.total_size,
+                );
+                stats
+                    .wire_bytes_served
+                    .fetch_add(encoded.len() as u64, Ordering::Relaxed);
                 writer.write_all(&encoded).await?;
                 writer.write_all(b".\r\n").await?;
             } else {
@@ -240,6 +276,7 @@ async fn handle_connection_inner(
             let msg_id = extract_message_id(cmd);
             let st = state.read().await;
             if st.is_missing(&msg_id) {
+                st.stats.article_not_found.fetch_add(1, Ordering::Relaxed);
                 writer.write_all(b"430 No Such Article\r\n").await?;
             } else if st.lookup(&msg_id).is_some() {
                 writer
@@ -250,9 +287,7 @@ async fn handle_connection_inner(
             }
         } else if upper.starts_with("CAPABILITIES") {
             writer
-                .write_all(
-                    b"101 Capability list:\r\nVERSION 2\r\nAUTHINFO USER\r\nREADER\r\n.\r\n",
-                )
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nAUTHINFO USER\r\nREADER\r\n.\r\n")
                 .await?;
         } else if upper.starts_with("MODE READER") {
             writer
@@ -317,11 +352,7 @@ pub async fn run(port: u16, data_dir: PathBuf, health_port: u16) -> Result<()> {
     }
 }
 
-async fn run_control_server(
-    port: u16,
-    state: Arc<RwLock<ServerState>>,
-    _data_dir: PathBuf,
-) {
+async fn run_control_server(port: u16, state: Arc<RwLock<ServerState>>, _data_dir: PathBuf) {
     let listener = TcpListener::bind(("0.0.0.0", port)).await.unwrap();
     tracing::info!("Control server on port {port} (/health, /status, /reload)");
 
@@ -348,9 +379,14 @@ async fn run_control_server(
                 "/status" => {
                     let st = state.read().await;
                     let body = format!(
-                        "{{\"entries\":{},\"missing\":{}}}",
+                        "{{\"entries\":{},\"missing\":{},\"article_requests\":{},\"articles_served\":{},\"payload_bytes_served\":{},\"wire_bytes_served\":{},\"article_not_found\":{}}}",
                         st.index.entries.len(),
-                        st.missing.len()
+                        st.missing.len(),
+                        st.stats.article_requests.load(Ordering::Relaxed),
+                        st.stats.articles_served.load(Ordering::Relaxed),
+                        st.stats.payload_bytes_served.load(Ordering::Relaxed),
+                        st.stats.wire_bytes_served.load(Ordering::Relaxed),
+                        st.stats.article_not_found.load(Ordering::Relaxed),
                     );
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -362,9 +398,14 @@ async fn run_control_server(
                     match st.reload() {
                         Ok(()) => {
                             let body = format!(
-                                "{{\"entries\":{},\"missing\":{}}}",
+                                "{{\"entries\":{},\"missing\":{},\"article_requests\":{},\"articles_served\":{},\"payload_bytes_served\":{},\"wire_bytes_served\":{},\"article_not_found\":{}}}",
                                 st.index.entries.len(),
-                                st.missing.len()
+                                st.missing.len(),
+                                st.stats.article_requests.load(Ordering::Relaxed),
+                                st.stats.articles_served.load(Ordering::Relaxed),
+                                st.stats.payload_bytes_served.load(Ordering::Relaxed),
+                                st.stats.wire_bytes_served.load(Ordering::Relaxed),
+                                st.stats.article_not_found.load(Ordering::Relaxed),
                             );
                             format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -379,6 +420,11 @@ async fn run_control_server(
                             )
                         }
                     }
+                }
+                "/reset-stats" => {
+                    let st = state.read().await;
+                    st.stats.reset();
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_string()
                 }
                 _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string(),
             };

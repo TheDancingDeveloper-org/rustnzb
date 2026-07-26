@@ -33,6 +33,7 @@ fn build_test_state() -> (Arc<AppState>, TempDir) {
         config.general.min_free_space_bytes,
         config.general.speed_limit_bps,
         false,
+        config.general.max_nested_archive_depth,
         config.general.abort_hopeless,
         config.general.early_failure_check,
         config.general.required_completion_pct,

@@ -4,7 +4,7 @@ version = "0.4.20"
 edition = "2024"
 description = "Usenet download engine: queue management, download orchestration, and background services"
 license = "MIT"
-repository = "https://github.com/AusAgentSmith-org/nzb-web"
+repository = "https://github.com/TheDancingDeveloper-org/nzb-web"
 
 [features]
 default = []

@@ -260,6 +260,29 @@ pub fn find_cleanup_files(dir: &Path) -> Vec<PathBuf> {
     cleanup
 }
 
+/// Returns whether a completed output directory contains at least one file
+/// that is not an archive or PAR2 recovery artifact. This is deliberately a
+/// conservative final-status check: a job made solely of raw recovery and
+/// archive files is not a usable completed download.
+pub fn has_usable_output(dir: &Path) -> std::io::Result<bool> {
+    for entry in WalkDir::new(dir).into_iter().flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_cleanup_candidate(&name.to_ascii_lowercase()) {
+            return Ok(true);
+        }
+    }
+
+    // Distinguish an empty, readable output directory from a missing one.
+    std::fs::read_dir(dir)?;
+    Ok(false)
+}
+
 /// Returns true if a lowercased filename is the first volume of a split 7z
 /// archive (e.g., `archive.7z.001`).
 fn is_split_7z_first_volume(name_lower: &str) -> bool {
@@ -288,7 +311,7 @@ fn is_split_7z_volume(name_lower: &str) -> bool {
 /// after successful extraction.
 fn is_cleanup_candidate(name: &str) -> bool {
     // Par2 files: .par2
-    if name.ends_with(".par2") {
+    if name.ends_with(".par2") || name.ends_with(".zip") || name.ends_with(".7z") {
         return true;
     }
 
@@ -431,6 +454,21 @@ mod tests {
     }
 
     #[test]
+    fn usable_output_requires_a_non_artifact_file() {
+        let raw_only = make_test_dir(&[
+            "release.part001.rar",
+            "release.part002.rar",
+            "release.par2",
+            "release.vol00+01.par2",
+            "release.7z",
+        ]);
+        assert!(!has_usable_output(raw_only.path()).unwrap());
+
+        let payload = make_test_dir(&["release.part001.rar", "Movie.2024.mkv"]);
+        assert!(has_usable_output(payload.path()).unwrap());
+    }
+
+    #[test]
     fn test_find_cleanup_files() {
         let dir = make_test_dir(&[
             "movie.par2",
@@ -520,6 +558,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_split_7z_volumes() {
+        assert!(is_cleanup_candidate("archive.7z"));
         assert!(is_cleanup_candidate("archive.7z.001"));
         assert!(is_cleanup_candidate("archive.7z.002"));
         assert!(is_cleanup_candidate("archive.7z.099"));

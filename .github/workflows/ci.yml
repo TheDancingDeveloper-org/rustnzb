@@ -30,6 +30,7 @@ jobs:
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo test --manifest-path benchnzb/Cargo.toml --all-targets --locked
 
   frontend:
     if: github.event_name != 'pull_request' || github.event.pull_request.user.type != 'Bot'

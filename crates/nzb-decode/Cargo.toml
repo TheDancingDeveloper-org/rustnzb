@@ -4,7 +4,7 @@ version = "0.1.2"
 edition = "2024"
 description = "yEnc decoding, file assembly, and article cache for NZB download clients"
 license = "MIT"
-repository = "https://github.com/AusAgentSmith-org/nzb-decode"
+repository = "https://github.com/TheDancingDeveloper-org/nzb-decode"
 readme = "README.md"
 
 [dependencies]

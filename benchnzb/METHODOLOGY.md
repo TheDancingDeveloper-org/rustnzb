@@ -39,6 +39,35 @@ The stress test runs three concurrent loops for the configured duration:
 | Memory usage | Docker stats | Container RSS (resident set size) |
 | Total bytes | Speed integration | Accumulated from speed samples (approximate) |
 
+The benchmark starts rustnzb through its image-provided service definition;
+the compose file must not override it with a second process, because both
+instances would contend for the same SQLite state.
+Each run stops any previous fixture before replacing bind-mounted configuration
+state, preventing an older service from overwriting the next run's server
+configuration during shutdown.
+
+## Correctness fixture and fault attribution
+
+The large scenarios are performance/soak workloads, not correctness proof.
+Run `./run.sh --scenarios verify` for the small (32 MiB) deterministic
+unpack fixture. It uses generated data only, verifies the extracted payload
+against the fixture source SHA-256, and records a terminal outcome. A failed
+or timed-out job is never reported as complete.
+
+Run `./run.sh --scenarios verify-fault` for the equivalent 32 MiB PAR2
+fixture with deterministic injected 430 responses. Its `fixture_metrics`
+record proves it is a fault/repair path; do not compare its bytes or duration
+with the healthy `verify` result.
+
+For comparison runs, the mock NNTP server records decoded payload bytes,
+yEnc-body bytes, article requests (including repeats), successful article
+responses, and injected 430 responses.
+The JSON result stores these as `fixture_metrics`; a non-zero
+`article_not_found` identifies a fault/repair path and must not be compared
+as a healthy-path wire-byte result. Peak disk usage is sampled from both
+`/downloads/incomplete` and `/downloads/complete` while the job is running,
+including post-processing.
+
 ## Analysis
 
 Results are analyzed in two ways:
@@ -89,5 +118,7 @@ Results are written to `results/` as JSON (full timeseries), CSV (windowed summa
 
 - Results are host-dependent: CPU, memory, disk speed, and Docker overhead all affect throughput. Comparative results (RustNZB vs SABnzbd) on the same host are meaningful; absolute numbers will vary across hardware.
 - The synthetic NNTP server generates data in memory. Real-world Usenet servers add network latency, TLS overhead, and article availability constraints that are not modeled here.
-- Total bytes downloaded is estimated by integrating instantaneous speed over time, not counted from actual bytes written. The NZB completion count is exact.
+- Docker network byte counters include protocol/yEnc framing; fixture payload
+  counters deliberately measure decoded payload only. Report both rather than
+  treating either as an unexplained "extra bytes" figure.
 - SABnzbd's `kbpersec` unit semantics (decimal KB vs binary KiB) may introduce a small (~2.4%) measurement discrepancy in reported speed.

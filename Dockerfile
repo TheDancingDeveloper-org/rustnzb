@@ -20,7 +20,7 @@ RUN apk add --no-cache build-base curl \
 FROM --platform=$BUILDPLATFORM ${CROSS_IMAGE} AS builder
 
 ARG TARGETPLATFORM
-ARG RUSTNZB_BUILD_REF
+ARG RUSTNZB_BUILD_REF=local
 ARG RELEASE_OPTIMIZED=false
 
 WORKDIR /build
@@ -61,8 +61,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
         cargo zigbuild --release --locked -p rustnzb \
             --features webdav,vendored-openssl --target "$rust_target"; \
     mkdir -p /out; \
-    cp "/build/target/$rust_target/release/rustnzb" /out/rustnzb; \
-
+    cp "/build/target/$rust_target/release/rustnzb" /out/rustnzb
 
 FROM lscr.io/linuxserver/baseimage-alpine:3.23@sha256:46d690858431e262d574274bb2863e1fbaf8de61c6f7677150dd79c2cc65cdcf AS runtime
 

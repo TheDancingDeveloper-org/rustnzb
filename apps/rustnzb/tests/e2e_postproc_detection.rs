@@ -162,6 +162,7 @@ async fn normal_subjects_pipeline_finds_files() {
         content_articles_failed: 0,
         skip_extract: false,
         password: None,
+        max_nested_archive_depth: 5,
     };
     let result = run_pipeline(dir.path(), &config_zero).await;
     let verify = result.stages.iter().find(|s| s.name == "Verify").unwrap();
@@ -188,6 +189,7 @@ async fn normal_subjects_pipeline_finds_files() {
         content_articles_failed: 1,
         skip_extract: false,
         password: None,
+        max_nested_archive_depth: 5,
     };
     let result = run_pipeline(dir.path(), &config_fail).await;
     let repair = result.stages.iter().find(|s| s.name == "Repair").unwrap();
@@ -322,6 +324,7 @@ async fn obfuscated_pipeline_skips_everything() {
         content_articles_failed: 0,
         skip_extract: false,
         password: None,
+        max_nested_archive_depth: 5,
     };
 
     let result = run_pipeline(dir.path(), &config).await;
@@ -514,6 +517,7 @@ async fn deobfuscation_enables_full_pipeline() {
         content_articles_failed: 0,
         skip_extract: false,
         password: None,
+        max_nested_archive_depth: 5,
     };
     let result = run_pipeline(dir.path(), &config).await;
     let verify = result.stages.iter().find(|s| s.name == "Verify").unwrap();
@@ -536,6 +540,7 @@ async fn deobfuscation_enables_full_pipeline() {
         content_articles_failed: 1,
         skip_extract: false,
         password: None,
+        max_nested_archive_depth: 5,
     };
     let result = run_pipeline(dir.path(), &config_fail).await;
     let repair = result.stages.iter().find(|s| s.name == "Repair").unwrap();
@@ -701,6 +706,7 @@ async fn pipeline_with_only_archives_no_par2() {
         content_articles_failed: 0,
         skip_extract: false,
         password: None,
+        max_nested_archive_depth: 5,
     };
 
     let result = run_pipeline(dir.path(), &config).await;

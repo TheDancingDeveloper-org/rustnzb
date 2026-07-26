@@ -100,10 +100,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, stats: Arc<ServerStats
     stats.connections_active.fetch_sub(1, Ordering::Relaxed);
 }
 
-async fn handle_connection_inner(
-    stream: tokio::net::TcpStream,
-    stats: &ServerStats,
-) -> Result<()> {
+async fn handle_connection_inner(stream: tokio::net::TcpStream, stats: &ServerStats) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
@@ -135,9 +132,7 @@ async fn handle_connection_inner(
         if upper.starts_with("AUTHINFO USER") {
             writer.write_all(b"381 PASS required\r\n").await?;
         } else if upper.starts_with("AUTHINFO PASS") {
-            writer
-                .write_all(b"281 Authentication accepted\r\n")
-                .await?;
+            writer.write_all(b"281 Authentication accepted\r\n").await?;
         } else if upper.starts_with("GROUP") {
             writer
                 .write_all(b"211 1000000 1 1000000 alt.binaries.test\r\n")
@@ -148,7 +143,7 @@ async fn handle_connection_inner(
 
             if let Some(parsed) = parse_message_id(&msg_id) {
                 // Validate part is within range
-                let total_parts = ((parsed.total_size + ARTICLE_SIZE - 1) / ARTICLE_SIZE) as u32;
+                let total_parts = parsed.total_size.div_ceil(ARTICLE_SIZE) as u32;
                 if parsed.part < 1 || parsed.part > total_parts {
                     writer.write_all(b"430 No Such Article\r\n").await?;
                 } else {
@@ -207,9 +202,7 @@ async fn handle_connection_inner(
             }
         } else if upper.starts_with("CAPABILITIES") {
             writer
-                .write_all(
-                    b"101 Capability list:\r\nVERSION 2\r\nAUTHINFO USER\r\nREADER\r\n.\r\n",
-                )
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nAUTHINFO USER\r\nREADER\r\n.\r\n")
                 .await?;
         } else if upper.starts_with("MODE READER") {
             writer
