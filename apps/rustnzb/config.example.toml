@@ -10,6 +10,8 @@ cache_size = 524288000  # 500 MB
 log_level = "info"
 # log_file = "data/rustnzb.log"
 # history_retention = 100  # Number of NZBs to keep in history (omit for keep all)
+direct_unpack = true  # Extract RAR volumes while downloading when unrar is available
+max_nested_archive_depth = 5  # 0=outer archive only; protects against unbounded nesting
 
 # NNTP servers — add as many as needed, ordered by priority
 # Use the web UI "Servers" tab to add/edit servers, or uncomment below:

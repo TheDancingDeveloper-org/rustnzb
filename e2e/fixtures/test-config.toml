@@ -11,6 +11,7 @@ max_active_downloads = 1
 min_free_space_bytes = 1073741824
 rss_history_limit = 500
 direct_unpack = true
+max_nested_archive_depth = 5
 abort_hopeless = true
 early_failure_check = true
 required_completion_pct = 100.2

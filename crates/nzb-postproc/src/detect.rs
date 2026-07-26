@@ -288,7 +288,7 @@ fn is_split_7z_volume(name_lower: &str) -> bool {
 /// after successful extraction.
 fn is_cleanup_candidate(name: &str) -> bool {
     // Par2 files: .par2
-    if name.ends_with(".par2") {
+    if name.ends_with(".par2") || name.ends_with(".zip") {
         return true;
     }
 

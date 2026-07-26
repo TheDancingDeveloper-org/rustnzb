@@ -706,6 +706,8 @@ pub struct QueueManager {
     bandwidth: Arc<BandwidthLimiter>,
     /// Whether direct unpack (RAR extraction during download) is enabled.
     direct_unpack_enabled: AtomicBool,
+    /// Maximum number of nested archive layers to extract after the outer archive.
+    max_nested_archive_depth: u8,
     /// Abort downloads that cannot possibly complete.
     abort_hopeless: bool,
     /// Phase 6: maximum time a job may sit in `Downloading` without any
@@ -736,6 +738,7 @@ impl QueueManager {
         min_free_space: u64,
         speed_limit_bps: u64,
         direct_unpack: bool,
+        max_nested_archive_depth: u8,
         abort_hopeless: bool,
         early_failure_check: bool,
         required_completion_pct: f64,
@@ -780,6 +783,7 @@ impl QueueManager {
             min_free_space,
             bandwidth,
             direct_unpack_enabled: AtomicBool::new(direct_unpack),
+            max_nested_archive_depth,
             dispatch,
             abort_hopeless,
             early_failure_check,
@@ -1739,7 +1743,7 @@ impl QueueManager {
                 info!(
                     job_id = %job_id,
                     sets = results.len(),
-                    "Direct unpack completed successfully — skipping extract stage"
+                    "Direct unpack completed successfully — checking output for nested archives"
                 );
             } else {
                 for r in &results {
@@ -1774,6 +1778,7 @@ impl QueueManager {
                 content_articles_failed,
                 skip_extract: direct_unpack_success,
                 password: password.clone(),
+                max_nested_archive_depth: self.max_nested_archive_depth,
             };
 
             let result = run_pipeline(&work_dir, &config).await;
@@ -3471,6 +3476,7 @@ mod global_pause_tests {
             0,
             0,
             false,
+            5,
             false,
             false,
             100.0,

@@ -71,6 +71,11 @@ pub struct GeneralConfig {
     /// post-processing if articles fail or unrar is unavailable.
     #[serde(default = "default_true")]
     pub direct_unpack: bool,
+    /// Maximum number of archive layers to extract after the outer archive.
+    /// `0` extracts only the outer archive; the default of `5` permits five
+    /// nested layers while preventing unbounded recursive extraction.
+    #[serde(default = "default_max_nested_archive_depth")]
+    pub max_nested_archive_depth: u8,
     /// Abort downloads that cannot possibly complete (too many missing articles).
     /// When enabled, the engine checks article failure rates and cancels jobs
     /// that have no chance of success. Default: true.
@@ -107,6 +112,10 @@ fn default_required_completion_pct() -> f64 {
     100.2
 }
 
+fn default_max_nested_archive_depth() -> u8 {
+    5
+}
+
 fn default_article_timeout_secs() -> u64 {
     30
 }
@@ -130,6 +139,7 @@ impl Default for GeneralConfig {
             watch_dir: None,
             rss_history_limit: default_rss_history_limit(),
             direct_unpack: true,
+            max_nested_archive_depth: default_max_nested_archive_depth(),
             abort_hopeless: true,
             early_failure_check: true,
             required_completion_pct: default_required_completion_pct(),
@@ -368,12 +378,19 @@ mod tests {
         assert!(cfg.watch_dir.is_none());
         assert_eq!(cfg.rss_history_limit, Some(500));
         assert!(cfg.direct_unpack);
+        assert_eq!(cfg.max_nested_archive_depth, 5);
     }
 
     #[test]
     fn direct_unpack_can_be_explicitly_disabled() {
         let cfg: GeneralConfig = toml::from_str("direct_unpack = false").unwrap();
         assert!(!cfg.direct_unpack);
+    }
+
+    #[test]
+    fn nested_archive_depth_can_be_configured() {
+        let cfg: GeneralConfig = toml::from_str("max_nested_archive_depth = 2").unwrap();
+        assert_eq!(cfg.max_nested_archive_depth, 2);
     }
 
     #[test]
