@@ -82,6 +82,10 @@ interface GeneralDirs {
   watch_dir: string | null;
 }
 
+interface SabApiKeyResponse {
+  api_key: string | null;
+}
+
 function emptyServer(): ServerConfig {
   return {
     id: '',
@@ -940,6 +944,34 @@ function emptyCategory(): CategoryConfig {
           </div>
 
           <div class="panel">
+            <h3>SABnzbd API key</h3>
+            <div class="body">
+              <p class="dim" style="margin-top:0">
+                This key grants access to the SABnzbd-compatible endpoint. Reveal it only when
+                configuring an integration; rotating it immediately invalidates the previous key.
+              </p>
+              <div class="inline">
+                <input
+                  [type]="showSabApiKey ? 'text' : 'password'"
+                  [value]="sabApiKey || ''"
+                  readonly
+                  autocomplete="off"
+                  placeholder="No SABnzbd API key configured"
+                />
+                <button class="btn sm" (click)="showSabApiKey = !showSabApiKey" type="button">
+                  {{ showSabApiKey ? 'Hide' : 'Reveal' }}
+                </button>
+                <button class="btn sm" [disabled]="!sabApiKey" (click)="copy(sabApiKey!)" type="button">
+                  Copy
+                </button>
+                <button class="btn sm danger" (click)="rotateSabApiKey()" type="button">
+                  {{ sabApiKey ? 'Rotate' : 'Generate' }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
             <h3>OpenAPI / Swagger</h3>
             <div class="body">
               <a href="/swagger-ui" target="_blank">Open <code>/swagger-ui</code></a>
@@ -1364,6 +1396,8 @@ export class SettingsViewComponent implements OnInit {
   };
   showDavPassword = false;
   showDavApiKey = false;
+  sabApiKey: string | null = null;
+  showSabApiKey = false;
 
   // Directory paths (from /api/config)
   dirs = signal<GeneralDirs | null>(null);
@@ -1379,6 +1413,7 @@ export class SettingsViewComponent implements OnInit {
     this.loadServers();
     this.loadCategories();
     this.loadGeneralSettings();
+    this.loadSabApiKey();
     this.loadStatus();
     this.loadDirs();
   }
@@ -1672,6 +1707,37 @@ export class SettingsViewComponent implements OnInit {
           this.abortHopeless = r.abort_hopeless;
         },
         error: () => {},
+      });
+  }
+
+  loadSabApiKey(): void {
+    this.api.get<SabApiKeyResponse>('/config/sabnzbd-api-key').subscribe({
+      next: (response) => (this.sabApiKey = response.api_key),
+      error: () => this.snack.open('Failed to load SABnzbd API key', 'Close', { duration: 3000 }),
+    });
+  }
+
+  rotateSabApiKey(): void {
+    const action = this.sabApiKey ? 'Rotate' : 'Generate';
+    this.confirmSvc
+      .confirm({
+        title: `${action} SABnzbd API key?`,
+        message: this.sabApiKey
+          ? 'The current key will stop working immediately. Update Sonarr, Radarr, Lidarr, and any other integrations with the new key.'
+          : 'This creates the credential used by Sonarr, Radarr, Lidarr, and other SABnzbd-compatible clients.',
+        confirmLabel: `${action} key`,
+        danger: !!this.sabApiKey,
+      })
+      .subscribe((ok) => {
+        if (!ok) return;
+        this.api.post<SabApiKeyResponse>('/config/sabnzbd-api-key/rotate', {}).subscribe({
+          next: (response) => {
+            this.sabApiKey = response.api_key;
+            this.showSabApiKey = true;
+            this.snack.open(`SABnzbd API key ${action.toLowerCase()}d`, 'Close', { duration: 2500 });
+          },
+          error: () => this.snack.open(`Failed to ${action.toLowerCase()} SABnzbd API key`, 'Close', { duration: 3000 }),
+        });
       });
   }
 

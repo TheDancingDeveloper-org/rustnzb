@@ -329,6 +329,13 @@ pub struct SimpleResponse {
     pub status: bool,
 }
 
+/// The credential used by Sonarr, Radarr, Lidarr, and other SABnzbd-compatible
+/// clients to call `/sabnzbd/api`.
+#[derive(Serialize)]
+pub struct SabApiKeyResponse {
+    pub api_key: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct LogResponse {
     pub entries: Vec<LogEntry>,
@@ -886,6 +893,38 @@ pub async fn h_config_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<nzb_web::nzb_core::config::AppConfig>, ApiError> {
     Ok(Json((*state.config()).clone()))
+}
+
+/// GET /api/config/sabnzbd-api-key -- Return the current SABnzbd API key.
+///
+/// This route is protected by the native API authentication middleware. The
+/// general config endpoint intentionally remains useful for regular settings,
+/// while this dedicated route makes the sensitive-value access explicit.
+pub async fn h_sab_api_key_get(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SabApiKeyResponse>, ApiError> {
+    Ok(Json(SabApiKeyResponse {
+        api_key: state.config().general.api_key.clone(),
+    }))
+}
+
+/// POST /api/config/sabnzbd-api-key/rotate -- Generate, persist, and return a
+/// replacement SABnzbd API key. The previous key stops working immediately.
+pub async fn h_sab_api_key_rotate(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SabApiKeyResponse>, ApiError> {
+    let mut config = (*state.config()).clone();
+    // UUID v4 is backed by the operating system's cryptographically secure
+    // random source. A simple-form UUID supplies a 32-character token without
+    // separators, matching the common SABnzbd API-key format.
+    let api_key = uuid::Uuid::new_v4().simple().to_string();
+    config.general.api_key = Some(api_key.clone());
+    state.update_config(config).map_err(ApiError::from)?;
+    tracing::info!("SABnzbd API key rotated");
+
+    Ok(Json(SabApiKeyResponse {
+        api_key: Some(api_key),
+    }))
 }
 
 /// GET /api/config/servers -- List configured servers.

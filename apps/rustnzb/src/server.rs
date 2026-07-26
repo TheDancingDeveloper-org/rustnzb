@@ -180,6 +180,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Config
         .route("/config", get(handlers::h_config_get))
         .route("/config/general", put(handlers::h_general_update))
+        .route("/config/sabnzbd-api-key", get(handlers::h_sab_api_key_get))
+        .route(
+            "/config/sabnzbd-api-key/rotate",
+            post(handlers::h_sab_api_key_rotate),
+        )
         .route("/config/servers/health", get(handlers::h_servers_health))
         .route("/config/servers/stats", get(handlers::h_server_stats))
         .route("/config/servers", get(handlers::h_servers_list))
@@ -297,16 +302,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Build the auth middleware closure
     let token_store = state.token_store.clone();
     let credential_store = state.credential_store.clone();
-    let api_key = state.config().general.api_key.clone();
+    let auth_state = state.clone();
 
     let auth_middleware = axum::middleware::from_fn(
         move |headers: HeaderMap, request: axum::extract::Request, next: Next| {
             let token_store = token_store.clone();
             let credential_store = credential_store.clone();
-            let api_key = api_key.clone();
+            let auth_state = auth_state.clone();
             async move {
                 // API key (X-Api-Key header) — config-based, bypasses session/credential auth
-                if let Some(ref expected) = api_key
+                if let Some(ref expected) = auth_state.config().general.api_key
                     && let Some(provided) = headers.get("X-Api-Key").and_then(|h| h.to_str().ok())
                 {
                     if auth::constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
