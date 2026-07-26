@@ -20,7 +20,10 @@ Both modes run entirely in Docker — a mock/synthetic NNTP server, the download
 ./run-stress.sh --duration 4h --nzb-size 10gb --concurrency 10 --connections 100
 ```
 
-Results land in `results/` — JSON, CSV, summary text, and SVG charts.
+Results land in `results/` — JSON, CSV, summary text, a self-contained HTML
+report, and SVG charts. Result artifacts are intentionally local and are not
+committed; generate publishable performance reports on the target benchmark
+host.
 
 ---
 
@@ -59,6 +62,16 @@ and peak incomplete/complete directory occupancy.
 `verify-fault` is the paired 32 MiB PAR2 case with controlled missing
 articles. Its fault counters distinguish repair/retry traffic from the
 healthy-path result.
+
+Run both correctness legs together with:
+
+```bash
+./run.sh --scenarios verify,verify-fault
+```
+
+This establishes the fixture and repair contract, not a representative
+throughput comparison. Run large scenarios on the intended higher-capacity
+benchmark host before publishing a report.
 
 The compose service deliberately uses the image's normal s6 service lifecycle
 instead of starting a second rustnzb process, so the fixture exercises the
@@ -147,6 +160,7 @@ Both modes write to `results/`:
 results/
   benchmark_YYYYMMDD_HHMMSS.json     # Full metrics + timeseries
   benchmark_YYYYMMDD_HHMMSS.csv      # Tabular comparison
+  benchmark_YYYYMMDD_HHMMSS.html     # Self-contained measured report
   summary_YYYYMMDD_HHMMSS.txt        # Human-readable side-by-side
   charts_YYYYMMDD_HHMMSS/            # SVG charts (comparison bars, timeseries, dashboard)
   logs_YYYYMMDD_HHMMSS/              # Per-scenario container logs

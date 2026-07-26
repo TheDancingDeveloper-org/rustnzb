@@ -12,14 +12,24 @@ Confirmed and addressed in the reliability change set:
   history row is durably present. Completed jobs remove their work directory
   only after it is empty; a failed output move retains files for safety.
 
-Benchmark report remediation is in progress in GitHub issue #24. The harness
-now uses compact deterministic fixtures, records terminal outcome plus
-source-payload SHA-256 verification, captures decoded/wire/request/430
-metrics, and samples both completed and incomplete work directories. A
-controlled missing-article/PAR2-repair run passed: rustnzb observed one 430,
-repaired the payload, verified its SHA-256, and removed its terminal work
-directory. The vendor measurements remain hypotheses until reproducible
-controlled runs are published.
+## Benchmark harness and publication status — 2026-07-26
+
+The reproducible `benchnzb` harness is complete and records terminal outcome,
+source-payload SHA-256 verification, decoded/wire/request/430 fixture metrics,
+and peak completed/incomplete working-directory occupancy. It can emit a
+self-contained HTML report alongside the existing JSON, CSV, text, logs, and
+SVG artifacts.
+
+The compact local correctness run (`verify,verify-fault`) completed for both
+SABnzbd and rustnzb: the clean archive payload verified, and rustnzb observed
+the injected missing article, repaired the payload through PAR2, and verified
+the resulting SHA-256. This is validation of the harness and repair contract,
+not a published performance comparison.
+
+The generated local report artifacts are intentionally untracked. A public
+performance report will be regenerated on a higher-capacity instance using the
+same committed harness; until then, no timing or throughput conclusion should
+be treated as representative.
 
 ## Nested archive extraction — 2026-07-26
 
