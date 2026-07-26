@@ -61,7 +61,7 @@ fn parse_benchmark_ini_general() {
 
     assert_eq!(
         preview.general.api_key.as_deref(),
-        Some("benchnzb0123456789abcdef01234567")
+        Some("0123456789abcdef0123456789abcdef")
     );
     assert_eq!(
         preview.general.complete_dir.as_deref(),
