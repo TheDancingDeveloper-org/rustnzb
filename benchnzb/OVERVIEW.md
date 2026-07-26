@@ -50,6 +50,16 @@ Runs SABnzbd and rustnzb sequentially against the same NZB, using a file-backed 
 | sz10gb_unpack | 10 GB | Download + 7z extraction |
 | sz50gb_unpack | 50 GB | Download + 7z extraction |
 
+`verify` is a separate 32 MiB generated archive fixture for regression and
+local correctness verification. It checks the extracted payload checksum and
+records fixture decoded/yEnc bytes, article requests, injected 430 faults,
+terminal outcome, CPU/RSS,
+and peak incomplete/complete directory occupancy.
+
+`verify-fault` is the paired 32 MiB PAR2 case with controlled missing
+articles. Its fault counters distinguish repair/retry traffic from the
+healthy-path result.
+
 ### Scenario Groups
 
 | Flag | Scenarios | Approx Time |

@@ -1,11 +1,43 @@
-use crate::clients::sabnzbd::SabnzbdClient;
 use crate::clients::rustnzb::RustnzbClient;
-use crate::config::{self, Scenario, MB, GB};
+use crate::clients::sabnzbd::SabnzbdClient;
+use crate::config::{self, Scenario, GB, MB};
 use crate::metrics::{MetricSample, MetricsCollector};
 use crate::{charts, datagen, docker, report};
 use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum BenchmarkOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
+    SubmissionFailed,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize, Default)]
+pub struct FixtureMetrics {
+    /// Bytes of decoded payload served by the controlled NNTP fixture. This is
+    /// authoritative for fixture traffic, unlike client speed integration.
+    pub payload_bytes_served: u64,
+    /// yEnc-body bytes emitted by the fixture (excluding variable NNTP
+    /// headers), providing a reproducible wire-volume comparison.
+    pub wire_bytes_served: u64,
+    /// BODY / ARTICLE requests including repeats and deterministic misses.
+    pub article_requests: u64,
+    pub articles_served: u64,
+    /// NNTP 430 responses injected by the fixture. A non-zero count makes
+    /// the run a fault/repair path, never a healthy-path comparison.
+    pub article_not_found: u64,
+}
+
+fn classify_terminal_status(status: &str) -> BenchmarkOutcome {
+    if status.eq_ignore_ascii_case("completed") {
+        BenchmarkOutcome::Succeeded
+    } else {
+        BenchmarkOutcome::Failed
+    }
+}
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ClientResult {
@@ -14,6 +46,10 @@ pub struct ClientResult {
     pub scenario_description: String,
     pub test_type: String,
     pub total_bytes: u64,
+    pub outcome: BenchmarkOutcome,
+    pub payload_verified: bool,
+    pub peak_work_dir_bytes: u64,
+    pub fixture_metrics: FixtureMetrics,
     pub download_sec: f64,
     pub par2_sec: f64,
     pub unpack_sec: f64,
@@ -120,11 +156,7 @@ async fn clean_download_dir(docker_client: &bollard::Docker, service: &str, dir:
     }
 }
 
-pub async fn run(
-    scenario_selector: String,
-    data_dir: PathBuf,
-    results_dir: PathBuf,
-) -> Result<()> {
+pub async fn run(scenario_selector: String, data_dir: PathBuf, results_dir: PathBuf) -> Result<()> {
     tracing::info!("============================================================");
     tracing::info!("  Usenet Client Benchmark: SABnzbd vs rustnzb");
     tracing::info!("============================================================");
@@ -263,9 +295,51 @@ pub async fn run(
             std::fs::write(&path, rnzb_logs)?;
         }
     }
-    tracing::info!("Logs: {} ({} scenario(s))", logs_dir.display(), scenario_logs.len());
+    tracing::info!(
+        "Logs: {} ({} scenario(s))",
+        logs_dir.display(),
+        scenario_logs.len()
+    );
 
     tracing::info!("Results: {}", results_dir.display());
+    validate_verification_results(&all_results)?;
+    Ok(())
+}
+
+/// The compact fixtures are regression gates, rather than best-effort report
+/// generators. Keep their result files for diagnosis, then fail the command
+/// when rustnzb cannot prove the stated healthy/fault behaviour.
+fn validate_verification_results(results: &[(ClientResult, ClientResult)]) -> Result<()> {
+    for (_, rustnzb) in results {
+        validate_rustnzb_verification(
+            &rustnzb.scenario,
+            &rustnzb.outcome,
+            rustnzb.payload_verified,
+            rustnzb.fixture_metrics.article_not_found,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_rustnzb_verification(
+    scenario: &str,
+    outcome: &BenchmarkOutcome,
+    payload_verified: bool,
+    article_not_found: u64,
+) -> Result<()> {
+    match scenario {
+        "verify_32mb_unpack" if *outcome != BenchmarkOutcome::Succeeded || !payload_verified => {
+            anyhow::bail!(
+                "rustnzb failed verified unpack fixture: outcome={:?}, payload_verified={}",
+                outcome,
+                payload_verified
+            );
+        }
+        "verify_fault_32mb_par2" if article_not_found == 0 => {
+            anyhow::bail!("rustnzb fault fixture did not observe any injected NNTP 430 responses");
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -283,6 +357,10 @@ async fn run_client(
         scenario_description: sc.description.clone(),
         test_type: sc.test_type.to_string(),
         total_bytes: sc.total_size,
+        outcome: BenchmarkOutcome::SubmissionFailed,
+        payload_verified: false,
+        peak_work_dir_bytes: 0,
+        fixture_metrics: FixtureMetrics::default(),
         download_sec: 0.0,
         par2_sec: 0.0,
         unpack_sec: 0.0,
@@ -311,11 +389,11 @@ async fn run_client(
             return result;
         }
     };
-    let nzb_filename = nzb_path
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let nzb_filename = nzb_path.file_name().unwrap().to_string_lossy().to_string();
+
+    if let Err(error) = reset_fixture_stats().await {
+        tracing::warn!("  [{client_name}] Failed to reset fixture counters: {error}");
+    }
 
     let add_result = if client_name == "sabnzbd" {
         sab.add_nzb(&nzb_data, &nzb_filename).await
@@ -326,6 +404,7 @@ async fn run_client(
         tracing::error!("  [{client_name}] Failed to add NZB: {e}");
         return result;
     }
+    result.outcome = BenchmarkOutcome::TimedOut;
 
     let stats_handle = metrics.start_collecting(client_name);
     let start = tokio::time::Instant::now();
@@ -344,16 +423,16 @@ async fn run_client(
             break;
         }
 
-        let (finished, progress, speed) = if client_name == "sabnzbd" {
-            let fin = sab.all_finished().await.unwrap_or(false);
+        let (terminal_status, progress, speed) = if client_name == "sabnzbd" {
+            let terminal = sab.terminal_status().await.unwrap_or(None);
             let prog = sab.progress_fraction().await;
             let spd = sab.download_speed().await;
-            (fin, prog, spd)
+            (terminal, prog, spd)
         } else {
-            let fin = rnzb.all_finished().await.unwrap_or(false);
+            let terminal = rnzb.terminal_status().await.unwrap_or(None);
             let prog = rnzb.progress_fraction().await;
             let spd = rnzb.download_speed().await;
-            (fin, prog, spd)
+            (terminal, prog, spd)
         };
 
         if speed > 0.0 {
@@ -361,10 +440,15 @@ async fn run_client(
             speeds.push(speed);
         }
 
-        if finished {
-            tracing::info!("  [{client_name}] Complete!");
+        if let Some(status) = terminal_status {
+            result.outcome = classify_terminal_status(&status);
+            tracing::info!("  [{client_name}] Terminal status: {status}");
             break;
         }
+
+        result.peak_work_dir_bytes = result
+            .peak_work_dir_bytes
+            .max(sample_work_dir_bytes(metrics, client_name).await);
 
         let bar_len = 30;
         let filled = (bar_len as f64 * progress) as usize;
@@ -383,10 +467,24 @@ async fn run_client(
     result.total_sec = start.elapsed().as_secs_f64();
     // Use actual throughput (bytes/time) for avg speed — self-reported speeds aren't comparable
     if result.total_sec > 0.0 {
-        result.avg_speed_mbps =
-            sc.total_size as f64 * 8.0 / result.total_sec / 1_000_000.0;
+        result.avg_speed_mbps = sc.total_size as f64 * 8.0 / result.total_sec / 1_000_000.0;
     }
     result.peak_speed_mbps = peak_speed * 8.0 / 1_000_000.0;
+    result.peak_work_dir_bytes = result
+        .peak_work_dir_bytes
+        .max(sample_work_dir_bytes(metrics, client_name).await);
+    result.fixture_metrics = fixture_metrics().await.unwrap_or_else(|error| {
+        tracing::warn!("  [{client_name}] Failed to read fixture counters: {error}");
+        FixtureMetrics::default()
+    });
+    result.payload_verified = result.outcome == BenchmarkOutcome::Succeeded
+        && verify_payload(metrics, client_name, sc)
+            .await
+            .unwrap_or(false);
+    if result.outcome == BenchmarkOutcome::Succeeded && !result.payload_verified {
+        tracing::error!("  [{client_name}] Completed without a verified payload");
+        result.outcome = BenchmarkOutcome::Failed;
+    }
 
     // Stage timing from history
     let stage_result = if client_name == "sabnzbd" {
@@ -400,8 +498,7 @@ async fn run_client(
         // Derive download time from harness-measured total minus post-processing
         // stages.  Client-reported download_time is integer-second granularity
         // (SABnzbd API limitation), while total_sec has full precision.
-        result.download_sec =
-            (result.total_sec - stages.par2_sec - stages.unpack_sec).max(0.0);
+        result.download_sec = (result.total_sec - stages.par2_sec - stages.unpack_sec).max(0.0);
     }
     if result.download_sec == 0.0 {
         result.download_sec = result.total_sec;
@@ -463,4 +560,146 @@ async fn run_client(
         result.avg_speed_mbps
     );
     result
+}
+
+async fn reset_fixture_stats() -> Result<()> {
+    reqwest::Client::new()
+        .post("http://mock-nntp:8080/reset-stats")
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+async fn fixture_metrics() -> Result<FixtureMetrics> {
+    Ok(reqwest::Client::new()
+        .get("http://mock-nntp:8080/status")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+async fn sample_work_dir_bytes(metrics: &MetricsCollector, client_name: &str) -> u64 {
+    let Some(container_id) = metrics.container_id(client_name) else {
+        return 0;
+    };
+    let docker = match docker::connect() {
+        Ok(docker) => docker,
+        Err(_) => return 0,
+    };
+    let command = "du -sb /downloads/incomplete /downloads/complete 2>/dev/null | awk '{total += $1} END {print total + 0}'";
+    docker::exec_in_container(&docker, container_id, vec!["sh", "-c", command])
+        .await
+        .ok()
+        .and_then(|output| output.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+async fn verify_payload(
+    metrics: &MetricsCollector,
+    client_name: &str,
+    scenario: &Scenario,
+) -> Result<bool> {
+    if scenario.test_type != config::TestType::Unpack {
+        return Ok(true);
+    }
+    let Some(container_id) = metrics.container_id(client_name) else {
+        return Ok(false);
+    };
+    let docker = docker::connect()?;
+    let expected_name = format!("bench_{}.bin", config::size_label(scenario.total_size));
+    let output_command = format!(
+        "set -eu; file=$(find /downloads/complete -type f -name '{expected_name}' -print -quit); test -n \"$file\"; sha256sum \"$file\" | awk '{{print $1}}'"
+    );
+    let output_digest =
+        docker::exec_in_container(&docker, container_id, vec!["sh", "-c", &output_command]).await?;
+    let Some(mock_container) = docker::get_container_id(&docker, "mock-nntp").await else {
+        return Ok(false);
+    };
+    let source_command = format!("sha256sum /data/testdata/{expected_name} | awk '{{print $1}}'");
+    let source_digest =
+        docker::exec_in_container(&docker, &mock_container, vec!["sh", "-c", &source_command])
+            .await?;
+    Ok(output_digest.trim() == source_digest.trim() && !source_digest.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        classify_terminal_status, validate_rustnzb_verification, BenchmarkOutcome, FixtureMetrics,
+    };
+
+    #[test]
+    fn completed_is_the_only_successful_terminal_status() {
+        assert_eq!(
+            classify_terminal_status("completed"),
+            BenchmarkOutcome::Succeeded
+        );
+        assert_eq!(
+            classify_terminal_status("Completed"),
+            BenchmarkOutcome::Succeeded
+        );
+    }
+
+    #[test]
+    fn failure_is_never_reported_as_a_successful_benchmark() {
+        for status in ["failed", "timeout", "", "repair failed"] {
+            assert_eq!(
+                classify_terminal_status(status),
+                BenchmarkOutcome::Failed,
+                "{status} must remain a failed benchmark"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_fault_metrics_are_machine_readable() {
+        let metrics: FixtureMetrics = serde_json::from_str(
+            r#"{"payload_bytes_served":33554432,"wire_bytes_served":33900000,"article_requests":47,"articles_served":45,"article_not_found":2}"#,
+        )
+        .unwrap();
+        assert_eq!(metrics.payload_bytes_served, 33_554_432);
+        assert_eq!(metrics.wire_bytes_served, 33_900_000);
+        assert_eq!(metrics.article_requests, 47);
+        assert_eq!(metrics.articles_served, 45);
+        assert_eq!(metrics.article_not_found, 2);
+    }
+
+    #[test]
+    fn verified_unpack_fixture_requires_success_and_matching_payload() {
+        assert!(validate_rustnzb_verification(
+            "verify_32mb_unpack",
+            &BenchmarkOutcome::Succeeded,
+            true,
+            0,
+        )
+        .is_ok());
+        assert!(validate_rustnzb_verification(
+            "verify_32mb_unpack",
+            &BenchmarkOutcome::Succeeded,
+            false,
+            0,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fault_fixture_requires_observable_injected_fault() {
+        assert!(validate_rustnzb_verification(
+            "verify_fault_32mb_par2",
+            &BenchmarkOutcome::Succeeded,
+            true,
+            1,
+        )
+        .is_ok());
+        assert!(validate_rustnzb_verification(
+            "verify_fault_32mb_par2",
+            &BenchmarkOutcome::Succeeded,
+            true,
+            0,
+        )
+        .is_err());
+    }
 }

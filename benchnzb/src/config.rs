@@ -106,6 +106,39 @@ fn generate_all() -> Vec<Scenario> {
     scenarios
 }
 
+/// A small deterministic unpack scenario suitable for exercising the full
+/// benchmark contract in CI or on a developer machine.  The large scenarios
+/// remain useful for performance measurements, but are intentionally not used
+/// as correctness evidence.
+fn verification_scenario() -> Scenario {
+    let size = 32 * MB;
+    Scenario {
+        name: "verify_32mb_unpack".to_string(),
+        description: "32 MB generated archive with verified extracted payload".to_string(),
+        total_size: size,
+        test_type: TestType::Unpack,
+        missing_pct: 0.0,
+        redundancy_pct: 8.0,
+        timeout_secs: 300,
+    }
+}
+
+/// A deliberately faulted companion to [`verification_scenario`]. The mock
+/// server returns deterministic 430s so repair/retry traffic can be reported
+/// separately from a healthy payload run.
+fn verification_fault_scenario() -> Scenario {
+    let size = 32 * MB;
+    Scenario {
+        name: "verify_fault_32mb_par2".to_string(),
+        description: "32 MB generated payload with injected 430s and PAR2 repair".to_string(),
+        total_size: size,
+        test_type: TestType::Par2,
+        missing_pct: 3.0,
+        redundancy_pct: 8.0,
+        timeout_secs: 300,
+    }
+}
+
 /// Window size for stress test analysis (seconds).
 pub const STRESS_WINDOW_SECS: u64 = 300;
 
@@ -202,6 +235,8 @@ pub fn resolve_scenarios(selector: &str) -> Vec<Scenario> {
 
     match sel.as_str() {
         "all" | "full" => all,
+        "verify" => vec![verification_scenario()],
+        "verify-fault" => vec![verification_fault_scenario()],
         "quick" => all
             .iter()
             .filter(|s| s.name == "sz5gb_raw")
@@ -231,7 +266,9 @@ pub fn resolve_scenarios(selector: &str) -> Vec<Scenario> {
                 .collect();
             if matched.is_empty() {
                 tracing::error!("No scenarios matched: {selector}");
-                tracing::info!("Groups: quick, medium, speed, postproc, full");
+                tracing::info!(
+                    "Groups: verify, verify-fault, quick, medium, speed, postproc, full"
+                );
             }
             matched
         }
@@ -272,6 +309,14 @@ mod tests {
         assert_eq!(resolve_scenarios("medium").len(), 6);
         assert_eq!(resolve_scenarios("speed").len(), 3);
         assert_eq!(resolve_scenarios("postproc").len(), 4);
+        let verify = resolve_scenarios("verify");
+        assert_eq!(verify.len(), 1);
+        assert_eq!(verify[0].total_size, 32 * MB);
+        assert_eq!(verify[0].test_type, TestType::Unpack);
+        let fault = resolve_scenarios("verify-fault");
+        assert_eq!(fault.len(), 1);
+        assert_eq!(fault[0].test_type, TestType::Par2);
+        assert!(fault[0].missing_pct > 0.0);
         assert!(resolve_scenarios("missing").is_empty());
     }
 

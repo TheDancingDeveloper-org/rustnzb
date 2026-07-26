@@ -31,9 +31,7 @@ impl SabnzbdClient {
     }
 
     pub async fn healthy(&self) -> bool {
-        self.api_get(&[("mode", "version")])
-            .await
-            .is_ok()
+        self.api_get(&[("mode", "version")]).await.is_ok()
     }
 
     pub async fn add_nzb(&self, data: &[u8], filename: &str) -> Result<()> {
@@ -83,6 +81,23 @@ impl SabnzbdClient {
         }))
     }
 
+    /// Return the terminal state of the current run, if the queue has drained.
+    pub async fn terminal_status(&self) -> Result<Option<String>> {
+        let queue = self.api_get(&[("mode", "queue")]).await?;
+        if queue["queue"]["slots"]
+            .as_array()
+            .is_some_and(|slots| !slots.is_empty())
+        {
+            return Ok(None);
+        }
+        let history = self.api_get(&[("mode", "history"), ("limit", "1")]).await?;
+        Ok(history["history"]["slots"]
+            .as_array()
+            .and_then(|slots| slots.first())
+            .and_then(|slot| slot["status"].as_str())
+            .map(str::to_string))
+    }
+
     pub async fn progress_fraction(&self) -> f64 {
         let queue = self.api_get(&[("mode", "queue")]).await.unwrap_or_default();
         if let Some(slots) = queue["queue"]["slots"].as_array() {
@@ -94,11 +109,7 @@ impl SabnzbdClient {
             }
             let total: f64 = slots
                 .iter()
-                .filter_map(|s| {
-                    s["percentage"]
-                        .as_str()
-                        .and_then(|p| p.parse::<f64>().ok())
-                })
+                .filter_map(|s| s["percentage"].as_str().and_then(|p| p.parse::<f64>().ok()))
                 .sum();
             return total / 100.0 / slots.len() as f64;
         }
@@ -115,9 +126,7 @@ impl SabnzbdClient {
     }
 
     pub async fn get_stage_timing(&self) -> Result<StageTiming> {
-        let history = self
-            .api_get(&[("mode", "history"), ("limit", "1")])
-            .await?;
+        let history = self.api_get(&[("mode", "history"), ("limit", "1")]).await?;
         let mut timing = StageTiming::default();
 
         if let Some(slots) = history["history"]["slots"].as_array() {
@@ -165,11 +174,7 @@ impl SabnzbdClient {
             .api_get(&[("mode", "queue"), ("name", "delete"), ("value", "all")])
             .await;
         let _ = self
-            .api_get(&[
-                ("mode", "history"),
-                ("name", "delete"),
-                ("value", "all"),
-            ])
+            .api_get(&[("mode", "history"), ("name", "delete"), ("value", "all")])
             .await;
     }
 
@@ -195,11 +200,7 @@ impl SabnzbdClient {
         let active_downloads = slots
             .map(|a| {
                 a.iter()
-                    .filter(|s| {
-                        s["status"]
-                            .as_str()
-                            .map_or(false, |st| st == "Downloading")
-                    })
+                    .filter(|s| s["status"].as_str().map_or(false, |st| st == "Downloading"))
                     .count()
             })
             .unwrap_or(0);
@@ -223,11 +224,7 @@ impl SabnzbdClient {
     /// Clear history only (not queue).
     pub async fn clear_history(&self) -> Result<()> {
         let _ = self
-            .api_get(&[
-                ("mode", "history"),
-                ("name", "delete"),
-                ("value", "all"),
-            ])
+            .api_get(&[("mode", "history"), ("name", "delete"), ("value", "all")])
             .await;
         Ok(())
     }

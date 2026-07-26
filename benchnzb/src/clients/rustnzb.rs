@@ -91,6 +91,40 @@ impl RustnzbClient {
         }))
     }
 
+    /// Return the terminal state of the current run, if the queue has drained.
+    /// A failed history entry is terminal but must never be reported as a
+    /// successful benchmark result.
+    pub async fn terminal_status(&self) -> Result<Option<String>> {
+        let queue: serde_json::Value = self
+            .http
+            .get(format!("{}/api/queue", self.url))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if queue["jobs"]
+            .as_array()
+            .is_some_and(|jobs| !jobs.is_empty())
+        {
+            return Ok(None);
+        }
+
+        let history: serde_json::Value = self
+            .http
+            .get(format!("{}/api/history", self.url))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(history["entries"]
+            .as_array()
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry["status"].as_str())
+            .map(str::to_string))
+    }
+
     pub async fn progress_fraction(&self) -> f64 {
         let queue: serde_json::Value = match self
             .http
@@ -174,10 +208,9 @@ impl RustnzbClient {
             }
 
             // Download time from added_at -> first stage start or completed_at
-            if let (Some(added), Some(completed)) = (
-                entry["added_at"].as_str(),
-                entry["completed_at"].as_str(),
-            ) {
+            if let (Some(added), Some(completed)) =
+                (entry["added_at"].as_str(), entry["completed_at"].as_str())
+            {
                 if let (Ok(a), Ok(c)) = (
                     chrono::DateTime::parse_from_rfc3339(added),
                     chrono::DateTime::parse_from_rfc3339(completed),
@@ -213,10 +246,7 @@ impl RustnzbClient {
             if let Some(stats) = entry["server_stats"].as_array() {
                 for ss in stats {
                     metrics.server_stats.push(crate::runner::ServerStat {
-                        server_name: ss["server_name"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string(),
+                        server_name: ss["server_name"].as_str().unwrap_or("").to_string(),
                         articles_downloaded: ss["articles_downloaded"].as_u64().unwrap_or(0),
                         articles_failed: ss["articles_failed"].as_u64().unwrap_or(0),
                         bytes_downloaded: ss["bytes_downloaded"].as_u64().unwrap_or(0),
@@ -242,10 +272,9 @@ impl RustnzbClient {
             metrics.articles_downloaded += downloaded;
 
             // Calculate download throughput from timestamps
-            if let (Some(added), Some(completed)) = (
-                entry["added_at"].as_str(),
-                entry["completed_at"].as_str(),
-            ) {
+            if let (Some(added), Some(completed)) =
+                (entry["added_at"].as_str(), entry["completed_at"].as_str())
+            {
                 if let (Ok(a), Ok(c)) = (
                     chrono::DateTime::parse_from_rfc3339(added),
                     chrono::DateTime::parse_from_rfc3339(completed),
@@ -286,10 +315,7 @@ impl RustnzbClient {
             .json()
             .await?;
 
-        Ok(queue["jobs"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0))
+        Ok(queue["jobs"].as_array().map(|a| a.len()).unwrap_or(0))
     }
 
     /// Get status summary from the API.
@@ -315,11 +341,7 @@ impl RustnzbClient {
         let jobs = queue["jobs"].as_array().cloned().unwrap_or_default();
         let active = jobs
             .iter()
-            .filter(|j| {
-                j["status"]
-                    .as_str()
-                    .map_or(false, |s| s == "downloading")
-            })
+            .filter(|j| j["status"].as_str().map_or(false, |s| s == "downloading"))
             .count();
 
         Ok(StatusSummary {

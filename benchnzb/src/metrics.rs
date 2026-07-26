@@ -188,6 +188,10 @@ impl MetricsCollector {
             samples,
         })
     }
+
+    pub fn container_id(&self, service: &str) -> Option<&str> {
+        self.container_ids.get(service).map(String::as_str)
+    }
 }
 
 pub struct StatsHandle {
