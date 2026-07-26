@@ -25,7 +25,7 @@ pub fn generate_all(results: &[(ClientResult, ClientResult)], dir: &Path) -> Res
     write_dashboard(results, dir)?;
     let count = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |x| x == "svg"))
+        .filter(|e| e.path().extension().is_some_and(|x| x == "svg"))
         .count();
     tracing::info!("  Generated {count} chart(s)");
     Ok(())
@@ -37,8 +37,12 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+type ComparisonMetric<'a> = (&'a str, f64, f64, &'a str);
+type ComparisonCategory<'a> = (&'a str, Vec<ComparisonMetric<'a>>);
+type MetricExtractor = Box<dyn Fn(&crate::metrics::MetricSample) -> f64>;
+
 fn write_bar_chart(sab: &ClientResult, rnzb: &ClientResult, dir: &Path) -> Result<()> {
-    let categories: Vec<(&str, Vec<(&str, f64, f64, &str)>)> = vec![
+    let categories: Vec<ComparisonCategory<'_>> = vec![
         (
             "Timing",
             vec![
@@ -52,7 +56,12 @@ fn write_bar_chart(sab: &ClientResult, rnzb: &ClientResult, dir: &Path) -> Resul
             "Speed",
             vec![
                 ("Avg Speed", sab.avg_speed_mbps, rnzb.avg_speed_mbps, "Mbps"),
-                ("Peak Speed", sab.peak_speed_mbps, rnzb.peak_speed_mbps, "Mbps"),
+                (
+                    "Peak Speed",
+                    sab.peak_speed_mbps,
+                    rnzb.peak_speed_mbps,
+                    "Mbps",
+                ),
             ],
         ),
         (
@@ -97,7 +106,11 @@ fn write_bar_chart(sab: &ClientResult, rnzb: &ClientResult, dir: &Path) -> Resul
 <text x="{}" y="48" fill="{MUTED_TEXT}" font-size="12" text-anchor="middle" font-family="monospace">{desc}</text>
 <text x="{}" y="68" fill="{SAB_COLOR}" font-size="11" font-family="monospace">■ SABnzbd</text>
 <text x="{}" y="68" fill="{RNZB_COLOR}" font-size="11" font-family="monospace">■ rustnzb</text>"#,
-        w / 2, sab.scenario, w / 2, w - 220, w - 110,
+        w / 2,
+        sab.scenario,
+        w / 2,
+        w - 220,
+        w - 110,
     );
 
     let mut y = 80;
@@ -111,7 +124,9 @@ fn write_bar_chart(sab: &ClientResult, rnzb: &ClientResult, dir: &Path) -> Resul
             ));
             svg.push_str(&format!(
                 r#"<line x1="20" y1="{}" x2="{}" y2="{}" stroke="{GRID_COLOR}" stroke-width="1"/>"#,
-                y + 16, w - 20, y + 16
+                y + 16,
+                w - 20,
+                y + 16
             ));
             y += 22;
             prev_cat = cat;
@@ -151,11 +166,15 @@ fn write_bar_chart(sab: &ClientResult, rnzb: &ClientResult, dir: &Path) -> Resul
 }
 
 fn write_timeseries(sab: &ClientResult, rnzb: &ClientResult, dir: &Path) -> Result<()> {
-    let panels: Vec<(&str, &str, Box<dyn Fn(&crate::metrics::MetricSample) -> f64>)> = vec![
+    let panels: Vec<(&str, &str, MetricExtractor)> = vec![
         ("CPU", "%", Box::new(|s| s.cpu_pct)),
         ("Memory", "MB", Box::new(|s| s.mem_bytes as f64 / MB as f64)),
         ("Net RX", "Mbps", Box::new(|s| s.net_rx_bps * 8.0 / 1e6)),
-        ("Disk Write", "MB/s", Box::new(|s| s.disk_write_bps / MB as f64)),
+        (
+            "Disk Write",
+            "MB/s",
+            Box::new(|s| s.disk_write_bps / MB as f64),
+        ),
     ];
 
     let panel_h: usize = 160;
@@ -173,7 +192,11 @@ fn write_timeseries(sab: &ClientResult, rnzb: &ClientResult, dir: &Path) -> Resu
 <text x="{}" y="48" fill="{MUTED_TEXT}" font-size="12" text-anchor="middle" font-family="monospace">{desc}</text>
 <text x="{}" y="66" fill="{SAB_COLOR}" font-size="11" font-family="monospace">— SABnzbd</text>
 <text x="{}" y="66" fill="{RNZB_COLOR}" font-size="11" font-family="monospace">— rustnzb</text>"#,
-        w / 2, sab.scenario, w / 2, w - 220, w - 110,
+        w / 2,
+        sab.scenario,
+        w / 2,
+        w - 220,
+        w - 110,
     );
 
     let sab_dur = if sab.timeseries.is_empty() {
@@ -191,8 +214,8 @@ fn write_timeseries(sab: &ClientResult, rnzb: &ClientResult, dir: &Path) -> Resu
     for (pi, (label, unit, extractor)) in panels.iter().enumerate() {
         let py = 75 + pi * (panel_h + panel_gap);
 
-        let sab_max = sab.timeseries.iter().map(|s| extractor(s)).fold(0.0f64, f64::max);
-        let rnzb_max = rnzb.timeseries.iter().map(|s| extractor(s)).fold(0.0f64, f64::max);
+        let sab_max = sab.timeseries.iter().map(extractor).fold(0.0f64, f64::max);
+        let rnzb_max = rnzb.timeseries.iter().map(extractor).fold(0.0f64, f64::max);
         let max_v = sab_max.max(rnzb_max).max(0.01);
 
         svg.push_str(&format!(
@@ -211,7 +234,11 @@ fn write_timeseries(sab: &ClientResult, rnzb: &ClientResult, dir: &Path) -> Resu
                 r#"<line x1="{px}" y1="{gy:.0}" x2="{}" y2="{gy:.0}" stroke="{GRID_COLOR}" stroke-width="0.5"/>"#,
                 px + pw,
             ));
-            let lbl = if max_v >= 100.0 { format!("{:.0}", val) } else { format!("{:.1}", val) };
+            let lbl = if max_v >= 100.0 {
+                format!("{val:.0}")
+            } else {
+                format!("{val:.1}")
+            };
             svg.push_str(&format!(
                 r#"<text x="{}" y="{}" fill="{MUTED_TEXT}" font-size="8" text-anchor="end" font-family="monospace">{lbl}</text>"#,
                 px - 4, gy + 3.0,
@@ -219,15 +246,21 @@ fn write_timeseries(sab: &ClientResult, rnzb: &ClientResult, dir: &Path) -> Resu
         }
 
         for (result, color) in [(sab, SAB_COLOR), (rnzb, RNZB_COLOR)] {
-            if result.timeseries.is_empty() { continue; }
+            if result.timeseries.is_empty() {
+                continue;
+            }
             let t0 = result.timeseries[0].ts;
-            let points: Vec<String> = result.timeseries.iter().map(|s| {
-                let t = s.ts - t0;
-                let v = extractor(s);
-                let x = px as f64 + (t / max_t) * pw as f64;
-                let y = (py + panel_h) as f64 - (v / max_v) * (panel_h - 10) as f64;
-                format!("{x:.1},{y:.1}")
-            }).collect();
+            let points: Vec<String> = result
+                .timeseries
+                .iter()
+                .map(|s| {
+                    let t = s.ts - t0;
+                    let v = extractor(s);
+                    let x = px as f64 + (t / max_t) * pw as f64;
+                    let y = (py + panel_h) as f64 - (v / max_v) * (panel_h - 10) as f64;
+                    format!("{x:.1},{y:.1}")
+                })
+                .collect();
             if !points.is_empty() {
                 svg.push_str(&format!(
                     r#"<polyline points="{}" fill="none" stroke="{color}" stroke-width="2" opacity="0.9"/>"#,
@@ -253,21 +286,31 @@ fn write_cross_scenario(results: &[(ClientResult, ClientResult)], dir: &Path) ->
 <text x="{}" y="28" fill="{TEXT_COLOR}" font-size="16" text-anchor="middle" font-family="monospace" font-weight="bold">Cross-Scenario: Speed Ratio (SABnzbd time / rustnzb time)</text>
 <text x="{}" y="50" fill="{GREEN}" font-size="10" font-family="monospace">Green = rustnzb faster</text>
 <text x="{}" y="50" fill="{RED}" font-size="10" font-family="monospace">Red = SABnzbd faster</text>"#,
-        w / 2, w / 2 - 120, w / 2 + 60,
+        w / 2,
+        w / 2 - 120,
+        w / 2 + 60,
     );
 
     let max_bar = 400.0;
     let max_ratio = results
         .iter()
         .map(|(sab, rnzb)| {
-            if rnzb.total_sec > 0.0 { sab.total_sec / rnzb.total_sec } else { 1.0 }
+            if rnzb.total_sec > 0.0 {
+                sab.total_sec / rnzb.total_sec
+            } else {
+                1.0
+            }
         })
         .fold(0.0f64, f64::max)
         .max(2.0);
 
     for (i, (sab, rnzb)) in results.iter().enumerate() {
         let y = 80 + i * row_h;
-        let ratio = if rnzb.total_sec > 0.0 { sab.total_sec / rnzb.total_sec } else { 1.0 };
+        let ratio = if rnzb.total_sec > 0.0 {
+            sab.total_sec / rnzb.total_sec
+        } else {
+            1.0
+        };
         let bar_w = (ratio / max_ratio * max_bar).min(max_bar);
         let color = if ratio >= 1.0 { GREEN } else { RED };
 
@@ -329,10 +372,26 @@ fn write_dashboard(results: &[(ClientResult, ClientResult)], dir: &Path) -> Resu
     for (i, (sab, rnzb)) in results.iter().enumerate() {
         let y = 90 + i * row_h;
         let cols: Vec<(f64, f64, f64)> = vec![
-            (sab.total_sec, rnzb.total_sec, sab.total_sec.max(rnzb.total_sec).max(1.0)),
-            (sab.avg_speed_mbps, rnzb.avg_speed_mbps, sab.avg_speed_mbps.max(rnzb.avg_speed_mbps).max(1.0)),
-            (sab.cpu_peak, rnzb.cpu_peak, sab.cpu_peak.max(rnzb.cpu_peak).max(0.1)),
-            (sab.mem_peak_mb, rnzb.mem_peak_mb, sab.mem_peak_mb.max(rnzb.mem_peak_mb).max(1.0)),
+            (
+                sab.total_sec,
+                rnzb.total_sec,
+                sab.total_sec.max(rnzb.total_sec).max(1.0),
+            ),
+            (
+                sab.avg_speed_mbps,
+                rnzb.avg_speed_mbps,
+                sab.avg_speed_mbps.max(rnzb.avg_speed_mbps).max(1.0),
+            ),
+            (
+                sab.cpu_peak,
+                rnzb.cpu_peak,
+                sab.cpu_peak.max(rnzb.cpu_peak).max(0.1),
+            ),
+            (
+                sab.mem_peak_mb,
+                rnzb.mem_peak_mb,
+                sab.mem_peak_mb.max(rnzb.mem_peak_mb).max(1.0),
+            ),
         ];
 
         svg.push_str(&format!(
@@ -371,7 +430,9 @@ fn write_dashboard(results: &[(ClientResult, ClientResult)], dir: &Path) -> Resu
         if i < n - 1 {
             svg.push_str(&format!(
                 r#"<line x1="10" y1="{}" x2="{}" y2="{}" stroke="{GRID_COLOR}" stroke-width="1"/>"#,
-                y + row_h - 5, w - 10, y + row_h - 5,
+                y + row_h - 5,
+                w - 10,
+                y + row_h - 5,
             ));
         }
     }

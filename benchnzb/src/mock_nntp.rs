@@ -145,9 +145,7 @@ impl ServerState {
         let entry_idx = self.prefix_map.get(prefix)?;
         let mf = &self.mapped_files[*entry_idx];
 
-        if mf.mmap.is_none() {
-            return None; // file not available
-        }
+        mf.mmap.as_ref()?;
 
         let article_size = self.index.article_size;
         let offset = (part as u64 - 1) * article_size;
@@ -155,7 +153,7 @@ impl ServerState {
             return None;
         }
         let length = std::cmp::min(article_size, mf.total_size - offset);
-        let total_parts = ((mf.total_size + article_size - 1) / article_size) as u32;
+        let total_parts = mf.total_size.div_ceil(article_size) as u32;
 
         Some((mf.clone(), offset, length, part, total_parts))
     }

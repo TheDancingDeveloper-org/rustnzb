@@ -20,16 +20,6 @@ impl RustnzbClient {
         }
     }
 
-    pub async fn healthy(&self) -> bool {
-        self.http
-            .get(format!("{}/api/status", self.url))
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-    }
-
     pub async fn add_nzb(&self, data: &[u8], filename: &str) -> Result<()> {
         let part = reqwest::multipart::Part::bytes(data.to_vec())
             .file_name(filename.to_string())
@@ -66,7 +56,7 @@ impl RustnzbClient {
             return Ok(jobs.iter().all(|j| {
                 j["status"]
                     .as_str()
-                    .map_or(false, |s| s == "completed" || s == "failed")
+                    .is_some_and(|s| s == "completed" || s == "failed")
             }));
         }
 
@@ -87,7 +77,7 @@ impl RustnzbClient {
         Ok(entries.iter().all(|e| {
             e["status"]
                 .as_str()
-                .map_or(false, |s| s == "completed" || s == "failed")
+                .is_some_and(|s| s == "completed" || s == "failed")
         }))
     }
 
@@ -132,7 +122,6 @@ impl RustnzbClient {
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .and_then(|r| Ok(r))
         {
             Ok(r) => r.json().await.unwrap_or_default(),
             Err(_) => serde_json::Value::default(),
@@ -341,7 +330,7 @@ impl RustnzbClient {
         let jobs = queue["jobs"].as_array().cloned().unwrap_or_default();
         let active = jobs
             .iter()
-            .filter(|j| j["status"].as_str().map_or(false, |s| s == "downloading"))
+            .filter(|j| j["status"].as_str() == Some("downloading"))
             .count();
 
         Ok(StatusSummary {

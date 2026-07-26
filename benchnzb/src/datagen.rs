@@ -57,18 +57,14 @@ pub async fn prepare_data(scenarios: &[Scenario], data_dir: &Path) -> Result<()>
                 });
 
                 // Mark some data articles as missing (evenly spaced)
-                let total_parts =
-                    ((sc.total_size + ARTICLE_SIZE - 1) / ARTICLE_SIZE) as u32;
-                let missing_count =
-                    (total_parts as f64 * sc.missing_pct / 100.0) as u32;
+                let total_parts = sc.total_size.div_ceil(ARTICLE_SIZE) as u32;
+                let missing_count = (total_parts as f64 * sc.missing_pct / 100.0) as u32;
                 if missing_count > 0 {
                     let step = total_parts / missing_count;
                     for i in 0..missing_count {
                         let part = i * step + step / 2 + 1;
                         if part <= total_parts {
-                            all_missing.push(format!(
-                                "{data_prefix}-p{part:05}@{MSG_ID_DOMAIN}"
-                            ));
+                            all_missing.push(format!("{data_prefix}-p{part:05}@{MSG_ID_DOMAIN}"));
                         }
                     }
                 }
@@ -79,12 +75,10 @@ pub async fn prepare_data(scenarios: &[Scenario], data_dir: &Path) -> Result<()>
                 }];
 
                 // Generate par2 recovery files
-                let par2_files =
-                    generate_par2(&raw_file, sc.redundancy_pct).await?;
+                let par2_files = generate_par2(&raw_file, sc.redundancy_pct).await?;
                 for (idx, par2_path) in par2_files.iter().enumerate() {
                     let par2_size = tokio::fs::metadata(par2_path).await?.len();
-                    let par2_name =
-                        par2_path.file_name().unwrap().to_string_lossy().to_string();
+                    let par2_name = par2_path.file_name().unwrap().to_string_lossy().to_string();
                     let par2_prefix = format!("d-{label}-par2-par{idx:02}");
 
                     all_entries.push(FileEntry {
@@ -112,8 +106,7 @@ pub async fn prepare_data(scenarios: &[Scenario], data_dir: &Path) -> Result<()>
                 // Create 7z archive (store mode, no compression)
                 let archive = create_7z_archive(&raw_file, &testdata_dir).await?;
                 let archive_size = tokio::fs::metadata(&archive).await?.len();
-                let archive_name =
-                    archive.file_name().unwrap().to_string_lossy().to_string();
+                let archive_name = archive.file_name().unwrap().to_string_lossy().to_string();
 
                 let archive_prefix = format!("d-{label}-unpack-f000");
                 all_entries.push(FileEntry {
@@ -129,12 +122,10 @@ pub async fn prepare_data(scenarios: &[Scenario], data_dir: &Path) -> Result<()>
                 }];
 
                 // Par2 for the archive
-                let par2_files =
-                    generate_par2(&archive, sc.redundancy_pct).await?;
+                let par2_files = generate_par2(&archive, sc.redundancy_pct).await?;
                 for (idx, par2_path) in par2_files.iter().enumerate() {
                     let par2_size = tokio::fs::metadata(par2_path).await?.len();
-                    let par2_name =
-                        par2_path.file_name().unwrap().to_string_lossy().to_string();
+                    let par2_name = par2_path.file_name().unwrap().to_string_lossy().to_string();
                     let par2_prefix = format!("d-{label}-unpack-par{idx:02}");
 
                     all_entries.push(FileEntry {
@@ -211,7 +202,7 @@ async fn generate_random_file(path: &Path, size: u64) -> Result<()> {
             if size >= GB && written % (512 * MB) == 0 {
                 let pct = written as f64 * 100.0 / size as f64;
                 let rate = written as f64 / MB as f64 / start.elapsed().as_secs_f64();
-                eprint!("\r    {:.0}% ({:.0} MB/s)", pct, rate);
+                eprint!("\r    {pct:.0}% ({rate:.0} MB/s)");
             }
         }
         f.flush()?;
@@ -285,10 +276,7 @@ async fn generate_par2(data_file: &Path, redundancy_pct: f64) -> Result<Vec<Path
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => {
             if !status.success() {
-                anyhow::bail!(
-                    "par2 create failed with exit code {:?}",
-                    status.code()
-                );
+                anyhow::bail!("par2 create failed with exit code {:?}", status.code());
             }
         }
         Ok(Err(e)) => {
@@ -416,7 +404,11 @@ async fn preflight_check(scenarios: &[Scenario], data_dir: &Path) -> Result<()> 
     let disk_available = get_available_disk_bytes(data_dir).await;
     if let Some(avail) = disk_available {
         let avail_gb = avail as f64 / GB as f64;
-        tracing::info!("Pre-flight: {:.1} GB disk available at {}", avail_gb, data_dir.display());
+        tracing::info!(
+            "Pre-flight: {:.1} GB disk available at {}",
+            avail_gb,
+            data_dir.display()
+        );
         if avail < estimated_bytes {
             anyhow::bail!(
                 "Insufficient disk space: need ~{:.1} GB but only {:.1} GB available at {}",
@@ -443,16 +435,14 @@ async fn preflight_check(scenarios: &[Scenario], data_dir: &Path) -> Result<()> 
         // par2 for large files needs roughly 1 GB per 5 GB of input
         let max_file_size = unique_sizes.iter().max().copied().unwrap_or(0);
         let estimated_par2_mem = max_file_size / 5;
-        if needs_par2 || needs_7z {
-            if avail < estimated_par2_mem {
-                tracing::warn!(
+        if (needs_par2 || needs_7z) && avail < estimated_par2_mem {
+            tracing::warn!(
                     "Pre-flight: LOW MEMORY — par2 for {:.1} GB files may need ~{} MB, only {} MB available. \
                      par2 may be OOM-killed.",
                     max_file_size as f64 / GB as f64,
                     estimated_par2_mem / MB,
                     avail_mb
                 );
-            }
         }
     }
 
@@ -473,12 +463,7 @@ async fn get_available_disk_bytes(path: &Path) -> Option<u64> {
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Second line has the value
-        stdout
-            .lines()
-            .nth(1)?
-            .trim()
-            .parse::<u64>()
-            .ok()
+        stdout.lines().nth(1)?.trim().parse::<u64>().ok()
     })
     .await
     .ok()

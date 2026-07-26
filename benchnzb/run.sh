@@ -61,8 +61,12 @@ echo "[*] Log file:    $LOGFILE"
 echo "[*] Building (first run compiles Rust — takes a few minutes)..."
 echo ""
 
-docker compose up --build --abort-on-container-exit --exit-code-from orchestrator 2>&1 | tee "$LOGFILE"
-EXIT_CODE=${PIPESTATUS[0]}
+docker compose up --build -d
+set +e
+docker compose wait orchestrator
+EXIT_CODE=$?
+set -e
+docker compose logs --no-color | tee "$LOGFILE"
 
 [[ "$CLEANUP" == "1" ]] && docker compose down -v 2>/dev/null || true
 

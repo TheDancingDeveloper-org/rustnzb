@@ -21,20 +21,6 @@ pub enum StressClient {
 }
 
 impl StressClient {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Rustnzb(_) => "rustnzb",
-            Self::Sabnzbd(_) => "sabnzbd",
-        }
-    }
-
-    pub async fn healthy(&self) -> bool {
-        match self {
-            Self::Rustnzb(c) => c.healthy().await,
-            Self::Sabnzbd(c) => c.healthy().await,
-        }
-    }
-
     pub async fn add_nzb(&self, data: &[u8], filename: &str) -> anyhow::Result<()> {
         match self {
             Self::Rustnzb(c) => c.add_nzb(data, filename).await,

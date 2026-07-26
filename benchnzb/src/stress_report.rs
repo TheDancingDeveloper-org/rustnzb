@@ -40,7 +40,10 @@ pub fn build_summary(result: &StressResult) -> String {
     let mut lines = Vec::new();
     lines.push(String::new());
     lines.push("=".repeat(72));
-    lines.push(format!("  STRESS TEST RESULTS: {}", result.config_summary.client));
+    lines.push(format!(
+        "  STRESS TEST RESULTS: {}",
+        result.config_summary.client
+    ));
     lines.push("=".repeat(72));
 
     lines.push(String::new());

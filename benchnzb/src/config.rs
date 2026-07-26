@@ -8,7 +8,6 @@ pub const NNTP_GROUP: &str = "alt.binaries.test";
 pub const MSG_ID_DOMAIN: &str = "benchnzb";
 
 pub const SABNZBD_API: &str = "http://sabnzbd:8080";
-pub const SABNZBD_API_KEY: &str = "benchnzb0123456789abcdef01234567";
 pub const RUSTNZB_API: &str = "http://rustnzb:9090";
 
 pub const POLL_INTERVAL_MS: u64 = 1000;
@@ -52,7 +51,7 @@ pub fn size_label(size: u64) -> String {
 fn make_scenario(size: u64, test_type: TestType) -> Scenario {
     let label = size_label(size);
     let type_str = test_type.to_string();
-    let name = format!("sz{}_{}", label, type_str);
+    let name = format!("sz{label}_{type_str}");
 
     let missing_pct = if test_type == TestType::Par2 {
         3.0
@@ -210,7 +209,7 @@ pub fn format_size(bytes: u64) -> String {
     } else if bytes >= MB {
         format!("{:.1} MB", bytes as f64 / MB as f64)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 

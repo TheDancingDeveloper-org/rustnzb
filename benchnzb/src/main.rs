@@ -18,7 +18,10 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "benchnzb", about = "Usenet client benchmark: SABnzbd vs rustnzb")]
+#[command(
+    name = "benchnzb",
+    about = "Usenet client benchmark: SABnzbd vs rustnzb"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -93,8 +96,7 @@ fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_target(false)
         .init();
@@ -133,9 +135,7 @@ fn main() -> anyhow::Result<()> {
                 tracing::info!("Charts written to {}", out.display());
                 Ok(())
             }
-            Command::SynthNntp { port, health_port } => {
-                synth_nntp::run(port, health_port).await
-            }
+            Command::SynthNntp { port, health_port } => synth_nntp::run(port, health_port).await,
             Command::Stress {
                 client,
                 duration,

@@ -12,9 +12,14 @@ Confirmed and addressed in the reliability change set:
   history row is durably present. Completed jobs remove their work directory
   only after it is empty; a failed output move retains files for safety.
 
-Open benchmark-led work is tracked in GitHub issues #21, #23, and #24. Their
-vendor measurements are hypotheses until reproduced with controlled, legal
-fixtures.
+Benchmark report remediation is in progress in GitHub issue #24. The harness
+now uses compact deterministic fixtures, records terminal outcome plus
+source-payload SHA-256 verification, captures decoded/wire/request/430
+metrics, and samples both completed and incomplete work directories. A
+controlled missing-article/PAR2-repair run passed: rustnzb observed one 430,
+repaired the payload, verified its SHA-256, and removed its terminal work
+directory. The vendor measurements remain hypotheses until reproducible
+controlled runs are published.
 
 ## Nested archive extraction — 2026-07-26
 

@@ -135,7 +135,7 @@ pub async fn run(cfg: StressConfig) -> Result<()> {
     tracing::info!("  Poll:        {}s", cfg.poll_interval_secs);
     tracing::info!("  Cleanup:     {}s", cfg.cleanup_interval_secs);
 
-    let articles_per_nzb = ((nzb_size + ARTICLE_SIZE - 1) / ARTICLE_SIZE) as u32;
+    let articles_per_nzb = nzb_size.div_ceil(ARTICLE_SIZE) as u32;
     tracing::info!(
         "  Articles/NZB: {} ({} bytes each)",
         articles_per_nzb,
@@ -147,8 +147,14 @@ pub async fn run(cfg: StressConfig) -> Result<()> {
     wait_for_service("synth-nntp", SYNTH_NNTP_HEALTH, 120).await?;
 
     let client: StressClient = if is_sabnzbd {
-        wait_for_service("sabnzbd", &format!("{SABNZBD_API}/api?mode=version&apikey={}&output=json", config::SABNZBD_API_KEY), 120).await?;
-        StressClient::Sabnzbd(crate::clients::sabnzbd::SabnzbdClient::new(SABNZBD_API))
+        let docker_client = docker::connect()?;
+        let sab = crate::clients::sabnzbd::SabnzbdClient::from_runtime_config(
+            SABNZBD_API,
+            &docker_client,
+        )
+        .await?;
+        wait_for_sabnzbd(&sab, 120).await?;
+        StressClient::Sabnzbd(sab)
     } else {
         wait_for_service("rustnzb", &format!("{RUSTNZB_API}/api/status"), 120).await?;
         StressClient::Rustnzb(crate::clients::rustnzb::RustnzbClient::new(RUSTNZB_API))
@@ -331,7 +337,9 @@ pub async fn run(cfg: StressConfig) -> Result<()> {
 
     // Write logs
     if !target_logs.is_empty() {
-        let log_path = cfg.results_dir.join(format!("stress_{container_name}_{timestamp}.log"));
+        let log_path = cfg
+            .results_dir
+            .join(format!("stress_{container_name}_{timestamp}.log"));
         std::fs::write(&log_path, &target_logs)?;
         tracing::info!("Logs: {}", log_path.display());
     }
@@ -346,10 +354,7 @@ fn generate_stress_nzb(nzb_size: u64, seq: u64) -> Vec<u8> {
     let segments = nzb::build_segments(&msg_prefix, nzb_size);
     let filename = format!("stress_f{seq:06}.bin");
 
-    let files = vec![nzb::NzbFile {
-        filename,
-        segments,
-    }];
+    let files = vec![nzb::NzbFile { filename, segments }];
 
     nzb::generate_nzb(&files, "bench@benchnzb").into_bytes()
 }
@@ -421,11 +426,7 @@ async fn metrics_loop(state: Arc<SharedState>, client: StressClient, interval_se
 
         // Get client status
         let (speed_bps, queue_size, active) = match client.get_status().await {
-            Ok(status) => (
-                status.speed_bps,
-                status.queue_size,
-                status.active_downloads,
-            ),
+            Ok(status) => (status.speed_bps, status.queue_size, status.active_downloads),
             Err(_) => (0, 0, 0),
         };
 
@@ -452,9 +453,9 @@ async fn metrics_loop(state: Arc<SharedState>, client: StressClient, interval_se
             ts: now,
             elapsed_secs: elapsed,
             speed_bps,
-            cpu_pct: 0.0,    // Filled from Docker stats merge
-            mem_bytes: 0,     // Filled from Docker stats merge
-            net_rx_bps: 0.0,  // Filled from Docker stats merge
+            cpu_pct: 0.0,        // Filled from Docker stats merge
+            mem_bytes: 0,        // Filled from Docker stats merge
+            net_rx_bps: 0.0,     // Filled from Docker stats merge
             disk_write_bps: 0.0, // Filled from Docker stats merge
             queue_size,
             active_downloads: active,
@@ -499,16 +500,10 @@ async fn cleanup_loop(
         let clean_cmd = if is_sabnzbd {
             "rm -rf /downloads/complete/* /downloads/complete/.[!.]* 2>/dev/null; echo ok"
         } else {
-            "rm -rf /downloads/complete/* /downloads/complete/.[!.]* /downloads/incomplete/* /downloads/incomplete/.[!.]* 2>/dev/null; echo ok"
+            "rm -rf /config/Downloads/complete/* /config/Downloads/complete/.[!.]* /config/Downloads/incomplete/* /config/Downloads/incomplete/.[!.]* 2>/dev/null; echo ok"
         };
         if let Some(cid) = docker::get_container_id(&docker, &container_name).await {
-            match docker::exec_in_container(
-                &docker,
-                &cid,
-                vec!["sh", "-c", clean_cmd],
-            )
-            .await
-            {
+            match docker::exec_in_container(&docker, &cid, vec!["sh", "-c", clean_cmd]).await {
                 Ok(_) => tracing::debug!("Cleaned completed downloads"),
                 Err(e) => tracing::warn!("Cleanup failed: {e}"),
             }
@@ -545,6 +540,23 @@ async fn wait_for_service(name: &str, url: &str, timeout_secs: u64) -> Result<()
     }
 }
 
+async fn wait_for_sabnzbd(
+    client: &crate::clients::sabnzbd::SabnzbdClient,
+    timeout_secs: u64,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            anyhow::bail!("sabnzbd not ready after {timeout_secs}s");
+        }
+        if client.healthy().await {
+            tracing::info!("  sabnzbd: ready");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// Merge Docker container stats into the stress samples by matching timestamps.
 fn merge_docker_stats(
     stress_samples: &[StressSample],
@@ -559,13 +571,11 @@ fn merge_docker_stats(
 
     for sample in &mut merged {
         // Find closest Docker sample by timestamp
-        let closest = docker_samples
-            .iter()
-            .min_by(|a, b| {
-                let da = (a.ts - sample.ts).abs();
-                let db = (b.ts - sample.ts).abs();
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            });
+        let closest = docker_samples.iter().min_by(|a, b| {
+            let da = (a.ts - sample.ts).abs();
+            let db = (b.ts - sample.ts).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         if let Some(ds) = closest {
             // Only merge if within 10 seconds
@@ -602,19 +612,13 @@ fn compute_windows(samples: &[StressSample], window_secs: u64) -> Vec<WindowStat
         if !in_window.is_empty() {
             let n = in_window.len() as f64;
 
-            let avg_speed_mbps = in_window.iter().map(|s| s.speed_bps as f64).sum::<f64>()
-                / n
-                * 8.0
-                / 1_000_000.0;
+            let avg_speed_mbps =
+                in_window.iter().map(|s| s.speed_bps as f64).sum::<f64>() / n * 8.0 / 1_000_000.0;
             let avg_cpu = in_window.iter().map(|s| s.cpu_pct).sum::<f64>() / n;
             let avg_mem_mb =
                 in_window.iter().map(|s| s.mem_bytes as f64).sum::<f64>() / n / 1_048_576.0;
-            let peak_mem_mb = in_window
-                .iter()
-                .map(|s| s.mem_bytes)
-                .max()
-                .unwrap_or(0) as f64
-                / 1_048_576.0;
+            let peak_mem_mb =
+                in_window.iter().map(|s| s.mem_bytes).max().unwrap_or(0) as f64 / 1_048_576.0;
 
             let first_completed = in_window.first().unwrap().nzbs_completed_total;
             let last_completed = in_window.last().unwrap().nzbs_completed_total;
@@ -653,7 +657,9 @@ fn analyze_degradation(windows: &[WindowStats]) -> DegradationAnalysis {
     };
 
     if windows.len() < 3 {
-        analysis.notes.push("Insufficient data for degradation analysis (need >=3 windows)".into());
+        analysis
+            .notes
+            .push("Insufficient data for degradation analysis (need >=3 windows)".into());
         return analysis;
     }
 
@@ -705,7 +711,9 @@ fn analyze_degradation(windows: &[WindowStats]) -> DegradationAnalysis {
     }
 
     if !analysis.degradation_detected {
-        analysis.notes.push("No significant degradation detected".into());
+        analysis
+            .notes
+            .push("No significant degradation detected".into());
     }
 
     analysis

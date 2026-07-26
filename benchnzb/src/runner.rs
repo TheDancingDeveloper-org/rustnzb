@@ -116,10 +116,24 @@ async fn wait_for_service(name: &str, url: &str, timeout_secs: u64) -> Result<()
             .send()
             .await
         {
-            if resp.status().as_u16() < 500 {
+            if resp.status().is_success() {
                 tracing::info!("  {name}: ready");
                 return Ok(());
             }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+async fn wait_for_sabnzbd(client: &SabnzbdClient, timeout_secs: u64) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            anyhow::bail!("sabnzbd not ready after {timeout_secs}s");
+        }
+        if client.healthy().await {
+            tracing::info!("  sabnzbd: ready");
+            return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
@@ -166,8 +180,12 @@ pub async fn run(scenario_selector: String, data_dir: PathBuf, results_dir: Path
 
     // Wait for services
     tracing::info!("Waiting for services...");
+    let rnzb = RustnzbClient::new(config::RUSTNZB_API);
+
     wait_for_service("mock-nntp", "http://mock-nntp:8080/health", 120).await?;
-    wait_for_service("sabnzbd", &format!("{}/", config::SABNZBD_API), 180).await?;
+    let sab = SabnzbdClient::from_runtime_config(config::SABNZBD_API, &docker_client).await?;
+    wait_for_sabnzbd(&sab, 180).await?;
+    sab.configure_mock_server().await?;
     wait_for_service(
         "rustnzb",
         &format!("{}/api/status", config::RUSTNZB_API),
@@ -175,9 +193,6 @@ pub async fn run(scenario_selector: String, data_dir: PathBuf, results_dir: Path
     )
     .await?;
     bootstrap_rustnzb_mock_server().await?;
-
-    let sab = SabnzbdClient::new(config::SABNZBD_API);
-    let rnzb = RustnzbClient::new(config::RUSTNZB_API);
 
     // Resolve container IDs for metrics and log capture
     metrics.resolve_container_id("sabnzbd").await;
@@ -230,7 +245,7 @@ pub async fn run(scenario_selector: String, data_dir: PathBuf, results_dir: Path
         let nzb_path = datagen::nzb_path(sc, &data_dir);
 
         // Clean download directories
-        clean_download_dir(&docker_client, "sabnzbd", "/downloads").await;
+        clean_download_dir(&docker_client, "sabnzbd", "/config/Downloads").await;
         clean_download_dir(&docker_client, "rustnzb", "/downloads").await;
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -248,7 +263,7 @@ pub async fn run(scenario_selector: String, data_dir: PathBuf, results_dir: Path
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
         // Clean between runs
-        clean_download_dir(&docker_client, "sabnzbd", "/downloads").await;
+        clean_download_dir(&docker_client, "sabnzbd", "/config/Downloads").await;
         clean_download_dir(&docker_client, "rustnzb", "/downloads").await;
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -331,13 +346,17 @@ fn validate_rustnzb_verification(
     match scenario {
         "verify_32mb_unpack" if *outcome != BenchmarkOutcome::Succeeded || !payload_verified => {
             anyhow::bail!(
-                "rustnzb failed verified unpack fixture: outcome={:?}, payload_verified={}",
-                outcome,
-                payload_verified
+                "rustnzb failed verified unpack fixture: outcome={outcome:?}, payload_verified={payload_verified}"
             );
         }
-        "verify_fault_32mb_par2" if article_not_found == 0 => {
-            anyhow::bail!("rustnzb fault fixture did not observe any injected NNTP 430 responses");
+        "verify_fault_32mb_par2"
+            if *outcome != BenchmarkOutcome::Succeeded
+                || !payload_verified
+                || article_not_found == 0 =>
+        {
+            anyhow::bail!(
+                    "rustnzb failed verified fault fixture: outcome={outcome:?}, payload_verified={payload_verified}, article_not_found={article_not_found}"
+                );
         }
         _ => {}
     }
@@ -658,8 +677,15 @@ async fn sample_work_dir_bytes(metrics: &MetricsCollector, client_name: &str) ->
         Ok(docker) => docker,
         Err(_) => return 0,
     };
-    let command = "du -sb /downloads/incomplete /downloads/complete 2>/dev/null | awk '{total += $1} END {print total + 0}'";
-    docker::exec_in_container(&docker, container_id, vec!["sh", "-c", command])
+    let work_dir = if client_name == "sabnzbd" {
+        "/config/Downloads"
+    } else {
+        "/downloads"
+    };
+    let command = format!(
+        "du -sb {work_dir}/incomplete {work_dir}/complete 2>/dev/null | awk '{{total += $1}} END {{print total + 0}}'"
+    );
+    docker::exec_in_container(&docker, container_id, vec!["sh", "-c", &command])
         .await
         .ok()
         .and_then(|output| output.trim().parse().ok())
@@ -671,7 +697,7 @@ async fn verify_payload(
     client_name: &str,
     scenario: &Scenario,
 ) -> Result<bool> {
-    if scenario.test_type != config::TestType::Unpack {
+    if !requires_payload_verification(scenario.test_type) {
         return Ok(true);
     }
     let Some(container_id) = metrics.container_id(client_name) else {
@@ -679,8 +705,13 @@ async fn verify_payload(
     };
     let docker = docker::connect()?;
     let expected_name = format!("bench_{}.bin", config::size_label(scenario.total_size));
+    let complete_dir = if client_name == "sabnzbd" {
+        "/config/Downloads/complete"
+    } else {
+        "/downloads/complete"
+    };
     let output_command = format!(
-        "set -eu; file=$(find /downloads/complete -type f -name '{expected_name}' -print -quit); test -n \"$file\"; sha256sum \"$file\" | awk '{{print $1}}'"
+        "set -eu; file=$(find {complete_dir} -type f \\( -name '{expected_name}' -o -name '*.bin' \\) -print -quit); test -n \"$file\"; sha256sum \"$file\" | awk '{{print $1}}'"
     );
     let output_digest =
         docker::exec_in_container(&docker, container_id, vec!["sh", "-c", &output_command]).await?;
@@ -694,10 +725,15 @@ async fn verify_payload(
     Ok(output_digest.trim() == source_digest.trim() && !source_digest.trim().is_empty())
 }
 
+const fn requires_payload_verification(test_type: config::TestType) -> bool {
+    matches!(test_type, config::TestType::Par2 | config::TestType::Unpack)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_terminal_status, validate_rustnzb_verification, BenchmarkOutcome, FixtureMetrics,
+        classify_terminal_status, requires_payload_verification, validate_rustnzb_verification,
+        BenchmarkOutcome, FixtureMetrics,
     };
 
     #[test]
@@ -770,5 +806,28 @@ mod tests {
             0,
         )
         .is_err());
+        assert!(validate_rustnzb_verification(
+            "verify_fault_32mb_par2",
+            &BenchmarkOutcome::Failed,
+            true,
+            1,
+        )
+        .is_err());
+        assert!(validate_rustnzb_verification(
+            "verify_fault_32mb_par2",
+            &BenchmarkOutcome::Succeeded,
+            false,
+            1,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn raw_scenarios_are_not_payload_verified_but_par2_and_unpack_are() {
+        assert!(!requires_payload_verification(crate::config::TestType::Raw));
+        assert!(requires_payload_verification(crate::config::TestType::Par2));
+        assert!(requires_payload_verification(
+            crate::config::TestType::Unpack
+        ));
     }
 }

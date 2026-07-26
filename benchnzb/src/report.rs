@@ -92,11 +92,12 @@ pub fn write_csv(
 }
 
 pub fn build_summary(results: &[(ClientResult, ClientResult)]) -> String {
-    let mut lines = Vec::new();
-    lines.push(String::new());
-    lines.push("=".repeat(84));
-    lines.push("  BENCHMARK RESULTS: SABnzbd vs rustnzb".into());
-    lines.push("=".repeat(84));
+    let mut lines = vec![
+        String::new(),
+        "=".repeat(84),
+        "  BENCHMARK RESULTS: SABnzbd vs rustnzb".into(),
+        "=".repeat(84),
+    ];
 
     for (sab, rnzb) in results {
         lines.push(String::new());
@@ -208,8 +209,7 @@ pub fn build_summary(results: &[(ClientResult, ClientResult)]) -> String {
             }
             let delta = delta_str(*sab_v, *rnzb_v, *lower_better);
             lines.push(format!(
-                "  {:<24} {:>15} {:>15} {:>14}",
-                label, sab_s, rnzb_s, delta
+                "  {label:<24} {sab_s:>15} {rnzb_s:>15} {delta:>14}"
             ));
         }
         lines.push("-".repeat(84));
