@@ -311,7 +311,7 @@ fn is_split_7z_volume(name_lower: &str) -> bool {
 /// after successful extraction.
 fn is_cleanup_candidate(name: &str) -> bool {
     // Par2 files: .par2
-    if name.ends_with(".par2") || name.ends_with(".zip") {
+    if name.ends_with(".par2") || name.ends_with(".zip") || name.ends_with(".7z") {
         return true;
     }
 
@@ -460,6 +460,7 @@ mod tests {
             "release.part002.rar",
             "release.par2",
             "release.vol00+01.par2",
+            "release.7z",
         ]);
         assert!(!has_usable_output(raw_only.path()).unwrap());
 
@@ -557,6 +558,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_split_7z_volumes() {
+        assert!(is_cleanup_candidate("archive.7z"));
         assert!(is_cleanup_candidate("archive.7z.001"));
         assert!(is_cleanup_candidate("archive.7z.002"));
         assert!(is_cleanup_candidate("archive.7z.099"));
