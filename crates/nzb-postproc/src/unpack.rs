@@ -4,7 +4,8 @@
 //! - 7z: Shell out to `7z`/`7zz`/`7za` binary
 //! - ZIP: Uses std::fs + zip crate
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use tokio::process::Command;
@@ -83,6 +84,41 @@ fn sevenz_extract_args(
     args
 }
 
+/// Return the regular files currently present below an extraction directory.
+/// Extractors do not expose a portable machine-readable file list, so a
+/// before/after snapshot is more reliable than parsing localized console text.
+fn output_files(root: &Path) -> std::io::Result<HashSet<PathBuf>> {
+    let mut files = HashSet::new();
+    let mut directories = vec![root.to_path_buf()];
+
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if file_type.is_file() {
+                files.insert(path);
+            }
+        }
+    }
+
+    Ok(files)
+}
+
+fn newly_extracted_files(
+    output_dir: &Path,
+    before: &HashSet<PathBuf>,
+) -> std::io::Result<Vec<String>> {
+    let mut files = output_files(output_dir)?
+        .difference(before)
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    files.sort();
+    Ok(files)
+}
+
 /// Extract RAR archives in a directory.
 ///
 /// If `password` is `Some`, it is passed to the extractor (`-p<pw>` for unrar,
@@ -107,6 +143,7 @@ pub async fn extract_rar(
     info!(file = %rar_file.display(), dest = %output_dir.display(), extractor = %bin, "Extracting RAR");
 
     std::fs::create_dir_all(output_dir)?;
+    let before = output_files(output_dir)?;
 
     let output = if use_7z {
         // Do not pass `-p-` to 7z when no password is set. p7zip's built-in
@@ -156,7 +193,11 @@ pub async fn extract_rar(
 
     Ok(UnpackResult {
         success,
-        files_extracted: Vec::new(), // TODO: parse from output
+        files_extracted: if success {
+            newly_extracted_files(output_dir, &before)?
+        } else {
+            Vec::new()
+        },
         output: stdout,
         error_output: stderr,
     })
@@ -183,6 +224,7 @@ pub async fn extract_7z(
     info!(file = %archive_file.display(), dest = %output_dir.display(), "Extracting 7z");
 
     std::fs::create_dir_all(output_dir)?;
+    let before = output_files(output_dir)?;
 
     let output = Command::new(&sevenz_bin)
         .args(sevenz_extract_args(archive_file, output_dir, password))
@@ -217,7 +259,11 @@ pub async fn extract_7z(
 
     Ok(UnpackResult {
         success,
-        files_extracted: Vec::new(), // TODO: parse from output
+        files_extracted: if success {
+            newly_extracted_files(output_dir, &before)?
+        } else {
+            Vec::new()
+        },
         output: stdout,
         error_output: stderr,
     })

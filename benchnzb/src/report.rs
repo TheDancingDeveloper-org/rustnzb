@@ -228,6 +228,91 @@ pub fn write_summary(summary: &str, dir: &Path, timestamp: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write a self-contained, shareable report for a single deterministic run.
+///
+/// This intentionally reports only what the fixture measured. It does not
+/// extrapolate a 32 MiB loopback run into an Internet-provider comparison.
+pub fn write_html(
+    results: &[(ClientResult, ClientResult)],
+    dir: &Path,
+    timestamp: &str,
+) -> Result<()> {
+    let path = dir.join(format!("benchmark_{timestamp}.html"));
+    let mut rows = String::new();
+
+    for (sab, rustnzb) in results {
+        rows.push_str(&format!(
+            "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&sab.scenario_description),
+            client_cell(sab),
+            client_cell(rustnzb),
+            bytes(sab.fixture_metrics.wire_bytes_served),
+            bytes(rustnzb.fixture_metrics.wire_bytes_served),
+            sab.fixture_metrics.article_requests,
+            rustnzb.fixture_metrics.article_requests,
+            bytes(sab.peak_work_dir_bytes),
+            bytes(rustnzb.peak_work_dir_bytes),
+        ));
+    }
+
+    let document = format!(
+        r##"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rustnzb benchmark report · {timestamp}</title>
+<style>
+:root {{ color-scheme: dark; --bg:#101722; --panel:#182334; --ink:#e9f1fc; --muted:#aebdd1; --line:#31445d; --accent:#61d8a0; --warn:#ffd166; }}
+body {{ margin:0; background:var(--bg); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }}
+main {{ max-width:1120px; margin:auto; padding:42px 22px 72px; }} h1 {{ font-size:clamp(2rem,5vw,3.5rem); line-height:1.08; margin:.1em 0; }}
+h2 {{ margin-top:2.4em; }} .kicker {{ color:var(--accent); font-weight:700; text-transform:uppercase; letter-spacing:.09em; font-size:.78rem; }}
+.sub,.muted {{ color:var(--muted); }} .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:14px; }}
+.card, .callout {{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; }} .card b {{ display:block; font-size:1.35rem; }}
+.callout {{ border-left:4px solid var(--warn); }} table {{ width:100%; border-collapse:collapse; margin-top:14px; font-size:.92rem; }} th,td {{ border-bottom:1px solid var(--line); padding:12px 10px; text-align:right; vertical-align:top; }} th:first-child,td:first-child {{ text-align:left; }}
+.ok {{ color:var(--accent); font-weight:700; }} .bad {{ color:#ff8b8b; font-weight:700; }} code {{ background:#0b111a; padding:.15em .35em; border-radius:4px; }} a {{ color:#8fc5ff; }}
+</style></head><body><main>
+<p class="kicker">Measured locally · reproducible fixture</p><h1>rustnzb benchmark report</h1>
+<p class="sub">Generated {timestamp}. This is a controlled Docker/loopback comparison of rustnzb and SABnzbd, not a claim about public Usenet-provider throughput.</p>
+<div class="grid"><div class="card"><span class="muted">Scenarios</span><b>{scenario_count}</b><span>clean verification and injected-miss repair paths</span></div><div class="card"><span class="muted">Correctness gate</span><b>payload hash</b><span>each successful result must verify the reconstructed payload</span></div><div class="card"><span class="muted">Primary metric</span><b>time to usable output</b><span>terminal success plus payload verification</span></div></div>
+<h2>Methodology</h2><ul><li>Both clients use the same generated NZB and deterministic mock NNTP server.</li><li>The fixture records decoded payload bytes, emitted yEnc-body bytes, article requests, served articles, and injected 430 responses.</li><li>Peak working-directory size is sampled during the run; it is not inferred from the final directory.</li><li>The clean scenario has no injected misses. The fault scenario deliberately returns one missing article and requires the PAR2/recovery path to still yield a verified payload.</li></ul>
+<h2>Results</h2><div style="overflow:auto"><table><thead><tr><th>Scenario</th><th>SABnzbd outcome / time</th><th>rustnzb outcome / time</th><th>SAB wire bytes</th><th>rustnzb wire bytes</th><th>SAB requests</th><th>rustnzb requests</th><th>SAB peak work disk</th><th>rustnzb peak work disk</th></tr></thead><tbody>{rows}</tbody></table></div>
+<h2>What this establishes</h2><div class="callout"><b>Scope matters.</b> These results establish the harness contract: both clients are measured against identical fixture data; rustnzb is only counted successful when its output hash verifies; and the fault leg exposes duplicate/retry traffic instead of silently treating it as a healthy download. They do not establish performance on multi-gigabyte public posts, provider latency, encrypted archives, or arbitrary production configurations.</div>
+<h2>Reproduce</h2><p>From the repository root, run <code>cd benchnzb &amp;&amp; ./run.sh --scenarios verify,verify-fault</code>. Raw JSON, CSV, text summary, container logs, SVG charts, and this HTML report are written to <code>benchnzb/results/</code>.</p>
+<p class="muted">Source: <a href="https://github.com/TheDancingDeveloper-org/rustnzb">TheDancingDeveloper-org/rustnzb</a>. No release, tag, or container publication is created by this report.</p>
+</main></body></html>"##,
+        scenario_count = results.len(),
+    );
+    std::fs::write(&path, document)?;
+    tracing::info!("HTML: {}", path.display());
+    Ok(())
+}
+
+fn client_cell(result: &ClientResult) -> String {
+    let outcome = match result.outcome {
+        crate::runner::BenchmarkOutcome::Succeeded if result.payload_verified => "<span class=\"ok\">verified</span>",
+        crate::runner::BenchmarkOutcome::Succeeded => "<span class=\"bad\">unverified</span>",
+        _ => "<span class=\"bad\">failed</span>",
+    };
+    format!("{outcome}<br>{:.2} s", result.total_sec)
+}
+
+fn bytes(value: u64) -> String {
+    if value >= 1_048_576 {
+        format!("{:.2} MiB", value as f64 / 1_048_576.0)
+    } else if value >= 1024 {
+        format!("{:.1} KiB", value as f64 / 1024.0)
+    } else {
+        format!("{value} B")
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 fn delta_str(sab: f64, rnzb: f64, lower_better: bool) -> String {
     if sab == 0.0 && rnzb == 0.0 {
         return "\u{2014}".to_string();
@@ -246,4 +331,14 @@ fn delta_str(sab: f64, rnzb: f64, lower_better: bool) -> String {
     // ▲ = rustnzb better, ▼ = rustnzb worse
     let arrow = if pct > 0.0 { " \u{25B2}" } else { " \u{25BC}" };
     format!("{prefix}{pct:.1}%{arrow}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_html;
+
+    #[test]
+    fn html_escapes_fixture_labels() {
+        assert_eq!(escape_html("a<&>'\""), "a&lt;&amp;&gt;&#39;&quot;");
+    }
 }

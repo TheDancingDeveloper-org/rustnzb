@@ -293,6 +293,7 @@ pub async fn run(scenario_selector: String, data_dir: PathBuf, results_dir: Path
     let summary = report::build_summary(&all_results);
     println!("\n{summary}");
     report::write_summary(&summary, &results_dir, &timestamp)?;
+    report::write_html(&all_results, &results_dir, &timestamp)?;
 
     let charts_dir = results_dir.join(format!("charts_{timestamp}"));
     std::fs::create_dir_all(&charts_dir)?;

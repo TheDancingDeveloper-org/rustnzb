@@ -229,8 +229,21 @@ pub fn format_duration(d: std::time::Duration) -> String {
 }
 
 pub fn resolve_scenarios(selector: &str) -> Vec<Scenario> {
-    let all = generate_all();
     let sel = selector.trim().to_lowercase();
+
+    // Permit combining named groups (for example, `verify,verify-fault`) as
+    // well as concrete scenario names. This is useful for a single report
+    // that covers both the clean and injected-fault correctness paths.
+    if sel.contains(',') {
+        let mut seen = std::collections::HashSet::new();
+        return sel
+            .split(',')
+            .flat_map(|part| resolve_scenarios(part.trim()))
+            .filter(|scenario| seen.insert(scenario.name.clone()))
+            .collect();
+    }
+
+    let all = generate_all();
 
     match sel.as_str() {
         "all" | "full" => all,
@@ -257,10 +270,9 @@ pub fn resolve_scenarios(selector: &str) -> Vec<Scenario> {
             .cloned()
             .collect(),
         _ => {
-            let names: Vec<&str> = sel.split(',').map(|s| s.trim()).collect();
             let matched: Vec<Scenario> = all
                 .iter()
-                .filter(|s| names.contains(&s.name.as_str()))
+                .filter(|s| s.name == sel)
                 .cloned()
                 .collect();
             if matched.is_empty() {
@@ -317,6 +329,7 @@ mod tests {
         assert_eq!(fault[0].test_type, TestType::Par2);
         assert!(fault[0].missing_pct > 0.0);
         assert!(resolve_scenarios("missing").is_empty());
+        assert_eq!(resolve_scenarios("verify,verify-fault").len(), 2);
     }
 
     #[test]
