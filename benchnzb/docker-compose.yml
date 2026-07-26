@@ -28,7 +28,6 @@ services:
     build:
       context: ${RUSTNZB_DIR:-..}
       dockerfile: Dockerfile
-    command: ["rustnzb", "--config", "/config/config.toml"]
     environment:
       - RUST_LOG=${RUST_LOG:-info}
     volumes:

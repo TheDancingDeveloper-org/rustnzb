@@ -39,6 +39,10 @@ The stress test runs three concurrent loops for the configured duration:
 | Memory usage | Docker stats | Container RSS (resident set size) |
 | Total bytes | Speed integration | Accumulated from speed samples (approximate) |
 
+The benchmark starts rustnzb through its image-provided service definition;
+the compose file must not override it with a second process, because both
+instances would contend for the same SQLite state.
+
 ## Correctness fixture and fault attribution
 
 The large scenarios are performance/soak workloads, not correctness proof.

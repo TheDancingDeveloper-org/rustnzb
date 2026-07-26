@@ -60,6 +60,10 @@ and peak incomplete/complete directory occupancy.
 articles. Its fault counters distinguish repair/retry traffic from the
 healthy-path result.
 
+The compose service deliberately uses the image's normal s6 service lifecycle
+instead of starting a second rustnzb process, so the fixture exercises the
+same database ownership model as the runtime image.
+
 ### Scenario Groups
 
 | Flag | Scenarios | Approx Time |

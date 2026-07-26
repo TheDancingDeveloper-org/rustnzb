@@ -12,7 +12,7 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  --scenarios GROUP   quick|medium|speed|postproc|full"
+    echo "  --scenarios GROUP   verify|verify-fault|quick|medium|speed|postproc|full"
     echo "  --no-cleanup        Keep containers after run"
     echo "  --help              Show this help"
     echo ""
