@@ -367,6 +367,13 @@ mod tests {
         assert_eq!(cfg.min_free_space_bytes, 1_073_741_824);
         assert!(cfg.watch_dir.is_none());
         assert_eq!(cfg.rss_history_limit, Some(500));
+        assert!(cfg.direct_unpack);
+    }
+
+    #[test]
+    fn direct_unpack_can_be_explicitly_disabled() {
+        let cfg: GeneralConfig = toml::from_str("direct_unpack = false").unwrap();
+        assert!(!cfg.direct_unpack);
     }
 
     #[test]

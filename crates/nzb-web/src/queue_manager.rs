@@ -27,6 +27,52 @@ use nzb_dispatch::{
     BandwidthConfig, BandwidthLimiter, DispatchEngine, DispatchHandle, ProgressUpdate,
 };
 
+fn cleanup_terminal_work_dir(job_id: &str, work_dir: &std::path::Path, final_status: JobStatus) {
+    if !work_dir.exists() {
+        return;
+    }
+
+    let cleanup_result = match final_status {
+        // Failed downloads can be retried from their retained NZB history, so
+        // retaining raw articles only leaks disk without improving recovery.
+        JobStatus::Failed => std::fs::remove_dir_all(work_dir),
+        // A successful job must not lose files if an output move failed. Only
+        // remove the directory after the move/pipeline has left it empty.
+        JobStatus::Completed => match std::fs::read_dir(work_dir) {
+            Ok(mut entries) => {
+                if entries.next().is_none() {
+                    std::fs::remove_dir(work_dir)
+                } else {
+                    warn!(
+                        job_id,
+                        work_dir = %work_dir.display(),
+                        "Retaining non-empty completed work directory after output move"
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    job_id,
+                    work_dir = %work_dir.display(),
+                    "Unable to inspect completed work directory for safe cleanup: {e}"
+                );
+                return;
+            }
+        },
+        _ => return,
+    };
+
+    match cleanup_result {
+        Ok(()) => info!(job_id, work_dir = %work_dir.display(), "Removed terminal work directory"),
+        Err(e) => warn!(
+            job_id,
+            work_dir = %work_dir.display(),
+            "Failed to remove terminal work directory: {e}"
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStatsData {
     pub server_id: String,
@@ -1859,7 +1905,7 @@ impl QueueManager {
         };
 
         let db = self.db.lock();
-        match db.history_get(&state.job.id) {
+        let history_persisted = match db.history_get(&state.job.id) {
             Ok(Some(existing)) => {
                 warn!(
                     job_id = %state.job.id,
@@ -1867,16 +1913,21 @@ impl QueueManager {
                     attempted_status = %final_status,
                     "History row already exists; terminal persistence is idempotent"
                 );
+                true
             }
             Ok(None) => {
                 if let Err(e) = db.history_insert(&history_entry) {
                     error!(job_id = %state.job.id, "Failed to insert history: {e}");
+                    false
+                } else {
+                    true
                 }
             }
             Err(e) => {
                 error!(job_id = %state.job.id, "Failed to check existing history row: {e}");
+                false
             }
-        }
+        };
 
         // Capture and persist per-job logs from the ring buffer
         if let Some(ref log_buffer) = self.log_buffer {
@@ -1898,6 +1949,17 @@ impl QueueManager {
             && let Err(e) = db.history_enforce_retention(max)
         {
             warn!("Failed to enforce history retention: {e}");
+        }
+        drop(db);
+
+        if history_persisted {
+            cleanup_terminal_work_dir(&state.job.id, &state.job.work_dir, final_status);
+        } else {
+            warn!(
+                job_id = %state.job.id,
+                work_dir = %state.job.work_dir.display(),
+                "Retaining terminal work directory because history persistence failed"
+            );
         }
     }
 
@@ -3543,6 +3605,58 @@ mod global_pause_tests {
                 .as_deref(),
             Some("original failure")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_history_cleanup_removes_raw_work_directory_after_persistence() {
+        let (manager, tempdir) = manager();
+        let failed = job("failed-cleanup", JobStatus::Failed, tempdir.path());
+        std::fs::create_dir_all(&failed.work_dir).unwrap();
+        std::fs::write(failed.work_dir.join("raw-volume.rar"), b"raw articles").unwrap();
+        let work_dir = failed.work_dir.clone();
+        insert_job(&manager, failed);
+
+        let mut jobs = manager.jobs.lock();
+        manager.move_to_history(jobs.get_mut("failed-cleanup").unwrap(), Vec::new());
+        drop(jobs);
+
+        assert!(
+            manager
+                .db
+                .lock()
+                .history_get("failed-cleanup")
+                .unwrap()
+                .is_some()
+        );
+        assert!(!work_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn completed_history_cleanup_retains_source_when_output_move_is_unsafe() {
+        let (manager, tempdir) = manager();
+        let completed = job("completed-retain", JobStatus::Completed, tempdir.path());
+        std::fs::create_dir_all(&completed.work_dir).unwrap();
+        std::fs::write(completed.work_dir.join("unmoved.bin"), b"payload").unwrap();
+        // A regular file at output_dir makes both rename and copy fail, so the
+        // work directory must be retained instead of silently losing data.
+        std::fs::create_dir_all(completed.output_dir.parent().unwrap()).unwrap();
+        std::fs::write(&completed.output_dir, b"not a directory").unwrap();
+        let work_dir = completed.work_dir.clone();
+        insert_job(&manager, completed);
+
+        let mut jobs = manager.jobs.lock();
+        manager.move_to_history(jobs.get_mut("completed-retain").unwrap(), Vec::new());
+        drop(jobs);
+
+        assert!(
+            manager
+                .db
+                .lock()
+                .history_get("completed-retain")
+                .unwrap()
+                .is_some()
+        );
+        assert!(work_dir.join("unmoved.bin").exists());
     }
 
     #[tokio::test]
