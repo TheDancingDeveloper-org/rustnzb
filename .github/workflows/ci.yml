@@ -76,6 +76,7 @@ jobs:
       - run: ci/run desktop-test
 
   container-smoke:
+    needs: rust
     if: github.event_name != 'pull_request' || (github.event.pull_request.user.type != 'Bot' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, node-b, linux, x64, publish, docker]
     env:
