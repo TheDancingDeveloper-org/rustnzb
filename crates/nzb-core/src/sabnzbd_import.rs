@@ -103,6 +103,16 @@ pub fn parse_ini_bool(s: &str) -> bool {
     matches!(s.trim(), "1" | "yes" | "true" | "True")
 }
 
+/// Read SABnzbd API booleans, which may be encoded as JSON booleans, numbers,
+/// or strings depending on the server version.
+fn parse_api_bool(value: &serde_json::Value, default: bool) -> bool {
+    value
+        .as_bool()
+        .or_else(|| value.as_u64().map(|number| number != 0))
+        .or_else(|| value.as_str().map(parse_ini_bool))
+        .unwrap_or(default)
+}
+
 // ---------------------------------------------------------------------------
 // INI Parser
 // ---------------------------------------------------------------------------
@@ -336,10 +346,8 @@ pub fn parse_sabnzbd_api_response(json: &serde_json::Value) -> SabnzbdImportPrev
                             .as_u64()
                             .or_else(|| s["port"].as_str().and_then(|p| p.parse().ok()))
                             .unwrap_or(563) as u16,
-                        ssl: s["ssl"].as_u64().unwrap_or(0) != 0
-                            || s["ssl"].as_bool().unwrap_or(false),
-                        ssl_verify: s["ssl_verify"].as_u64().unwrap_or(0) != 0
-                            || s["ssl_verify"].as_bool().unwrap_or(false),
+                        ssl: parse_api_bool(&s["ssl"], false),
+                        ssl_verify: parse_api_bool(&s["ssl_verify"], false),
                         username: s["username"]
                             .as_str()
                             .map(|u| u.to_string())
@@ -354,14 +362,12 @@ pub fn parse_sabnzbd_api_response(json: &serde_json::Value) -> SabnzbdImportPrev
                             .as_u64()
                             .or_else(|| s["priority"].as_str().and_then(|p| p.parse().ok()))
                             .unwrap_or(0) as u8,
-                        enabled: s["enable"].as_u64().unwrap_or(1) != 0
-                            || s["enable"].as_bool().unwrap_or(true),
+                        enabled: parse_api_bool(&s["enable"], true),
                         retention: s["retention"]
                             .as_u64()
                             .or_else(|| s["retention"].as_str().and_then(|r| r.parse().ok()))
                             .unwrap_or(0) as u32,
-                        optional: s["optional"].as_u64().unwrap_or(0) != 0
-                            || s["optional"].as_bool().unwrap_or(false),
+                        optional: parse_api_bool(&s["optional"], false),
                     }
                 })
                 .collect()
@@ -455,5 +461,104 @@ fn build_imported_server(kv: &HashMap<String, String>, from_api: bool) -> Import
             .get("optional")
             .map(|s| parse_ini_bool(s))
             .unwrap_or(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn imports_ini_fields_and_reports_unsupported_sections() {
+        let preview = parse_sabnzbd_ini(
+            r#"
+            [misc]
+            api_key = key
+            complete_dir = "/complete"
+            download_dir = "/incomplete"
+            bandwidth_limit = 2M
+            no_dupes = 1
+            [servers]
+            [[primary]]
+            name = Primary
+            host = news.example.test
+            port = 563
+            ssl = 1
+            username = user
+            password = pass
+            [categories]
+            [[tv]]
+            name = tv
+            dir = /complete/tv
+            pp = 2
+            script = cleanup.py
+            [rss]
+            [[daily]]
+            uri = https://example.test/feed
+            cat = tv
+            enable = yes
+            [sorting]
+            enabled = 1
+            "#,
+        );
+
+        assert_eq!(preview.general.speed_limit_bps, 2 * 1024 * 1024);
+        assert_eq!(preview.servers.len(), 1);
+        assert_eq!(preview.servers[0].host, "news.example.test");
+        assert_eq!(preview.categories[0].name, "tv");
+        assert_eq!(preview.rss_feeds[0].category.as_deref(), Some("tv"));
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cleanup.py"))
+        );
+        assert!(
+            preview
+                .skipped_fields
+                .iter()
+                .any(|field| field.contains("sorting"))
+        );
+        assert!(
+            preview
+                .skipped_fields
+                .iter()
+                .any(|field| field.contains("Duplicate"))
+        );
+    }
+
+    #[test]
+    fn api_import_handles_string_numbers_and_masked_passwords() {
+        let preview = parse_sabnzbd_api_response(&serde_json::json!({
+            "config": {
+                "misc": { "bandwidth_limit": "500K" },
+                "servers": [{
+                    "displayname": "Primary", "host": "news.example.test",
+                    "port": "563", "ssl": true, "password": "***",
+                    "connections": "12", "enable": 0
+                }]
+            }
+        }));
+
+        assert_eq!(preview.general.speed_limit_bps, 500 * 1024);
+        assert_eq!(preview.servers[0].connections, 12);
+        assert!(!preview.servers[0].enabled);
+        assert!(preview.servers[0].password_masked);
+        assert_eq!(preview.warnings.len(), 1);
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_ini_input_never_panics(input in ".{0,4096}") {
+            let preview = parse_sabnzbd_ini(&input);
+            prop_assert!(preview.servers.len() <= input.lines().count());
+        }
+
+        #[test]
+        fn bandwidth_parser_is_case_insensitive_for_units(value in 0u32..1_000_000) {
+            prop_assert_eq!(parse_bandwidth_limit(&format!("{value}m")), value as u64 * 1024 * 1024);
+            prop_assert_eq!(parse_bandwidth_limit(&format!("{value}M")), value as u64 * 1024 * 1024);
+        }
     }
 }

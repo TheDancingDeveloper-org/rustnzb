@@ -1,0 +1,8 @@
+{
+  "statements": 18.5,
+  "branches": 32.59,
+  "functions": 34.7,
+  "lines": 26.43,
+  "next_statement_target": 25,
+  "long_term_statement_target": 60
+}

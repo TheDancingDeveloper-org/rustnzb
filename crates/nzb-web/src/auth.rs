@@ -354,3 +354,54 @@ pub async fn h_auth_logout(
     state.token_store.revoke_refresh_token(&req.refresh_token);
     StatusCode::NO_CONTENT
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_rotation_invalidates_the_previous_refresh_token() {
+        let store = TokenStore::new();
+        let first = store.create_tokens();
+        assert!(store.validate_access_token(&first.access_token));
+
+        let second = store
+            .refresh(&first.refresh_token)
+            .expect("refresh token is valid");
+        assert!(store.validate_access_token(&first.access_token));
+        assert!(store.validate_access_token(&second.access_token));
+        assert!(store.refresh(&first.refresh_token).is_none());
+
+        store.revoke_refresh_token(&second.refresh_token);
+        assert!(store.refresh(&second.refresh_token).is_none());
+    }
+
+    #[test]
+    fn credential_store_persists_owner_only_credentials_and_validates_in_constant_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(temp.path().to_path_buf());
+        assert!(!store.has_credentials());
+        store
+            .set_credentials(StoredCredentials {
+                username: "alice".into(),
+                password: "correct horse".into(),
+            })
+            .unwrap();
+        assert!(store.validate("alice", "correct horse"));
+        assert!(!store.validate("alice", "wrong"));
+        assert!(!constant_time_eq(b"same", b"different"));
+
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(temp.path().join("credentials.json"))
+                    .unwrap()
+                    .permissions(),
+            ) & 0o777,
+            0o600,
+        );
+
+        let reloaded = CredentialStore::new(temp.path().to_path_buf());
+        assert!(reloaded.validate("alice", "correct horse"));
+    }
+}

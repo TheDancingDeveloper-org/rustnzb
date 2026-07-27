@@ -1,0 +1,46 @@
+[package]
+name = "rustnzb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+nzb-core = { path = "../crates/nzb-core" }
+nzb-decode = { path = "../crates/nzb-decode" }
+nzb-nntp = { path = "../crates/nzb-nntp" }
+serde_json = "1"
+
+[[bin]]
+name = "nzb_xml"
+path = "fuzz_targets/nzb_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yenc"
+path = "fuzz_targets/yenc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nntp_response"
+path = "fuzz_targets/nntp_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sab_api"
+path = "fuzz_targets/sab_api.rs"
+test = false
+doc = false
+bench = false

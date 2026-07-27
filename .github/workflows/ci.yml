@@ -29,7 +29,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo test --workspace --all-targets --locked
+      - run: cargo test -p rustnzb --features webdav --lib --locked
       - run: cargo test --manifest-path benchnzb/Cargo.toml --all-targets --locked
 
   frontend:
@@ -45,6 +46,42 @@ jobs:
       - working-directory: apps/rustnzb/frontend
         run: npm ci --no-audit --no-fund
       - working-directory: apps/rustnzb/frontend
-        run: npm test -- --watch=false
+        run: npm test -- --coverage --coverage-reporters=text-summary --coverage-reporters=json-summary
+      - run: node ci/check-frontend-coverage.mjs apps/rustnzb/frontend/coverage/frontend/coverage-summary.json ci/frontend-coverage-baseline.json
       - working-directory: apps/rustnzb/frontend
         run: npm run build -- --configuration=production
+
+  e2e:
+    if: github.event_name != 'pull_request' || (github.event.pull_request.user.type != 'Bot' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, node-b, linux, x64, rust]
+    env:
+      GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: ci/run e2e
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: .ci-artifacts/e2e
+          if-no-files-found: ignore
+
+  desktop:
+    if: github.event_name != 'pull_request' || (github.event.pull_request.user.type != 'Bot' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, node-b, linux, x64, rust]
+    env:
+      GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: ci/run desktop-test
+
+  container-smoke:
+    if: github.event_name != 'pull_request' || (github.event.pull_request.user.type != 'Bot' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, node-b, linux, x64, publish, docker]
+    env:
+      GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
+      IMAGE: rustnzb:ci-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: ci/tasks/build-image "$IMAGE"
+      - run: ci/tasks/smoke-image "$IMAGE" "$GITHUB_SHA"

@@ -28,6 +28,7 @@ unicode-normalization = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

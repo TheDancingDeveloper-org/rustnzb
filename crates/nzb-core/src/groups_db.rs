@@ -430,3 +430,56 @@ impl Database {
         Ok(result)
     }
 }
+
+#[cfg(all(test, feature = "groups-db"))]
+mod tests {
+    use super::*;
+    use nzb_nntp::XoverEntry;
+
+    #[test]
+    fn groups_headers_and_threads_persist_with_read_state() {
+        let db = Database::open_memory().unwrap();
+        db.group_upsert_batch(&[("alt.binaries.test".into(), 30, 10)])
+            .unwrap();
+        let group = db.group_list(false, None, 10, 0).unwrap().pop().unwrap();
+        db.group_set_subscribed(group.id, true).unwrap();
+        db.header_insert_batch(
+            group.id,
+            &[
+                XoverEntry {
+                    article_num: 10,
+                    subject: "Release".into(),
+                    from: "poster".into(),
+                    date: "2026-01-01".into(),
+                    message_id: "root@test".into(),
+                    references: "".into(),
+                    bytes: 42,
+                    lines: 1,
+                },
+                XoverEntry {
+                    article_num: 11,
+                    subject: "Re: Release".into(),
+                    from: "reply".into(),
+                    date: "2026-01-02".into(),
+                    message_id: "reply@test".into(),
+                    references: "root@test".into(),
+                    bytes: 84,
+                    lines: 2,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(db.header_unread_count(group.id).unwrap(), 2);
+        let headers = db.header_list(group.id, Some("Release"), 10, 0).unwrap();
+        assert_eq!(headers.len(), 2);
+        db.header_mark_read(headers[0].id).unwrap();
+        assert_eq!(db.header_unread_count(group.id).unwrap(), 1);
+        let (threads, total) = db.header_list_threads(group.id, 10, 0).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(threads[0].root_message_id, "root@test");
+        assert_eq!(threads[0].reply_count, 1);
+        assert_eq!(threads[0].unread_count, 1);
+        assert_eq!(db.group_get(group.id).unwrap().unwrap().unread_count, 1);
+    }
+}

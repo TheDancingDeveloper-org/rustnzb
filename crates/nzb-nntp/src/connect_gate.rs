@@ -127,3 +127,27 @@ pub async fn acquire(host: &str) -> ConnectPermit {
 pub struct ConnectPermit {
     _permit: tokio::sync::SemaphorePermit<'static>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn per_host_gate_paces_successive_connection_starts() {
+        let host = format!("gate-test-{}", uuid::Uuid::new_v4());
+        let _first = acquire(&host).await;
+        let started = Instant::now();
+        let _second = acquire(&host).await;
+        assert!(started.elapsed() >= MIN_CONNECT_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn hosts_do_not_share_pacing_state() {
+        let first = format!("gate-test-{}", uuid::Uuid::new_v4());
+        let second = format!("gate-test-{}", uuid::Uuid::new_v4());
+        let _ = acquire(&first).await;
+        let started = Instant::now();
+        let _ = acquire(&second).await;
+        assert!(started.elapsed() < MIN_CONNECT_INTERVAL);
+    }
+}

@@ -227,3 +227,46 @@ where
 struct SpanFields {
     job_id: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(level: &str, job_id: Option<&str>) -> LogEntry {
+        LogEntry {
+            timestamp: Utc::now(),
+            level: level.into(),
+            target: "test".into(),
+            message: "message".into(),
+            job_id: job_id.map(str::to_string),
+            seq: 0,
+        }
+    }
+
+    #[test]
+    fn filters_entries_by_sequence_job_and_level_in_chronological_order() {
+        let buffer = LogBuffer::new();
+        buffer.push(entry("INFO", Some("one")));
+        buffer.push(entry("WARN", Some("two")));
+        buffer.push(entry("INFO", Some("one")));
+
+        let entries = buffer.get_entries(Some("one"), Some(0), Some("info"), 10);
+        assert_eq!(
+            entries.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(buffer.latest_seq(), 2);
+    }
+
+    #[test]
+    fn ring_buffer_discards_oldest_entries_at_capacity() {
+        let buffer = LogBuffer::new();
+        for _ in 0..=MAX_LOG_ENTRIES {
+            buffer.push(entry("INFO", None));
+        }
+        let entries = buffer.get_entries(None, None, None, MAX_LOG_ENTRIES + 1);
+        assert_eq!(entries.len(), MAX_LOG_ENTRIES);
+        assert_eq!(entries.first().unwrap().seq, 1);
+        assert_eq!(entries.last().unwrap().seq, MAX_LOG_ENTRIES as u64);
+    }
+}

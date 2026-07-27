@@ -56,7 +56,7 @@ impl DirWatcher {
             match event.kind {
                 EventKind::Create(_) | EventKind::Modify(_) => {
                     for path in &event.paths {
-                        if self.is_nzb_file(path) {
+                        if Self::is_nzb_file(path) {
                             // Small delay to ensure file is fully written
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             self.process_file(path).await;
@@ -68,7 +68,7 @@ impl DirWatcher {
         }
     }
 
-    fn is_nzb_file(&self, path: &Path) -> bool {
+    fn is_nzb_file(path: &Path) -> bool {
         path.extension().is_some_and(|ext| ext == "nzb")
             || path.to_str().is_some_and(|s| s.ends_with(".nzb.gz"))
     }
@@ -84,7 +84,7 @@ impl DirWatcher {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if self.is_nzb_file(&path) {
+            if Self::is_nzb_file(&path) {
                 self.process_file(&path).await;
             }
         }
@@ -141,5 +141,18 @@ impl DirWatcher {
                 warn!(error = %e, file = %path.display(), "Failed to parse NZB from watch dir");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_plain_and_gzipped_nzb_paths_case_sensitively() {
+        assert!(DirWatcher::is_nzb_file(Path::new("release.nzb")));
+        assert!(DirWatcher::is_nzb_file(Path::new("release.nzb.gz")));
+        assert!(!DirWatcher::is_nzb_file(Path::new("release.NZB")));
+        assert!(!DirWatcher::is_nzb_file(Path::new("release.txt")));
     }
 }

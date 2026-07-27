@@ -3115,23 +3115,14 @@ dependencies = [
  "governor",
  "nzb-core",
  "nzb-decode",
- "nzb-news",
  "nzb-nntp",
+ "opentelemetry",
  "parking_lot",
  "serde",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "unicode-normalization",
-]
-
-[[package]]
-name = "nzb-news"
-version = "0.1.12"
-dependencies = [
- "nzb-nntp",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -4453,7 +4444,7 @@ dependencies = [
 
 [[package]]
 name = "rustnzb"
-version = "1.3.5"
+version = "1.3.7"
 dependencies = [
  "anyhow",
  "axum 0.8.9",

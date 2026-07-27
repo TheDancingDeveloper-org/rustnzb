@@ -5,4 +5,7 @@ trap cleanup_frontend EXIT
 task_start frontend-test node npm
 frontend_dir=$REPO_ROOT/apps/rustnzb/frontend
 npm --prefix "$frontend_dir" ci --no-audit --no-fund
-npm --prefix "$frontend_dir" test -- --coverage --coverage-reporters=text-summary
+npm --prefix "$frontend_dir" test -- --coverage --coverage-reporters=text-summary --coverage-reporters=json-summary
+node "$REPO_ROOT/ci/check-frontend-coverage.mjs" \
+    "$frontend_dir/coverage/frontend/coverage-summary.json" \
+    "$REPO_ROOT/ci/frontend-coverage-baseline.json"

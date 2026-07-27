@@ -5,6 +5,7 @@ pub use yenc_simd::{YencDecodeResult, YencError, decode_yenc, encode_article};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_encode_decode_roundtrip() {
@@ -52,5 +53,14 @@ mod tests {
             encode_article(&original, "large.bin", 1, 1, 0, original.len() as u64);
         let result = decode_yenc(&encoded).unwrap();
         assert_eq!(result.data, original);
+    }
+
+    proptest! {
+        #[test]
+        fn encode_decode_roundtrips_arbitrary_bytes(data in proptest::collection::vec(any::<u8>(), 1..4096)) {
+            let (encoded, _) = encode_article(&data, "property.bin", 1, 1, 0, data.len() as u64);
+            let decoded = decode_yenc(&encoded).expect("encoder must produce decodable data");
+            prop_assert_eq!(decoded.data, data);
+        }
     }
 }

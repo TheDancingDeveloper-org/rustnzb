@@ -358,3 +358,79 @@ impl RssMonitor {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log_buffer::LogBuffer;
+    use crate::nzb_core::db::Database;
+
+    fn monitor(data_dir: PathBuf) -> (RssMonitor, Arc<QueueManager>) {
+        let config = Arc::new(ArcSwap::from_pointee(AppConfig::default()));
+        let queue_manager = QueueManager::new(
+            Vec::new(),
+            Database::open_memory().expect("in-memory database"),
+            data_dir.join("incomplete"),
+            data_dir.join("complete"),
+            LogBuffer::default(),
+            1,
+            Vec::new(),
+            0,
+            0,
+            false,
+            5,
+            false,
+            false,
+            100.0,
+            30,
+        );
+        let monitor = RssMonitor::new(config, queue_manager.clone(), data_dir);
+        (monitor, queue_manager)
+    }
+
+    #[test]
+    fn extracts_nzb_links_before_falling_back_to_the_first_link() {
+        let feed = feed_rs::parser::parse(
+            &br#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
+                <id>feed</id><title>Feed</title><updated>2026-07-27T00:00:00Z</updated>
+                <entry><id>nzb</id><title>NZB</title><updated>2026-07-27T00:00:00Z</updated>
+                    <link href="https://example.test/page"/><link href="https://example.test/release.nzb"/>
+                </entry>
+                <entry><id>fallback</id><title>Fallback</title><updated>2026-07-27T00:00:00Z</updated>
+                    <link href="https://example.test/page"/>
+                </entry>
+            </feed>"#[..],
+        )
+        .expect("valid atom feed");
+
+        assert_eq!(
+            RssMonitor::extract_nzb_url(&feed.entries[0]).as_deref(),
+            Some("https://example.test/release.nzb")
+        );
+        assert_eq!(
+            RssMonitor::extract_nzb_url(&feed.entries[1]).as_deref(),
+            Some("https://example.test/page")
+        );
+    }
+
+    #[tokio::test]
+    async fn migrates_legacy_seen_file_once_and_marks_items_downloaded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let seen_file = temp.path().join("rss_seen.json");
+        std::fs::write(&seen_file, r#"["first-item", "second-item"]"#).expect("seen file");
+        let (monitor, queue_manager) = monitor(temp.path().to_path_buf());
+
+        monitor.migrate_seen_json();
+
+        assert!(!seen_file.exists());
+        for id in ["first-item", "second-item"] {
+            let item = queue_manager
+                .rss_item_get(id)
+                .expect("database query")
+                .expect("migrated item");
+            assert_eq!(item.feed_name, "migrated");
+            assert!(item.downloaded);
+            assert!(item.downloaded_at.is_some());
+        }
+    }
+}

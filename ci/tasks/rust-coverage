@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/lib.sh"
+trap cleanup_frontend EXIT
+task_start rust-coverage cargo node
+task_target_dir rust-coverage
+prepare_placeholder_frontend
+
+cargo llvm-cov --workspace --all-features --locked \
+    --json --summary-only \
+    --output-path "$REPO_ROOT/.ci-artifacts/rust-coverage.json"
+node "$REPO_ROOT/ci/check-rust-coverage.mjs" \
+    "$REPO_ROOT/.ci-artifacts/rust-coverage.json" \
+    "$REPO_ROOT/ci/rust-coverage-baseline.json"

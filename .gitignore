@@ -19,7 +19,11 @@ e2e/mock-auth-state.json
 /.ci-output/
 /.ci-artifacts/
 /tempmigration.md
+/testuplift.md
 /status.md
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
 
 # Codesight
 .codesight/

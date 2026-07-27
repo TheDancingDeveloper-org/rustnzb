@@ -80,3 +80,23 @@ impl BandwidthLimiter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn limiter_can_be_reconfigured_without_recreation() {
+        let limiter = BandwidthLimiter::new(BandwidthConfig::default());
+        assert_eq!(limiter.get_download_bps(), None);
+        limiter
+            .acquire_download(NonZeroU32::new(1).unwrap())
+            .await
+            .unwrap();
+
+        limiter.set_download_bps(NonZeroU32::new(1_000));
+        assert_eq!(limiter.get_config().download_bps.unwrap().get(), 1_000);
+        limiter.set_download_bps(None);
+        assert_eq!(limiter.get_download_bps(), None);
+    }
+}

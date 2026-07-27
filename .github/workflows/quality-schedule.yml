@@ -1,0 +1,65 @@
+name: Scheduled test quality
+
+on:
+  schedule:
+    - cron: '17 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: [self-hosted, node-b, linux, x64, rust]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88
+          components: llvm-tools-preview
+      - name: Install Rust coverage tooling
+        run: cargo install cargo-llvm-cov --locked
+      - name: Enforce non-decreasing Rust coverage
+        run: ci/tasks/rust-coverage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage
+          path: .ci-artifacts/rust-coverage.json
+
+  fuzz:
+    runs-on: [self-hosted, node-b, linux, x64, rust]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+      - name: Install fuzzing tooling
+        run: cargo install cargo-fuzz --locked
+      - name: Run bounded fuzz targets
+        working-directory: fuzz
+        run: |
+          for target in nzb_xml yenc nntp_response sab_api; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=60
+          done
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  mutation:
+    runs-on: [self-hosted, node-b, linux, x64, rust]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88
+      - name: Install mutation tooling
+        run: cargo install cargo-mutants --locked
+      - name: Mutation-test parser and decoder crates
+        run: cargo mutants --package nzb-core --package nzb-decode --timeout 60 --output .ci-artifacts/mutants
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mutation-report
+          path: .ci-artifacts/mutants

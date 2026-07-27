@@ -1887,7 +1887,8 @@ impl NntpConnection {
 // ---------------------------------------------------------------------------
 
 /// Parse a single NNTP response line into code + message.
-fn parse_response_line(line: &str) -> NntpResult<NntpResponse> {
+/// Parse an NNTP status line into a response code and human-readable message.
+pub fn parse_response_line(line: &str) -> NntpResult<NntpResponse> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
     if trimmed.len() < 3 {
         return Err(NntpError::Protocol(format!(
@@ -1947,7 +1948,8 @@ fn strip_article_headers(article: &[u8]) -> Vec<u8> {
 /// Parse XOVER multi-line body into structured entries.
 /// Each line is tab-delimited:
 /// article_num \t subject \t from \t date \t message-id \t references \t bytes \t lines
-fn parse_xover_data(data: &[u8]) -> Vec<XoverEntry> {
+/// Parse the multi-line data returned by an XOVER/OVER command.
+pub fn parse_xover_data(data: &[u8]) -> Vec<XoverEntry> {
     let text = String::from_utf8_lossy(data);
     let mut entries = Vec::new();
 
@@ -1977,7 +1979,8 @@ fn parse_xover_data(data: &[u8]) -> Vec<XoverEntry> {
 /// Each line format: `article_num value` (space or tab separated).
 /// The first token is the article number; everything after the first
 /// whitespace is the header value.
-fn parse_header_data(data: &[u8]) -> Vec<HeaderEntry> {
+/// Parse the multi-line data returned by an XHDR or XPAT command.
+pub fn parse_header_data(data: &[u8]) -> Vec<HeaderEntry> {
     let text = String::from_utf8_lossy(data);
     let mut entries = Vec::new();
 
@@ -2003,7 +2006,8 @@ fn parse_header_data(data: &[u8]) -> Vec<HeaderEntry> {
 ///
 /// Each line format: `groupname last first posting_flag`
 /// Fields are whitespace-separated.
-fn parse_list_active_data(data: &[u8]) -> Vec<ListActiveEntry> {
+/// Parse the multi-line data returned by LIST ACTIVE.
+pub fn parse_list_active_data(data: &[u8]) -> Vec<ListActiveEntry> {
     let text = String::from_utf8_lossy(data);
     let mut entries = Vec::new();
 
