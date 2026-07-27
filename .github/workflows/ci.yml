@@ -30,11 +30,12 @@ jobs:
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets --locked
-      # The WebDAV feature links a large test binary. GNU ld otherwise keeps
-      # every input in memory and can be OOM-killed on a shared runner.
+      # The WebDAV feature compiles a substantially larger dependency graph.
+      # CI does not need debug symbols for this test, and omitting them keeps
+      # the isolated runner within its memory limit while linking.
       - run: cargo test -p rustnzb --features webdav --lib --locked
         env:
-          RUSTFLAGS: -C link-arg=-Wl,--no-keep-memory
+          CARGO_PROFILE_TEST_DEBUG: 0
       - run: cargo test --manifest-path benchnzb/Cargo.toml --all-targets --locked
 
   frontend:
