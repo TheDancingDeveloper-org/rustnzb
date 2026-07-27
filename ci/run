@@ -69,6 +69,7 @@ esac
 # When this wrapper itself runs in a development container connected to the
 # host Docker socket, translate the checkout to the daemon-visible bind path.
 docker_root=$ROOT
+copy_workspace=false
 if command -v jq >/dev/null 2>&1; then
     mount_json=$(docker inspect "${HOSTNAME:-$(hostname)}" --format '{{json .Mounts}}' 2>/dev/null || true)
     if [ -n "$mount_json" ]; then
@@ -83,6 +84,9 @@ if command -v jq >/dev/null 2>&1; then
             docker_root=$source_path${ROOT#"$destination_path"}
         fi
     fi
+fi
+if [ "$docker_root" = "$ROOT" ]; then
+    copy_workspace=true
 fi
 
 docker_config=$(mktemp -d)
@@ -138,5 +142,21 @@ fi
 for name in CI_COMMIT_SHA CI_COMMIT_TAG CI_PIPELINE_NUMBER RUSTNZB_BUILD_REF CI_ARTIFACT_DIR CI_PACKAGE_DIR; do
     [ -z "${!name:-}" ] || docker_args+=(--env "$name")
 done
+
+if [ "$copy_workspace" = true ]; then
+    container="rustnzb-ci-${task}-$$"
+    create_args=("${docker_args[@]}")
+    create_args[0]=create
+    cleanup_container() {
+        docker rm -f "$container" >/dev/null 2>&1 || true
+        cleanup
+    }
+    trap cleanup_container EXIT
+    docker "${create_args[@]}" --name "$container" "$image" \
+        "/woodpecker/src/ci/tasks/$task" "${task_args[@]}" >/dev/null
+    docker cp "$ROOT/." "$container:/woodpecker/src"
+    docker start -a "$container"
+    exit $?
+fi
 
 exec docker "${docker_args[@]}" "$image" "/woodpecker/src/ci/tasks/$task" "${task_args[@]}"
