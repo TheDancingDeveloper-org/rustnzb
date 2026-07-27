@@ -388,6 +388,19 @@ impl Database {
         Ok(())
     }
 
+    /// Update the non-terminal, user-visible queue message for a job.
+    pub fn queue_update_error_message(
+        &self,
+        id: &str,
+        error_message: Option<&str>,
+    ) -> Result<(), NzbError> {
+        self.conn.execute(
+            "UPDATE queue SET error_message=?2 WHERE id=?1",
+            params![id, error_message],
+        )?;
+        Ok(())
+    }
+
     /// Update job priority in the queue.
     pub fn queue_update_priority(&self, id: &str, priority: i32) -> Result<(), NzbError> {
         self.conn.execute(

@@ -1241,6 +1241,47 @@ impl QueueManager {
 
         while let Some(update) = progress_rx.recv().await {
             match update {
+                ProgressUpdate::WaitingForProviders { message, .. } => {
+                    let mut changed = false;
+                    {
+                        let mut jobs = self.jobs.lock();
+                        if let Some(state) = jobs.get_mut(&job_id)
+                            && state.job.error_message.as_deref() != Some(&message)
+                        {
+                            // Keep the job downloading: provider recovery is
+                            // automatic and this is not missing content.
+                            state.job.error_message = Some(message.clone());
+                            changed = true;
+                        }
+                    }
+                    if changed
+                        && let Err(error) = self
+                            .db
+                            .lock()
+                            .queue_update_error_message(&job_id, Some(&message))
+                    {
+                        warn!(job_id = %job_id, "Failed to persist provider waiting status: {error}");
+                    }
+                }
+                ProgressUpdate::ProvidersAvailable { .. } => {
+                    let mut cleared = false;
+                    {
+                        let mut jobs = self.jobs.lock();
+                        if let Some(state) = jobs.get_mut(&job_id)
+                            && state.job.error_message.as_deref().is_some_and(|message| {
+                                message.starts_with("Waiting for providers:")
+                            })
+                        {
+                            state.job.error_message = None;
+                            cleared = true;
+                        }
+                    }
+                    if cleared
+                        && let Err(error) = self.db.lock().queue_update_error_message(&job_id, None)
+                    {
+                        warn!(job_id = %job_id, "Failed to clear provider waiting status: {error}");
+                    }
+                }
                 ProgressUpdate::ArticleComplete {
                     file_id,
                     segment_number,
@@ -3560,6 +3601,52 @@ mod global_pause_tests {
 
         assert!(!manager.is_paused());
         assert_eq!(manager.get_job("manual").unwrap().status, JobStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn provider_waiting_status_keeps_job_active_and_clears_on_recovery() {
+        let (manager, tempdir) = manager();
+        insert_job(
+            &manager,
+            job("provider-wait", JobStatus::Downloading, tempdir.path()),
+        );
+        let (progress_tx, progress_rx) = mpsc::channel(4);
+        let handler = tokio::spawn(Arc::clone(&manager).handle_progress(
+            "provider-wait".to_string(),
+            progress_rx,
+            Arc::new(SpeedTracker::new()),
+        ));
+        let message = "Waiting for providers: every enabled server is temporarily unavailable. rustnzb will retry automatically.";
+
+        progress_tx
+            .send(ProgressUpdate::WaitingForProviders {
+                job_id: "provider-wait".to_string(),
+                message: message.to_string(),
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        let waiting = manager.get_job("provider-wait").unwrap();
+        assert_eq!(waiting.status, JobStatus::Downloading);
+        assert_eq!(waiting.error_message.as_deref(), Some(message));
+
+        progress_tx
+            .send(ProgressUpdate::ProvidersAvailable {
+                job_id: "provider-wait".to_string(),
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            manager
+                .get_job("provider-wait")
+                .unwrap()
+                .error_message
+                .is_none()
+        );
+
+        drop(progress_tx);
+        handler.await.unwrap();
     }
 
     #[tokio::test]

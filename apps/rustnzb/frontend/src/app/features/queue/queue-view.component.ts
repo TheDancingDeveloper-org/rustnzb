@@ -392,6 +392,11 @@ interface PipelineStep {
                       <span class="tag cat">{{ job.category }}</span>
                     </div>
                   }
+                  @if (job.error_message) {
+                    <div class="job-status-message" role="status" [title]="job.error_message">
+                      {{ job.error_message }}
+                    </div>
+                  }
                 </td>
                 <td>{{ formatBytes(job.total_bytes) }}</td>
                 <td>
@@ -1027,6 +1032,12 @@ interface PipelineStep {
         margin-top: 3px;
         display: flex;
         justify-content: flex-start;
+      }
+      .job-status-message {
+        color: #d97706;
+        font-size: 10.5px;
+        line-height: 1.3;
+        margin-top: 3px;
       }
       .queue-table-panel .progress {
         margin: 0 auto;

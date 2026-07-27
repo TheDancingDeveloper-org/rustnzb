@@ -469,6 +469,12 @@ pub type ServerHealthMap = Arc<Mutex<HashMap<String, ServerHealth>>>;
 
 #[derive(Debug, Clone)]
 pub enum ProgressUpdate {
+    /// Every enabled NNTP provider is temporarily unavailable. The job stays
+    /// active and will retry automatically when a provider recovers.
+    WaitingForProviders { job_id: String, message: String },
+    /// At least one NNTP provider recovered after a
+    /// [`ProgressUpdate::WaitingForProviders`] notification.
+    ProvidersAvailable { job_id: String },
     ArticleComplete {
         job_id: String,
         file_id: String,
@@ -559,6 +565,9 @@ pub(crate) struct JobContext {
     pub total_bytes: u64,
     /// Ensures JobFinished/JobAborted is only emitted once.
     finished: AtomicBool,
+    /// Avoid repeatedly reporting the same all-provider outage while the
+    /// workers wait for circuit-breaker cooldown.
+    waiting_for_providers_reported: AtomicBool,
 }
 
 pub(crate) type JobContextMap = Arc<Mutex<HashMap<String, Arc<JobContext>>>>;
@@ -595,6 +604,39 @@ impl JobContext {
             active_elapsed: Mutex::new(Duration::ZERO),
             total_bytes: job.total_bytes,
             finished: AtomicBool::new(false),
+            waiting_for_providers_reported: AtomicBool::new(false),
+        }
+    }
+
+    fn report_waiting_for_providers(&self, message: &str) {
+        if self
+            .waiting_for_providers_reported
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            try_send_progress(
+                &self.progress_tx,
+                &self.job_id,
+                ProgressUpdate::WaitingForProviders {
+                    job_id: self.job_id.clone(),
+                    message: message.to_string(),
+                },
+            );
+        }
+    }
+
+    fn report_providers_available(&self) {
+        if self
+            .waiting_for_providers_reported
+            .swap(false, Ordering::Relaxed)
+        {
+            try_send_progress(
+                &self.progress_tx,
+                &self.job_id,
+                ProgressUpdate::ProvidersAvailable {
+                    job_id: self.job_id.clone(),
+                },
+            );
         }
     }
 
@@ -755,21 +797,33 @@ impl JobContext {
 // Shared work queue
 // ---------------------------------------------------------------------------
 
-/// Multi-job FIFO work queue with PAR2-first priority within each submission.
+/// Multi-job queue with per-server round-robin fairness and PAR2-first
+/// priority within each submission.
 ///
 /// Items submitted via [`SharedWorkQueue::submit_items`] are inserted so that
 /// PAR2 index and volume files land ahead of data files (matching the prior
 /// per-job ordering), while data files land at the tail. Cross-job ordering
-/// is FIFO by submission time, per the chosen FIFO priority model.
+/// is FIFO by submission time until a server has served a job; it then prefers
+/// another eligible job before returning to that job's backlog.
 pub(crate) struct SharedWorkQueue {
-    inner: Mutex<VecDeque<WorkItem>>,
+    inner: Mutex<QueueState>,
     notify: Notify,
+}
+
+struct QueueState {
+    items: VecDeque<WorkItem>,
+    /// Last job selected by each server. This is intentionally per server:
+    /// separate NNTP providers can make independent fair scheduling choices.
+    last_served: HashMap<String, String>,
 }
 
 impl SharedWorkQueue {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(VecDeque::new()),
+            inner: Mutex::new(QueueState {
+                items: VecDeque::new(),
+                last_served: HashMap::new(),
+            }),
             notify: Notify::new(),
         }
     }
@@ -782,9 +836,9 @@ impl SharedWorkQueue {
         let had_items = !items.is_empty();
         {
             let mut q = self.inner.lock();
-            q.reserve(items.len());
+            q.items.reserve(items.len());
             for item in items {
-                q.push_back(item);
+                q.items.push_back(item);
             }
         }
         if had_items {
@@ -796,14 +850,14 @@ impl SharedWorkQueue {
     /// returning an item because its job is paused or its server was just
     /// tried for this item).
     fn push_front(&self, item: WorkItem) {
-        self.inner.lock().push_front(item);
+        self.inner.lock().items.push_front(item);
         self.notify.notify_waiters();
     }
 
     /// Push a single item to the back (used after handle_article_not_available
     /// when another server can still try it).
     fn push_back(&self, item: WorkItem) {
-        self.inner.lock().push_back(item);
+        self.inner.lock().items.push_back(item);
         self.notify.notify_waiters();
     }
 
@@ -827,8 +881,9 @@ impl SharedWorkQueue {
         higher_priority_servers: &[String],
     ) -> (usize, usize) {
         let q = self.inner.lock();
-        let total = q.len();
+        let total = q.items.len();
         let workable = q
+            .items
             .iter()
             .filter(|i| !i.tried_servers.iter().any(|s| s == server_id))
             .filter(|i| {
@@ -842,10 +897,10 @@ impl SharedWorkQueue {
 
     /// Pop the next item that can be processed by a worker on `server_id`.
     ///
-    /// Skips items that have already tried `server_id`, rotating them to the
-    /// back of the queue. Also enforces server priority: items where any
-    /// healthy higher-priority server has not yet tried the article are
-    /// rotated to the back so the primary server sees them first.
+    /// Prefers an eligible item from a job other than the one this server last
+    /// served, then falls back to any eligible item. It also enforces server
+    /// priority: items where any healthy higher-priority server has not yet
+    /// tried the article are skipped for the backup server.
     ///
     /// `higher_priority_servers` is a caller-prepared list of server IDs with
     /// strictly higher priority (lower priority number) than the caller, filtered
@@ -861,47 +916,54 @@ impl SharedWorkQueue {
         server_id: &str,
         higher_priority_servers: &[String],
     ) -> Option<WorkItem> {
-        let mut q = self.inner.lock();
-        let len = q.len();
-        for _ in 0..len {
-            let item = q.pop_front()?;
-            if item.tried_servers.iter().any(|s| s == server_id) {
-                q.push_back(item);
-                continue;
-            }
-            // Priority gate: rotate back if any higher-priority server still
-            // needs to try this item. Matches SABnzbd's get_article() behaviour
-            // (sabnzbd/nzb/article.py:149-170).
-            if higher_priority_servers
-                .iter()
-                .any(|hp| !item.tried_servers.contains(hp))
-            {
-                q.push_back(item);
-                continue;
-            }
-            return Some(item);
+        let mut state = self.inner.lock();
+        let last_served = state.last_served.get(server_id).cloned();
+        let is_eligible = |item: &WorkItem| {
+            !item.tried_servers.iter().any(|s| s == server_id)
+                && higher_priority_servers
+                    .iter()
+                    .all(|server| item.tried_servers.contains(server))
+        };
+
+        let selected = last_served
+            .as_deref()
+            .and_then(|last_job| {
+                state
+                    .items
+                    .iter()
+                    .position(|item| is_eligible(item) && item.job_id != last_job)
+            })
+            .or_else(|| state.items.iter().position(is_eligible));
+
+        if let Some(index) = selected {
+            let item = state.items.remove(index)?;
+            state
+                .last_served
+                .insert(server_id.to_string(), item.job_id.clone());
+            Some(item)
+        } else {
+            None
         }
-        None
     }
 
     /// Remove all items belonging to `job_id`. Used on cancel_job / remove_job.
     fn drain_job(&self, job_id: &str) -> Vec<WorkItem> {
         let mut q = self.inner.lock();
-        let mut kept = VecDeque::with_capacity(q.len());
+        let mut kept = VecDeque::with_capacity(q.items.len());
         let mut drained = Vec::new();
-        while let Some(item) = q.pop_front() {
+        while let Some(item) = q.items.pop_front() {
             if item.job_id == job_id {
                 drained.push(item);
             } else {
                 kept.push_back(item);
             }
         }
-        *q = kept;
+        q.items = kept;
         drained
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().len()
+        self.inner.lock().items.len()
     }
 }
 
@@ -1026,6 +1088,42 @@ impl WorkerPool {
             .collect()
     }
 
+    /// Return a queue-facing message when no enabled provider can currently
+    /// accept work. A circuit-broken provider is deliberately retried later,
+    /// so this is a waiting condition rather than an article failure.
+    fn provider_unavailable_message(&self) -> Option<&'static str> {
+        let servers = self.servers.lock();
+        let enabled: Vec<_> = servers.iter().filter(|server| server.enabled).collect();
+        if enabled.is_empty() {
+            return Some("Waiting for providers: no enabled NNTP servers are configured.");
+        }
+
+        let health = self.server_health.lock();
+        enabled
+            .iter()
+            .all(|server| health.get(&server.id).is_some_and(|entry| !entry.is_available()))
+            .then_some(
+                "Waiting for providers: every enabled server is temporarily unavailable. rustnzb will retry automatically.",
+            )
+    }
+
+    fn report_provider_outage(&self) {
+        let Some(message) = self.provider_unavailable_message() else {
+            return;
+        };
+        let contexts: Vec<_> = self.job_contexts.lock().values().cloned().collect();
+        for ctx in contexts {
+            ctx.report_waiting_for_providers(message);
+        }
+    }
+
+    fn report_providers_available(&self) {
+        let contexts: Vec<_> = self.job_contexts.lock().values().cloned().collect();
+        for ctx in contexts {
+            ctx.report_providers_available();
+        }
+    }
+
     /// Lifetime count of worker evictions performed by the heartbeat
     /// watchdog. Increases by 1 each time the supervisor reclaims a stalled
     /// worker. Test harnesses use this as a positive signal that the Phase
@@ -1129,6 +1227,7 @@ impl WorkerPool {
         }
         self.job_contexts.lock().insert(job_id.clone(), ctx);
         self.work_queue.submit_items(items);
+        self.report_provider_outage();
         debug!(job_id = %job_id, queue_len = self.work_queue.len(), "Job submitted to worker pool");
     }
 
@@ -1449,6 +1548,7 @@ async fn pool_worker(
                 .is_some_and(|h| !h.is_available())
         };
         if circuit_broken {
+            pool.report_provider_outage();
             tokio::time::sleep(WORKER_IDLE_POLL).await;
             continue 'reconnect;
         }
@@ -1490,9 +1590,11 @@ async fn pool_worker(
             if should_exit(&worker_shutdown, &pool) {
                 return;
             }
+            pool.report_provider_outage();
             tokio::time::sleep(RECONNECT_DELAY).await;
             continue 'reconnect;
         }
+        pool.report_providers_available();
         let pipe_depth = primary_server.pipelining.max(1);
         let active_conns = pool.conn_tracker.total();
         info!(
@@ -1787,6 +1889,7 @@ async fn run_worker_serial(
                     .entry(primary_server.id.clone())
                     .or_default()
                     .record_failure(is_auth, &message);
+                pool.report_provider_outage();
                 pool.work_queue.push_front(item);
                 return WorkerExit::Reconnect;
             }
@@ -2201,6 +2304,7 @@ async fn run_worker_pipelined(
                             .entry(primary_server.id.clone())
                             .or_default()
                             .record_failure(is_auth, &e.to_string());
+                        pool.report_provider_outage();
                         pool.work_queue.push_front(item);
                         requeue_all(&mut in_flight_items, &pool.work_queue);
                         return WorkerExit::Reconnect;
@@ -2986,6 +3090,80 @@ mod tests {
         // srv1 should skip the first item and return the second.
         let picked = q.pop_workable("srv1", &[]).unwrap();
         assert_eq!(picked.message_id, "b");
+    }
+
+    #[test]
+    fn shared_queue_round_robins_eligible_jobs_per_server() {
+        let q = SharedWorkQueue::new();
+        q.submit_items(vec![
+            make_item("job-a", "a-1", "first.rar"),
+            make_item("job-a", "a-2", "second.rar"),
+            make_item("job-b", "b-1", "third.rar"),
+        ]);
+
+        assert_eq!(q.pop_workable("srv1", &[]).unwrap().job_id, "job-a");
+        assert_eq!(q.pop_workable("srv1", &[]).unwrap().job_id, "job-b");
+        assert_eq!(q.pop_workable("srv1", &[]).unwrap().job_id, "job-a");
+    }
+
+    #[tokio::test]
+    async fn provider_outage_is_reported_once_then_cleared_on_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = ServerConfig::new("srv1", "one.invalid");
+        let pool = WorkerPool::new(
+            Arc::new(Mutex::new(vec![server.clone()])),
+            Arc::new(BandwidthLimiter::new(Default::default())),
+            Arc::new(ConnectionTracker::new()),
+            0,
+        );
+        let job = test_job("provider-outage", temp.path());
+        let (progress_tx, mut progress_rx) = mpsc::channel(4);
+        let ctx = Arc::new(JobContext::new(
+            &job,
+            Arc::new(FileAssembler::new()),
+            progress_tx,
+            1,
+        ));
+        pool.job_contexts.lock().insert(job.id.clone(), ctx);
+        pool.server_health
+            .lock()
+            .entry(server.id.clone())
+            .or_default()
+            .record_failure(false, "connection refused");
+        pool.server_health
+            .lock()
+            .entry(server.id.clone())
+            .or_default()
+            .record_failure(false, "connection refused");
+        pool.server_health
+            .lock()
+            .entry(server.id.clone())
+            .or_default()
+            .record_failure(false, "connection refused");
+
+        pool.report_provider_outage();
+        pool.report_provider_outage();
+        match progress_rx.recv().await.unwrap() {
+            ProgressUpdate::WaitingForProviders { message, .. } => {
+                assert!(message.contains("retry automatically"));
+            }
+            other => panic!("unexpected progress event: {other:?}"),
+        }
+        assert!(
+            progress_rx.try_recv().is_err(),
+            "outage event is deduplicated"
+        );
+
+        pool.server_health
+            .lock()
+            .get_mut(&server.id)
+            .unwrap()
+            .record_success();
+        pool.report_providers_available();
+        assert!(matches!(
+            progress_rx.recv().await,
+            Some(ProgressUpdate::ProvidersAvailable { .. })
+        ));
     }
 
     #[test]
