@@ -94,6 +94,7 @@ jobs:
     env:
       GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
       IMAGE: rustnzb:ci-${{ github.sha }}
+      RUSTNZB_BUILD_REF: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v7
       - run: ci/tasks/build-image "$IMAGE"
