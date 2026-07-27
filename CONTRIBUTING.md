@@ -38,6 +38,26 @@ The containerized task interface in [`ci/run`](ci/run) provides local parity
 with selected build tasks. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for
 the supported commands.
 
+## AI-assisted contributions
+
+AI coding agents and other AI-assisted tools are welcome contributors to this
+project. They are held to the same engineering and community standards as any
+other contribution.
+
+The person submitting or merging an AI-assisted change remains responsible for:
+
+- reviewing and understanding the complete change;
+- running the required tests and accurately reporting their results;
+- ensuring the change does not include credentials, private infrastructure
+  details, personal data, generated artifacts, or copied material without an
+  appropriate license; and
+- responding to review feedback and maintaining the contribution after merge.
+
+Use of AI does not require a co-author trailer or a contributor-credit entry.
+When it materially helps reviewers—for example, for a broad refactor or a
+generated test matrix—briefly describe the tool's role in the pull-request
+body. Do not present unverified AI output as tested or production-ready.
+
 ## Pull requests
 
 - Branch from current `main` and keep each pull request focused.
