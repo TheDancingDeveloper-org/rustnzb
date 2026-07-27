@@ -106,7 +106,6 @@ fi
 docker_args=(
     run --rm
     --workdir /woodpecker/src
-    --mount "type=bind,src=$docker_root,dst=/woodpecker/src"
     --user "$(id -u):$(id -g)"
     --env HOME=/tmp/ci-home
     --env CI=true
@@ -114,6 +113,10 @@ docker_args=(
     --env "SCCACHE_REDIS=${SCCACHE_REDIS:-redis://100.92.54.45:6380}"
     --env "SCCACHE_REDIS_KEY_PREFIX=rustnzb-rust-1.88-$task"
 )
+
+if [ "$copy_workspace" = false ]; then
+    docker_args+=(--mount "type=bind,src=$docker_root,dst=/woodpecker/src")
+fi
 
 if [ "$cold" = true ]; then
     docker_args+=(
