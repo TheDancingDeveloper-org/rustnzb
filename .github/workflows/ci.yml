@@ -53,7 +53,7 @@ jobs:
 
   e2e:
     if: github.event_name != 'pull_request' || (github.event.pull_request.user.type != 'Bot' && github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: [self-hosted, node-b, linux, x64, rust]
+    runs-on: [self-hosted, node-b, linux, x64, publish, docker]
     env:
       GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
     steps:
@@ -68,7 +68,7 @@ jobs:
 
   desktop:
     if: github.event_name != 'pull_request' || (github.event.pull_request.user.type != 'Bot' && github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: [self-hosted, node-b, linux, x64, rust]
+    runs-on: [self-hosted, node-b, linux, x64, publish, docker]
     env:
       GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
     steps:
