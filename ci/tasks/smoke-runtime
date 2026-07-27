@@ -84,17 +84,27 @@ http_get() {
 }
 
 ready=false
-i=0
-while [ "$i" -lt 60 ]; do
-    if http_get "$base_url/api/health" >"$work/health.json"; then
+attempt=0
+# A failed curl within a function can cause some /bin/sh implementations to
+# honour `set -e` before the surrounding `if` sees the result.  Temporarily
+# handle the probe status explicitly so a cold s6 service gets its full
+# readiness window.
+set +e
+while [ "$attempt" -lt 90 ]; do
+    http_get "$base_url/api/health" >"$work/health.json" 2>"$work/health.err"
+    probe_status=$?
+    if [ "$probe_status" -eq 0 ]; then
         ready=true
         break
     fi
-    i=$((i + 1))
+    attempt=$((attempt + 1))
     sleep 1
 done
+set -e
 if [ "$ready" != true ]; then
     docker logs "$name" >"$logs/container.log" 2>&1 || true
+    docker inspect "$name" >"$logs/container-inspect.json" 2>&1 || true
+    cp "$work/health.err" "$logs/health.err" 2>/dev/null || true
     printf 'runtime did not become healthy; logs retained in %s\n' "$logs" >&2
     exit 1
 fi
