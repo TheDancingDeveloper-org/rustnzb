@@ -22,8 +22,8 @@ Both modes run entirely in Docker — a mock/synthetic NNTP server, the download
 
 Results land in `results/` — JSON, CSV, summary text, a self-contained HTML
 report, and SVG charts. Result artifacts are intentionally local and are not
-committed; generate publishable performance reports on the target benchmark
-host.
+committed; publish a report only with its complete machine and scenario
+metadata.
 
 ---
 

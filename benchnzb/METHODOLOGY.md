@@ -4,16 +4,13 @@
 
 The benchnzb stress test framework measures sustained download throughput, memory stability, and degradation over time. Both RustNZB and SABnzbd are tested against the same synthetic NNTP server under identical conditions, with configurable duration, concurrency, and NZB size.
 
-## Test Machine
+## Test machine
 
-| Component | Specification |
-|-----------|--------------|
-| CPU | 48 vCPUs (QEMU Virtual CPU, 1 socket, 48 cores, 1 thread/core) |
-| RAM | 252 GB DDR |
-| OS Disk | 50 GB virtual SSD |
-| Data Disk | 300 GB virtual SSD (`/mnt/data`) |
-| OS | Ubuntu Linux (kernel 6.17) |
-| Runtime | Docker containers (no resource limits) |
+Benchmark results are meaningful only with the complete machine and container
+configuration. Record the CPU model/count, memory, storage, operating system,
+container image digests, client configuration, scenario, and commit SHA with
+every published result. Do not treat local correctness or soak runs as public
+performance comparisons.
 
 ## Test Environment
 

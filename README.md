@@ -7,7 +7,7 @@ decoding, PAR2 verification and repair, and archive extraction, wrapped in a
 web UI with real automation. One static binary, built for self-hosters.
 
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange)](https://www.rust-lang.org/)
-[![Container](https://img.shields.io/badge/container-GHCR-blue)](https://github.com/AusAgentSmith-org/rustnzb/pkgs/container/rustnzb)
+[![Container](https://img.shields.io/badge/container-GHCR-blue)](https://github.com/TheDancingDeveloper-org/rustnzb/pkgs/container/rustnzbd)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## Try it now — live demo
@@ -19,7 +19,7 @@ in your browser — queue, history, statistics, newsgroup search, RSS rules, the
 media library, settings, all of it. Nothing to install, no Usenet provider
 required, and nothing leaves the page.
 
-More at [rustnzb.dev](https://rustnzb.dev/) · [GitHub Releases](https://github.com/AusAgentSmith-org/rustnzb/releases) · [Discord](https://discord.gg/pu6chSqpnJ)
+More at [rustnzb.dev](https://rustnzb.dev/) · [GitHub Releases](https://github.com/TheDancingDeveloper-org/rustnzb/releases) · [Discord](https://discord.gg/pu6chSqpnJ)
 
 ---
 
@@ -52,7 +52,7 @@ docker run -d \
   -v ./config:/config \
   -v ./data:/data \
   -v /path/to/downloads:/downloads \
-  ghcr.io/ausagentsmith-org/rustnzb:latest
+  ghcr.io/thedancingdeveloper-org/rustnzbd:latest
 ```
 
 Open `http://localhost:9090` and add your NNTP servers via the web UI.
@@ -60,7 +60,7 @@ Open `http://localhost:9090` and add your NNTP servers via the web UI.
 ### Docker Compose
 
 ```bash
-git clone https://github.com/AusAgentSmith-org/rustnzb.git
+git clone https://github.com/TheDancingDeveloper-org/rustnzb.git
 cd rustnzb
 cp apps/rustnzb/config.example.toml config.toml
 docker compose up -d
@@ -68,7 +68,7 @@ docker compose up -d
 
 ### Binaries
 
-Download the latest release from [GitHub Releases](https://github.com/AusAgentSmith-org/rustnzb/releases):
+Download the latest release from [GitHub Releases](https://github.com/TheDancingDeveloper-org/rustnzb/releases):
 
 - **Linux** — `tar.gz` (x86_64, aarch64) or `.deb` (amd64, arm64, installs a systemd service)
 - **Windows** — NSIS installer
@@ -77,7 +77,7 @@ Download the latest release from [GitHub Releases](https://github.com/AusAgentSm
 ### From source
 
 ```bash
-git clone https://github.com/AusAgentSmith-org/rustnzb.git
+git clone https://github.com/TheDancingDeveloper-org/rustnzb.git
 cd rustnzb
 cp apps/rustnzb/config.example.toml config.toml
 cargo build -p rustnzb --release
@@ -218,9 +218,10 @@ For exact CI parity, use the checked-in container task interface:
 ./ci/run e2e
 ```
 
-See [`ci/README.md`](ci/README.md) for the full task list, caching, and image
-promotion details, and [`CLAUDE.md`](CLAUDE.md) for repository layout and build
-conventions.
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the full task list and
+build details. See [CONTRIBUTING.md](CONTRIBUTING.md) for repository workflow
+and [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) for current user-visible
+limitations.
 
 ---
 
@@ -230,4 +231,8 @@ MIT
 
 ---
 
-Also by [AusAgentSmith](https://github.com/AusAgentSmith-org): [Indexarr](https://indexarr.net) | [rustTorrent](https://rusttorrent.dev)
+## Contributing and security
+
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md),
+[SECURITY.md](SECURITY.md), and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) before
+opening an issue or pull request.

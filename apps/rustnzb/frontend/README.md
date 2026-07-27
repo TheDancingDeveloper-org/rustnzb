@@ -37,16 +37,14 @@ The repository-level equivalents are:
 ./ci/run e2e
 ```
 
-Browser E2E tests live in the root `e2e/` project and use Playwright with the
-pinned browser included in the `rustnzb-ci-e2e` image.
+Browser E2E tests live in the root `e2e/` project and use Playwright.
 
 ## Rust embedding behavior
 
 The `rust-embed` folder is resolved from the app crate's
-`CARGO_MANIFEST_DIR`, not the process working directory. Debug builds enable
-`debug-embed`, so a compiled E2E/backend binary keeps serving its embedded SPA
-even if another CI task removes `dist` while that binary is running. Release
-builds embed the same production assets normally.
+`CARGO_MANIFEST_DIR`, not the process working directory. Debug and release
+builds embed the built SPA so a running server does not depend on a mutable
+`dist` directory.
 
 `index.html` is served with revalidation headers; content-hashed Angular assets
 receive immutable caching. Unknown frontend routes fall back to `index.html`
