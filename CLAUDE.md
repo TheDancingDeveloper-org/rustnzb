@@ -214,6 +214,5 @@ reported healthy with zero restarts.
 - `README.md`: user-facing setup, architecture, development, and CI overview
 - `ci/README.md`: reproducible task and image-promotion contract
 - `generate_release.md`: crate/application release procedure
-- `CONTAINERIZED_BUILD_PLAN.md`: completed convergence design and outcome
 - `DEPLOY.local.md`: private environment-specific Node B notes (gitignored)
 - Workspace `AGENTS.md`: workspace service access and commit rules

@@ -309,8 +309,8 @@ release commit.
 
 The tag pipeline builds Linux x86_64, Linux aarch64, Windows x86_64, and both
 Debian packages. It uploads the same files and checksum manifest to
-`dl.rustnzb.dev`, Forgejo, and GitHub. Both release objects read the checked-in
-`RELEASE_NOTES_vX.Y.Z.md` verbatim.
+`dl.rustnzb.dev`, Forgejo, and GitHub. The release workflow generates release
+notes from the tagged history.
 
 Manual publication is a recovery path only:
 
@@ -322,16 +322,17 @@ ssh root@100.92.4.57 ls /var/www/dl.rustnzb.dev/vX.Y.Z/
 mkdir -p /tmp/rustnzb-vX.Y.Z && cd /tmp/rustnzb-vX.Y.Z
 scp root@100.92.4.57:/var/www/dl.rustnzb.dev/vX.Y.Z/* .
 
-# Create GitHub release with artefacts
+# Create GitHub release with generated release notes and artefacts
 gh release create vX.Y.Z \
   --repo AusAgentSmith-org/rustnzb \
   --title "rustnzb vX.Y.Z" \
-  --notes-file RELEASE_NOTES_vX.Y.Z.md \
+  --generate-notes \
   ./*
 ```
 
-`RELEASE_NOTES_vX.Y.Z.md` should summarise notable features, fixes, breaking
-changes, upgrade notes, and bundled crate versions.
+Review and edit the generated GitHub release notes before publication. Keep
+release notes with the release object rather than committing version-specific
+Markdown files to the repository.
 
 ### 7. Verify
 
