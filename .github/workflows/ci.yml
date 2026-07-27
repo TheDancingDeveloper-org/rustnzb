@@ -41,6 +41,9 @@ jobs:
       - run: cargo test --manifest-path benchnzb/Cargo.toml --all-targets --locked
         env:
           CARGO_PROFILE_TEST_DEBUG: 0
+          # GNU gold has a substantially lower peak-memory footprint than
+          # GNU ld for benchnzb's large test binary.
+          RUSTFLAGS: -C linker=/usr/bin/gcc -C link-arg=-fuse-ld=gold
 
   frontend:
     if: github.event_name != 'pull_request' || github.event.pull_request.user.type != 'Bot'
