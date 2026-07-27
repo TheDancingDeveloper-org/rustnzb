@@ -381,9 +381,6 @@ impl NntpConnection {
             "NNTP connecting"
         );
 
-        // Rate-limit connection attempts per host to prevent thundering herd
-        let _gate_permit = crate::connect_gate::acquire(&config.host).await;
-
         // 1. TCP connect (optionally through SOCKS5 proxy)
         let tcp = if let Some(proxy_url) = config
             .proxy_url
@@ -2453,6 +2450,35 @@ mod tests {
         conn.connect(&config).await.unwrap();
         assert_eq!(conn.state, ConnectionState::Ready);
         assert!(conn.is_connected());
+    }
+
+    #[tokio::test]
+    async fn zero_ramp_up_allows_configured_connections_to_start_together() {
+        let server = MockNntpServer::start(MockConfig {
+            response_delay: Some(Duration::from_millis(10)),
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let started = Instant::now();
+        let mut connections = tokio::task::JoinSet::new();
+
+        for id in 0..8 {
+            let config = config.clone();
+            connections.spawn(async move {
+                let mut conn = NntpConnection::new(format!("parallel-{id}"));
+                conn.connect(&config).await
+            });
+        }
+
+        while let Some(result) = connections.join_next().await {
+            result.expect("connection task panicked").unwrap();
+        }
+
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "zero configured ramp-up must not be overridden by a global connection gate"
+        );
     }
 
     #[tokio::test]
