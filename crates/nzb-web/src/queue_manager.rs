@@ -3319,7 +3319,7 @@ impl QueueManager {
                 // Tick per-job speed trackers
                 {
                     let jobs = qm.jobs.lock();
-                    for (_id, state) in jobs.iter() {
+                    for state in jobs.values() {
                         state.speed.tick(1.0);
                     }
                 }

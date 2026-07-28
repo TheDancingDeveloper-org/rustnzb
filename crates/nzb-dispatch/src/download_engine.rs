@@ -1386,7 +1386,7 @@ impl WorkerPool {
             // ---------- 2. Reap finished workers and respawn ----------
             {
                 let mut workers = self.workers.lock();
-                for (_id, list) in workers.iter_mut() {
+                for list in workers.values_mut() {
                     list.retain(|w| !w.handle.is_finished());
                 }
             }
