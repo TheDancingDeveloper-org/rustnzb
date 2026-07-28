@@ -31,6 +31,7 @@ pub struct ServerConfig {
     /// Article retention in days (0 = unlimited)
     pub retention: u32,
     /// Number of pipelined requests per connection
+    #[serde(default = "default_pipelining")]
     pub pipelining: u8,
     /// Server is optional (failure is non-fatal)
     pub optional: bool,
@@ -74,6 +75,11 @@ fn default_connect_timeout_secs() -> u32 {
     30
 }
 
+/// Default number of in-flight ARTICLE requests per connection.
+fn default_pipelining() -> u8 {
+    4
+}
+
 impl ServerConfig {
     /// Create a new `ServerConfig` with the given id and host, using defaults for all other fields.
     pub fn new(id: impl Into<String>, host: impl Into<String>) -> Self {
@@ -100,7 +106,7 @@ impl Default for ServerConfig {
             priority: 0,
             enabled: true,
             retention: 0,
-            pipelining: 1,
+            pipelining: default_pipelining(),
             optional: false,
             compress: false,
             ramp_up_delay_ms: default_ramp_up_delay_ms(),
@@ -236,7 +242,7 @@ mod tests {
         assert_eq!(config.priority, 0);
         assert!(config.enabled);
         assert_eq!(config.retention, 0);
-        assert_eq!(config.pipelining, 1);
+        assert_eq!(config.pipelining, 4);
         assert!(!config.optional);
         assert!(!config.compress);
         assert_eq!(config.ramp_up_delay_ms, 50);
@@ -256,6 +262,20 @@ mod tests {
         let config: ServerConfig = toml::from_str(&without_ramp_up).unwrap();
 
         assert_eq!(config.ramp_up_delay_ms, 50);
+    }
+
+    #[test]
+    fn test_server_config_missing_pipelining_uses_default() {
+        let serialized = toml::to_string(&ServerConfig::default()).unwrap();
+        let without_pipelining = serialized
+            .lines()
+            .filter(|line| !line.starts_with("pipelining ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config: ServerConfig = toml::from_str(&without_pipelining).unwrap();
+
+        assert_eq!(config.pipelining, 4);
     }
 
     #[test]

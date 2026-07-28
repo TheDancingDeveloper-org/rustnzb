@@ -61,7 +61,7 @@ export async function apiAddServer(baseUrl: string, token: string, server?: Part
     priority: server?.priority ?? 0,
     enabled: server?.enabled ?? true,
     retention: server?.retention ?? 0,
-    pipelining: server?.pipelining ?? 16,
+    pipelining: server?.pipelining ?? 4,
     optional: server?.optional ?? false,
     compress: server?.compress ?? false,
     ramp_up_delay_ms: server?.ramp_up_delay_ms ?? 50,
