@@ -2,6 +2,39 @@
 
 Last updated: 2026-07-28 UTC
 
+## Full 4-client comparison with the buffer-pooling fix
+
+After the buffer-pooling fix below was retained, the harness was run across
+all four supported clients in one matrix: `rustnzb:pooled` (this fix),
+NZBFast, SABnzbd, and NZBGet. Same configuration as the retained baseline —
+5 GiB raw scenario, 8 connections, RustNZB pipeline depth 2, 3 rounds per
+client, `--keep-containers` off, hash-validated. All 12 legs (4 clients × 3
+rounds) passed full-byte SHA-256 validation.
+
+| Client | Round 1 | Round 2 | Round 3 | Median | Throughput |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RustNZB (pooled) | 5.038 s | 6.049 s | 5.046 s | 5.046 s | 1,014.7 MiB/s |
+| NZBFast | 5.022 s | 4.028 s | 5.038 s | 5.022 s | 1,019.5 MiB/s |
+| SABnzbd | 6.107 s | 6.077 s | 5.069 s | 6.077 s | 842.5 MiB/s |
+| NZBGet | 16.133 s | 19.219 s | 18.163 s | 18.163 s | 281.9 MiB/s |
+
+**RustNZB and NZBFast are now statistically tied** — 5.046 s vs. 5.022 s
+median, under 0.5% apart, well inside the round-to-round noise already
+documented on this host (individual rounds for both clients span
+4.0–6.1 s). This is the first point in this document's history where
+RustNZB has reached parity with NZBFast rather than trailing it by
+2–3×. Both RustNZB and NZBFast substantially outperform SABnzbd (~17%
+slower median) and NZBGet (~3.6× slower median) in this raw-scenario,
+loopback, mock-NNTP configuration — those two comparisons are not the
+subject of this investigation and are recorded here only for completeness;
+no changes were made to reach them.
+
+This result should be read with the same caveats as everything else in this
+document: single 3-round matrix, one workload (raw, 5 GiB, depth 2), one
+noisy shared host. It is not a claim of general real-world parity across
+scenarios, providers, or hardware — it is the specific, hash-validated
+result of this specific matrix, run the same way the retained baseline was.
+
 ## Buffer-pooling fix — implemented and benchmarked (RETAINED)
 
 Following the profiling below (kernel page-fault/allocation overhead — see
@@ -86,14 +119,52 @@ suite green, fmt/clippy clean, and the perf mechanism matches the wall-clock
 result — this passes every condition in the "Optimization gate" below. The
 change is already in the source tree (not behind a flag; no revert needed).
 
+## Correction to the "stale image" finding below (2026-07-28, later same day)
+
+The section below originally claimed every prior entry in "Attempts that
+were not retained" and the retained queue-maintenance fix must be treated as
+unverified, because the harness's default `RUSTNZB_IMAGE` pulls a
+months-old registry image. That default-config observation is still
+factually correct (see below), but the conclusion drawn from it was too
+strong. Evidence found later the same day points the other way for the
+*specific* experiments already recorded in this document: this host has
+locally-built Docker images tagged to match every one of them —
+`rustnzb:perf-yencsimd`, `perf-buffered-recv`, `perf-buffered-yield8`,
+`perf-thinlto`, `perf-fix-0f10d60`, `local-next-timeout` — all built earlier
+the same day, all present in `docker images` on both this sandbox and Node B
+(`docker inspect` shows identical image IDs on both, confirming they share
+one Docker daemon). Corresponding `results/comparison_20260728_*.json`
+files exist locally with timestamps matching the experiment sequence in this
+document. The prior session's own conversation history (`~/.codex/history.jsonl`)
+confirms it was Codex, working in this exact repo on this exact task.
+
+This is strong circumstantial evidence the prior session built and
+benchmarked real per-experiment images (an `RUSTNZB_IMAGE` override, the
+same mechanism used for the buffer-pooling fix above), not a static stale
+binary — I could not find a definitive command-level log proving the
+override was set, but a session sophisticated enough to build eight
+distinctly-tagged experimental images and record detailed per-round
+timings is very unlikely to have been comparing all of them against one
+unchanging binary without noticing. The specific numbers recorded for each
+"rejected" experiment below should therefore be treated as probably valid
+measurements of that experiment's real code, not artifacts of a stale image.
+
+What still stands, unweakened: the harness's *default* invocation (no
+explicit `RUSTNZB_IMAGE`) does pull `ausagentsmith/rustnzb:latest`, built
+2026-04-06 — a real latent trap for anyone running this harness without
+knowing to override it. That part of the finding below is accurate and
+worth keeping. Only the blanket "every entry must be treated as unverified"
+conclusion is retracted.
+
 ## Critical finding: the benchmarked RustNZB image is stale, and a real profile changes the diagnosis
 
 Two things were confirmed on 2026-07-28 by profiling the actual benchmark
 container (via a working `perf`, on a host without the capability
 restrictions that blocked earlier attempts in this investigation — see
-below). Together they mean **every entry in "Attempts that were not
-retained" and the "retained" queue-maintenance fix below must be treated as
-unverified**, not as settled conclusions.
+below). **See the correction above** — the following paragraph's blanket
+conclusion does not hold for the specific experiments in this document, only
+for the general risk of running this harness without an explicit
+`RUSTNZB_IMAGE` override.
 
 **1. The RustNZB image the harness benchmarks has not reflected the source
 tree for months.** `nntp-client-bench/docker-compose.yml` references the
