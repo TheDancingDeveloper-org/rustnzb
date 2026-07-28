@@ -2132,7 +2132,12 @@ async fn run_worker_pipelined(
                         let yield_t = Instant::now();
                         tokio::task::yield_now().await;
                         perf_yield_us += yield_t.elapsed().as_micros() as u64;
-                        match decode_and_assemble(&item, &raw_data, &ctx.assembler) {
+                        let decode_result = decode_and_assemble(&item, &raw_data, &ctx.assembler);
+                        // Return the buffer to the connection's pool so the
+                        // next article's fetch reuses it instead of
+                        // allocating fresh.
+                        conn.release_body_buffer(raw_data);
+                        match decode_result {
                             Ok(process_result) => {
                                 perf_decode_us += process_result.decode_us;
                                 perf_assemble_us += process_result.assemble_us;
@@ -2718,7 +2723,11 @@ async fn fetch_article_with_retry(
                     fetch_us,
                     "NNTP fetch complete"
                 );
-                return decode_and_assemble(item, &raw_data, assembler);
+                let result = decode_and_assemble(item, &raw_data, assembler);
+                // Return the buffer to the connection's pool so the next
+                // article's fetch reuses it instead of allocating fresh.
+                conn.release_body_buffer(raw_data);
+                return result;
             }
             Err(NntpError::ArticleNotFound(_)) => {
                 debug!(

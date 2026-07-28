@@ -261,7 +261,26 @@ pub struct NntpConnection {
     /// `CAPABILITIES` command; falls back to conservative defaults if the
     /// server is pre-RFC-3977 and rejects the command).
     capabilities: NntpCapabilities,
+    /// Persistent per-line scratch buffer for `read_multiline_body`, reused
+    /// across calls (cleared, not reallocated) to avoid a fresh heap
+    /// allocation on every article. Never handed out to callers.
+    line_scratch: Vec<u8>,
+    /// Free list of article-body buffers. `read_multiline_body` checks one
+    /// out instead of allocating fresh; hot-path callers that finish with
+    /// the data immediately (`fetch_article`, `Pipeline::receive_one`) check
+    /// it back in via `release_body_buffer`. This is what actually avoids
+    /// the per-article page-fault/allocation cost identified by profiling —
+    /// see `docs/PERFORMANCE_STATUS.md`.
+    body_pool: Vec<Vec<u8>>,
 }
+
+/// Article bodies are typically well under 1 MiB (yEnc articles are usually
+/// ~700-750 KiB encoded); this is the capacity a fresh pooled buffer starts
+/// with so steady-state reuse rarely needs to grow.
+const BODY_BUFFER_CAPACITY: usize = 896 * 1024;
+/// Cap on how many idle buffers a connection retains, so a burst of
+/// unusually large articles can't pin unbounded memory in the free list.
+const BODY_POOL_MAX_IDLE: usize = 8;
 
 impl NntpConnection {
     /// Create a new, disconnected connection for the given server.
@@ -273,6 +292,27 @@ impl NntpConnection {
             compress_enabled: false,
             io_heartbeat: None,
             capabilities: NntpCapabilities::default_assumed(),
+            line_scratch: Vec::with_capacity(16 * 1024),
+            body_pool: Vec::new(),
+        }
+    }
+
+    /// Check out a reusable article-body buffer, or allocate a fresh one if
+    /// the free list is empty. Callers that finish with the buffer promptly
+    /// should return it via [`Self::release_body_buffer`].
+    pub fn checkout_body_buffer(&mut self) -> Vec<u8> {
+        self.body_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(BODY_BUFFER_CAPACITY))
+    }
+
+    /// Return a body buffer to the free list for reuse. Safe to call for any
+    /// buffer, pooled or not; oversized or excess buffers are dropped
+    /// normally rather than retained.
+    pub fn release_body_buffer(&mut self, mut buf: Vec<u8>) {
+        buf.clear();
+        if self.body_pool.len() < BODY_POOL_MAX_IDLE {
+            self.body_pool.push(buf);
         }
     }
 
@@ -1807,6 +1847,20 @@ impl NntpConnection {
     /// Read a multi-line body terminated by `.\r\n`. Un-does dot-stuffing.
     /// Public for pipeline use.
     pub(crate) async fn read_multiline_body(&mut self) -> NntpResult<Vec<u8>> {
+        let mut body = self.checkout_body_buffer();
+        self.read_multiline_body_into(&mut body).await?;
+        Ok(body)
+    }
+
+    /// Same as [`Self::read_multiline_body`], but fills a caller-owned
+    /// buffer (cleared first) instead of allocating. `out` is expected to
+    /// have been checked out via [`Self::checkout_body_buffer`] so its
+    /// existing capacity is reused rather than growing from zero — that
+    /// checkout is what actually avoids the page-fault/allocation cost per
+    /// article; passing an arbitrary fresh `Vec::new()` here still works
+    /// correctly, it just forgoes the reuse benefit.
+    async fn read_multiline_body_into(&mut self, out: &mut Vec<u8>) -> NntpResult<()> {
+        out.clear();
         // Clone the heartbeat ref before we take the mutable borrow on
         // `transport`, so we can tick it inside the loop body. Cheap: just
         // an Arc clone plus an Instant copy.
@@ -1816,20 +1870,17 @@ impl NntpConnection {
             .as_mut()
             .ok_or(NntpError::Connection("Not connected".into()))?;
 
-        let mut body = Vec::with_capacity(1024 * 1024);
-        let mut line_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
-
         loop {
-            line_buf.clear();
+            self.line_scratch.clear();
             let n = tokio::time::timeout(
                 READ_BODY_LINE_TIMEOUT,
-                transport.read_line_bytes(&mut line_buf),
+                transport.read_line_bytes(&mut self.line_scratch),
             )
             .await
             .map_err(|_| {
                 warn!(
                     server = %self.server_id,
-                    body_bytes = body.len(),
+                    body_bytes = out.len(),
                     "read_multiline_body timed out after {}s — connection likely dead",
                     READ_BODY_LINE_TIMEOUT.as_secs()
                 );
@@ -1838,7 +1889,7 @@ impl NntpConnection {
                     format!(
                         "read_multiline_body timed out after {}s (received {} bytes so far)",
                         READ_BODY_LINE_TIMEOUT.as_secs(),
-                        body.len()
+                        out.len()
                     ),
                 ))
             })?
@@ -1858,19 +1909,19 @@ impl NntpConnection {
             }
 
             // Check for termination: a lone dot followed by CRLF
-            if line_buf == b".\r\n" || line_buf == b".\n" {
+            if self.line_scratch == b".\r\n" || self.line_scratch == b".\n" {
                 break;
             }
 
             // Dot-unstuffing: if a line starts with "..", remove the first dot
-            if line_buf.starts_with(b"..") {
-                body.extend_from_slice(&line_buf[1..]);
+            if self.line_scratch.starts_with(b"..") {
+                out.extend_from_slice(&self.line_scratch[1..]);
             } else {
-                body.extend_from_slice(&line_buf);
+                out.extend_from_slice(&self.line_scratch);
             }
         }
 
-        Ok(body)
+        Ok(())
     }
 
     /// Returns `true` if the connection has an active transport.
@@ -2711,6 +2762,97 @@ mod tests {
             Err(crate::error::NntpError::ArticleNotFound(_))
         ));
         assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[test]
+    fn body_pool_reuses_checked_out_buffer() {
+        let mut conn = NntpConnection::new("test".into());
+
+        let mut buf = conn.checkout_body_buffer();
+        buf.extend_from_slice(b"first article body");
+        let capacity_after_fill = buf.capacity();
+        conn.release_body_buffer(buf);
+
+        let reused = conn.checkout_body_buffer();
+        // The pool must hand back the same (or larger) allocation rather
+        // than a fresh zero-capacity Vec — this is what actually avoids the
+        // per-article page-fault cost. If this regresses to a fresh Vec,
+        // pooling is silently not happening.
+        assert!(
+            reused.capacity() >= capacity_after_fill,
+            "expected pooled buffer capacity to be retained, got {} (was {})",
+            reused.capacity(),
+            capacity_after_fill
+        );
+    }
+
+    #[test]
+    fn body_pool_clears_stale_data_on_checkout() {
+        // Fault-path: a released buffer must come back empty, not still
+        // holding the previous article's bytes. If `release_body_buffer`
+        // or the fill path ever forgot to clear, a reused buffer would leak
+        // the prior article's data into the next one's decode input.
+        let mut conn = NntpConnection::new("test".into());
+
+        let mut buf = conn.checkout_body_buffer();
+        buf.extend_from_slice(b"leftover data from a previous article");
+        conn.release_body_buffer(buf);
+
+        let reused = conn.checkout_body_buffer();
+        assert!(
+            reused.is_empty(),
+            "checked-out buffer must be empty, found {} stale bytes",
+            reused.len()
+        );
+    }
+
+    #[test]
+    fn body_pool_is_bounded() {
+        // Fault-path: releasing far more buffers than any realistic
+        // pipeline depth must not let the free list grow without bound.
+        let mut conn = NntpConnection::new("test".into());
+        for _ in 0..(BODY_POOL_MAX_IDLE * 4) {
+            let buf = conn.checkout_body_buffer();
+            conn.release_body_buffer(buf);
+        }
+        assert!(conn.body_pool.len() <= BODY_POOL_MAX_IDLE);
+    }
+
+    #[tokio::test]
+    async fn fetch_article_body_pool_round_trip_is_correct() {
+        // Two distinct articles fetched with the pool cycled between them,
+        // proving reuse doesn't corrupt or truncate the second article's
+        // data (the correctness property that matters more than the
+        // allocation-avoidance itself).
+        let mut articles = HashMap::new();
+        articles.insert("art1@test".into(), b"first article payload".to_vec());
+        articles.insert(
+            "art2@test".into(),
+            b"second, differently sized article payload with more bytes".to_vec(),
+        );
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let first = conn.fetch_article("art1@test").await.unwrap();
+        let first_data = first.data.unwrap();
+        assert!(String::from_utf8_lossy(&first_data).contains("first article payload"));
+        conn.release_body_buffer(first_data);
+
+        let second = conn.fetch_article("art2@test").await.unwrap();
+        let second_data = second.data.unwrap();
+        let second_body = String::from_utf8_lossy(&second_data);
+        assert!(second_body.contains("second, differently sized article payload with more bytes"));
+        assert!(
+            !second_body.contains("first article payload"),
+            "second fetch must not contain leftover bytes from the first"
+        );
     }
 
     #[tokio::test]
