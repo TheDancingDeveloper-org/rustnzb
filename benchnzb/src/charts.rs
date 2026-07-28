@@ -284,7 +284,7 @@ fn write_cross_scenario(results: &[(ClientResult, ClientResult)], dir: &Path) ->
     let mut svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" style="background:{BG_COLOR}">
 <text x="{}" y="28" fill="{TEXT_COLOR}" font-size="16" text-anchor="middle" font-family="monospace" font-weight="bold">Cross-Scenario: Speed Ratio (SABnzbd time / rustnzb time)</text>
-<text x="{}" y="50" fill="{GREEN}" font-size="10" font-family="monospace">Green = rustnzb faster</text>
+<text x="{}" y="50" fill="{GREEN}" font-size="10" font-family="monospace">Green = rustnzb lower time</text>
 <text x="{}" y="50" fill="{RED}" font-size="10" font-family="monospace">Red = SABnzbd faster</text>"#,
         w / 2,
         w / 2 - 120,
