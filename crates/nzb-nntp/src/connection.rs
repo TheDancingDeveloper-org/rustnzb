@@ -278,6 +278,8 @@ pub struct NntpConnection {
 /// ~700-750 KiB encoded); this is the capacity a fresh pooled buffer starts
 /// with so steady-state reuse rarely needs to grow.
 const BODY_BUFFER_CAPACITY: usize = 896 * 1024;
+/// Do not retain buffers that grew well beyond the normal article size.
+const BODY_BUFFER_MAX_RETAINED_CAPACITY: usize = 4 * 1024 * 1024;
 /// Cap on how many idle buffers a connection retains, so a burst of
 /// unusually large articles can't pin unbounded memory in the free list.
 const BODY_POOL_MAX_IDLE: usize = 8;
@@ -311,7 +313,9 @@ impl NntpConnection {
     /// normally rather than retained.
     pub fn release_body_buffer(&mut self, mut buf: Vec<u8>) {
         buf.clear();
-        if self.body_pool.len() < BODY_POOL_MAX_IDLE {
+        if buf.capacity() <= BODY_BUFFER_MAX_RETAINED_CAPACITY
+            && self.body_pool.len() < BODY_POOL_MAX_IDLE
+        {
             self.body_pool.push(buf);
         }
     }
@@ -2816,6 +2820,15 @@ mod tests {
             conn.release_body_buffer(buf);
         }
         assert!(conn.body_pool.len() <= BODY_POOL_MAX_IDLE);
+    }
+
+    #[test]
+    fn body_pool_drops_oversized_buffers() {
+        let mut conn = NntpConnection::new("test".into());
+        let mut buf = Vec::with_capacity(BODY_BUFFER_MAX_RETAINED_CAPACITY + 1);
+        buf.extend_from_slice(b"oversized article");
+        conn.release_body_buffer(buf);
+        assert!(conn.body_pool.is_empty());
     }
 
     #[tokio::test]
