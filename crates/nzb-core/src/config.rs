@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(cfg.priority, 0);
         assert!(cfg.enabled);
         assert_eq!(cfg.retention, 0);
-        assert_eq!(cfg.pipelining, 1);
+        assert_eq!(cfg.pipelining, 4);
         assert!(!cfg.optional);
     }
 

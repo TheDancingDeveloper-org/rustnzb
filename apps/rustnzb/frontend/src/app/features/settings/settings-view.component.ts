@@ -100,7 +100,7 @@ function emptyServer(): ServerConfig {
     priority: 0,
     enabled: true,
     retention: 0,
-    pipelining: 16,
+    pipelining: 4,
     optional: false,
     compress: false,
     ramp_up_delay_ms: 50,

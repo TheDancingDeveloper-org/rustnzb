@@ -29,7 +29,7 @@ max_nested_archive_depth = 5  # 0=outer archive only; protects against unbounded
 # priority = 0  # 0 = highest priority
 # enabled = true
 # retention = 3000  # days
-# pipelining = 1
+# pipelining = 4
 # optional = false
 # ramp_up_delay_ms = 50
 #
@@ -46,7 +46,7 @@ max_nested_archive_depth = 5  # 0=outer archive only; protects against unbounded
 # priority = 1
 # enabled = true
 # retention = 1000
-# pipelining = 1
+# pipelining = 4
 # optional = true
 
 # Download categories

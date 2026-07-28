@@ -312,6 +312,6 @@ fn imported_server_to_config() {
     assert_eq!(sc.port, 563);
     assert!(sc.ssl);
     assert_eq!(sc.connections, 16);
-    assert_eq!(sc.pipelining, 1);
+    assert_eq!(sc.pipelining, 4);
     assert!(!sc.id.is_empty()); // UUID was generated
 }

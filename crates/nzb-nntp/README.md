@@ -343,7 +343,7 @@ async fn pooled_usage() -> nzb_nntp::NntpResult<()> {
 | `priority` | `0` | Server priority (0 = highest, tried first) |
 | `enabled` | `true` | Include this server in downloads |
 | `retention` | `0` | Article retention in days (0 = unlimited) |
-| `pipelining` | `1` | Pipeline depth (1 = no pipelining) |
+| `pipelining` | `4` | Pipeline depth (1 = no pipelining) |
 | `optional` | `false` | If true, failures don't block the download |
 | `compress` | `false` | Negotiate XFEATURE COMPRESS GZIP |
 | `proxy_url` | `None` | SOCKS5 proxy: `socks5://[user:pass@]host:port` |
