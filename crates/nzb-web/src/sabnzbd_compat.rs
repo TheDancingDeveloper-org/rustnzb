@@ -413,7 +413,7 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         _ => {}
     }
 
-    let jobs = qm.get_jobs();
+    let jobs = qm.get_active_jobs();
     let paused = qm.is_paused();
     let speed_bps = qm.get_speed();
 

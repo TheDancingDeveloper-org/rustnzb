@@ -111,24 +111,19 @@ async fn upload_nzb_downloads_via_mock_server_and_reaches_history() {
         "idle API status still reports connections in use: {idle_status}"
     );
 
-    loop {
-        let queue: serde_json::Value = client
-            .get(format!("{}/api/queue", app.base_url))
-            .send()
-            .await
-            .expect("queue request failed")
-            .json()
-            .await
-            .expect("queue response should be JSON");
-        if queue["jobs"].as_array().unwrap().is_empty() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "job reached history but never drained from queue"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let queue_after_history: serde_json::Value = client
+        .get(format!("{}/api/queue", app.base_url))
+        .send()
+        .await
+        .expect("queue request after history failed")
+        .json()
+        .await
+        .expect("queue response after history should be JSON");
+    assert_eq!(
+        queue_after_history["jobs"].as_array().map(Vec::len),
+        Some(0),
+        "a terminal job persisted to history must not remain in the active queue: {queue_after_history}"
+    );
 
     let downloaded = app
         .complete_dir

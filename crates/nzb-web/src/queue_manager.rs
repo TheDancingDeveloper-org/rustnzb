@@ -2678,6 +2678,18 @@ impl QueueManager {
         result
     }
 
+    /// Get jobs that are still actionable in the active download queue.
+    ///
+    /// Completed and failed jobs remain in the in-memory snapshot briefly so
+    /// internal consumers can observe the terminal transition, but they have
+    /// already been persisted to history and must not keep queue views busy.
+    pub fn get_active_jobs(&self) -> Vec<NzbJob> {
+        self.get_jobs()
+            .into_iter()
+            .filter(|job| !matches!(job.status, JobStatus::Completed | JobStatus::Failed))
+            .collect()
+    }
+
     /// Get a single job by ID (with files included).
     pub fn get_job(&self, job_id: &str) -> Option<NzbJob> {
         let jobs = self.jobs.lock();
@@ -2700,7 +2712,11 @@ impl QueueManager {
 
     /// Get the number of jobs in the queue.
     pub fn queue_size(&self) -> usize {
-        self.jobs.lock().len()
+        self.jobs
+            .lock()
+            .values()
+            .filter(|state| !matches!(state.job.status, JobStatus::Completed | JobStatus::Failed))
+            .count()
     }
 
     /// Get the current incomplete directory.
@@ -3561,6 +3577,25 @@ mod global_pause_tests {
             },
         );
         manager.job_order.lock().push(id);
+    }
+
+    #[tokio::test]
+    async fn active_queue_view_excludes_terminal_jobs() {
+        let (manager, tempdir) = manager();
+        insert_job(
+            &manager,
+            job("downloading", JobStatus::Downloading, tempdir.path()),
+        );
+        insert_job(
+            &manager,
+            job("completed", JobStatus::Completed, tempdir.path()),
+        );
+        insert_job(&manager, job("failed", JobStatus::Failed, tempdir.path()));
+
+        assert_eq!(manager.get_jobs().len(), 3);
+        assert_eq!(manager.get_active_jobs().len(), 1);
+        assert_eq!(manager.get_active_jobs()[0].id, "downloading");
+        assert_eq!(manager.queue_size(), 1);
     }
 
     #[tokio::test]

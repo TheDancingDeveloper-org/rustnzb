@@ -346,13 +346,13 @@ pub struct LogResponse {
 // Queue handlers
 // ---------------------------------------------------------------------------
 
-/// GET /api/queue -- List all jobs in the download queue.
+/// GET /api/queue -- List jobs that are still active in the download queue.
 pub async fn h_queue_list(
     State(state): State<Arc<AppState>>,
     Query(q): Query<QueueQuery>,
 ) -> Result<Json<QueueResponse>, ApiError> {
     let qm = &state.queue_manager;
-    let all_jobs = qm.get_jobs();
+    let all_jobs = qm.get_active_jobs();
     let total = all_jobs.len();
     let speed_bps = qm.get_speed();
     let paused = qm.is_paused();
