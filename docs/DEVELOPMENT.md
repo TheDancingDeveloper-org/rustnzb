@@ -28,6 +28,22 @@ npm test -- --watch=false
 npm run build -- --configuration=production
 ```
 
+CI additionally gates frontend coverage against `ci/frontend-coverage-baseline.json`:
+
+```bash
+cd apps/rustnzb/frontend
+npm test -- --coverage --coverage-reporters=text-summary --coverage-reporters=json-summary
+cd -
+node ci/check-frontend-coverage.mjs \
+  apps/rustnzb/frontend/coverage/frontend/coverage-summary.json \
+  ci/frontend-coverage-baseline.json
+```
+
+The baseline is a ratchet floor, not a target. Identical code reports a small
+environment-dependent coverage spread (960/5191 statements on some machines,
+965-966/5191 on others), so the floor sits below the low end of that band and
+only a real regression trips it. Raise it deliberately when coverage improves.
+
 ## Containerized tasks
 
 `./ci/run` runs checked-in task scripts in the pinned toolchain images. It is

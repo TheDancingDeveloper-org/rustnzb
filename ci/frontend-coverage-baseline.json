@@ -1,8 +1,9 @@
 {
-  "statements": 18.5,
-  "branches": 32.59,
-  "functions": 34.7,
-  "lines": 26.43,
+  "comment": "Ratchet floor, not a target. The frontend suite reports a small, environment-dependent coverage spread for identical code: 960/5191 statements locally and on some runners, 965-966/5191 on others (18.49%-18.6% statements, 32.55%-32.99% branches). The floor is set below the low end of that band so the gate only fires on a real regression. Raise it deliberately when coverage improves; see next_statement_target.",
+  "statements": 18.4,
+  "branches": 32.5,
+  "functions": 34.6,
+  "lines": 26.3,
   "next_statement_target": 25,
   "long_term_statement_target": 60
 }
