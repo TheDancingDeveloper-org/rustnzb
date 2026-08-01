@@ -9,6 +9,7 @@ web UI with real automation. One static binary, built for self-hosters.
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange)](https://www.rust-lang.org/)
 [![Container](https://img.shields.io/badge/container-GHCR-blue)](https://github.com/TheDancingDeveloper-org/rustnzb/pkgs/container/rustnzbd)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![AGENTS.md](https://img.shields.io/badge/AGENTS.md-AI--friendly-8A2BE2)](AGENTS.md)
 
 ## Try it now — live demo
 
@@ -232,6 +233,42 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the full task list and
 build details. See [CONTRIBUTING.md](CONTRIBUTING.md) for repository workflow
 and [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) for current user-visible
 limitations.
+
+---
+
+## AI-friendly by design
+
+rustnzb is built to be worked on by AI coding agents as well as people, and
+agent-assisted pull requests are welcome.
+
+[**AGENTS.md**](AGENTS.md) is the entry point for any agent: it maps the
+workspace crate by crate, lists the exact build and test commands, states the
+project conventions, marks the compatibility surfaces that must not drift, and
+sets explicit boundaries on what an agent should not do unprompted. It follows
+the [agents.md](https://agents.md/) convention, so Claude Code, Codex, Cursor,
+Copilot, Gemini CLI, Aider, and anything else that reads `AGENTS.md` pick it up
+automatically.
+
+What makes the repository tractable for an agent:
+
+- **Deterministic checks.** `cargo fmt`, `cargo check`, `cargo clippy -D
+  warnings`, and `cargo test --workspace` are the whole gate — no hidden steps.
+- **Reproducible environments.** `./ci/run <task>` executes the same
+  checked-in task scripts in the same pinned images CI uses, so local results
+  and CI results agree.
+- **No live dependencies in tests.** `crates/mock-nntp-server` provides a
+  deterministic NNTP fixture; nothing in the test suite needs a Usenet
+  provider, network access, or wall-clock timing.
+- **Documented contracts.** The REST API is annotated with utoipa and served
+  at `/swagger-ui`; the SABnzbd compatibility layer is checked against captured
+  SABnzbd 5.0.4 golden responses, so a response-shape regression fails CI
+  rather than a user's client.
+- **Clear boundaries.** Small crates with narrow responsibilities, so a change
+  usually touches one of them.
+
+Contributor expectations for AI-assisted changes — reviewing the complete
+change, running the tests, reporting results accurately — are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
