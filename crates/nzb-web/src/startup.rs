@@ -263,11 +263,18 @@ mod tests {
         std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let target = locked_parent.join("data");
-        let err = create_data_dir(&target).expect_err("should fail under a non-writable parent");
-        let debug_text = format!("{err:?}");
+        let result = create_data_dir(&target);
 
         // Restore permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = match result {
+            Err(e) => e,
+            // Running as root (e.g. CI containers) bypasses the permission
+            // check entirely, so there's nothing to assert.
+            Ok(()) => return,
+        };
+        let debug_text = format!("{err:?}");
 
         assert!(
             debug_text.contains(&target.display().to_string()),
