@@ -93,6 +93,8 @@ jobs:
     runs-on: [self-hosted, node-b, linux, x64, publish, docker]
     env:
       GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       IMAGE: rustnzb:ci-${{ github.sha }}
       RUSTNZB_BUILD_REF: ${{ github.sha }}
     steps:

@@ -19,12 +19,19 @@ fi
 cleanup() {
     docker buildx rm "$builder" >/dev/null 2>&1 || true
     rm -rf "$docker_config"
-    unset GIT_AUTH_TOKEN
+    unset GIT_AUTH_TOKEN DOCKERHUB_TOKEN DOCKERHUB_USERNAME
 }
 trap cleanup EXIT
 export DOCKER_CONFIG=$docker_config
 printf '%s' "$GIT_AUTH_TOKEN" | docker login repo.indexarr.net \
     --username x-access-token --password-stdin >/dev/null
+# Authenticated Docker Hub pulls get a much higher rate limit than
+# anonymous, IP-based ones (which the shared self-hosted runner exhausts
+# easily). Optional: falls back to anonymous pulls if unset.
+if [ -n "${DOCKERHUB_TOKEN:-}" ] && [ -n "${DOCKERHUB_USERNAME:-}" ]; then
+    printf '%s' "$DOCKERHUB_TOKEN" | docker login docker.io \
+        --username "$DOCKERHUB_USERNAME" --password-stdin >/dev/null
+fi
 docker buildx create --name "$builder" --driver docker-container --use >/dev/null
 
 set -- \
