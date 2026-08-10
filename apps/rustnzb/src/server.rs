@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::Context;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::middleware::Next;
@@ -396,7 +397,9 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
 pub async fn serve(state: Arc<AppState>, router: Router) -> anyhow::Result<()> {
     let config = state.config();
     let addr = format!("{}:{}", config.general.listen_addr, config.general.port);
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("Failed to bind HTTP server to {addr}"))?;
 
     info!("HTTP server listening on http://{addr}");
     info!("Web GUI: http://{addr}/");

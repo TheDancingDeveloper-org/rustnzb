@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use arc_swap::ArcSwap;
 use tracing::info;
 
@@ -41,6 +42,20 @@ fn env_flag_enabled(name: &str) -> Option<bool> {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Create a data directory (e.g. `data_dir`/`incomplete_dir`/`complete_dir`), attaching
+/// the failing path and a permission hint to any error so failures are actionable
+/// instead of a bare `Permission denied (os error 13)`.
+fn create_data_dir(path: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path).with_context(|| {
+        format!(
+            "Failed to create directory {}. \
+             Check that the directory (and its parent) is writable by the current user. \
+             If using Docker, ensure the volume is owned by the container's user.",
+            path.display()
         )
     })
 }
@@ -121,9 +136,9 @@ pub async fn initialize(
     }
 
     // Ensure directories exist
-    std::fs::create_dir_all(&config.general.data_dir)?;
-    std::fs::create_dir_all(&config.general.incomplete_dir)?;
-    std::fs::create_dir_all(&config.general.complete_dir)?;
+    create_data_dir(&config.general.data_dir)?;
+    create_data_dir(&config.general.incomplete_dir)?;
+    create_data_dir(&config.general.complete_dir)?;
 
     // Open database
     let db_path = config.general.data_dir.join("rustnzb.db");
@@ -223,9 +238,46 @@ pub async fn initialize(
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_loaded_config;
+    use super::{create_data_dir, sanitize_loaded_config};
     use crate::nzb_core::config::AppConfig;
     use crate::nzb_core::config::ServerConfig;
+
+    #[test]
+    fn create_data_dir_creates_nested_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("a").join("b").join("c");
+
+        create_data_dir(&nested).expect("nested directory creation should succeed");
+
+        assert!(nested.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_data_dir_wraps_permission_denied_with_context() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let locked_parent = tmp.path().join("locked");
+        std::fs::create_dir_all(&locked_parent).unwrap();
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let target = locked_parent.join("data");
+        let err = create_data_dir(&target).expect_err("should fail under a non-writable parent");
+        let debug_text = format!("{err:?}");
+
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            debug_text.contains(&target.display().to_string()),
+            "error should mention the failing path, got: {debug_text}"
+        );
+        assert!(
+            debug_text.contains("Caused by"),
+            "error should retain the underlying io::Error in the chain, got: {debug_text}"
+        );
+    }
 
     #[test]
     fn sanitize_loaded_config_trims_server_fields() {
