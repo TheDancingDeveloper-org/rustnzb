@@ -2062,6 +2062,27 @@ pub async fn h_setup_apply(
         }
     }
 
+    // Reject relative complete_dir/incomplete_dir rather than silently persisting
+    // them: SABnzbd allows relative paths (resolved against its own working
+    // directory), but rustnzb creates these directories eagerly at startup via
+    // create_dir_all, which resolves a relative path against *its* process CWD
+    // (e.g. "/" in Docker) instead of the intended download volume — producing
+    // a confusing crash far away from the actual misconfiguration (see #62).
+    if let Some(ref dir) = preview.general.complete_dir
+        && !std::path::Path::new(dir).is_absolute()
+    {
+        return Err(ApiError::bad_request(
+            "cannot apply: complete_dir must be an absolute path",
+        ));
+    }
+    if let Some(ref dir) = preview.general.incomplete_dir
+        && !std::path::Path::new(dir).is_absolute()
+    {
+        return Err(ApiError::bad_request(
+            "cannot apply: incomplete_dir must be an absolute path",
+        ));
+    }
+
     let mut config = (*state.config()).clone();
 
     // Convert imported servers → ServerConfig with fresh UUIDs
