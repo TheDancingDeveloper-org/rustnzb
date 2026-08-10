@@ -1,6 +1,11 @@
 #!/usr/bin/with-contenv sh
 
+# No --port here: clap gives an explicit CLI flag precedence over the
+# RUSTNZB_PORT env var, so hardcoding one here would make RUSTNZB_PORT (and
+# config.toml's general.port) silently unconfigurable in the image. Falls
+# back to 9090 (matching the Dockerfile's default EXPOSE) when neither is
+# set. If you override RUSTNZB_PORT, remember to remap the host port to
+# match (`-p host:$RUSTNZB_PORT`) since the image's EXPOSE stays 9090.
 exec s6-setuidgid abc rustnzb \
     --config /config/config.toml \
-    --data-dir /data \
-    --port 9090
+    --data-dir /data

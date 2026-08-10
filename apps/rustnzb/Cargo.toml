@@ -83,3 +83,4 @@ arc-swap.workspace = true
 nzb-nntp = { workspace = true, features = ["test-support"] }
 crc32fast = { workspace = true }
 mock-nntp-server = { workspace = true }
+serial_test = "3"

@@ -419,3 +419,54 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+    use serial_test::serial;
+
+    // These tests mutate the real process environment, so they must run
+    // serialized against each other (see issue #62 follow-up: the Docker
+    // image used to hardcode `--port 9090`, which silently defeated
+    // RUSTNZB_PORT — this locks in the precedence the fix relies on).
+
+    #[test]
+    #[serial(rustnzb_port_env)]
+    fn port_env_var_is_used_when_no_explicit_flag_is_given() {
+        unsafe {
+            std::env::set_var("RUSTNZB_PORT", "8123");
+        }
+        let args = Args::parse_from(["rustnzb"]);
+        unsafe {
+            std::env::remove_var("RUSTNZB_PORT");
+        }
+
+        assert_eq!(args.port, Some(8123));
+    }
+
+    #[test]
+    #[serial(rustnzb_port_env)]
+    fn explicit_port_flag_still_wins_over_env_var() {
+        unsafe {
+            std::env::set_var("RUSTNZB_PORT", "8123");
+        }
+        let args = Args::parse_from(["rustnzb", "--port", "1234"]);
+        unsafe {
+            std::env::remove_var("RUSTNZB_PORT");
+        }
+
+        assert_eq!(args.port, Some(1234));
+    }
+
+    #[test]
+    #[serial(rustnzb_port_env)]
+    fn port_is_none_when_neither_flag_nor_env_var_is_set() {
+        unsafe {
+            std::env::remove_var("RUSTNZB_PORT");
+        }
+        let args = Args::parse_from(["rustnzb"]);
+
+        assert_eq!(args.port, None);
+    }
+}

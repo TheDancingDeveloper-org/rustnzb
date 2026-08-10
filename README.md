@@ -177,6 +177,13 @@ full reference.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint |
 | `OTEL_SERVICE_NAME` | Service name for telemetry |
 
+> **Docker note:** setting `RUSTNZB_PORT` changes the port the app listens
+> on *inside* the container (default `9090`). The image's `EXPOSE 9090` is
+> static Dockerfile metadata and won't follow it, so remap the host port to
+> match your chosen value yourself: `-p <host-port>:$RUSTNZB_PORT` (don't
+> rely on `-P`/auto-mapping, which only publishes the declared `EXPOSE`
+> port).
+
 ### Docker volumes
 
 | Path | Purpose |

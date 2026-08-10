@@ -2932,6 +2932,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "serial_test",
  "tempfile",
  "tokio",
  "tokio-util",
