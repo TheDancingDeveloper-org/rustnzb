@@ -171,6 +171,61 @@ public issue tracker.
 
 ---
 
+## Work tracking — Vogt
+
+This project is registered in **Vogt** as the single source of truth for its
+work. Ask Vogt what is outstanding here; do not re-derive it from the repo.
+
+| | |
+|---|---|
+| Slug | `rustnzb` (not `rustnzbd` — see below) |
+| Instance | dev, `ins_01M019AZ8GBNE22FT74Y746JBK`, reachable at `http://127.0.0.1:8910/mcp` from MyDevEnv2 |
+| Project id | `prj_01M04J3R35QZ2FHB04YKESAFDK` |
+| Registered | 2026-08-16, via `vogt-onboarding/docs/IMPORT-PLAYBOOK.md` |
+| Write-back | `none` — Vogt says nothing upstream on this repo |
+
+**Names.** The directory is `rustnzbd`, the repo and the product are `rustnzb`.
+The trailing `d` is a local directory artefact and is deliberately not carried
+into Vogt. `rustnzbd` is also a GHCR/Forgejo image name; no repository by that
+name exists.
+
+**Canonical remote.** `https://github.com/TheDancingDeveloper-org/rustnzb`.
+The older `AusAgentSmith-org/rustnzb` URL still resolves, because GitHub follows
+transfer redirects and returns `200` — it is a redirect, not a home. Both `origin`
+and `destination` in this checkout already point at the canonical owner.
+
+**Other copies.** This working tree is the one people develop in, which is why
+the project was `register`ed rather than `import`ed — `project import` would have
+manufactured a second server-side checkout. A record for this project also exists
+on the separate production Vogt instance (`ins_01KZTQ95C4Y7DGHEAK42M0TBR3`); the
+dev instance above is the destination by owner decision of 2026-08-16, and the
+production record is out of scope.
+
+**The monorepo layout is deliberate.** This repository was converted to a
+monorepo with its crates internal. `crates/` and `apps/` are the code; there is
+no root `src/` and there is not going to be one. Note also that the root
+workspace carries `exclude = ["benchnzb", "desktop"]`, and `fuzz/` is not a
+member either — those three are separate Cargo workspaces nested in this
+repository that reach back into the main workspace's crates by relative path.
+That is intended, and any tool reasoning about this tree needs to handle it.
+
+**Contract status: `non_compliant`, and accepted as such.** Contract v1 fails on
+three criteria — no root `LICENSE` file (though `Cargo.toml` declares
+`license = "MIT"`), no `design/`, and no `src/`. The last is structural, and
+follows from the monorepo layout above: it is the intended end state, not a
+migration anyone is waiting to see finish. Do not create a `src/` to score a
+pass. Tracked as Vogt `WI-1`.
+
+**Known collector noise.** The first drift pass opened 30 `unresolved_dependency`
+proposals, every one of them an intra-workspace Cargo path dependency
+(`../nzb-core`, `workspace:.`, `crates/…`) that resolves inside this repository.
+They are not missing projects and must not be accepted as such — accepting one
+asserts the target is not a project, which is false for every one of them.
+Tracked as Vogt `WI-2`. `gh-posture` also fails on this project with a
+`JSONDecodeError` (`WI-4`).
+
+---
+
 ## Further reading
 
 - [README.md](README.md) — features, install, configuration, API overview
