@@ -10,6 +10,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Lets the gate be re-run without a push. Needed because a run that fails to
+  # resolve the reusable workflow produces no jobs, and GitHub refuses to retry
+  # a jobless run -- which is exactly the state every public repo's gate was in
+  # while github-policy was private.
+  workflow_dispatch:
 
 jobs:
   runner-policy:
