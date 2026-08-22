@@ -258,6 +258,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/groups/header-pattern",
             post(group_observation::h_header_pattern),
         )
+        .route(
+            "/groups/article-head",
+            post(group_observation::h_article_head),
+        )
         .route("/groups/{id}", get(group_handlers::h_group_get))
         .route("/groups/{id}/status", get(group_handlers::h_group_status))
         .route(

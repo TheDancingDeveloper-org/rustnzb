@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 mod contract;
 
-use contract::{HeaderPatternInput, OverviewRangeInput};
+use contract::{ArticleHeadInput, HeaderPatternInput, OverviewRangeInput};
 
 fn blocked(operation: &str, request_id: &str, group: &str, failure_code: &str) -> Json<Value> {
     Json(json!({
@@ -37,12 +37,108 @@ fn nntp_failure(error: &NntpError, operation: &str) -> &'static str {
         NntpError::Connection(_) | NntpError::Io(_) | NntpError::Tls(_) => {
             "nntp_transport_unavailable"
         }
+        NntpError::ArticleNotFound(_) if operation == "article_head" => "nntp_article_unavailable",
+        NntpError::Protocol(_) if operation == "article_head" => "nntp_head_unavailable",
         NntpError::Protocol(_) if operation == "header_pattern" => {
             "nntp_header_pattern_unavailable"
         }
         NntpError::Protocol(_) => "nntp_overview_unavailable",
         _ => "nntp_operation_failed",
     }
+}
+
+pub(crate) async fn h_article_head(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<ArticleHeadInput>,
+) -> Result<Json<Value>, ApiError> {
+    input.validate().map_err(ApiError::bad_request)?;
+    let servers = state.queue_manager.get_servers();
+    let Some(server) = servers.first() else {
+        return Ok(blocked(
+            "article_head",
+            &input.request_id,
+            &input.group,
+            "nntp_provider_not_configured",
+        ));
+    };
+    let mut connection = NntpConnection::new(format!("head-{}", input.request_id));
+    if let Err(error) = connection.connect(server).await {
+        return Ok(blocked(
+            "article_head",
+            &input.request_id,
+            &input.group,
+            nntp_failure(&error, "article_head"),
+        ));
+    }
+    let group = match connection.group(&input.group).await {
+        Ok(group) => group,
+        Err(error) => {
+            let _ = connection.quit().await;
+            return Ok(blocked(
+                "article_head",
+                &input.request_id,
+                &input.group,
+                nntp_failure(&error, "article_head"),
+            ));
+        }
+    };
+    if group.name != input.group
+        || input.article_number < group.first
+        || input.article_number > group.last
+    {
+        let _ = connection.quit().await;
+        return Ok(blocked(
+            "article_head",
+            &input.request_id,
+            &input.group,
+            "nntp_article_binding_invalid",
+        ));
+    }
+    let response = match connection
+        .fetch_head_number(input.article_number, input.max_header_bytes)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = connection.quit().await;
+            return Ok(blocked(
+                "article_head",
+                &input.request_id,
+                &input.group,
+                nntp_failure(&error, "article_head"),
+            ));
+        }
+    };
+    let _ = connection.quit().await;
+    let Some(headers) = response.data else {
+        return Ok(blocked(
+            "article_head",
+            &input.request_id,
+            &input.group,
+            "nntp_head_response_invalid",
+        ));
+    };
+    if headers.len() > input.max_header_bytes {
+        return Ok(blocked(
+            "article_head",
+            &input.request_id,
+            &input.group,
+            "nntp_head_byte_limit_exceeded",
+        ));
+    }
+    let digest = format!("{:x}", Sha256::digest(&headers));
+    Ok(Json(json!({
+        "status": "complete",
+        "operation": "article_head",
+        "request_id": input.request_id,
+        "group": group.name,
+        "group_first_article": group.first,
+        "group_last_article": group.last,
+        "article_number": input.article_number,
+        "header_byte_count": headers.len(),
+        "headers_base64": BASE64.encode(headers),
+        "headers_sha256": digest
+    })))
 }
 
 fn missing_ranges(start: u64, end: u64, present: &BTreeSet<u64>) -> Vec<(u64, u64)> {

@@ -5,6 +5,7 @@ const MAX_PATTERN_ARTICLES: u64 = 100_000;
 const MAX_PATTERNS: usize = 16;
 const MAX_PATTERN_COMMAND_BYTES: usize = 400;
 const MAX_PATTERN_MATCHES: usize = 1_000;
+pub(super) const MAX_HEAD_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +26,15 @@ pub(crate) struct HeaderPatternInput {
     pub(crate) end_article: u64,
     pub(crate) patterns: Vec<String>,
     pub(crate) max_matches: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArticleHeadInput {
+    pub(crate) request_id: String,
+    pub(crate) group: String,
+    pub(crate) article_number: u64,
+    pub(crate) max_header_bytes: usize,
 }
 
 impl OverviewRangeInput {
@@ -71,6 +81,19 @@ impl HeaderPatternInput {
             })
         {
             return Err("header pattern request is outside its admitted bounds");
+        }
+        Ok(())
+    }
+}
+
+impl ArticleHeadInput {
+    pub(super) fn validate(&self) -> Result<(), &'static str> {
+        validate_observation_identity(&self.request_id, &self.group)?;
+        if self.article_number == 0
+            || self.max_header_bytes == 0
+            || self.max_header_bytes > MAX_HEAD_BYTES
+        {
+            return Err("article head request is outside its admitted bounds");
         }
         Ok(())
     }
@@ -154,5 +177,15 @@ mod tests {
         let mut injection = pattern;
         injection.patterns = vec!["*Traitors*\r\nQUIT".to_string()];
         assert!(injection.validate().is_err());
+
+        let mut head = ArticleHeadInput {
+            request_id: "head-one".to_string(),
+            group: "esp.binarios.series.misc".to_string(),
+            article_number: 42,
+            max_header_bytes: MAX_HEAD_BYTES,
+        };
+        assert!(head.validate().is_ok());
+        head.max_header_bytes += 1;
+        assert!(head.validate().is_err());
     }
 }

@@ -10,8 +10,8 @@ use nzb_web::{
 use tempfile::TempDir;
 
 use super::{
-    contract::{HeaderPatternInput, OverviewRangeInput},
-    h_header_pattern, h_overview_range, missing_ranges,
+    contract::{ArticleHeadInput, HeaderPatternInput, OverviewRangeInput},
+    h_article_head, h_header_pattern, h_overview_range, missing_ranges,
 };
 
 fn state_without_provider() -> (Arc<AppState>, TempDir) {
@@ -52,7 +52,7 @@ fn state_without_provider() -> (Arc<AppState>, TempDir) {
 }
 
 #[tokio::test]
-async fn missing_provider_is_a_typed_blocker_for_both_operations() {
+async fn missing_provider_is_a_typed_blocker_for_every_observation() {
     let (state, _temporary) = state_without_provider();
     let Json(overview) = h_overview_range(
         State(Arc::clone(&state)),
@@ -71,7 +71,7 @@ async fn missing_provider_is_a_typed_blocker_for_both_operations() {
     assert_eq!(overview["request_id"], "overview-one");
 
     let Json(pattern) = h_header_pattern(
-        State(state),
+        State(Arc::clone(&state)),
         Json(HeaderPatternInput {
             request_id: "pattern-one".to_string(),
             group: "esp.binarios.series.misc".to_string(),
@@ -86,6 +86,21 @@ async fn missing_provider_is_a_typed_blocker_for_both_operations() {
     assert_eq!(pattern["status"], "blocked");
     assert_eq!(pattern["failure_code"], "nntp_provider_not_configured");
     assert_eq!(pattern["request_id"], "pattern-one");
+
+    let Json(head) = h_article_head(
+        State(state),
+        Json(ArticleHeadInput {
+            request_id: "head-one".to_string(),
+            group: "esp.binarios.series.misc".to_string(),
+            article_number: 42,
+            max_header_bytes: 64 * 1024,
+        }),
+    )
+    .await
+    .expect("head response");
+    assert_eq!(head["status"], "blocked");
+    assert_eq!(head["failure_code"], "nntp_provider_not_configured");
+    assert_eq!(head["request_id"], "head-one");
 }
 
 #[test]

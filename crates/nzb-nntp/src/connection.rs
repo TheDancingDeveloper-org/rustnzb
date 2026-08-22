@@ -931,6 +931,34 @@ impl NntpConnection {
         }
     }
 
+    async fn read_multiline_body_maybe_decompress_bounded(
+        &mut self,
+        max_bytes: usize,
+    ) -> NntpResult<Vec<u8>> {
+        let raw = self.read_multiline_body_bounded(max_bytes).await?;
+        if self.compress_enabled && raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+            use flate2::read::GzDecoder;
+            use std::io::Read;
+
+            let decoder = GzDecoder::new(&raw[..]);
+            let mut decompressed = Vec::with_capacity(max_bytes.min(raw.len() * 4));
+            decoder
+                .take(max_bytes as u64 + 1)
+                .read_to_end(&mut decompressed)
+                .map_err(|error| {
+                    NntpError::Protocol(format!("gzip HEAD decode failed: {error}"))
+                })?;
+            if decompressed.len() > max_bytes {
+                return Err(NntpError::Protocol(
+                    "HEAD response exceeds its byte bound".into(),
+                ));
+            }
+            Ok(decompressed)
+        } else {
+            Ok(raw)
+        }
+    }
+
     // ------------------------------------------------------------------
     // ARTICLE command
     // ------------------------------------------------------------------
@@ -1037,6 +1065,86 @@ impl NntpConnection {
                     status.code,
                     status.message,
                 ))
+            }
+        }
+    }
+
+    /// Fetch exact headers for one article number in the selected group.
+    pub async fn fetch_head_number(
+        &mut self,
+        article_number: u64,
+        max_header_bytes: usize,
+    ) -> NntpResult<NntpResponse> {
+        if !self.capabilities.have_head {
+            return Err(NntpError::Protocol("Server does not support HEAD".into()));
+        }
+        if article_number == 0 || max_header_bytes == 0 || max_header_bytes > 64 * 1024 {
+            return Err(NntpError::Protocol("HEAD request bound is invalid".into()));
+        }
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot HEAD in state {:?}",
+                self.state
+            )));
+        }
+        self.state = ConnectionState::Busy;
+        self.send_command(&format!("HEAD {article_number}"))
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        match status.code {
+            221 => {
+                let data = self
+                    .read_multiline_body_maybe_decompress_bounded(max_header_bytes)
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
+                self.state = ConnectionState::Ready;
+                Ok(NntpResponse {
+                    code: status.code,
+                    message: status.message,
+                    data: Some(data),
+                })
+            }
+            423 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::ArticleNotFound(article_number.to_string()))
+            }
+            411 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::NoSuchGroup(status.message))
+            }
+            412 | 420 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::NoArticleSelected(status.message))
+            }
+            403 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::PermissionDenied(status.message))
+            }
+            480 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::AuthRequired(status.message))
+            }
+            481 | 482 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Auth(format!(
+                    "HEAD rejected ({}): {}",
+                    status.code, status.message
+                )))
+            }
+            502 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::ServiceUnavailable(status.message))
+            }
+            _ => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Protocol(format!(
+                    "Unexpected HEAD response {}: {}",
+                    status.code, status.message
+                )))
             }
         }
     }
@@ -1967,7 +2075,15 @@ impl NntpConnection {
     /// Public for pipeline use.
     pub(crate) async fn read_multiline_body(&mut self) -> NntpResult<Vec<u8>> {
         let mut body = self.checkout_body_buffer();
-        self.read_multiline_body_into(&mut body).await?;
+        self.read_multiline_body_into_bounded(&mut body, None)
+            .await?;
+        Ok(body)
+    }
+
+    async fn read_multiline_body_bounded(&mut self, max_bytes: usize) -> NntpResult<Vec<u8>> {
+        let mut body = Vec::with_capacity(max_bytes.min(16 * 1024));
+        self.read_multiline_body_into_bounded(&mut body, Some(max_bytes))
+            .await?;
         Ok(body)
     }
 
@@ -1978,7 +2094,11 @@ impl NntpConnection {
     /// checkout is what actually avoids the page-fault/allocation cost per
     /// article; passing an arbitrary fresh `Vec::new()` here still works
     /// correctly, it just forgoes the reuse benefit.
-    async fn read_multiline_body_into(&mut self, out: &mut Vec<u8>) -> NntpResult<()> {
+    async fn read_multiline_body_into_bounded(
+        &mut self,
+        out: &mut Vec<u8>,
+        max_bytes: Option<usize>,
+    ) -> NntpResult<()> {
         out.clear();
         // Clone the heartbeat ref before we take the mutable borrow on
         // `transport`, so we can tick it inside the loop body. Cheap: just
@@ -2033,11 +2153,21 @@ impl NntpConnection {
             }
 
             // Dot-unstuffing: if a line starts with "..", remove the first dot
-            if self.line_scratch.starts_with(b"..") {
-                out.extend_from_slice(&self.line_scratch[1..]);
+            let line = if self.line_scratch.starts_with(b"..") {
+                &self.line_scratch[1..]
             } else {
-                out.extend_from_slice(&self.line_scratch);
+                &self.line_scratch
+            };
+            if max_bytes.is_some_and(|maximum| {
+                out.len()
+                    .checked_add(line.len())
+                    .is_none_or(|length| length > maximum)
+            }) {
+                return Err(NntpError::Protocol(
+                    "multi-line response exceeds its byte bound".into(),
+                ));
             }
+            out.extend_from_slice(line);
         }
 
         Ok(())
@@ -2664,6 +2794,52 @@ mod tests {
 
         conn.connect(&config).await.unwrap();
         assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn head_by_article_number_is_exact_and_bounded() {
+        let mut groups = HashMap::new();
+        groups.insert("alt.binaries.test".into(), (1, 42, 42));
+        let headers = b"Date: Wed, 07 May 2025 20:50:00 +0000\r\nXref: news 42\r\n".to_vec();
+        let server = MockNntpServer::start(MockConfig {
+            groups,
+            heads: HashMap::from([(42, headers.clone())]),
+            ..MockConfig::default()
+        })
+        .await;
+        let mut connection = NntpConnection::new("head-exact".into());
+        connection
+            .connect(&test_config(server.port()))
+            .await
+            .unwrap();
+        connection.group("alt.binaries.test").await.unwrap();
+        let response = connection
+            .fetch_head_number(42, headers.len())
+            .await
+            .unwrap();
+        assert_eq!(response.code, 221);
+        assert_eq!(response.data, Some(headers));
+
+        let mut groups = HashMap::new();
+        groups.insert("alt.binaries.test".into(), (1, 42, 42));
+        let server = MockNntpServer::start(MockConfig {
+            groups,
+            heads: HashMap::from([(42, b"Header: value that exceeds the bound\r\n".to_vec())]),
+            ..MockConfig::default()
+        })
+        .await;
+        let mut connection = NntpConnection::new("head-bounded".into());
+        connection
+            .connect(&test_config(server.port()))
+            .await
+            .unwrap();
+        connection.group("alt.binaries.test").await.unwrap();
+        let error = connection
+            .fetch_head_number(42, 8)
+            .await
+            .expect_err("bounded HEAD");
+        assert!(matches!(error, NntpError::Protocol(_)));
+        assert_eq!(connection.state, ConnectionState::Error);
     }
 
     #[tokio::test]

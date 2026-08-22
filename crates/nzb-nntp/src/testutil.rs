@@ -110,6 +110,8 @@ pub struct MockConfig {
     pub groups: HashMap<String, (u64, u64, u64)>,
     /// Articles: message-id (without angle brackets) -> body bytes.
     pub articles: HashMap<String, Vec<u8>>,
+    /// Exact HEAD response bytes keyed by article number.
+    pub heads: HashMap<u64, Vec<u8>>,
     /// XOVER entries as pre-formatted tab-delimited lines.
     pub xover_entries: Vec<String>,
     /// Raw XOVER entries used when exact non-UTF-8 bytes are required.
@@ -177,6 +179,7 @@ impl Default for MockConfig {
             service_unavailable: false,
             groups: HashMap::new(),
             articles: HashMap::new(),
+            heads: HashMap::new(),
             xover_entries: Vec::new(),
             xover_raw_entries: Vec::new(),
             xhdr_entries: Vec::new(),
@@ -531,6 +534,27 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                         mwrite!(conn, b"\r\n");
                     }
                     mwrite!(conn, b".\r\n");
+                }
+            }
+
+            "HEAD" => {
+                if !authenticated {
+                    mwrite!(conn, b"480 Authentication required\r\n");
+                } else if selected_group.is_none() {
+                    mwrite!(conn, b"412 No newsgroup selected\r\n");
+                } else if let Some(article_number) =
+                    parts.get(1).and_then(|value| value.parse().ok())
+                    && let Some(headers) = config.heads.get(&article_number)
+                {
+                    let resp = format!("221 {article_number} article headers follow\r\n");
+                    mwrite!(conn, resp.as_bytes());
+                    mwrite!(conn, headers);
+                    if !headers.ends_with(b"\n") {
+                        mwrite!(conn, b"\r\n");
+                    }
+                    mwrite!(conn, b".\r\n");
+                } else {
+                    mwrite!(conn, b"423 No article with that number\r\n");
                 }
             }
 
