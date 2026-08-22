@@ -255,12 +255,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(group_observation::h_overview_range),
         )
         .route(
-            "/groups/header-pattern",
-            post(group_observation::h_header_pattern),
-        )
-        .route(
             "/groups/article-head",
             post(group_observation::h_article_head),
+        )
+        .route(
+            "/groups/clear-search",
+            post(group_observation::h_clear_search),
         )
         .route("/groups/{id}", get(group_handlers::h_group_get))
         .route("/groups/{id}/status", get(group_handlers::h_group_status))

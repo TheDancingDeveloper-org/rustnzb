@@ -114,12 +114,18 @@ pub struct MockConfig {
     pub heads: HashMap<u64, Vec<u8>>,
     /// XOVER entries as pre-formatted tab-delimited lines.
     pub xover_entries: Vec<String>,
+    /// XOVER entries keyed by the exact requested article range.
+    pub xover_entries_by_range: HashMap<String, Vec<String>>,
     /// Raw XOVER entries used when exact non-UTF-8 bytes are required.
     pub xover_raw_entries: Vec<Vec<u8>>,
     /// XHDR entries as pre-formatted `artnum value` lines.
     pub xhdr_entries: Vec<String>,
     /// XPAT entries as pre-formatted `artnum value` lines.
     pub xpat_entries: Vec<String>,
+    /// XPAT entries keyed by the exact range and pattern arguments.
+    pub xpat_entries_by_request: HashMap<String, Vec<String>>,
+    /// If true, XPAT returns an unsupported-command response.
+    pub xpat_unsupported: bool,
     /// LIST ACTIVE entries as pre-formatted `groupname last first status` lines.
     pub list_active_entries: Vec<String>,
     /// LIST OVERVIEW.FMT entries in negotiated order.
@@ -181,9 +187,12 @@ impl Default for MockConfig {
             articles: HashMap::new(),
             heads: HashMap::new(),
             xover_entries: Vec::new(),
+            xover_entries_by_range: HashMap::new(),
             xover_raw_entries: Vec::new(),
             xhdr_entries: Vec::new(),
             xpat_entries: Vec::new(),
+            xpat_entries_by_request: HashMap::new(),
+            xpat_unsupported: false,
             list_active_entries: Vec::new(),
             overview_format_entries: vec![
                 "Subject:".into(),
@@ -517,11 +526,19 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
             }
 
             "XOVER" => {
+                let range_entries = parts
+                    .get(1)
+                    .and_then(|range| config.xover_entries_by_range.get(*range));
+                let entries = if config.xover_entries_by_range.is_empty() {
+                    &config.xover_entries
+                } else {
+                    range_entries.unwrap_or(&config.xover_entries)
+                };
                 if !authenticated {
                     mwrite!(conn, b"480 Authentication required\r\n");
                 } else if selected_group.is_none() {
                     mwrite!(conn, b"412 No newsgroup selected\r\n");
-                } else if config.xover_entries.is_empty() && config.xover_raw_entries.is_empty() {
+                } else if entries.is_empty() && config.xover_raw_entries.is_empty() {
                     mwrite!(conn, b"420 No articles in range\r\n");
                 } else {
                     mwrite!(conn, b"224 Overview data follows\r\n");
@@ -529,7 +546,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                         mwrite!(conn, entry);
                         mwrite!(conn, b"\r\n");
                     }
-                    for entry in &config.xover_entries {
+                    for entry in entries {
                         mwrite!(conn, entry.as_bytes());
                         mwrite!(conn, b"\r\n");
                     }
@@ -574,13 +591,23 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
             }
 
             "XPAT" => {
+                let request_entries = parts
+                    .get(2)
+                    .and_then(|request| config.xpat_entries_by_request.get(*request));
+                let entries = if config.xpat_entries_by_request.is_empty() {
+                    &config.xpat_entries
+                } else {
+                    request_entries.unwrap_or(&config.xpat_entries)
+                };
                 if !authenticated {
                     mwrite!(conn, b"480 Authentication required\r\n");
-                } else if config.xpat_entries.is_empty() {
+                } else if config.xpat_unsupported {
+                    mwrite!(conn, b"500 XPAT unsupported\r\n");
+                } else if entries.is_empty() {
                     mwrite!(conn, b"420 No articles matched\r\n");
                 } else {
                     mwrite!(conn, b"221 Header data follows\r\n");
-                    for entry in &config.xpat_entries {
+                    for entry in entries {
                         mwrite!(conn, entry.as_bytes());
                         mwrite!(conn, b"\r\n");
                     }

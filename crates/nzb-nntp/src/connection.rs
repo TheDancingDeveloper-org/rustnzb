@@ -121,6 +121,12 @@ pub struct HeaderEntry {
     pub value: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct BoundedResponse<T> {
+    pub value: T,
+    pub response_bytes: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Article range for XHDR / XPAT queries
 // ---------------------------------------------------------------------------
@@ -949,8 +955,8 @@ impl NntpConnection {
                     NntpError::Protocol(format!("gzip HEAD decode failed: {error}"))
                 })?;
             if decompressed.len() > max_bytes {
-                return Err(NntpError::Protocol(
-                    "HEAD response exceeds its byte bound".into(),
+                return Err(NntpError::ResponseTooLarge(
+                    "decompressed multi-line response exceeds its byte bound".into(),
                 ));
             }
             Ok(decompressed)
@@ -1338,6 +1344,34 @@ impl NntpConnection {
         end: u64,
         format: &OverviewFormat,
     ) -> NntpResult<LosslessOverviewRows> {
+        self.xover_lossless_with_limit(start, end, format, None)
+            .await
+            .map(|response| response.value)
+    }
+
+    pub async fn xover_lossless_bounded(
+        &mut self,
+        start: u64,
+        end: u64,
+        format: &OverviewFormat,
+        max_response_bytes: usize,
+    ) -> NntpResult<BoundedResponse<LosslessOverviewRows>> {
+        if max_response_bytes == 0 || max_response_bytes > 8 * 1024 * 1024 {
+            return Err(NntpError::Protocol(
+                "XOVER response bound is invalid".into(),
+            ));
+        }
+        self.xover_lossless_with_limit(start, end, format, Some(max_response_bytes))
+            .await
+    }
+
+    async fn xover_lossless_with_limit(
+        &mut self,
+        start: u64,
+        end: u64,
+        format: &OverviewFormat,
+        max_response_bytes: Option<usize>,
+    ) -> NntpResult<BoundedResponse<LosslessOverviewRows>> {
         if self.state != ConnectionState::Ready {
             return Err(NntpError::Protocol(format!(
                 "Cannot XOVER in state {:?}",
@@ -1354,18 +1388,28 @@ impl NntpConnection {
             .inspect_err(|_| self.state = ConnectionState::Error)?;
         match status.code {
             224 => {
-                let data = self
-                    .read_multiline_body_maybe_decompress()
-                    .await
-                    .inspect_err(|_| self.state = ConnectionState::Error)?;
+                let data = match max_response_bytes {
+                    Some(maximum) => {
+                        self.read_multiline_body_maybe_decompress_bounded(maximum)
+                            .await
+                    }
+                    None => self.read_multiline_body_maybe_decompress().await,
+                }
+                .inspect_err(|_| self.state = ConnectionState::Error)?;
                 self.state = ConnectionState::Ready;
-                Ok(parse_lossless_overview_rows(&data, format, start, end))
+                Ok(BoundedResponse {
+                    response_bytes: data.len(),
+                    value: parse_lossless_overview_rows(&data, format, start, end),
+                })
             }
             420 => {
                 self.state = ConnectionState::Ready;
-                Ok(LosslessOverviewRows {
-                    rows: Vec::new(),
-                    defective_rows: Vec::new(),
+                Ok(BoundedResponse {
+                    value: LosslessOverviewRows {
+                        rows: Vec::new(),
+                        defective_rows: Vec::new(),
+                    },
+                    response_bytes: 0,
                 })
             }
             412 => {
@@ -1556,6 +1600,32 @@ impl NntpConnection {
         range: ArticleRange,
         patterns: &[&str],
     ) -> NntpResult<Vec<HeaderEntry>> {
+        self.xpat_with_limit(header, range, patterns, None)
+            .await
+            .map(|response| response.value)
+    }
+
+    pub async fn xpat_bounded(
+        &mut self,
+        header: &str,
+        range: ArticleRange,
+        patterns: &[&str],
+        max_response_bytes: usize,
+    ) -> NntpResult<BoundedResponse<Vec<HeaderEntry>>> {
+        if max_response_bytes == 0 || max_response_bytes > 8 * 1024 * 1024 {
+            return Err(NntpError::Protocol("XPAT response bound is invalid".into()));
+        }
+        self.xpat_with_limit(header, range, patterns, Some(max_response_bytes))
+            .await
+    }
+
+    async fn xpat_with_limit(
+        &mut self,
+        header: &str,
+        range: ArticleRange,
+        patterns: &[&str],
+        max_response_bytes: Option<usize>,
+    ) -> NntpResult<BoundedResponse<Vec<HeaderEntry>>> {
         if self.state != ConnectionState::Ready {
             return Err(NntpError::Protocol(format!(
                 "Cannot XPAT in state {:?}",
@@ -1581,16 +1651,26 @@ impl NntpConnection {
 
         match status.code {
             221 => {
-                let data = self
-                    .read_multiline_body_maybe_decompress()
-                    .await
-                    .inspect_err(|_| self.state = ConnectionState::Error)?;
+                let data = match max_response_bytes {
+                    Some(maximum) => {
+                        self.read_multiline_body_maybe_decompress_bounded(maximum)
+                            .await
+                    }
+                    None => self.read_multiline_body_maybe_decompress().await,
+                }
+                .inspect_err(|_| self.state = ConnectionState::Error)?;
                 self.state = ConnectionState::Ready;
-                Ok(parse_header_data(&data))
+                Ok(BoundedResponse {
+                    response_bytes: data.len(),
+                    value: parse_header_data(&data),
+                })
             }
             420 => {
                 self.state = ConnectionState::Ready;
-                Ok(Vec::new()) // No articles matched
+                Ok(BoundedResponse {
+                    value: Vec::new(),
+                    response_bytes: 0,
+                })
             }
             412 => {
                 self.state = ConnectionState::Ready;
@@ -1612,6 +1692,13 @@ impl NntpConnection {
             502 => {
                 self.state = ConnectionState::Error;
                 Err(NntpError::ServiceUnavailable(status.message))
+            }
+            500 | 501 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::UnsupportedCommand(format!(
+                    "XPAT unsupported ({}): {}",
+                    status.code, status.message
+                )))
             }
             _ => {
                 self.state = ConnectionState::Error;
@@ -2163,7 +2250,7 @@ impl NntpConnection {
                     .checked_add(line.len())
                     .is_none_or(|length| length > maximum)
             }) {
-                return Err(NntpError::Protocol(
+                return Err(NntpError::ResponseTooLarge(
                     "multi-line response exceeds its byte bound".into(),
                 ));
             }
@@ -2838,7 +2925,7 @@ mod tests {
             .fetch_head_number(42, 8)
             .await
             .expect_err("bounded HEAD");
-        assert!(matches!(error, NntpError::Protocol(_)));
+        assert!(matches!(error, NntpError::ResponseTooLarge(_)));
         assert_eq!(connection.state, ConnectionState::Error);
     }
 
@@ -3692,6 +3779,66 @@ mod tests {
             .unwrap();
         assert!(entries.is_empty());
         assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn unsupported_xpat_keeps_the_connection_ready_for_bounded_xover() {
+        let mut groups = HashMap::new();
+        groups.insert("alt.binaries.test".into(), (1, 1, 1));
+        let server = MockNntpServer::start(MockConfig {
+            groups,
+            xpat_unsupported: true,
+            xover_entries: vec![
+                "1\tTraitors Espana S02E01\tposter\tWed, 07 May 2025 20:50:00 +0000\t<1@test>\t\t100\t1".into(),
+            ],
+            ..MockConfig::default()
+        })
+        .await;
+        let mut connection = NntpConnection::new("xpat-fallback".into());
+        connection
+            .connect(&test_config(server.port()))
+            .await
+            .unwrap();
+        connection.group("alt.binaries.test").await.unwrap();
+        let format = connection.overview_format().await.unwrap();
+        let error = connection
+            .xpat_bounded("Subject", ArticleRange::Range(1, 1), &["*Traitors*"], 1024)
+            .await
+            .expect_err("unsupported XPAT");
+        assert!(matches!(error, NntpError::UnsupportedCommand(_)));
+        assert_eq!(connection.state, ConnectionState::Ready);
+        let overview = connection
+            .xover_lossless_bounded(1, 1, &format, 1024)
+            .await
+            .unwrap();
+        assert_eq!(overview.value.rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_lossless_xover_fails_before_retaining_an_oversized_response() {
+        let mut groups = HashMap::new();
+        groups.insert("alt.binaries.test".into(), (1, 1, 1));
+        let server = MockNntpServer::start(MockConfig {
+            groups,
+            xover_entries: vec![
+                "1\tTraitors Espana S02E01\tposter\tWed, 07 May 2025 20:50:00 +0000\t<1@test>\t\t100\t1".into(),
+            ],
+            ..MockConfig::default()
+        })
+        .await;
+        let mut connection = NntpConnection::new("xover-bounded".into());
+        connection
+            .connect(&test_config(server.port()))
+            .await
+            .unwrap();
+        connection.group("alt.binaries.test").await.unwrap();
+        let format = connection.overview_format().await.unwrap();
+        let error = connection
+            .xover_lossless_bounded(1, 1, &format, 8)
+            .await
+            .expect_err("bounded XOVER");
+        assert!(matches!(error, NntpError::ResponseTooLarge(_)));
+        assert_eq!(connection.state, ConnectionState::Error);
     }
 
     #[tokio::test]

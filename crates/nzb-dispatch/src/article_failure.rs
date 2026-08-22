@@ -106,7 +106,9 @@ impl ArticleFailure {
             NntpError::Connection(_) => ArticleFailureKind::ConnectionClosed,
             NntpError::Io(_) => ArticleFailureKind::ConnectionClosed,
             NntpError::Timeout(_) => ArticleFailureKind::Timeout,
-            NntpError::Protocol(_) => ArticleFailureKind::Protocol,
+            NntpError::Protocol(_)
+            | NntpError::UnsupportedCommand(_)
+            | NntpError::ResponseTooLarge(_) => ArticleFailureKind::Protocol,
             NntpError::NoSuchGroup(_) | NntpError::NoArticleSelected(_) => {
                 ArticleFailureKind::Protocol
             }

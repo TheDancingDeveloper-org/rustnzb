@@ -1,11 +1,16 @@
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_OBSERVATION_HEADERS: u64 = 10_000;
-const MAX_PATTERN_ARTICLES: u64 = 100_000;
 const MAX_PATTERNS: usize = 16;
 const MAX_PATTERN_COMMAND_BYTES: usize = 400;
 const MAX_PATTERN_MATCHES: usize = 1_000;
 pub(super) const MAX_HEAD_BYTES: usize = 64 * 1024;
+const MAX_CLEAR_SEARCH_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CLEAR_SEARCH_RANGES: usize = 8;
+const MAX_CLEAR_SEARCH_ARTICLES_PER_RANGE: u64 = 10_000;
+const MAX_CLEAR_SEARCH_DURATION_MS: u64 = 120_000;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,22 +24,32 @@ pub(crate) struct OverviewRangeInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct HeaderPatternInput {
-    pub(crate) request_id: String,
-    pub(crate) group: String,
-    pub(crate) start_article: u64,
-    pub(crate) end_article: u64,
-    pub(crate) patterns: Vec<String>,
-    pub(crate) max_matches: usize,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct ArticleHeadInput {
     pub(crate) request_id: String,
     pub(crate) group: String,
     pub(crate) article_number: u64,
     pub(crate) max_header_bytes: usize,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClearSearchRangeInput {
+    pub(crate) start_article: u64,
+    pub(crate) end_article: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClearSearchInput {
+    pub(crate) request_id: String,
+    pub(crate) cancellation_id: String,
+    pub(crate) group: String,
+    pub(crate) ranges: Vec<ClearSearchRangeInput>,
+    pub(crate) patterns: Vec<String>,
+    pub(crate) predicate_sha256: String,
+    pub(crate) max_matches_per_range: usize,
+    pub(crate) max_response_bytes: usize,
+    pub(crate) deadline_at_unix_ms: u64,
 }
 
 impl OverviewRangeInput {
@@ -55,14 +70,42 @@ impl OverviewRangeInput {
     }
 }
 
-impl HeaderPatternInput {
+impl ArticleHeadInput {
     pub(super) fn validate(&self) -> Result<(), &'static str> {
         validate_observation_identity(&self.request_id, &self.group)?;
-        range_count(self.start_article, self.end_article, MAX_PATTERN_ARTICLES)?;
-        if self.patterns.is_empty()
+        if self.article_number == 0
+            || self.max_header_bytes == 0
+            || self.max_header_bytes > MAX_HEAD_BYTES
+        {
+            return Err("article head request is outside its admitted bounds");
+        }
+        Ok(())
+    }
+}
+
+impl ClearSearchInput {
+    pub(super) fn validate(&self) -> Result<(), &'static str> {
+        validate_observation_identity(&self.request_id, &self.group)?;
+        let now = now_unix_ms()?;
+        if !valid_control_id(&self.cancellation_id)
+            || self.ranges.is_empty()
+            || self.ranges.len() > MAX_CLEAR_SEARCH_RANGES
+            || self.ranges.iter().any(|range| {
+                range_count(
+                    range.start_article,
+                    range.end_article,
+                    MAX_CLEAR_SEARCH_ARTICLES_PER_RANGE,
+                )
+                .is_err()
+            })
+            || self
+                .ranges
+                .windows(2)
+                .any(|pair| pair[0].end_article >= pair[1].start_article)
+            || self.patterns.is_empty()
             || self.patterns.len() > MAX_PATTERNS
-            || self.max_matches == 0
-            || self.max_matches > MAX_PATTERN_MATCHES
+            || self.max_matches_per_range == 0
+            || self.max_matches_per_range > MAX_PATTERN_MATCHES
             || self.patterns.iter().map(String::len).sum::<usize>()
                 + self.patterns.len().saturating_sub(1)
                 > MAX_PATTERN_COMMAND_BYTES
@@ -79,24 +122,41 @@ impl HeaderPatternInput {
                         .bytes()
                         .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
             })
+            || self.predicate_sha256 != clear_search_predicate_digest(&self.patterns)
+            || self.max_response_bytes == 0
+            || self.max_response_bytes > MAX_CLEAR_SEARCH_RESPONSE_BYTES
+            || self.deadline_at_unix_ms <= now
+            || self.deadline_at_unix_ms.saturating_sub(now) > MAX_CLEAR_SEARCH_DURATION_MS
         {
-            return Err("header pattern request is outside its admitted bounds");
+            return Err("clear search request is outside its admitted bounds");
         }
         Ok(())
     }
 }
 
-impl ArticleHeadInput {
-    pub(super) fn validate(&self) -> Result<(), &'static str> {
-        validate_observation_identity(&self.request_id, &self.group)?;
-        if self.article_number == 0
-            || self.max_header_bytes == 0
-            || self.max_header_bytes > MAX_HEAD_BYTES
-        {
-            return Err("article head request is outside its admitted bounds");
-        }
-        Ok(())
+pub(super) fn clear_search_predicate_digest(patterns: &[String]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"newsgroups-clear-search-predicates");
+    for pattern in patterns {
+        digest.update((pattern.len() as u64).to_be_bytes());
+        digest.update(pattern.as_bytes());
     }
+    format!("{:x}", digest.finalize())
+}
+
+pub(super) fn now_unix_ms() -> Result<u64, &'static str> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|_| "system clock is before the Unix epoch")
+}
+
+fn valid_control_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn validate_observation_identity(request_id: &str, group: &str) -> Result<(), &'static str> {
@@ -152,32 +212,6 @@ mod tests {
         oversized.end_article = 10_010;
         assert!(oversized.validate().is_err());
 
-        let pattern = HeaderPatternInput {
-            request_id: "pattern-one".to_string(),
-            group: "esp.binarios.series.misc".to_string(),
-            start_article: 1,
-            end_article: 10_000,
-            patterns: vec!["*Traitors*Espana*".to_string()],
-            max_matches: 100,
-        };
-        assert!(pattern.validate().is_ok());
-
-        let mut broad = HeaderPatternInput {
-            request_id: "pattern-two".to_string(),
-            group: "esp.binarios.series.misc".to_string(),
-            start_article: 1,
-            end_article: 100_001,
-            patterns: vec!["*".to_string()],
-            max_matches: 100,
-        };
-        assert!(broad.validate().is_err());
-        broad.end_article = 100_000;
-        assert!(broad.validate().is_err());
-
-        let mut injection = pattern;
-        injection.patterns = vec!["*Traitors*\r\nQUIT".to_string()];
-        assert!(injection.validate().is_err());
-
         let mut head = ArticleHeadInput {
             request_id: "head-one".to_string(),
             group: "esp.binarios.series.misc".to_string(),
@@ -187,5 +221,29 @@ mod tests {
         assert!(head.validate().is_ok());
         head.max_header_bytes += 1;
         assert!(head.validate().is_err());
+
+        let mut clear = ClearSearchInput {
+            request_id: "clear-one".to_string(),
+            cancellation_id: "cancel-one".to_string(),
+            group: "esp.binarios.series.misc".to_string(),
+            ranges: vec![
+                ClearSearchRangeInput {
+                    start_article: 1,
+                    end_article: 10,
+                },
+                ClearSearchRangeInput {
+                    start_article: 20,
+                    end_article: 30,
+                },
+            ],
+            patterns: vec!["*Traitors*".to_string()],
+            predicate_sha256: clear_search_predicate_digest(&["*Traitors*".to_string()]),
+            max_matches_per_range: 100,
+            max_response_bytes: 1024,
+            deadline_at_unix_ms: now_unix_ms().expect("clock") + 1_000,
+        };
+        assert!(clear.validate().is_ok());
+        clear.ranges[1].start_article = 10;
+        assert!(clear.validate().is_err());
     }
 }

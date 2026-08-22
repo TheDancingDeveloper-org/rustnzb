@@ -1840,6 +1840,8 @@ fn clone_err(err: &NntpError) -> NntpError {
         NntpError::NoSuchGroup(m) => NntpError::NoSuchGroup(m.clone()),
         NntpError::NoArticleSelected(m) => NntpError::NoArticleSelected(m.clone()),
         NntpError::Protocol(m) => NntpError::Protocol(m.clone()),
+        NntpError::UnsupportedCommand(m) => NntpError::UnsupportedCommand(m.clone()),
+        NntpError::ResponseTooLarge(m) => NntpError::ResponseTooLarge(m.clone()),
         NntpError::Io(e) => NntpError::Io(std::io::Error::new(e.kind(), e.to_string())),
         NntpError::NoConnectionsAvailable(m) => NntpError::NoConnectionsAvailable(m.clone()),
         NntpError::Timeout(m) => NntpError::Timeout(m.clone()),

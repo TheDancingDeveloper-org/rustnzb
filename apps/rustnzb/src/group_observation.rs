@@ -5,17 +5,19 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use nzb_web::{
     error::ApiError,
     nzb_core::nzb_nntp::{
-        ArticleRange, DefectiveOverviewRow, LosslessOverviewRow, NntpConnection, NntpError,
-        OverviewFormat,
+        DefectiveOverviewRow, LosslessOverviewRow, NntpConnection, NntpError, OverviewFormat,
     },
     state::AppState,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+mod clear_search;
 mod contract;
 
-use contract::{ArticleHeadInput, HeaderPatternInput, OverviewRangeInput};
+pub(crate) use clear_search::h_clear_search;
+
+use contract::{ArticleHeadInput, OverviewRangeInput};
 
 fn blocked(operation: &str, request_id: &str, group: &str, failure_code: &str) -> Json<Value> {
     Json(json!({
@@ -34,14 +36,13 @@ fn nntp_failure(error: &NntpError, operation: &str) -> &'static str {
         NntpError::NoSuchGroup(_) => "nntp_group_unavailable",
         NntpError::ServiceUnavailable(_) => "nntp_service_unavailable",
         NntpError::Timeout(_) => "nntp_operation_timed_out",
+        NntpError::ResponseTooLarge(_) => "nntp_observation_response_limit_exceeded",
+        NntpError::UnsupportedCommand(_) => "nntp_operation_unsupported",
         NntpError::Connection(_) | NntpError::Io(_) | NntpError::Tls(_) => {
             "nntp_transport_unavailable"
         }
         NntpError::ArticleNotFound(_) if operation == "article_head" => "nntp_article_unavailable",
         NntpError::Protocol(_) if operation == "article_head" => "nntp_head_unavailable",
-        NntpError::Protocol(_) if operation == "header_pattern" => {
-            "nntp_header_pattern_unavailable"
-        }
         NntpError::Protocol(_) => "nntp_overview_unavailable",
         _ => "nntp_operation_failed",
     }
@@ -328,101 +329,6 @@ pub(crate) async fn h_overview_range(
         },
         "rows": rows,
         "defective_rows": defective_rows
-    })))
-}
-
-pub(crate) async fn h_header_pattern(
-    State(state): State<Arc<AppState>>,
-    Json(input): Json<HeaderPatternInput>,
-) -> Result<Json<Value>, ApiError> {
-    input.validate().map_err(ApiError::bad_request)?;
-    let servers = state.queue_manager.get_servers();
-    let Some(server) = servers.first() else {
-        return Ok(blocked(
-            "header_pattern",
-            &input.request_id,
-            &input.group,
-            "nntp_provider_not_configured",
-        ));
-    };
-    let mut connection = NntpConnection::new(format!("pattern-{}", input.request_id));
-    if let Err(error) = connection.connect(server).await {
-        return Ok(blocked(
-            "header_pattern",
-            &input.request_id,
-            &input.group,
-            nntp_failure(&error, "header_pattern"),
-        ));
-    }
-    let group = match connection.group(&input.group).await {
-        Ok(group) => group,
-        Err(error) => {
-            let _ = connection.quit().await;
-            return Ok(blocked(
-                "header_pattern",
-                &input.request_id,
-                &input.group,
-                nntp_failure(&error, "header_pattern"),
-            ));
-        }
-    };
-    if group.name != input.group {
-        let _ = connection.quit().await;
-        return Ok(blocked(
-            "header_pattern",
-            &input.request_id,
-            &input.group,
-            "nntp_group_binding_invalid",
-        ));
-    }
-    let patterns = input
-        .patterns
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    let matches = match connection
-        .xpat(
-            "Subject",
-            ArticleRange::Range(input.start_article, input.end_article),
-            &patterns,
-        )
-        .await
-    {
-        Ok(matches) => matches,
-        Err(error) => {
-            let _ = connection.quit().await;
-            return Ok(blocked(
-                "header_pattern",
-                &input.request_id,
-                &input.group,
-                nntp_failure(&error, "header_pattern"),
-            ));
-        }
-    };
-    let _ = connection.quit().await;
-    if matches.len() > input.max_matches {
-        return Ok(blocked(
-            "header_pattern",
-            &input.request_id,
-            &input.group,
-            "nntp_header_pattern_match_limit_exceeded",
-        ));
-    }
-    let matched = matches.len();
-    Ok(Json(json!({
-        "status": "complete",
-        "operation": "header_pattern",
-        "request_id": input.request_id,
-        "group": group.name,
-        "group_first_article": group.first,
-        "group_last_article": group.last,
-        "requested_start_article": input.start_article,
-        "requested_end_article": input.end_article,
-        "match_count": matched,
-        "matches": matches.into_iter().map(|header| json!({
-            "article_number": header.article_num,
-            "value": header.value
-        })).collect::<Vec<_>>()
     })))
 }
 
