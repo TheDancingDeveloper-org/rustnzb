@@ -112,12 +112,16 @@ pub struct MockConfig {
     pub articles: HashMap<String, Vec<u8>>,
     /// XOVER entries as pre-formatted tab-delimited lines.
     pub xover_entries: Vec<String>,
+    /// Raw XOVER entries used when exact non-UTF-8 bytes are required.
+    pub xover_raw_entries: Vec<Vec<u8>>,
     /// XHDR entries as pre-formatted `artnum value` lines.
     pub xhdr_entries: Vec<String>,
     /// XPAT entries as pre-formatted `artnum value` lines.
     pub xpat_entries: Vec<String>,
     /// LIST ACTIVE entries as pre-formatted `groupname last first status` lines.
     pub list_active_entries: Vec<String>,
+    /// LIST OVERVIEW.FMT entries in negotiated order.
+    pub overview_format_entries: Vec<String>,
     /// If true, `POST` returns 440 instead of accepting an article body.
     pub post_not_permitted: bool,
     /// Captured raw articles received via `POST`, after un-dot-stuffing and
@@ -174,9 +178,19 @@ impl Default for MockConfig {
             groups: HashMap::new(),
             articles: HashMap::new(),
             xover_entries: Vec::new(),
+            xover_raw_entries: Vec::new(),
             xhdr_entries: Vec::new(),
             xpat_entries: Vec::new(),
             list_active_entries: Vec::new(),
+            overview_format_entries: vec![
+                "Subject:".into(),
+                "From:".into(),
+                "Date:".into(),
+                "Message-ID:".into(),
+                "References:".into(),
+                ":bytes".into(),
+                ":lines".into(),
+            ],
             post_not_permitted: false,
             posted_articles: None,
             silent_close_after_bytes: None,
@@ -504,10 +518,14 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                     mwrite!(conn, b"480 Authentication required\r\n");
                 } else if selected_group.is_none() {
                     mwrite!(conn, b"412 No newsgroup selected\r\n");
-                } else if config.xover_entries.is_empty() {
+                } else if config.xover_entries.is_empty() && config.xover_raw_entries.is_empty() {
                     mwrite!(conn, b"420 No articles in range\r\n");
                 } else {
                     mwrite!(conn, b"224 Overview data follows\r\n");
+                    for entry in &config.xover_raw_entries {
+                        mwrite!(conn, entry);
+                        mwrite!(conn, b"\r\n");
+                    }
                     for entry in &config.xover_entries {
                         mwrite!(conn, entry.as_bytes());
                         mwrite!(conn, b"\r\n");
@@ -549,6 +567,16 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
             "LIST" => {
                 if !authenticated {
                     mwrite!(conn, b"480 Authentication required\r\n");
+                } else if parts
+                    .get(1)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("OVERVIEW.FMT"))
+                {
+                    mwrite!(conn, b"215 Order of fields in overview database\r\n");
+                    for entry in &config.overview_format_entries {
+                        mwrite!(conn, entry.as_bytes());
+                        mwrite!(conn, b"\r\n");
+                    }
+                    mwrite!(conn, b".\r\n");
                 } else if config.list_active_entries.is_empty() {
                     mwrite!(conn, b"215 List of newsgroups follows\r\n");
                     mwrite!(conn, b".\r\n");

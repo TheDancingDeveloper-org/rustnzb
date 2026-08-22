@@ -39,6 +39,9 @@ use crate::capabilities::NntpCapabilities;
 use crate::config::{ListActiveEntry, ServerConfig};
 
 use crate::error::{NntpError, NntpResult};
+use crate::overview::{
+    LosslessOverviewRows, OverviewFormat, parse_lossless_overview_rows, parse_overview_format,
+};
 
 // ---------------------------------------------------------------------------
 // Response
@@ -1171,6 +1174,118 @@ impl NntpConnection {
     // ------------------------------------------------------------------
     // XOVER command (RFC 2980 Section 2.8)
     // ------------------------------------------------------------------
+
+    pub async fn overview_format(&mut self) -> NntpResult<OverviewFormat> {
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot LIST OVERVIEW.FMT in state {:?}",
+                self.state
+            )));
+        }
+        self.state = ConnectionState::Busy;
+        self.send_command("LIST OVERVIEW.FMT")
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        match status.code {
+            215 => {
+                let data = self
+                    .read_multiline_body_maybe_decompress()
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
+                self.state = ConnectionState::Ready;
+                parse_overview_format(&data)
+            }
+            480 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::AuthRequired(status.message))
+            }
+            481 | 482 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Auth(format!(
+                    "LIST OVERVIEW.FMT rejected ({}): {}",
+                    status.code, status.message
+                )))
+            }
+            502 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::ServiceUnavailable(status.message))
+            }
+            _ => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Protocol(format!(
+                    "Unexpected LIST OVERVIEW.FMT response {}: {}",
+                    status.code, status.message
+                )))
+            }
+        }
+    }
+
+    pub async fn xover_lossless(
+        &mut self,
+        start: u64,
+        end: u64,
+        format: &OverviewFormat,
+    ) -> NntpResult<LosslessOverviewRows> {
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot XOVER in state {:?}",
+                self.state
+            )));
+        }
+        self.state = ConnectionState::Busy;
+        self.send_command(&format!("XOVER {start}-{end}"))
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        match status.code {
+            224 => {
+                let data = self
+                    .read_multiline_body_maybe_decompress()
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
+                self.state = ConnectionState::Ready;
+                Ok(parse_lossless_overview_rows(&data, format, start, end))
+            }
+            420 => {
+                self.state = ConnectionState::Ready;
+                Ok(LosslessOverviewRows {
+                    rows: Vec::new(),
+                    defective_rows: Vec::new(),
+                })
+            }
+            412 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::NoSuchGroup(
+                    "No newsgroup selected (send GROUP first)".into(),
+                ))
+            }
+            481 | 482 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Auth(format!(
+                    "XOVER rejected ({}): {}",
+                    status.code, status.message
+                )))
+            }
+            502 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::ServiceUnavailable(status.message))
+            }
+            _ => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Protocol(format!(
+                    "Unexpected XOVER response {}: {}",
+                    status.code, status.message
+                )))
+            }
+        }
+    }
 
     /// Fetch overview data for a range of article numbers.
     ///
@@ -2693,6 +2808,37 @@ mod tests {
         assert_eq!(entries[0].bytes, 50000);
         assert_eq!(entries[1].article_num, 2);
         assert_eq!(entries[1].bytes, 60000);
+        assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn lossless_overview_negotiates_format_and_retains_defects() {
+        let mut groups = HashMap::new();
+        groups.insert("alt.binaries.test".into(), (2u64, 1u64, 2u64));
+        let server = MockNntpServer::start(MockConfig {
+            groups,
+            xover_raw_entries: vec![
+                b"1\tEspa\xf1a\tposter@test\tDate\t<one@test>\t\t10\t1".to_vec(),
+                b"2\tSub\tject\tposter@test\tDate\t<two@test>\t\t10\t1".to_vec(),
+            ],
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+        conn.group("alt.binaries.test").await.unwrap();
+
+        let format = conn.overview_format().await.unwrap();
+        let rows = conn.xover_lossless(1, 2, &format).await.unwrap();
+
+        assert_eq!(format.fields.len(), 7);
+        assert_eq!(rows.rows[0].fields[0], b"Espa\xf1a");
+        assert_eq!(rows.defective_rows[0].article_number, Some(2));
+        assert_eq!(
+            rows.defective_rows[0].failure_code,
+            crate::overview::DefectiveOverviewRowCode::FieldCountInvalid
+        );
         assert_eq!(conn.state, ConnectionState::Ready);
     }
 

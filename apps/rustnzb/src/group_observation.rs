@@ -1,12 +1,17 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use axum::{Json, extract::State};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use nzb_web::{
     error::ApiError,
-    nzb_core::nzb_nntp::{ArticleRange, NntpConnection, NntpError, XoverEntry},
+    nzb_core::nzb_nntp::{
+        ArticleRange, DefectiveOverviewRow, LosslessOverviewRow, NntpConnection, NntpError,
+        OverviewFormat,
+    },
     state::AppState,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 mod contract;
 
@@ -40,11 +45,7 @@ fn nntp_failure(error: &NntpError, operation: &str) -> &'static str {
     }
 }
 
-fn missing_ranges(start: u64, end: u64, entries: &[XoverEntry]) -> Vec<(u64, u64)> {
-    let present = entries
-        .iter()
-        .map(|entry| entry.article_num)
-        .collect::<BTreeSet<_>>();
+fn missing_ranges(start: u64, end: u64, present: &BTreeSet<u64>) -> Vec<(u64, u64)> {
     let mut ranges = Vec::new();
     let mut missing_start = None;
     for article in start..=end {
@@ -60,6 +61,45 @@ fn missing_ranges(start: u64, end: u64, entries: &[XoverEntry]) -> Vec<(u64, u64
         ranges.push((first, end));
     }
     ranges
+}
+
+fn digest_parts<'a>(prefix: &[u8], parts: impl IntoIterator<Item = &'a [u8]>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(prefix);
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn format_digest(format: &OverviewFormat) -> String {
+    digest_parts(b"overview-format", format.fields.iter().map(Vec::as_slice))
+}
+
+fn row_json(row: LosslessOverviewRow, format_digest: &str) -> Value {
+    let article = row.article_number.to_be_bytes();
+    let digest = digest_parts(
+        b"overview-row",
+        std::iter::once(article.as_slice())
+            .chain(std::iter::once(format_digest.as_bytes()))
+            .chain(row.fields.iter().map(Vec::as_slice)),
+    );
+    json!({
+        "article_number": row.article_number,
+        "fields_base64": row.fields.into_iter().map(|field| BASE64.encode(field)).collect::<Vec<_>>(),
+        "row_sha256": digest
+    })
+}
+
+fn defective_row_json(row: DefectiveOverviewRow) -> Value {
+    let digest = digest_parts(b"defective-overview-row", [row.wire_line.as_slice()]);
+    json!({
+        "article_number": row.article_number,
+        "wire_row_base64": BASE64.encode(row.wire_line),
+        "raw_sha256": digest,
+        "failure_code": row.failure_code.as_str()
+    })
 }
 
 pub(crate) async fn h_overview_range(
@@ -106,11 +146,23 @@ pub(crate) async fn h_overview_range(
             "nntp_group_binding_invalid",
         ));
     }
-    let headers = match connection
-        .xover(input.start_article, input.end_article)
+    let format = match connection.overview_format().await {
+        Ok(format) => format,
+        Err(error) => {
+            let _ = connection.quit().await;
+            return Ok(blocked(
+                "overview_range",
+                &input.request_id,
+                &input.group,
+                nntp_failure(&error, "overview_range"),
+            ));
+        }
+    };
+    let overview = match connection
+        .xover_lossless(input.start_article, input.end_article, &format)
         .await
     {
-        Ok(headers) => headers,
+        Ok(overview) => overview,
         Err(error) => {
             let _ = connection.quit().await;
             return Ok(blocked(
@@ -122,8 +174,45 @@ pub(crate) async fn h_overview_range(
         }
     };
     let _ = connection.quit().await;
-    let missing = missing_ranges(input.start_article, input.end_article, &headers);
-    let returned = headers.len();
+    let returned = overview.rows.len() + overview.defective_rows.len();
+    if returned as u64 > input.max_headers {
+        return Ok(blocked(
+            "overview_range",
+            &input.request_id,
+            &input.group,
+            "nntp_overview_header_limit_exceeded",
+        ));
+    }
+    let present = overview
+        .rows
+        .iter()
+        .map(|row| row.article_number)
+        .chain(
+            overview
+                .defective_rows
+                .iter()
+                .filter_map(|row| row.article_number),
+        )
+        .collect::<BTreeSet<_>>();
+    let missing = missing_ranges(input.start_article, input.end_article, &present);
+    let format_digest = format_digest(&format);
+    let valid = overview.rows.len();
+    let defective = overview.defective_rows.len();
+    let format_fields = format
+        .fields
+        .into_iter()
+        .map(|field| BASE64.encode(field))
+        .collect::<Vec<_>>();
+    let rows = overview
+        .rows
+        .into_iter()
+        .map(|row| row_json(row, &format_digest))
+        .collect::<Vec<_>>();
+    let defective_rows = overview
+        .defective_rows
+        .into_iter()
+        .map(defective_row_json)
+        .collect::<Vec<_>>();
     Ok(Json(json!({
         "status": "complete",
         "operation": "overview_range",
@@ -133,18 +222,16 @@ pub(crate) async fn h_overview_range(
         "group_last_article": group.last,
         "requested_start_article": input.start_article,
         "requested_end_article": input.end_article,
-        "returned_header_count": returned,
+        "returned_row_count": returned,
+        "valid_row_count": valid,
+        "defective_row_count": defective,
         "missing_ranges": missing,
-        "headers": headers.into_iter().map(|header| json!({
-            "article_number": header.article_num,
-            "subject": header.subject,
-            "author": header.from,
-            "date": header.date,
-            "message_id": header.message_id,
-            "references": header.references,
-            "bytes": header.bytes,
-            "lines": header.lines
-        })).collect::<Vec<_>>()
+        "overview_format": {
+            "fields_base64": format_fields,
+            "sha256": format_digest
+        },
+        "rows": rows,
+        "defective_rows": defective_rows
     })))
 }
 

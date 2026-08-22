@@ -2,7 +2,8 @@ use serde::Deserialize;
 
 const MAX_OBSERVATION_HEADERS: u64 = 10_000;
 const MAX_PATTERN_ARTICLES: u64 = 100_000;
-const MAX_PATTERNS: usize = 8;
+const MAX_PATTERNS: usize = 16;
+const MAX_PATTERN_COMMAND_BYTES: usize = 400;
 const MAX_PATTERN_MATCHES: usize = 1_000;
 
 #[derive(Deserialize)]
@@ -52,6 +53,9 @@ impl HeaderPatternInput {
             || self.patterns.len() > MAX_PATTERNS
             || self.max_matches == 0
             || self.max_matches > MAX_PATTERN_MATCHES
+            || self.patterns.iter().map(String::len).sum::<usize>()
+                + self.patterns.len().saturating_sub(1)
+                > MAX_PATTERN_COMMAND_BYTES
             || self.patterns.iter().any(|pattern| {
                 pattern.is_empty()
                     || pattern.len() > 256

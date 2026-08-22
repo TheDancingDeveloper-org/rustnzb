@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use arc_swap::ArcSwap;
 use axum::{Json, extract::State};
 use nzb_web::{
     AppState, QueueManager,
     auth::{CredentialStore, TokenStore},
-    nzb_core::{config::AppConfig, db::Database, nzb_nntp::XoverEntry},
+    nzb_core::{config::AppConfig, db::Database},
 };
 use tempfile::TempDir;
 
@@ -90,18 +90,6 @@ async fn missing_provider_is_a_typed_blocker_for_both_operations() {
 
 #[test]
 fn missing_articles_are_compact_ranges() {
-    let entry = |article_num| XoverEntry {
-        article_num,
-        subject: String::new(),
-        from: String::new(),
-        date: String::new(),
-        message_id: format!("<{article_num}@example.invalid>"),
-        references: String::new(),
-        bytes: 0,
-        lines: 0,
-    };
-    assert_eq!(
-        missing_ranges(1, 8, &[entry(2), entry(3), entry(6), entry(8)]),
-        [(1, 1), (4, 5), (7, 7)]
-    );
+    let present = BTreeSet::from([2, 3, 6, 8]);
+    assert_eq!(missing_ranges(1, 8, &present), [(1, 1), (4, 5), (7, 7)]);
 }
