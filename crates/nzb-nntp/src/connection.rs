@@ -58,6 +58,12 @@ pub struct NntpResponse {
     pub data: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BodyPrefixResponse {
+    pub data: Vec<u8>,
+    pub complete: bool,
+}
+
 impl NntpResponse {
     /// Returns `true` if the response indicates success (2xx).
     pub fn is_success(&self) -> bool {
@@ -1801,6 +1807,97 @@ impl NntpConnection {
         }
     }
 
+    pub async fn fetch_body_prefix(
+        &mut self,
+        message_id: &str,
+        max_bytes: usize,
+    ) -> NntpResult<BodyPrefixResponse> {
+        if max_bytes == 0 || max_bytes > 256 * 1024 {
+            return Err(NntpError::Protocol(
+                "BODY prefix request bound is invalid".into(),
+            ));
+        }
+        if self.compress_enabled {
+            return Err(NntpError::UnsupportedCommand(
+                "BODY prefix requires an uncompressed observation connection".into(),
+            ));
+        }
+        if !self.capabilities.have_body {
+            return Err(NntpError::UnsupportedCommand(
+                "Server does not support BODY prefix observation".into(),
+            ));
+        }
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot BODY prefix in state {:?}",
+                self.state
+            )));
+        }
+        self.state = ConnectionState::Busy;
+        let mid = normalize_message_id(message_id);
+        self.send_command(&format!("BODY {mid}"))
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let status = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        match status.code {
+            222 => {
+                let prefix = self
+                    .read_multiline_body_prefix(max_bytes)
+                    .await
+                    .inspect_err(|_| self.state = ConnectionState::Error)?;
+                if prefix.complete {
+                    self.state = ConnectionState::Ready;
+                } else {
+                    self.transport.take();
+                    self.compress_enabled = false;
+                    self.state = ConnectionState::Disconnected;
+                }
+                Ok(prefix)
+            }
+            430 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::ArticleNotFound(mid))
+            }
+            412 | 420 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::NoArticleSelected(status.message))
+            }
+            403 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::PermissionDenied(status.message))
+            }
+            480 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::AuthRequired(status.message))
+            }
+            481 | 482 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Auth(format!(
+                    "BODY prefix rejected ({}): {}",
+                    status.code, status.message
+                )))
+            }
+            500 | 501 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::UnsupportedCommand(status.message))
+            }
+            502 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::ServiceUnavailable(status.message))
+            }
+            _ => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Protocol(format!(
+                    "Unexpected BODY prefix response {}: {}",
+                    status.code, status.message
+                )))
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // LIST ACTIVE (RFC 3977 Section 7.6.3)
     // ------------------------------------------------------------------
@@ -2172,6 +2269,55 @@ impl NntpConnection {
         self.read_multiline_body_into_bounded(&mut body, Some(max_bytes))
             .await?;
         Ok(body)
+    }
+
+    async fn read_multiline_body_prefix(
+        &mut self,
+        max_bytes: usize,
+    ) -> NntpResult<BodyPrefixResponse> {
+        let mut data = Vec::with_capacity(max_bytes.min(16 * 1024));
+        let heartbeat = self.io_heartbeat.clone();
+        let transport = self
+            .transport
+            .as_mut()
+            .ok_or(NntpError::Connection("Not connected".into()))?;
+        let complete = loop {
+            self.line_scratch.clear();
+            let count = tokio::time::timeout(
+                READ_BODY_LINE_TIMEOUT,
+                transport.read_line_bytes(&mut self.line_scratch),
+            )
+            .await
+            .map_err(|_| NntpError::Timeout("BODY prefix line timed out".into()))?
+            .map_err(NntpError::Io)?;
+            if count == 0 {
+                return Err(NntpError::Connection(
+                    "Server closed connection during BODY prefix".into(),
+                ));
+            }
+            if let Some(heartbeat) = &heartbeat {
+                heartbeat.tick();
+            }
+            if self.line_scratch == b".\r\n" || self.line_scratch == b".\n" {
+                break true;
+            }
+            if self.line_scratch.len() > 16 * 1024 {
+                return Err(NntpError::ResponseTooLarge(
+                    "BODY prefix line exceeds its byte bound".into(),
+                ));
+            }
+            let line = if self.line_scratch.starts_with(b"..") {
+                &self.line_scratch[1..]
+            } else {
+                &self.line_scratch
+            };
+            let remaining = max_bytes.saturating_sub(data.len());
+            data.extend_from_slice(&line[..line.len().min(remaining)]);
+            if line.len() > remaining || data.len() == max_bytes {
+                break false;
+            }
+        };
+        Ok(BodyPrefixResponse { data, complete })
     }
 
     /// Same as [`Self::read_multiline_body`], but fills a caller-owned
@@ -3296,6 +3442,48 @@ mod tests {
         let data = response.data.unwrap();
         let body = String::from_utf8_lossy(&data);
         assert!(body.contains("Body content here"));
+        assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn body_prefix_retires_an_incomplete_connection_without_exceeding_the_bound() {
+        let mut articles = HashMap::new();
+        articles.insert(
+            "prefix@test".into(),
+            b"first line\r\nsecond line\r\n".to_vec(),
+        );
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let prefix = conn.fetch_body_prefix("prefix@test", 8).await.unwrap();
+        assert_eq!(prefix.data, b"first li");
+        assert!(!prefix.complete);
+        assert_eq!(conn.state, ConnectionState::Disconnected);
+        assert!(!conn.is_connected());
+    }
+
+    #[tokio::test]
+    async fn body_prefix_keeps_a_complete_bounded_connection_ready() {
+        let mut articles = HashMap::new();
+        articles.insert("small@test".into(), b"small\r\n".to_vec());
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let prefix = conn.fetch_body_prefix("small@test", 1024).await.unwrap();
+        assert_eq!(prefix.data, b"small\r\n");
+        assert!(prefix.complete);
         assert_eq!(conn.state, ConnectionState::Ready);
     }
 

@@ -18,10 +18,10 @@ use tempfile::TempDir;
 
 use super::{
     contract::{
-        ArticleHeadInput, ClearSearchInput, ClearSearchRangeInput, OverviewRangeInput,
-        clear_search_predicate_digest, now_unix_ms,
+        ArticleBodyPrefixInput, ArticleHeadInput, ClearSearchInput, ClearSearchRangeInput,
+        OverviewRangeInput, clear_search_predicate_digest, now_unix_ms,
     },
-    h_article_head, h_clear_search, h_overview_range, missing_ranges,
+    h_article_body_prefix, h_article_head, h_clear_search, h_overview_range, missing_ranges,
 };
 
 fn state_without_provider() -> (Arc<AppState>, TempDir) {
@@ -277,7 +277,7 @@ async fn missing_provider_is_a_typed_blocker_for_every_observation() {
     assert_eq!(clear_search["request_id"], "clear-one");
 
     let Json(head) = h_article_head(
-        State(state),
+        State(Arc::clone(&state)),
         Json(ArticleHeadInput {
             request_id: "head-one".to_string(),
             group: "esp.binarios.series.misc".to_string(),
@@ -290,6 +290,73 @@ async fn missing_provider_is_a_typed_blocker_for_every_observation() {
     assert_eq!(head["status"], "blocked");
     assert_eq!(head["failure_code"], "nntp_provider_not_configured");
     assert_eq!(head["request_id"], "head-one");
+
+    let Json(body) = h_article_body_prefix(
+        State(state),
+        Json(ArticleBodyPrefixInput {
+            request_id: "body-one".to_string(),
+            group: "esp.binarios.series.misc".to_string(),
+            message_id: "one@example.invalid".to_string(),
+            max_wire_bytes: 64 * 1024,
+            max_payload_bytes: 32 * 1024,
+        }),
+    )
+    .await
+    .expect("body response");
+    assert_eq!(body["status"], "blocked");
+    assert_eq!(body["failure_code"], "nntp_provider_not_configured");
+    assert_eq!(body["request_id"], "body-one");
+}
+
+#[tokio::test]
+async fn body_prefix_returns_digest_bound_decoded_binary_magic() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+    let mut wire = b"=ybegin line=128 size=8 name=random.bin\r\n".to_vec();
+    for byte in b"PAR2\0PKT" {
+        let encoded = byte.wrapping_add(42);
+        if matches!(encoded, 0 | b'\n' | b'\r' | b'=') {
+            wire.push(b'=');
+            wire.push(encoded.wrapping_add(64));
+        } else {
+            wire.push(encoded);
+        }
+    }
+    wire.extend_from_slice(b"\r\n=yend size=8\r\n");
+    let mut articles = std::collections::HashMap::new();
+    articles.insert("one@example.invalid".to_string(), wire);
+    let group = "esp.binarios.series.misc";
+    let mut groups = std::collections::HashMap::new();
+    groups.insert(group.to_string(), (1, 1, 1));
+    let server = MockNntpServer::start(MockConfig {
+        groups,
+        articles,
+        ..MockConfig::default()
+    })
+    .await;
+    let (state, _temporary) = state_with_servers(vec![test_config(server.port())]);
+    let Json(body) = h_article_body_prefix(
+        State(state),
+        Json(ArticleBodyPrefixInput {
+            request_id: "body-magic".to_string(),
+            group: group.to_string(),
+            message_id: "one@example.invalid".to_string(),
+            max_wire_bytes: 64 * 1024,
+            max_payload_bytes: 32 * 1024,
+        }),
+    )
+    .await
+    .expect("body prefix");
+    assert_eq!(body["status"], "complete");
+    assert_eq!(body["payload_encoding"], "yenc");
+    assert_eq!(body["body_complete"], true);
+    assert_eq!(body["payload_complete"], true);
+    assert_eq!(
+        BASE64
+            .decode(body["payload_prefix_base64"].as_str().unwrap())
+            .unwrap(),
+        b"PAR2\0PKT"
+    );
 }
 
 #[test]

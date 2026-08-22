@@ -26,8 +26,8 @@ pub mod testutil;
 pub use capabilities::NntpCapabilities;
 pub use config::{Article, ListActiveEntry, ServerConfig};
 pub use connection::{
-    ArticleRange, BoundedResponse, ConnectionState, GroupResponse, HeaderEntry, NntpConnection,
-    NntpResponse, XoverEntry,
+    ArticleRange, BodyPrefixResponse, BoundedResponse, ConnectionState, GroupResponse, HeaderEntry,
+    NntpConnection, NntpResponse, XoverEntry,
 };
 pub use downloader::{ArticleResult, Downloader};
 pub use error::{NntpError, NntpResult};

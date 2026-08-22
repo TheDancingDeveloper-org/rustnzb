@@ -8,13 +8,13 @@ repository = "https://github.com/TheDancingDeveloper-org/nzb-news"
 readme = "README.md"
 
 [dependencies]
-nzb-nntp = { version = "0.2.25", path = "../nzb-nntp" }
+nzb-nntp = { version = "0.2.26", path = "../nzb-nntp" }
 
 tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
 tracing = "0.1"
 
 [dev-dependencies]
-nzb-nntp = { version = "0.2.25", path = "../nzb-nntp", features = ["test-support"] }
+nzb-nntp = { version = "0.2.26", path = "../nzb-nntp", features = ["test-support"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

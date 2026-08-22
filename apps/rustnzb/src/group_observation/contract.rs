@@ -7,6 +7,8 @@ const MAX_PATTERNS: usize = 16;
 const MAX_PATTERN_COMMAND_BYTES: usize = 400;
 const MAX_PATTERN_MATCHES: usize = 1_000;
 pub(super) const MAX_HEAD_BYTES: usize = 64 * 1024;
+pub(super) const MAX_BODY_PREFIX_BYTES: usize = 256 * 1024;
+pub(super) const MAX_PAYLOAD_PREFIX_BYTES: usize = 64 * 1024;
 const MAX_CLEAR_SEARCH_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CLEAR_SEARCH_RANGES: usize = 8;
 const MAX_CLEAR_SEARCH_ARTICLES_PER_RANGE: u64 = 10_000;
@@ -29,6 +31,16 @@ pub(crate) struct ArticleHeadInput {
     pub(crate) group: String,
     pub(crate) article_number: u64,
     pub(crate) max_header_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArticleBodyPrefixInput {
+    pub(crate) request_id: String,
+    pub(crate) group: String,
+    pub(crate) message_id: String,
+    pub(crate) max_wire_bytes: usize,
+    pub(crate) max_payload_bytes: usize,
 }
 
 #[derive(Clone, Deserialize)]
@@ -78,6 +90,28 @@ impl ArticleHeadInput {
             || self.max_header_bytes > MAX_HEAD_BYTES
         {
             return Err("article head request is outside its admitted bounds");
+        }
+        Ok(())
+    }
+}
+
+impl ArticleBodyPrefixInput {
+    pub(super) fn validate(&self) -> Result<(), &'static str> {
+        validate_observation_identity(&self.request_id, &self.group)?;
+        let message_id = self.message_id.trim_matches(['<', '>']);
+        if message_id.is_empty()
+            || message_id.len() > 2048
+            || !message_id.contains('@')
+            || !message_id
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
+            || self.max_wire_bytes == 0
+            || self.max_wire_bytes > MAX_BODY_PREFIX_BYTES
+            || self.max_payload_bytes == 0
+            || self.max_payload_bytes > MAX_PAYLOAD_PREFIX_BYTES
+            || self.max_payload_bytes > self.max_wire_bytes
+        {
+            return Err("article body prefix request is outside its admitted bounds");
         }
         Ok(())
     }
@@ -221,6 +255,17 @@ mod tests {
         assert!(head.validate().is_ok());
         head.max_header_bytes += 1;
         assert!(head.validate().is_err());
+
+        let mut body = ArticleBodyPrefixInput {
+            request_id: "body-one".to_string(),
+            group: "esp.binarios.series.misc".to_string(),
+            message_id: "one@example.invalid".to_string(),
+            max_wire_bytes: MAX_BODY_PREFIX_BYTES,
+            max_payload_bytes: MAX_PAYLOAD_PREFIX_BYTES,
+        };
+        assert!(body.validate().is_ok());
+        body.max_payload_bytes = body.max_wire_bytes + 1;
+        assert!(body.validate().is_err());
 
         let mut clear = ClearSearchInput {
             request_id: "clear-one".to_string(),

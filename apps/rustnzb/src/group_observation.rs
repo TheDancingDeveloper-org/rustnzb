@@ -12,9 +12,11 @@ use nzb_web::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+mod body_prefix;
 mod clear_search;
 mod contract;
 
+pub(crate) use body_prefix::h_article_body_prefix;
 pub(crate) use clear_search::h_clear_search;
 
 use contract::{ArticleHeadInput, OverviewRangeInput};
@@ -41,8 +43,13 @@ fn nntp_failure(error: &NntpError, operation: &str) -> &'static str {
         NntpError::Connection(_) | NntpError::Io(_) | NntpError::Tls(_) => {
             "nntp_transport_unavailable"
         }
-        NntpError::ArticleNotFound(_) if operation == "article_head" => "nntp_article_unavailable",
+        NntpError::ArticleNotFound(_)
+            if matches!(operation, "article_head" | "article_body_prefix") =>
+        {
+            "nntp_article_unavailable"
+        }
         NntpError::Protocol(_) if operation == "article_head" => "nntp_head_unavailable",
+        NntpError::Protocol(_) if operation == "article_body_prefix" => "nntp_body_unavailable",
         NntpError::Protocol(_) => "nntp_overview_unavailable",
         _ => "nntp_operation_failed",
     }
