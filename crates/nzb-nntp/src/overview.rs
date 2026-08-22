@@ -2,14 +2,12 @@ use std::collections::BTreeSet;
 
 use crate::error::{NntpError, NntpResult};
 
-const REQUIRED_FIELDS: [&[u8]; 7] = [
+const REQUIRED_HEADER_FIELDS: [&[u8]; 5] = [
     b"Subject:",
     b"From:",
     b"Date:",
     b"Message-ID:",
     b"References:",
-    b":bytes",
-    b":lines",
 ];
 const MAX_OVERVIEW_FIELDS: usize = 64;
 const MAX_FIELD_DESCRIPTOR_BYTES: usize = 256;
@@ -61,9 +59,17 @@ pub fn parse_overview_format(data: &[u8]) -> NntpResult<OverviewFormat> {
     let fields = wire_lines(data)
         .map(|line| line.to_vec())
         .collect::<Vec<_>>();
-    if fields.len() < REQUIRED_FIELDS.len() || fields.len() > MAX_OVERVIEW_FIELDS {
+    if fields.len() < REQUIRED_HEADER_FIELDS.len() + 2 || fields.len() > MAX_OVERVIEW_FIELDS {
         return Err(NntpError::Protocol(
             "LIST OVERVIEW.FMT field count is invalid".into(),
+        ));
+    }
+    let metadata_fields_valid = fields[5].eq_ignore_ascii_case(b":bytes")
+        && fields[6].eq_ignore_ascii_case(b":lines")
+        || fields[5].eq_ignore_ascii_case(b"Bytes:") && fields[6].eq_ignore_ascii_case(b"Lines:");
+    if !metadata_fields_valid {
+        return Err(NntpError::Protocol(
+            "LIST OVERVIEW.FMT metadata fields are invalid".into(),
         ));
     }
     for (index, field) in fields.iter().enumerate() {
@@ -75,7 +81,7 @@ pub fn parse_overview_format(data: &[u8]) -> NntpResult<OverviewFormat> {
                 "LIST OVERVIEW.FMT field descriptor is invalid".into(),
             ));
         }
-        if let Some(required) = REQUIRED_FIELDS.get(index)
+        if let Some(required) = REQUIRED_HEADER_FIELDS.get(index)
             && !field.eq_ignore_ascii_case(required)
         {
             return Err(NntpError::Protocol(
@@ -163,6 +169,22 @@ mod tests {
         assert_eq!(format.fields.len(), 8);
         assert_eq!(format.fields[7], b"Xref:full");
         assert!(parse_overview_format(b"From:\r\nSubject:\r\n").is_err());
+    }
+
+    #[test]
+    fn format_accepts_and_preserves_the_alternative_metadata_names() {
+        let format = parse_overview_format(
+            b"Subject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\nBytes:\r\nLines:\r\nXref:full\r\n",
+        )
+        .expect("alternative metadata names");
+        assert_eq!(format.fields[5], b"Bytes:");
+        assert_eq!(format.fields[6], b"Lines:");
+        assert!(
+            parse_overview_format(
+                b"Subject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\nBytes:\r\n:lines\r\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
