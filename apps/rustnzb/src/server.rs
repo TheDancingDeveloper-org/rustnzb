@@ -263,6 +263,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(group_observation::h_article_body_prefix),
         )
         .route(
+            "/groups/article-availability",
+            post(group_observation::h_article_availability),
+        )
+        .route(
             "/groups/clear-search",
             post(group_observation::h_clear_search),
         )

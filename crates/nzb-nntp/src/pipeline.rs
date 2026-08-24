@@ -335,12 +335,11 @@ impl StatPipeline {
                         return Err(NntpError::ServiceUnavailable(resp.message));
                     }
                     _ => {
-                        // Unknown response — treat as missing but don't abort
-                        trace!(code = resp.code, mid = %mid, "Unexpected STAT response");
-                        results.push(StatResult {
-                            message_id: mid.clone(),
-                            exists: false,
-                        });
+                        conn.state = ConnectionState::Error;
+                        return Err(NntpError::Protocol(format!(
+                            "Unexpected STAT response {}: {}",
+                            resp.code, resp.message
+                        )));
                     }
                 }
             }
@@ -699,5 +698,26 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].exists);
         assert!(results[1].exists);
+    }
+
+    #[tokio::test]
+    async fn test_stat_pipeline_unknown_response_fails_closed() {
+        let mut overrides = HashMap::new();
+        overrides.insert("unknown@test".to_string(), 499);
+        let server = MockNntpServer::start(MockConfig {
+            article_response_overrides: overrides,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut stat = StatPipeline::new();
+        stat.add("unknown@test".into());
+        assert!(matches!(
+            stat.execute(&mut conn).await,
+            Err(NntpError::Protocol(_))
+        ));
     }
 }

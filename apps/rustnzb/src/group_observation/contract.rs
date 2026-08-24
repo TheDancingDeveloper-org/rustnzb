@@ -13,6 +13,7 @@ const MAX_CLEAR_SEARCH_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CLEAR_SEARCH_RANGES: usize = 8;
 const MAX_CLEAR_SEARCH_ARTICLES_PER_RANGE: u64 = 10_000;
 const MAX_CLEAR_SEARCH_DURATION_MS: u64 = 120_000;
+const MAX_AVAILABILITY_SEGMENTS: usize = 64;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,6 +63,14 @@ pub(crate) struct ClearSearchInput {
     pub(crate) max_matches_per_range: usize,
     pub(crate) max_response_bytes: usize,
     pub(crate) deadline_at_unix_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArticleAvailabilityInput {
+    pub(crate) request_id: String,
+    pub(crate) message_ids: Vec<String>,
+    pub(crate) sample_sha256: String,
 }
 
 impl OverviewRangeInput {
@@ -168,6 +177,46 @@ impl ClearSearchInput {
     }
 }
 
+impl ArticleAvailabilityInput {
+    pub(super) fn validate(&self) -> Result<(), &'static str> {
+        if !valid_control_id(&self.request_id)
+            || self.message_ids.is_empty()
+            || self.message_ids.len() > MAX_AVAILABILITY_SEGMENTS
+            || self.message_ids.iter().any(|message_id| {
+                let message_id = message_id.trim_matches(['<', '>']);
+                message_id.is_empty()
+                    || message_id.len() > 2048
+                    || !message_id.contains('@')
+                    || !message_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
+            })
+            || self
+                .message_ids
+                .iter()
+                .map(|message_id| message_id.trim_matches(['<', '>']))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.message_ids.len()
+            || self.sample_sha256 != article_availability_digest(&self.message_ids)
+        {
+            return Err("article availability request is outside its admitted bounds");
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn article_availability_digest(message_ids: &[String]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"newsgroups-article-availability-sample");
+    for message_id in message_ids {
+        let message_id = message_id.trim_matches(['<', '>']);
+        digest.update((message_id.len() as u64).to_be_bytes());
+        digest.update(message_id.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
 pub(super) fn clear_search_predicate_digest(patterns: &[String]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"newsgroups-clear-search-predicates");
@@ -266,6 +315,17 @@ mod tests {
         assert!(body.validate().is_ok());
         body.max_payload_bytes = body.max_wire_bytes + 1;
         assert!(body.validate().is_err());
+
+        let mut availability = ArticleAvailabilityInput {
+            request_id: "availability-one".to_string(),
+            message_ids: vec!["one@example.invalid".to_string()],
+            sample_sha256: article_availability_digest(&["one@example.invalid".to_string()]),
+        };
+        assert!(availability.validate().is_ok());
+        availability
+            .message_ids
+            .push("one@example.invalid".to_string());
+        assert!(availability.validate().is_err());
 
         let mut clear = ClearSearchInput {
             request_id: "clear-one".to_string(),

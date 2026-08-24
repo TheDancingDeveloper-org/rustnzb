@@ -12,10 +12,12 @@ use nzb_web::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+mod availability;
 mod body_prefix;
 mod clear_search;
 mod contract;
 
+pub(crate) use availability::h_article_availability;
 pub(crate) use body_prefix::h_article_body_prefix;
 pub(crate) use clear_search::h_clear_search;
 
@@ -50,6 +52,7 @@ fn nntp_failure(error: &NntpError, operation: &str) -> &'static str {
         }
         NntpError::Protocol(_) if operation == "article_head" => "nntp_head_unavailable",
         NntpError::Protocol(_) if operation == "article_body_prefix" => "nntp_body_unavailable",
+        NntpError::Protocol(_) if operation == "article_availability" => "nntp_stat_unavailable",
         NntpError::Protocol(_) => "nntp_overview_unavailable",
         _ => "nntp_operation_failed",
     }
