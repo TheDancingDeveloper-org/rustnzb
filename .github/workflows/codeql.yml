@@ -1,0 +1,66 @@
+name: CodeQL
+
+# Static analysis (code scanning) for the Rust workspace and the Angular
+# frontend. Findings surface under the repository's Security > Code scanning
+# tab and as PR annotations.
+#
+# Runners: matches the rest of CI on the self-hosted fleet so the runner-policy
+# gate passes. The `rust` runner already carries cargo (for the Rust build
+# tracer) and Node, so a single label set covers both languages.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["*.md", "docs/**", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"]
+  pull_request:
+    paths-ignore: ["*.md", "docs/**", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"]
+  schedule:
+    # Weekly, so advisories that appear after a quiet period are still caught.
+    - cron: "27 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    # Dependabot PRs change dependency metadata only; skip to avoid spending a
+    # self-hosted runner on each. Skipped jobs report success, so a required
+    # check would not stay pending.
+    if: github.event_name != 'pull_request' || github.event.pull_request.user.type != 'Bot'
+    runs-on: [self-hosted, node-b, linux, x64, rust]
+    permissions:
+      # Uploading CodeQL results requires write on security events.
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: autobuild
+          - language: javascript-typescript
+            build-mode: none
+    env:
+      # Match the memory-conscious build settings the rest of CI uses on the
+      # isolated runners.
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
