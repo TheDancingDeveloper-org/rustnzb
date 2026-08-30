@@ -56,7 +56,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "regis
 tracing-appender = "0.2"
 # OpenTelemetry
 opentelemetry = "0.28"
-opentelemetry_sdk = { version = "0.28", features = ["rt-tokio", "metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "metrics"] }
 opentelemetry-otlp = { version = "0.28", default-features = false, features = ["grpc-tonic", "metrics", "logs", "trace"] }
 tracing-opentelemetry = "0.29"
 opentelemetry-appender-tracing = "0.28"
