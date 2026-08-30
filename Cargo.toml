@@ -55,11 +55,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
 tracing-appender = "0.2"
 # OpenTelemetry
-opentelemetry = "0.28"
-opentelemetry_sdk = { version = "0.28", features = ["rt-tokio", "metrics"] }
-opentelemetry-otlp = { version = "0.28", default-features = false, features = ["grpc-tonic", "metrics", "logs", "trace"] }
-tracing-opentelemetry = "0.29"
-opentelemetry-appender-tracing = "0.28"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "metrics"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "metrics", "logs", "trace"] }
+tracing-opentelemetry = "0.33"
+opentelemetry-appender-tracing = "0.32"
 # Error handling
 thiserror = "2"
 anyhow = "1"
