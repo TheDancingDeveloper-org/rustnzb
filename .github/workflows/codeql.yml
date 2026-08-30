@@ -5,8 +5,8 @@ name: CodeQL
 # tab and as PR annotations.
 #
 # Runners: matches the rest of CI on the self-hosted fleet so the runner-policy
-# gate passes. The `rust` runner already carries cargo (for the Rust build
-# tracer) and Node, so a single label set covers both languages.
+# gate passes. Both languages use buildless extraction (build-mode: none), so
+# no compiler/toolchain step is needed; a single label set covers both.
 
 on:
   push:
@@ -43,14 +43,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Rust CodeQL only supports buildless extraction (build-mode: none);
+          # it does not support autobuild.
           - language: rust
-            build-mode: autobuild
+            build-mode: none
           - language: javascript-typescript
             build-mode: none
-    env:
-      # Match the memory-conscious build settings the rest of CI uses on the
-      # isolated runners.
-      CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v7
 
