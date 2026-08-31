@@ -1861,7 +1861,7 @@ name = "nzb-postproc"
 version = "0.2.6"
 dependencies = [
  "anyhow",
- "md-5 0.10.6",
+ "md-5 0.11.0",
  "nzb-core",
  "opentelemetry",
  "rust-par2",

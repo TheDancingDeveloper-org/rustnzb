@@ -27,7 +27,7 @@ tempfile = "3"
 # Integration tests synthesise real PAR2 index files (see
 # `tests/support/par2_fixture.rs`), which requires writing spec-correct
 # packet MD5s. Version tracks what `rust-par2` itself parses with.
-md-5 = "0.10"
+md-5 = "0.11"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints.clippy]
