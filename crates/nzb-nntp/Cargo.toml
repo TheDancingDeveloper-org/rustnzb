@@ -23,7 +23,7 @@ parking_lot = "0.12"
 flate2 = "1"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
-socket2 = "0.5"
+socket2 = "0.6"
 tokio-socks = "0.5"
 uuid = { version = "1", features = ["v4"] }
 
