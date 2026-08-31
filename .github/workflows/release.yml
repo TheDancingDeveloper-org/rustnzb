@@ -93,7 +93,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
-          SKOPEO_IMAGE: quay.io/skopeo/stable@sha256:c7d3c512612f52805023cd38351081dad7e2729fc13d14b701e47c7c8bdd6615
+          SKOPEO_IMAGE: quay.io/skopeo/stable:v1.19@sha256:77e6c8901f6976bdfa87b8b14c40b96de754794c492d8ed295f77fba1454a4ab
         run: |
           docker run --rm --entrypoint sh \
             -e GH_TOKEN -e FORGEJO_TOKEN -e GITHUB_ACTOR -e GITHUB_REF_NAME \
@@ -116,7 +116,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
           OLD_GHCR_TOKEN: ${{ secrets.OLD_GHCR_TOKEN }}
-          SKOPEO_IMAGE: quay.io/skopeo/stable@sha256:c7d3c512612f52805023cd38351081dad7e2729fc13d14b701e47c7c8bdd6615
+          SKOPEO_IMAGE: quay.io/skopeo/stable:v1.19@sha256:77e6c8901f6976bdfa87b8b14c40b96de754794c492d8ed295f77fba1454a4ab
         run: |
           docker run --rm --entrypoint sh \
             -e GH_TOKEN -e OLD_GHCR_TOKEN -e GITHUB_ACTOR -e GITHUB_REF_NAME \
