@@ -1764,7 +1764,7 @@ dependencies = [
  "nzb-nntp",
  "parking_lot",
  "proptest",
- "quick-xml 0.37.5",
+ "quick-xml 0.41.0",
  "rusqlite",
  "serde",
  "serde_json",

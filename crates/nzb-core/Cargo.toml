@@ -23,7 +23,7 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 parking_lot = "0.12"
-quick-xml = "0.37"
+quick-xml = "0.41"
 unicode-normalization = "0.1"
 
 [dev-dependencies]

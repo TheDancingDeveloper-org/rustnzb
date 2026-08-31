@@ -75,7 +75,7 @@ governor = "0.10"
 webpki-roots = "0.26"
 rustls-pki-types = "1"
 # XML
-quick-xml = "0.37"
+quick-xml = "0.41"
 regex = "1"
 walkdir = "2"
 flate2 = "1"
