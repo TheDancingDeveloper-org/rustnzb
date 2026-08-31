@@ -34,7 +34,7 @@ parking_lot = "0.12"
 rand = "0.9"
 hex = "0.4"
 base64 = "0.22"
-sha2 = "0.10"
+sha2 = "0.11"
 governor = "0.10"
 arc-swap = "1"
 uuid = { version = "1", features = ["v4", "serde"] }

@@ -21,7 +21,7 @@ webpki-roots = "1"
 rustls-pki-types = "1"
 parking_lot = "0.12"
 flate2 = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 serde = { version = "1", features = ["derive"] }
 socket2 = "0.5"
 tokio-socks = "0.5"
