@@ -3069,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "nzb-nntp"
-version = "0.2.24"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4363,6 +4363,7 @@ dependencies = [
  "chrono",
  "clap",
  "flate2",
+ "hex",
  "http",
  "libc",
  "mime_guess",
@@ -4378,6 +4379,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "tokio-util",
  "tower-http 0.7.0",
