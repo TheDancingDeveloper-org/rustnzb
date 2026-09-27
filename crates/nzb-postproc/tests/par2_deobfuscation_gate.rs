@@ -177,6 +177,34 @@ async fn pos_healthy_download_deobfuscates_via_par2() {
     );
 }
 
+#[tokio::test]
+async fn pos_multiple_recovery_sets_each_restore_their_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = b"first recovery set payload";
+    let second = b"second recovery set payload";
+    Par2Fixture::new()
+        .with_recovery_set_id(*b"rustnzbfixture01")
+        .add_file("First.Release.rar", first)
+        .write_index(&dir.path().join("First.Release.par2"));
+    Par2Fixture::new()
+        .with_recovery_set_id(*b"rustnzbfixture02")
+        .add_file("Second.Release.rar", second)
+        .write_index(&dir.path().join("Second.Release.par2"));
+    fs::write(dir.path().join("obfuscated.01"), first).unwrap();
+    fs::write(dir.path().join("obfuscated.02"), second).unwrap();
+
+    let _ = run_pipeline(dir.path(), &config(0)).await;
+
+    assert_eq!(
+        names_on_disk(dir.path()),
+        vec![
+            "First.Release.rar".to_string(),
+            "Second.Release.rar".to_string(),
+        ],
+        "every distinct PAR2 recovery set must participate in deobfuscation"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Guards — the rename must stay targeted now that it runs on every job.
 // ---------------------------------------------------------------------------

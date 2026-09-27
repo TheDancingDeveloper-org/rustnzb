@@ -208,7 +208,7 @@ pub fn find_par2_files(dir: &Path) -> Vec<PathBuf> {
 
 /// Returns true if a filename looks like a par2 volume file (e.g.
 /// `foo.vol00+01.par2` or `foo.vol00-01.par2`) rather than the index file.
-fn is_par2_volume(name_lower: &str) -> bool {
+pub(crate) fn is_par2_volume(name_lower: &str) -> bool {
     // Typical patterns: .vol000+000.par2 and .vol000-000.par2.
     // We check for ".vol" anywhere before the final ".par2"
     let without_ext = name_lower.trim_end_matches(".par2");
