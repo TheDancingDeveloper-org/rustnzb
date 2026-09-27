@@ -225,6 +225,52 @@ pub struct DownloadStatistic {
     pub server_stats: Vec<ServerArticleStats>,
 }
 
+/// Durable binding between a caller idempotency key and one admitted job.
+///
+/// This row intentionally outlives queue and history retention so a caller can
+/// resolve an ambiguous admission response without creating another job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueAdmission {
+    pub idempotency_key: String,
+    pub payload_digest: String,
+    pub job_id: String,
+    pub accepted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "location", rename_all = "snake_case")]
+pub enum QueueAdmissionState {
+    Queue {
+        status: JobStatus,
+        total_bytes: u64,
+        downloaded_bytes: u64,
+        output_dir: PathBuf,
+        error_message: Option<String>,
+    },
+    History {
+        status: JobStatus,
+        total_bytes: u64,
+        downloaded_bytes: u64,
+        completed_at: DateTime<Utc>,
+        output_dir: PathBuf,
+        error_message: Option<String>,
+    },
+    Unobserved,
+}
+
+/// Exact observation of a durable admission and its current engine location.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueAdmissionObservation {
+    pub admission: QueueAdmission,
+    pub state: QueueAdmissionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueAdmissionOutcome {
+    Inserted(QueueAdmission),
+    Existing(QueueAdmission),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageResult {
     pub name: String,

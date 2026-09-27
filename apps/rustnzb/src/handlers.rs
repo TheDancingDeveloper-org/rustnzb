@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Multipart, Path, Query, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use flate2::read::GzDecoder;
 use http::StatusCode;
@@ -37,6 +38,8 @@ use nzb_web::fetch_guard::{
 };
 use nzb_web::log_buffer::LogEntry;
 use nzb_web::state::AppState;
+
+use crate::admissions::{IdempotencyKey, payload_digest};
 
 // ---------------------------------------------------------------------------
 // Priority helpers
@@ -359,11 +362,33 @@ fn extract_nzbs(file_name: &str, data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, 
 }
 
 /// Enqueue a single NZB from raw bytes, applying category/priority from query params.
+async fn next_uploaded_file(
+    multipart: &mut Multipart,
+) -> Result<Option<(String, Vec<u8>)>, ApiError> {
+    let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!("Multipart error: {error}")))?
+    else {
+        return Ok(None);
+    };
+    let file_name = field
+        .file_name()
+        .map(str::to_string)
+        .unwrap_or_else(|| "unknown.nzb".to_string());
+    let data = field
+        .bytes()
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!("Read error: {error}")))?;
+    Ok(Some((file_name, data.to_vec())))
+}
+
 fn enqueue_nzb(
     state: &AppState,
     q: &AddNzbQuery,
     file_name: &str,
     data: Vec<u8>,
+    idempotency_key: Option<&IdempotencyKey>,
 ) -> Result<String, ApiError> {
     let name = q.name.clone().unwrap_or_else(|| {
         file_name
@@ -387,24 +412,21 @@ fn enqueue_nzb(
         .output_dir_for(&job.category, &job.name)
         .map_err(ApiError::from)?;
 
-    std::fs::create_dir_all(&job.work_dir).map_err(|e| {
-        ApiError::from(anyhow::anyhow!(
-            "Failed to create work dir '{}': {}",
-            job.work_dir.display(),
-            e
-        ))
-    })?;
+    if let Some(idempotency_key) = idempotency_key {
+        let digest = payload_digest(&data);
+        let outcome = qm
+            .add_job_idempotent(job, data, idempotency_key.as_str(), &digest)
+            .map_err(|error| match error {
+                nzb_web::nzb_core::NzbError::AdmissionConflict => ApiError::admission_conflict(),
+                error => ApiError::from(error),
+            })?;
+        return Ok(match outcome {
+            QueueAdmissionOutcome::Inserted(admission)
+            | QueueAdmissionOutcome::Existing(admission) => admission.job_id,
+        });
+    }
 
     let id = job.id.clone();
-
-    tracing::info!(
-        name = %job.name,
-        id = %job.id,
-        files = job.file_count,
-        articles = job.article_count,
-        "NZB added to queue"
-    );
-
     qm.add_job(job, Some(data)).map_err(ApiError::from)?;
     Ok(id)
 }
@@ -415,31 +437,37 @@ fn enqueue_nzb(
 pub async fn h_queue_add(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AddNzbQuery>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, ApiError> {
+    let idempotency_key = IdempotencyKey::from_headers(&headers)?;
     let mut nzo_ids = Vec::new();
-
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Multipart error: {e}")))?
-    {
-        let file_name = field
-            .file_name()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "unknown.nzb".into());
-
-        let data = field
-            .bytes()
-            .await
-            .map_err(|e| ApiError::from(anyhow::anyhow!("Read error: {e}")))?;
-
-        // Extract NZBs (handles zip/gz archives or plain .nzb)
-        let nzbs = extract_nzbs(&file_name, &data).map_err(ApiError::from)?;
-
-        for (nzb_name, nzb_data) in nzbs {
-            let id = enqueue_nzb(&state, &q, &nzb_name, nzb_data)?;
-            nzo_ids.push(id);
+    if let Some(idempotency_key) = idempotency_key.as_ref() {
+        // A keyed admission binds exactly one payload, so the request must carry
+        // exactly one NZB — a multi-NZB upload has no single job to replay.
+        let mut uploaded_nzbs = Vec::new();
+        while let Some((file_name, data)) = next_uploaded_file(&mut multipart).await? {
+            uploaded_nzbs.extend(extract_nzbs(&file_name, &data).map_err(ApiError::from)?);
+        }
+        if uploaded_nzbs.len() != 1 {
+            return Err(ApiError::bad_request(
+                "Idempotency-Key requires exactly one NZB payload",
+            ));
+        }
+        let (nzb_name, nzb_data) = uploaded_nzbs.pop().expect("exactly one NZB payload");
+        nzo_ids.push(enqueue_nzb(
+            &state,
+            &q,
+            &nzb_name,
+            nzb_data,
+            Some(idempotency_key),
+        )?);
+    } else {
+        while let Some((file_name, data)) = next_uploaded_file(&mut multipart).await? {
+            // Extract NZBs (handles zip/gz archives or plain .nzb)
+            for (nzb_name, nzb_data) in extract_nzbs(&file_name, &data).map_err(ApiError::from)? {
+                nzo_ids.push(enqueue_nzb(&state, &q, &nzb_name, nzb_data, None)?);
+            }
         }
     }
 
@@ -543,7 +571,7 @@ pub async fn h_queue_add_url(
     let nzbs = extract_nzbs(&file_name, &data).map_err(ApiError::from)?;
     let mut nzo_ids = Vec::new();
     for (nzb_name, nzb_data) in nzbs {
-        let id = enqueue_nzb(&state, &q, &nzb_name, nzb_data)?;
+        let id = enqueue_nzb(&state, &q, &nzb_name, nzb_data, None)?;
         nzo_ids.push(id);
     }
 

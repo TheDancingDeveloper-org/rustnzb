@@ -1386,7 +1386,7 @@ impl QueueManager {
     /// the `max_active_downloads` limit.
     pub fn add_job(
         self: &Arc<Self>,
-        mut job: NzbJob,
+        job: NzbJob,
         nzb_data: Option<Vec<u8>>,
     ) -> crate::nzb_core::Result<()> {
         if crate::nzb_core::path::safe_component(&job.category).is_none() {
@@ -1428,6 +1428,66 @@ impl QueueManager {
             }
         }
 
+        self.activate_admitted_job(job, nzb_data);
+        Ok(())
+    }
+
+    /// Admit one NZB exactly once for a caller-provided idempotency key.
+    ///
+    /// A first admission inserts the queue row, the durable admission binding,
+    /// and activates the job. A replay with the same key and identical payload
+    /// returns the existing admission without creating a second job; a replay
+    /// with a different payload is a conflict.
+    pub fn add_job_idempotent(
+        self: &Arc<Self>,
+        job: NzbJob,
+        nzb_data: Vec<u8>,
+        idempotency_key: &str,
+        payload_digest: &str,
+    ) -> crate::nzb_core::Result<QueueAdmissionOutcome> {
+        if let Some(observation) = self.db.lock().queue_admission_observe(idempotency_key)? {
+            if observation.admission.payload_digest != payload_digest {
+                return Err(crate::nzb_core::NzbError::AdmissionConflict);
+            }
+            return Ok(QueueAdmissionOutcome::Existing(observation.admission));
+        }
+
+        std::fs::create_dir_all(&job.work_dir)?;
+        let outcome =
+            self.db
+                .lock()
+                .queue_admit(&job, &nzb_data, idempotency_key, payload_digest)?;
+        match &outcome {
+            QueueAdmissionOutcome::Inserted(_) => {
+                self.activate_admitted_job(job, Some(nzb_data));
+            }
+            QueueAdmissionOutcome::Existing(_) => {
+                if let Err(error) = std::fs::remove_dir(&job.work_dir)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(
+                        work_dir = %job.work_dir.display(),
+                        "Unable to remove an unused replay work directory: {error}"
+                    );
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Observe one durable admission without scanning bounded queue or history lists.
+    pub fn queue_admission_observe(
+        &self,
+        idempotency_key: &str,
+    ) -> crate::nzb_core::Result<Option<QueueAdmissionObservation>> {
+        self.db.lock().queue_admission_observe(idempotency_key)
+    }
+
+    /// Activate an already-persisted job: emit the added event and place it in
+    /// the in-memory queue (or paused set), starting a download slot if free.
+    /// The queue row must already exist — `add_job` and `add_job_idempotent`
+    /// persist it before calling this.
+    fn activate_admitted_job(self: &Arc<Self>, mut job: NzbJob, nzb_data: Option<Vec<u8>>) {
         let job_id = job.id.clone();
         info!(
             job_id = %job_id,
@@ -1460,7 +1520,7 @@ impl QueueManager {
             self.globally_paused_jobs.lock().insert(job_id.clone());
             self.persist_globally_paused_jobs();
             self.job_order.lock().push(job_id);
-            return Ok(());
+            return;
         }
 
         // Insert as Queued — start_next_queued will atomically claim a
@@ -1480,7 +1540,6 @@ impl QueueManager {
 
         // Try to start this or other queued jobs
         self.start_next_queued();
-        Ok(())
     }
 
     /// Rebuild a history job for retry. Newer history rows carry a checkpoint

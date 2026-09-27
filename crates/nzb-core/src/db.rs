@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use tracing::info;
 
 use crate::error::NzbError;
@@ -349,6 +349,26 @@ impl Database {
             )?;
         }
 
+        if version < 11 {
+            info!("Applying database migration v11: idempotent queue admissions");
+            self.conn.execute_batch(
+                "
+                CREATE TABLE queue_admissions (
+                    idempotency_key TEXT PRIMARY KEY,
+                    payload_digest TEXT NOT NULL,
+                    job_id TEXT NOT NULL UNIQUE,
+                    accepted_at TEXT NOT NULL
+                );
+
+                CREATE INDEX idx_queue_admissions_job
+                    ON queue_admissions(job_id);
+
+                DELETE FROM schema_version;
+                INSERT INTO schema_version (version) VALUES (11);
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -373,6 +393,165 @@ impl Database {
     // -----------------------------------------------------------------------
     // Queue operations
     // -----------------------------------------------------------------------
+
+    /// Atomically bind an idempotency key to one payload and queued job.
+    ///
+    /// The admission row intentionally has no foreign key to queue or history:
+    /// it remains authoritative after a job moves or bounded history is pruned.
+    pub fn queue_admit(
+        &mut self,
+        job: &NzbJob,
+        nzb_data: &[u8],
+        idempotency_key: &str,
+        payload_digest: &str,
+    ) -> Result<QueueAdmissionOutcome, NzbError> {
+        let transaction = self.conn.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT idempotency_key, payload_digest, job_id, accepted_at
+                 FROM queue_admissions WHERE idempotency_key = ?1",
+                [idempotency_key],
+                |row| {
+                    Ok(QueueAdmission {
+                        idempotency_key: row.get(0)?,
+                        payload_digest: row.get(1)?,
+                        job_id: row.get(2)?,
+                        accepted_at: parse_datetime(&row.get::<_, String>(3)?),
+                    })
+                },
+            )
+            .optional()?;
+
+        if let Some(existing) = existing {
+            if existing.payload_digest != payload_digest {
+                return Err(NzbError::AdmissionConflict);
+            }
+            transaction.commit()?;
+            return Ok(QueueAdmissionOutcome::Existing(existing));
+        }
+
+        transaction.execute(
+            "INSERT INTO queue (id, name, category, status, priority, total_bytes,
+             downloaded_bytes, file_count, files_completed, article_count,
+             articles_downloaded, articles_failed, added_at, work_dir, output_dir, password,
+             nzb_raw)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+             ?16, ?17)",
+            params![
+                job.id,
+                job.name,
+                job.category,
+                job.status.to_string(),
+                job.priority as i32,
+                job.total_bytes as i64,
+                job.downloaded_bytes as i64,
+                job.file_count as i64,
+                job.files_completed as i64,
+                job.article_count as i64,
+                job.articles_downloaded as i64,
+                job.articles_failed as i64,
+                job.added_at.to_rfc3339(),
+                job.work_dir.to_string_lossy().to_string(),
+                job.output_dir.to_string_lossy().to_string(),
+                job.password,
+                nzb_data,
+            ],
+        )?;
+
+        let admission = QueueAdmission {
+            idempotency_key: idempotency_key.to_string(),
+            payload_digest: payload_digest.to_string(),
+            job_id: job.id.clone(),
+            accepted_at: job.added_at,
+        };
+        transaction.execute(
+            "INSERT INTO queue_admissions (
+                idempotency_key, payload_digest, job_id, accepted_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                admission.idempotency_key,
+                admission.payload_digest,
+                admission.job_id,
+                admission.accepted_at.to_rfc3339(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(QueueAdmissionOutcome::Inserted(admission))
+    }
+
+    /// Resolve one admission without relying on bounded queue/history lists.
+    pub fn queue_admission_observe(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<QueueAdmissionObservation>, NzbError> {
+        let admission = self
+            .conn
+            .query_row(
+                "SELECT idempotency_key, payload_digest, job_id, accepted_at
+                 FROM queue_admissions WHERE idempotency_key = ?1",
+                [idempotency_key],
+                |row| {
+                    Ok(QueueAdmission {
+                        idempotency_key: row.get(0)?,
+                        payload_digest: row.get(1)?,
+                        job_id: row.get(2)?,
+                        accepted_at: parse_datetime(&row.get::<_, String>(3)?),
+                    })
+                },
+            )
+            .optional()?;
+        let Some(admission) = admission else {
+            return Ok(None);
+        };
+
+        let queued_state = self
+            .conn
+            .query_row(
+                "SELECT status, total_bytes, downloaded_bytes, output_dir, error_message
+                 FROM queue WHERE id = ?1",
+                [&admission.job_id],
+                |row| {
+                    Ok(QueueAdmissionState::Queue {
+                        status: parse_status(&row.get::<_, String>(0)?),
+                        total_bytes: row.get::<_, i64>(1)? as u64,
+                        downloaded_bytes: row.get::<_, i64>(2)? as u64,
+                        output_dir: row.get::<_, String>(3)?.into(),
+                        error_message: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(state) = queued_state {
+            return Ok(Some(QueueAdmissionObservation { admission, state }));
+        }
+
+        let history_state = self
+            .conn
+            .query_row(
+                "SELECT status, total_bytes, downloaded_bytes, completed_at, output_dir,
+                 error_message FROM history WHERE id = ?1",
+                [&admission.job_id],
+                |row| {
+                    Ok(QueueAdmissionState::History {
+                        status: parse_status(&row.get::<_, String>(0)?),
+                        total_bytes: row.get::<_, i64>(1)? as u64,
+                        downloaded_bytes: row.get::<_, i64>(2)? as u64,
+                        completed_at: parse_datetime(&row.get::<_, String>(3)?),
+                        output_dir: row.get::<_, String>(4)?.into(),
+                        error_message: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(state) = history_state {
+            return Ok(Some(QueueAdmissionObservation { admission, state }));
+        }
+
+        Ok(Some(QueueAdmissionObservation {
+            admission,
+            state: QueueAdmissionState::Unobserved,
+        }))
+    }
 
     /// Insert a new job into the queue.
     pub fn queue_insert(&self, job: &NzbJob) -> Result<(), NzbError> {
@@ -1183,6 +1362,81 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].name, "Test Download");
         assert_eq!(jobs[0].total_bytes, 1_000_000);
+    }
+
+    #[test]
+    fn queue_admission_replays_exact_payload_and_rejects_conflict() {
+        let mut db = Database::open_memory().unwrap();
+        let job = make_job("admitted-job", "Admitted");
+        let inserted = db
+            .queue_admit(&job, b"payload", "request-key", "sha256:first")
+            .unwrap();
+        assert!(matches!(inserted, QueueAdmissionOutcome::Inserted(_)));
+
+        let replay = db
+            .queue_admit(
+                &make_job("unused-job", "Replay"),
+                b"payload",
+                "request-key",
+                "sha256:first",
+            )
+            .unwrap();
+        let QueueAdmissionOutcome::Existing(replay) = replay else {
+            panic!("exact replay should return the existing admission");
+        };
+        assert_eq!(replay.job_id, "admitted-job");
+        assert_eq!(db.queue_list().unwrap().len(), 1);
+
+        let conflict = db.queue_admit(
+            &make_job("conflicting-job", "Conflict"),
+            b"different",
+            "request-key",
+            "sha256:different",
+        );
+        assert!(matches!(conflict, Err(NzbError::AdmissionConflict)));
+        assert_eq!(db.queue_list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn queue_admission_survives_reopen_and_outlives_queue_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.queue_admit(
+                &make_job("durable-job", "Durable"),
+                b"payload",
+                "durable-key",
+                "sha256:durable",
+            )
+            .unwrap();
+        }
+
+        let mut db = Database::open(&path).unwrap();
+        let observation = db.queue_admission_observe("durable-key").unwrap().unwrap();
+        assert_eq!(observation.admission.job_id, "durable-job");
+        assert!(matches!(
+            observation.state,
+            QueueAdmissionState::Queue { .. }
+        ));
+
+        db.queue_remove("durable-job").unwrap();
+        let observation = db.queue_admission_observe("durable-key").unwrap().unwrap();
+        assert_eq!(observation.state, QueueAdmissionState::Unobserved);
+
+        let replay = db
+            .queue_admit(
+                &make_job("new-job", "New"),
+                b"payload",
+                "durable-key",
+                "sha256:durable",
+            )
+            .unwrap();
+        let QueueAdmissionOutcome::Existing(replay) = replay else {
+            panic!("durable replay should preserve the original job identity");
+        };
+        assert_eq!(replay.job_id, "durable-job");
+        assert!(db.queue_list().unwrap().is_empty());
     }
 
     #[test]

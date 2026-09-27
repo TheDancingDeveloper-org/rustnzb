@@ -67,6 +67,13 @@ impl ApiError {
         }
     }
 
+    pub const fn admission_conflict() -> Self {
+        Self {
+            status: Some(StatusCode::CONFLICT),
+            kind: ApiErrorKind::AdmissionConflict,
+        }
+    }
+
     pub fn status(&self) -> StatusCode {
         self.status.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
     }
@@ -80,6 +87,8 @@ pub enum ApiErrorKind {
     ServerNotFound(String),
     #[error("unauthorized")]
     Unauthorized,
+    #[error("idempotency key is already bound to another NZB payload")]
+    AdmissionConflict,
     #[error("{0}")]
     Text(&'static str),
     #[error("{0}")]
@@ -119,6 +128,7 @@ impl Serialize for ApiError {
                 ApiErrorKind::JobNotFound(_) => "job_not_found",
                 ApiErrorKind::ServerNotFound(_) => "server_not_found",
                 ApiErrorKind::Unauthorized => "unauthorized",
+                ApiErrorKind::AdmissionConflict => "admission_conflict",
                 _ => "internal_error",
             },
             human_readable: format!("{:#}", self.kind),

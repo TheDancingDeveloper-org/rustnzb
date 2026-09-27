@@ -11,6 +11,9 @@ pub enum NzbError {
     #[error("Job not found: {0}")]
     JobNotFound(String),
 
+    #[error("Idempotency key is already bound to another payload")]
+    AdmissionConflict,
+
     #[error("Server not found: {0}")]
     ServerNotFound(String),
 
