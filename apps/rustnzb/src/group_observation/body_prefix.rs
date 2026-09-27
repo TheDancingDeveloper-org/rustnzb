@@ -1,4 +1,8 @@
-use super::{blocked, contract::ArticleBodyPrefixInput, nntp_failure};
+use super::{
+    blocked,
+    contract::{ArticleBodyPrefixInput, MAX_PAYLOAD_PREFIX_BYTES},
+    nntp_failure,
+};
 use axum::{Json, extract::State};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use nzb_web::{error::ApiError, nzb_core::nzb_nntp::NntpConnection, state::AppState};
@@ -92,7 +96,11 @@ fn decode_payload_prefix(wire: &[u8], body_complete: bool, maximum: usize) -> De
     let mut started = false;
     let mut ended = false;
     let mut truncated = false;
-    let mut output = Vec::with_capacity(maximum.min(wire.len()));
+    // `maximum` is validated <= MAX_PAYLOAD_PREFIX_BYTES upstream; clamp again at
+    // the allocation so the reserved capacity is provably bounded by a constant
+    // (defends against an unbounded reservation and satisfies allocation-size
+    // static analysis).
+    let mut output = Vec::with_capacity(maximum.min(wire.len()).min(MAX_PAYLOAD_PREFIX_BYTES));
     for raw_line in wire.split_inclusive(|byte| *byte == b'\n') {
         let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
         let line = line.strip_suffix(b"\r").unwrap_or(line);

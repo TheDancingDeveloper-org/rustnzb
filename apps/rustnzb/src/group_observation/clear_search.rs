@@ -1,5 +1,7 @@
 use super::{defective_row_json, format_digest, missing_ranges, nntp_failure, row_json};
-use crate::group_observation::contract::{ClearSearchInput, ClearSearchRangeInput, now_unix_ms};
+use crate::group_observation::contract::{
+    ClearSearchInput, ClearSearchRangeInput, MAX_CLEAR_SEARCH_RANGES, now_unix_ms,
+};
 use axum::{Json, extract::State};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use nzb_web::{
@@ -181,7 +183,7 @@ async fn observe(state: Arc<AppState>, input: &ClearSearchInput, deadline: &Dead
     };
     let mut budget = Budget::new(input.max_response_bytes);
     let mut calibration = None;
-    let mut range_rows = Vec::with_capacity(input.ranges.len());
+    let mut range_rows = Vec::with_capacity(input.ranges.len().min(MAX_CLEAR_SEARCH_RANGES));
     let patterns = input
         .patterns
         .iter()
@@ -586,7 +588,7 @@ fn append_failure_receipts(
 }
 
 fn failed_response(input: &ClearSearchInput, stop: Stop) -> Value {
-    let mut receipts = Vec::with_capacity(input.ranges.len());
+    let mut receipts = Vec::with_capacity(input.ranges.len().min(MAX_CLEAR_SEARCH_RANGES));
     append_failure_receipts(&mut receipts, &input.ranges, stop);
     response(
         input,
