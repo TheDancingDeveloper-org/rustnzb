@@ -12,6 +12,10 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tracing::{info, warn};
 
+#[derive(Debug, thiserror::Error)]
+#[error("archive password required")]
+pub(crate) struct ArchivePasswordRequired;
+
 /// Result of an unpack operation.
 #[derive(Debug)]
 pub struct UnpackResult {
@@ -247,7 +251,7 @@ pub async fn extract_rar(
                 file = %rar_file.display(),
                 "RAR extraction failed — archive is password-protected"
             );
-            anyhow::bail!("archive is password-protected");
+            return Err(ArchivePasswordRequired.into());
         }
         warn!(
             file = %rar_file.display(),
@@ -318,7 +322,7 @@ pub async fn extract_7z(
                 file = %archive_file.display(),
                 "7z extraction failed — archive is password-protected"
             );
-            anyhow::bail!("archive is password-protected");
+            return Err(ArchivePasswordRequired.into());
         }
         warn!(
             file = %archive_file.display(),
@@ -788,5 +792,11 @@ mod tests {
 
         let args = sevenz_extract_args(archive, out, Some("secret"));
         assert!(args.iter().any(|arg| arg == "-psecret"));
+    }
+
+    #[test]
+    fn password_failure_survives_as_a_typed_error() {
+        let error: anyhow::Error = ArchivePasswordRequired.into();
+        assert!(error.downcast_ref::<ArchivePasswordRequired>().is_some());
     }
 }

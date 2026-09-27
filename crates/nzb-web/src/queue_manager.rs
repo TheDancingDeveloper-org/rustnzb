@@ -891,6 +891,9 @@ struct JobState {
     hopeless_tracker: Option<HopelessTracker>,
     /// Active worker-pool duration captured at terminal download resolution.
     download_time_secs: Option<f64>,
+    /// Typed terminal failure code, tracked in memory until it is persisted to
+    /// the terminal history row.
+    failure_code: Option<JobFailureCode>,
 }
 
 /// Notification fired immediately when a job is accepted into the queue.
@@ -1515,6 +1518,7 @@ impl QueueManager {
                 direct_unpacker: None,
                 hopeless_tracker: None,
                 download_time_secs: None,
+                failure_code: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.globally_paused_jobs.lock().insert(job_id.clone());
@@ -1534,6 +1538,7 @@ impl QueueManager {
             direct_unpacker: None,
             hopeless_tracker: None,
             download_time_secs: None,
+            failure_code: None,
         };
         self.jobs.lock().insert(job_id.clone(), state);
         self.job_order.lock().push(job_id);
@@ -1648,6 +1653,7 @@ impl QueueManager {
             if let Some(state) = jobs.get_mut(job_id) {
                 state.job.status = JobStatus::Paused;
                 state.job.error_message = Some("Paused: low disk space".to_string());
+                state.failure_code = Some(JobFailureCode::StorageUnavailable);
             }
             return;
         }
@@ -1758,6 +1764,7 @@ impl QueueManager {
                             })
                         {
                             state.job.error_message = None;
+                            state.failure_code = None;
                             cleared = true;
                         }
                     }
@@ -2184,6 +2191,7 @@ impl QueueManager {
                             state.download_time_secs = Some(download_time_secs);
                             state.job.status = JobStatus::Failed;
                             state.job.error_message = Some(reason.clone());
+                            state.failure_code = Some(JobFailureCode::ArticlesUnavailable);
                             state.job.articles_failed =
                                 state.job.articles_failed.max(articles_failed);
                             state.job.completed_at = Some(chrono::Utc::now());
@@ -2403,6 +2411,8 @@ impl QueueManager {
                 {
                     state.job.status = JobStatus::Failed;
                     state.job.error_message = result.error.clone();
+                    state.failure_code =
+                        result.failure_code.or(Some(JobFailureCode::DownloadFailed));
                 }
             }
 
@@ -2416,6 +2426,7 @@ impl QueueManager {
                     state.job.status = JobStatus::Failed;
                     state.job.error_message =
                         Some(format!("{articles_failed} article(s) failed to download"));
+                    state.failure_code = Some(JobFailureCode::ArticlesUnavailable);
                 }
             }
             Vec::new()
@@ -2616,6 +2627,7 @@ impl QueueManager {
                 warn!(job_id = %state.job.id, output_dir = %state.job.output_dir.display(), "{message}");
                 final_status = JobStatus::Failed;
                 state.job.error_message = Some(message.to_string());
+                state.failure_code = Some(JobFailureCode::ArchiveInvalid);
                 stages.push(StageResult {
                     name: "Output".to_string(),
                     status: StageStatus::Failed,
@@ -2701,6 +2713,8 @@ impl QueueManager {
             output_dir: state.job.output_dir.clone(),
             stages,
             error_message: state.job.error_message.clone(),
+            failure_code: (final_status == JobStatus::Failed)
+                .then(|| state.failure_code.unwrap_or(JobFailureCode::DownloadFailed)),
             server_stats: state.job.server_stats.clone(),
             nzb_data: state.nzb_data.clone(),
             retry_data,
@@ -3045,6 +3059,7 @@ impl QueueManager {
                 // Job context still lives in the pool — just unpause it.
                 state.job.status = JobStatus::Downloading;
                 state.job.error_message = None;
+                state.failure_code = None;
                 // The no-progress watchdog measures wall-clock idle time and
                 // does not stop while paused, so restart its clock here or the
                 // paused interval counts toward the article timeout and aborts
@@ -3072,6 +3087,7 @@ impl QueueManager {
                 } else {
                     state.job.status = JobStatus::Downloading;
                     state.job.error_message = None;
+                    state.failure_code = None;
                     true
                 }
             }
@@ -3140,6 +3156,9 @@ impl QueueManager {
                     output_dir: state.job.output_dir.clone(),
                     stages: Vec::new(),
                     error_message: state.job.error_message.clone(),
+                    failure_code: Some(
+                        state.failure_code.unwrap_or(JobFailureCode::DownloadFailed),
+                    ),
                     server_stats: state.job.server_stats.clone(),
                     nzb_data: state.nzb_data.clone(),
                     retry_data: None,
@@ -3341,6 +3360,7 @@ impl QueueManager {
                 };
                 if state.job.status == JobStatus::Paused {
                     state.job.error_message = None;
+                    state.failure_code = None;
                     if self.dispatch.has_job(&id) {
                         state.job.status = JobStatus::Downloading;
                         to_unpause.push(id);
@@ -3399,6 +3419,7 @@ impl QueueManager {
             for (id, state) in jobs.iter_mut() {
                 if state.job.status == JobStatus::Paused && state.job.error_message.is_some() {
                     state.job.error_message = None;
+                    state.failure_code = None;
                     if self.dispatch.has_job(id) {
                         state.job.status = JobStatus::Downloading;
                         to_unpause.push(id.clone());
@@ -4089,6 +4110,7 @@ impl QueueManager {
                 direct_unpacker: None,
                 hopeless_tracker: None,
                 download_time_secs: None,
+                failure_code: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);
@@ -4441,6 +4463,7 @@ mod global_pause_tests {
                 direct_unpacker: None,
                 hopeless_tracker: None,
                 download_time_secs: None,
+                failure_code: None,
             },
         );
         manager.job_order.lock().push(id);
@@ -4798,6 +4821,16 @@ mod global_pause_tests {
                 .is_some()
         );
         assert!(!work_dir.exists());
+        assert_eq!(
+            manager
+                .db
+                .lock()
+                .history_get("failed-cleanup")
+                .unwrap()
+                .unwrap()
+                .failure_code,
+            Some(JobFailureCode::DownloadFailed)
+        );
     }
 
     #[tokio::test]
@@ -4856,6 +4889,7 @@ mod global_pause_tests {
             .unwrap()
             .unwrap();
         assert_eq!(entry.status, JobStatus::Failed);
+        assert_eq!(entry.failure_code, Some(JobFailureCode::ArchiveInvalid));
         assert_eq!(
             entry.error_message.as_deref(),
             Some("No usable output produced; only archive or PAR2 artifacts remain")

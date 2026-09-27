@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use nzb_core::models::{StageResult, StageStatus};
+use nzb_core::models::{JobFailureCode, StageResult, StageStatus};
 use tracing::{debug, error, info, warn};
 
 use crate::detect::{ArchiveType, find_archives, find_cleanup_files, find_par2_files};
 use crate::par2::par2_repair;
 use crate::resources::PostProcResourcePool;
-use crate::unpack::{extract_7z, extract_rar, extract_tar, extract_zip};
+use crate::unpack::{ArchivePasswordRequired, extract_7z, extract_rar, extract_tar, extract_zip};
 
 fn increment_counter(name: &'static str) {
     opentelemetry::global::meter_provider()
@@ -53,6 +53,8 @@ pub struct PostProcResult {
     pub stages: Vec<StageResult>,
     /// Error message if the pipeline failed.
     pub error: Option<String>,
+    /// Typed terminal failure code when the pipeline failed.
+    pub failure_code: Option<JobFailureCode>,
 }
 
 /// Configuration for the post-processing pipeline.
@@ -129,6 +131,7 @@ pub async fn run_pipeline_with_cleanup(
 ) -> PostProcResult {
     let mut stages: Vec<StageResult> = Vec::new();
     let mut pipeline_ok = true;
+    let mut failure_code = None;
 
     info!(dir = %job_dir.display(), "Starting post-processing pipeline");
 
@@ -153,6 +156,7 @@ pub async fn run_pipeline_with_cleanup(
     if par2_files.is_empty() {
         if config.content_articles_failed > 0 {
             pipeline_ok = false;
+            failure_code = Some(JobFailureCode::ArticlesUnavailable);
             stages.push(StageResult {
                 name: "Verify".to_string(),
                 status: StageStatus::Failed,
@@ -317,6 +321,7 @@ pub async fn run_pipeline_with_cleanup(
                                 );
                                 if !result.success {
                                     pipeline_ok = false;
+                                    failure_code = Some(JobFailureCode::RepairFailed);
                                 }
                                 stages.push(StageResult {
                                     name: "Repair".to_string(),
@@ -340,6 +345,7 @@ pub async fn run_pipeline_with_cleanup(
                                     "Native PAR2 repair failed"
                                 );
                                 pipeline_ok = false;
+                                failure_code = Some(JobFailureCode::RepairFailed);
                                 stages.push(StageResult {
                                     name: "Repair".to_string(),
                                     status: StageStatus::Failed,
@@ -352,6 +358,7 @@ pub async fn run_pipeline_with_cleanup(
                     Err(e) => {
                         error!(error = %e, "Verify/repair task panicked");
                         pipeline_ok = false;
+                        failure_code = Some(JobFailureCode::RepairFailed);
                         stages.push(StageResult {
                             name: "Verify".to_string(),
                             status: StageStatus::Failed,
@@ -393,6 +400,7 @@ pub async fn run_pipeline_with_cleanup(
                     });
                     if repair_result.status == StageStatus::Failed {
                         pipeline_ok = false;
+                        failure_code = Some(JobFailureCode::RepairFailed);
                     }
                     stages.push(repair_result);
                 }
@@ -424,7 +432,7 @@ pub async fn run_pipeline_with_cleanup(
         } else {
             None
         };
-        let (result, processed_archives) = run_extract_stage(
+        let (result, processed_archives, extract_failure_code) = run_extract_stage(
             source_dir,
             output_dir,
             config.password.as_deref(),
@@ -434,6 +442,7 @@ pub async fn run_pipeline_with_cleanup(
         extracted_archives = processed_archives;
         if result.status == StageStatus::Failed {
             pipeline_ok = false;
+            failure_code = extract_failure_code.or(Some(JobFailureCode::ArchiveInvalid));
         } else if result.status == StageStatus::Success {
             // Extraction succeeded despite verify/repair failure — recover
             pipeline_ok = true;
@@ -478,6 +487,11 @@ pub async fn run_pipeline_with_cleanup(
         success: pipeline_ok,
         stages,
         error,
+        failure_code: if pipeline_ok {
+            None
+        } else {
+            failure_code.or(Some(JobFailureCode::DownloadFailed))
+        },
     }
 }
 
@@ -622,7 +636,7 @@ async fn run_extract_stage(
     output_dir: &Path,
     password: Option<&str>,
     max_nested_archive_depth: u8,
-) -> (StageResult, Vec<PathBuf>) {
+) -> (StageResult, Vec<PathBuf>, Option<JobFailureCode>) {
     let start = Instant::now();
     let mut all_ok = true;
     let mut messages: Vec<String> = Vec::new();
@@ -641,6 +655,7 @@ async fn run_extract_stage(
     let mut extracted_archives = Vec::new();
     let mut scan_dir = source_dir;
     let mut extracted_any = false;
+    let mut failure_code = None;
 
     for depth in 0..=max_nested_archive_depth {
         let archives: Vec<_> = find_archives(scan_dir)
@@ -668,6 +683,7 @@ async fn run_extract_stage(
                 }
                 Ok(unpack_result) => {
                     all_ok = false;
+                    failure_code = Some(JobFailureCode::ArchiveInvalid);
                     let detail = unpack_result
                         .error_output
                         .trim()
@@ -680,6 +696,11 @@ async fn run_extract_stage(
                 }
                 Err(e) => {
                     all_ok = false;
+                    failure_code = Some(if e.downcast_ref::<ArchivePasswordRequired>().is_some() {
+                        JobFailureCode::ArchivePasswordRequired
+                    } else {
+                        JobFailureCode::ArchiveInvalid
+                    });
                     error!(depth, kind = %archive_type, file = %path.display(), error = %e, "Extraction error");
                     messages.push(format!("depth {depth} {archive_type}: {e}"));
                 }
@@ -698,6 +719,7 @@ async fn run_extract_stage(
             .all(|(_, path)| processed.contains(&path))
     {
         all_ok = false;
+        failure_code = Some(JobFailureCode::ArchiveInvalid);
         messages.push(format!(
             "nested archive depth limit ({max_nested_archive_depth}) reached; source files retained"
         ));
@@ -713,6 +735,7 @@ async fn run_extract_stage(
                 duration_secs: start.elapsed().as_secs_f64(),
             },
             Vec::new(),
+            None,
         );
     }
 
@@ -728,6 +751,7 @@ async fn run_extract_stage(
             duration_secs: start.elapsed().as_secs_f64(),
         },
         extracted_archives,
+        failure_code,
     )
 }
 
@@ -911,10 +935,12 @@ mod tests {
             success: true,
             stages: vec![],
             error: None,
+            failure_code: None,
         };
         assert!(result.success);
         assert!(result.stages.is_empty());
         assert!(result.error.is_none());
+        assert!(result.failure_code.is_none());
     }
 
     #[test]
@@ -1006,9 +1032,11 @@ mod tests {
         write_zip(&outer, &[("inner.zip", &fs::read(&inner).unwrap())]);
         fs::remove_file(inner).unwrap();
 
-        let (result, _) = run_extract_stage(source.path(), output.path(), None, 1).await;
+        let (result, _, failure_code) =
+            run_extract_stage(source.path(), output.path(), None, 1).await;
 
         assert_eq!(result.status, StageStatus::Success, "{result:?}");
+        assert_eq!(failure_code, None);
         assert_eq!(
             fs::read(output.path().join("payload.txt")).unwrap(),
             b"nested payload"
@@ -1025,9 +1053,11 @@ mod tests {
         write_zip(&outer, &[("inner.zip", &fs::read(&inner).unwrap())]);
         fs::remove_file(inner).unwrap();
 
-        let (result, _) = run_extract_stage(source.path(), output.path(), None, 0).await;
+        let (result, _, failure_code) =
+            run_extract_stage(source.path(), output.path(), None, 0).await;
 
         assert_eq!(result.status, StageStatus::Failed, "{result:?}");
+        assert_eq!(failure_code, Some(JobFailureCode::ArchiveInvalid));
         assert!(output.path().join("inner.zip").exists());
         assert!(!output.path().join("payload.txt").exists());
     }
@@ -1171,6 +1201,10 @@ mod tests {
         };
         let result = run_pipeline(dir.path(), &config).await;
         assert!(!result.success);
+        assert_eq!(
+            result.failure_code,
+            Some(JobFailureCode::ArticlesUnavailable)
+        );
 
         let verify_stage = result.stages.iter().find(|s| s.name == "Verify").unwrap();
         assert_eq!(
