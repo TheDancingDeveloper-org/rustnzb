@@ -18,6 +18,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::group_handlers;
+use crate::group_observation;
 use crate::handlers;
 use nzb_web::auth;
 use nzb_web::error::ApiError;
@@ -249,6 +250,26 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Newsgroup browsing
         .route("/groups", get(group_handlers::h_group_list))
         .route("/groups/refresh", post(group_handlers::h_group_refresh))
+        .route(
+            "/groups/overview-range",
+            post(group_observation::h_overview_range),
+        )
+        .route(
+            "/groups/article-head",
+            post(group_observation::h_article_head),
+        )
+        .route(
+            "/groups/article-body-prefix",
+            post(group_observation::h_article_body_prefix),
+        )
+        .route(
+            "/groups/article-availability",
+            post(group_observation::h_article_availability),
+        )
+        .route(
+            "/groups/clear-search",
+            post(group_observation::h_clear_search),
+        )
         .route("/groups/{id}", get(group_handlers::h_group_get))
         .route("/groups/{id}/status", get(group_handlers::h_group_status))
         .route(

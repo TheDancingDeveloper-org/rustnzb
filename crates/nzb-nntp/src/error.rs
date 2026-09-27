@@ -47,6 +47,14 @@ pub enum NntpError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    /// The server explicitly rejected a command as unsupported.
+    #[error("Unsupported command: {0}")]
+    UnsupportedCommand(String),
+
+    /// A bounded NNTP response exceeded its admitted byte limit.
+    #[error("Response too large: {0}")]
+    ResponseTooLarge(String),
+
     /// Underlying I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

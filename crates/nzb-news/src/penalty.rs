@@ -78,7 +78,9 @@ pub fn penalty_for_error(err: &NntpError) -> PenaltyAction {
         // Timeouts and unexpected protocol responses: medium cooldown
         // after bad_cons threshold. A single slow article shouldn't
         // penalise the whole server, but a run of timeouts should.
-        Timeout(_) | Protocol(_) => PenaltyAction::BadCons(PENALTY_TIMEOUT),
+        Timeout(_) | Protocol(_) | UnsupportedCommand(_) | ResponseTooLarge(_) => {
+            PenaltyAction::BadCons(PENALTY_TIMEOUT)
+        }
 
         // Pool/orchestrator-side errors — shouldn't flow through this
         // path, but if they do, take the conservative default penalty.

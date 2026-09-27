@@ -14,6 +14,7 @@ pub mod config;
 pub mod connection;
 pub mod downloader;
 pub mod error;
+pub mod overview;
 pub mod pipeline;
 pub mod pool;
 pub mod server;
@@ -25,11 +26,15 @@ pub mod testutil;
 pub use capabilities::NntpCapabilities;
 pub use config::{Article, ListActiveEntry, ServerConfig};
 pub use connection::{
-    ArticleRange, ConnectionState, GroupResponse, HeaderEntry, NntpConnection, NntpResponse,
-    XoverEntry,
+    ArticleRange, BodyPrefixResponse, BoundedResponse, ConnectionState, GroupResponse, HeaderEntry,
+    NntpConnection, NntpResponse, XoverEntry,
 };
 pub use downloader::{ArticleResult, Downloader};
 pub use error::{NntpError, NntpResult};
+pub use overview::{
+    DefectiveOverviewRow, DefectiveOverviewRowCode, LosslessOverviewRow, LosslessOverviewRows,
+    OverviewFormat,
+};
 pub use pipeline::{Pipeline, StatPipeline, StatResult};
 pub use pool::ConnectionPool;
 pub use server::ServerState;

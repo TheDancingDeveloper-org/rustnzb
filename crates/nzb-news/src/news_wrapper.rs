@@ -271,6 +271,8 @@ impl NewsWrapper {
             | NntpError::PermissionDenied(_)
             | NntpError::ServiceUnavailable(_)
             | NntpError::Protocol(_)
+            | NntpError::UnsupportedCommand(_)
+            | NntpError::ResponseTooLarge(_)
             | NntpError::Timeout(_) => {
                 self.bump_bad_cons();
                 self.hard_reset().await;
