@@ -369,6 +369,21 @@ impl Database {
             )?;
         }
 
+        if version < 12 {
+            info!("Applying database migration v12: typed terminal failure codes");
+            self.conn.execute_batch(
+                "
+                ALTER TABLE history ADD COLUMN failure_code TEXT;
+                UPDATE history
+                SET failure_code = 'download_failed'
+                WHERE LOWER(status) = 'failed' AND failure_code IS NULL;
+
+                DELETE FROM schema_version;
+                INSERT INTO schema_version (version) VALUES (12);
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -504,6 +519,32 @@ impl Database {
             return Ok(None);
         };
 
+        // The durable terminal history row is authoritative over the lingering
+        // queue view, so it is consulted first: a job that has completed or
+        // failed carries its typed failure code here.
+        let history_state = self
+            .conn
+            .query_row(
+                "SELECT status, total_bytes, downloaded_bytes, completed_at, output_dir,
+                 error_message, failure_code FROM history WHERE id = ?1",
+                [&admission.job_id],
+                |row| {
+                    Ok(QueueAdmissionState::History {
+                        status: parse_status(&row.get::<_, String>(0)?),
+                        total_bytes: row.get::<_, i64>(1)? as u64,
+                        downloaded_bytes: row.get::<_, i64>(2)? as u64,
+                        completed_at: parse_datetime(&row.get::<_, String>(3)?),
+                        output_dir: row.get::<_, String>(4)?.into(),
+                        error_message: row.get(5)?,
+                        failure_code: parse_failure_code(row.get(6)?)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(state) = history_state {
+            return Ok(Some(QueueAdmissionObservation { admission, state }));
+        }
+
         let queued_state = self
             .conn
             .query_row(
@@ -522,28 +563,6 @@ impl Database {
             )
             .optional()?;
         if let Some(state) = queued_state {
-            return Ok(Some(QueueAdmissionObservation { admission, state }));
-        }
-
-        let history_state = self
-            .conn
-            .query_row(
-                "SELECT status, total_bytes, downloaded_bytes, completed_at, output_dir,
-                 error_message FROM history WHERE id = ?1",
-                [&admission.job_id],
-                |row| {
-                    Ok(QueueAdmissionState::History {
-                        status: parse_status(&row.get::<_, String>(0)?),
-                        total_bytes: row.get::<_, i64>(1)? as u64,
-                        downloaded_bytes: row.get::<_, i64>(2)? as u64,
-                        completed_at: parse_datetime(&row.get::<_, String>(3)?),
-                        output_dir: row.get::<_, String>(4)?.into(),
-                        error_message: row.get(5)?,
-                    })
-                },
-            )
-            .optional()?;
-        if let Some(state) = history_state {
             return Ok(Some(QueueAdmissionObservation { admission, state }));
         }
 
@@ -684,12 +703,19 @@ impl Database {
 
     /// Move a completed/failed job to history.
     pub fn history_insert(&self, entry: &HistoryEntry) -> Result<(), NzbError> {
+        // Invariant: a Failed row carries exactly one typed failure code, and a
+        // non-Failed row carries none. This keeps the terminal history row a
+        // trustworthy source of the failure reason.
+        if (entry.status == JobStatus::Failed) != entry.failure_code.is_some() {
+            return Err(NzbError::Other("terminal_failure_code_invalid".to_string()));
+        }
         let stages_json = serde_json::to_string(&entry.stages).unwrap_or_default();
         let server_stats_json = serde_json::to_string(&entry.server_stats).unwrap_or_default();
         self.conn.execute(
             "INSERT INTO history (id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, download_time_secs, output_dir, stages, error_message, nzb_data, server_stats, retry_data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             added_at, completed_at, download_time_secs, output_dir, stages, error_message,
+             nzb_data, server_stats, retry_data, failure_code)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 entry.id,
                 entry.name,
@@ -706,6 +732,7 @@ impl Database {
                 entry.nzb_data,
                 server_stats_json,
                 entry.retry_data,
+                entry.failure_code.map(|code| code.to_string()),
             ],
         )?;
 
@@ -770,7 +797,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, total_bytes, downloaded_bytes,
              added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
-             CASE WHEN nzb_data IS NOT NULL THEN 1 ELSE 0 END as has_nzb
+             CASE WHEN nzb_data IS NOT NULL THEN 1 ELSE 0 END as has_nzb, failure_code
              FROM history ORDER BY completed_at DESC LIMIT ?1",
         )?;
 
@@ -797,6 +824,7 @@ impl Database {
                     output_dir: row.get::<_, String>(9)?.into(),
                     stages,
                     error_message: row.get(11)?,
+                    failure_code: parse_failure_code(row.get(14)?)?,
                     server_stats,
                     // Don't load actual blob in list - just note if it exists
                     nzb_data: if has_nzb != 0 { Some(Vec::new()) } else { None },
@@ -859,7 +887,8 @@ impl Database {
     pub fn history_get(&self, id: &str) -> Result<Option<HistoryEntry>, NzbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats
+             added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
+             failure_code
              FROM history WHERE id = ?1",
         )?;
 
@@ -883,6 +912,7 @@ impl Database {
                 output_dir: row.get::<_, String>(9)?.into(),
                 stages,
                 error_message: row.get(11)?,
+                failure_code: parse_failure_code(row.get(13)?)?,
                 server_stats,
                 nzb_data: None,
                 retry_data: None,
@@ -1251,6 +1281,24 @@ fn parse_status(s: &str) -> JobStatus {
     }
 }
 
+fn parse_failure_code(value: Option<String>) -> rusqlite::Result<Option<JobFailureCode>> {
+    value
+        .map(|value| {
+            value.parse().map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid terminal failure code",
+                    )
+                    .into(),
+                )
+            })
+        })
+        .transpose()
+}
+
 fn parse_priority(v: i32) -> Priority {
     match v {
         0 => Priority::Low,
@@ -1316,6 +1364,7 @@ mod tests {
                 duration_secs: 2.5,
             }],
             error_message: None,
+            failure_code: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
@@ -1437,6 +1486,97 @@ mod tests {
         };
         assert_eq!(replay.job_id, "durable-job");
         assert!(db.queue_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn typed_failure_migration_backfills_only_failed_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE schema_version (version INTEGER NOT NULL);
+                INSERT INTO schema_version (version) VALUES (11);
+                CREATE TABLE history (
+                    id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL
+                );
+                INSERT INTO history (id, status) VALUES
+                    ('failed-job', 'Failed'),
+                    ('completed-job', 'Completed');
+                ",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(&path).unwrap();
+        let failed: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT failure_code FROM history WHERE id = 'failed-job'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let completed: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT failure_code FROM history WHERE id = 'completed-job'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed.as_deref(), Some("download_failed"));
+        assert_eq!(completed, None);
+    }
+
+    #[test]
+    fn queue_admission_prefers_typed_terminal_history_over_lingering_queue_view() {
+        let mut db = Database::open_memory().unwrap();
+        db.queue_admit(
+            &make_job("terminal-job", "Terminal"),
+            b"payload",
+            "terminal-key",
+            "sha256:terminal",
+        )
+        .unwrap();
+        let mut history = make_history("terminal-job", "Terminal");
+        history.status = JobStatus::Failed;
+        history.failure_code = Some(JobFailureCode::ArchiveInvalid);
+        history.error_message = Some("private extractor diagnostic".to_string());
+        db.history_insert(&history).unwrap();
+
+        let observation = db.queue_admission_observe("terminal-key").unwrap().unwrap();
+        assert!(matches!(
+            observation.state,
+            QueueAdmissionState::History {
+                status: JobStatus::Failed,
+                failure_code: Some(JobFailureCode::ArchiveInvalid),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_history_requires_failure_code_exactly_on_failure() {
+        let db = Database::open_memory().unwrap();
+        let mut failed = make_history("failed-job", "Failed");
+        failed.status = JobStatus::Failed;
+        assert!(matches!(
+            db.history_insert(&failed),
+            Err(NzbError::Other(code)) if code == "terminal_failure_code_invalid"
+        ));
+
+        failed.failure_code = Some(JobFailureCode::DownloadFailed);
+        db.history_insert(&failed).unwrap();
+
+        let mut completed = make_history("completed-job", "Completed");
+        completed.failure_code = Some(JobFailureCode::DownloadFailed);
+        assert!(matches!(
+            db.history_insert(&completed),
+            Err(NzbError::Other(code)) if code == "terminal_failure_code_invalid"
+        ));
     }
 
     #[test]
