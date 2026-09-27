@@ -14,7 +14,9 @@ use std::time::Instant;
 use nzb_core::models::{JobFailureCode, StageResult, StageStatus};
 use tracing::{debug, error, info, warn};
 
-use crate::detect::{ArchiveType, find_archives, find_cleanup_files, find_par2_files};
+use crate::detect::{
+    ArchiveType, find_archives, find_cleanup_files, find_par2_files, is_par2_volume,
+};
 use crate::par2::par2_repair;
 use crate::resources::PostProcResourcePool;
 use crate::unpack::{ArchivePasswordRequired, extract_7z, extract_rar, extract_tar, extract_zip};
@@ -42,6 +44,65 @@ enum VerifyRepairOutcome {
         blocks_available: u32,
         repair_result: Result<rust_par2::RepairResult, rust_par2::RepairError>,
     },
+}
+
+/// Parse every distinct PAR2 recovery set present in `paths`.
+///
+/// Volume files (`*.volNNN+NNN.par2`) are skipped — they carry recovery blocks,
+/// not an index — and duplicate index files that describe the same recovery set
+/// are collapsed by `recovery_set_id`. Parse failures are collected so the
+/// caller can report them without aborting the other sets. A job that carries
+/// two independently posted releases yields two sets here; earlier code only
+/// ever inspected `par2_files[0]`, silently ignoring the rest.
+fn parse_par2_sets(paths: &[PathBuf]) -> (Vec<rust_par2::Par2FileSet>, Vec<String>) {
+    let mut recovery_set_ids = HashSet::new();
+    let mut sets = Vec::new();
+    let mut errors = Vec::new();
+    for path in paths.iter().filter(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| !is_par2_volume(&name.to_ascii_lowercase()))
+    }) {
+        match rust_par2::parse(path) {
+            Ok(set) if recovery_set_ids.insert(set.recovery_set_id) => sets.push(set),
+            Ok(_) => {}
+            Err(error) => errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+    (sets, errors)
+}
+
+/// Verify one recovery set and, if it is damaged, attempt a native repair using
+/// the pre-computed verify result (no redundant second verification pass).
+fn verify_repair_set(file_set: &rust_par2::Par2FileSet, dir: &Path) -> VerifyRepairOutcome {
+    let verify_result = rust_par2::verify(file_set, dir);
+    if verify_result.all_correct() {
+        return VerifyRepairOutcome::AllCorrect {
+            intact_count: verify_result.intact.len(),
+        };
+    }
+
+    let intact = verify_result.intact.len();
+    let damaged = verify_result.damaged.len();
+    let missing = verify_result.missing.len();
+    let blocks_needed = verify_result.blocks_needed();
+    let blocks_available = verify_result.recovery_blocks_available;
+    info!(
+        intact,
+        damaged,
+        missing,
+        blocks_needed,
+        "Native PAR2 verify: damage detected, attempting native repair"
+    );
+    let repair_result = rust_par2::repair_from_verify(file_set, dir, &verify_result);
+    VerifyRepairOutcome::Damaged {
+        intact,
+        damaged,
+        missing,
+        blocks_needed,
+        blocks_available,
+        repair_result,
+    }
 }
 
 /// Final result of the complete post-processing pipeline.
@@ -174,235 +235,211 @@ pub async fn run_pipeline_with_cleanup(
                 duration_secs: 0.0,
             });
         }
-    } else if config.articles_failed == 0 {
-        // Files are known-good from CRC checks during yEnc decode, so the
-        // expensive MD5 verification pass is skipped.
-        //
-        // PAR2-guided deobfuscation still has to run. Obfuscated posts arrive
-        // with meaningless filenames whether or not an article failed, and the
-        // PAR2 metadata is the only record of the real names. While this
-        // rename lived inside the verify branch below, a *clean* download of
-        // an obfuscated post was never deobfuscated: no archive was found, the
-        // Extract stage reported "No archives found", and the job completed
-        // with raw volumes on disk. A damaged download self-healed; a healthy
-        // one did not (issue #87).
-        info!("Skipping PAR2 verification — zero article failures (CRC-verified)");
-        let start = Instant::now();
-        let message = match rust_par2::parse(&par2_files[0]) {
-            Ok(file_set) => {
-                rename_to_par2_names(&file_set, job_dir);
-                "Skipped — zero article failures (PAR2-guided rename applied)".to_string()
-            }
-            Err(e) => {
-                debug!(error = %e, "PAR2 parse failed; skipping PAR2-guided deobfuscation");
-                format!("Skipped — zero article failures (PAR2 parse failed: {e})")
-            }
-        };
-        stages.push(StageResult {
-            name: "Verify".to_string(),
-            status: StageStatus::Skipped,
-            message: Some(message),
-            duration_secs: start.elapsed().as_secs_f64(),
-        });
     } else {
-        let verify_start = Instant::now();
-        let _repair_permit = if let Some(resources) = resources {
-            Some(resources.acquire_repair().await)
+        let started = Instant::now();
+        let (file_sets, parse_errors) = parse_par2_sets(&par2_files);
+        debug!(
+            recovery_sets = file_sets.len(),
+            parse_failures = parse_errors.len(),
+            "Parsed distinct PAR2 recovery sets"
+        );
+
+        if file_sets.is_empty() {
+            // Nothing parsed into a usable recovery set (every index file failed
+            // to parse). Fall back to main's existing behaviour.
+            let error = parse_errors
+                .first()
+                .map(String::as_str)
+                .unwrap_or("no PAR2 index file found");
+            if config.articles_failed == 0 {
+                stages.push(StageResult {
+                    name: "Verify".to_string(),
+                    status: StageStatus::Skipped,
+                    message: Some(format!(
+                        "PAR2 parse failed ({error}), but zero article failures"
+                    )),
+                    duration_secs: started.elapsed().as_secs_f64(),
+                });
+            } else {
+                stages.push(StageResult {
+                    name: "Verify".to_string(),
+                    status: StageStatus::Skipped,
+                    message: Some(format!("PAR2 parse failed ({error}), attempting repair")),
+                    duration_secs: started.elapsed().as_secs_f64(),
+                });
+                let repair_result = run_repair_stage(job_dir).await;
+                increment_counter(if repair_result.status == StageStatus::Failed {
+                    "par2.repair_failure"
+                } else {
+                    "par2.repair_success"
+                });
+                if repair_result.status == StageStatus::Failed {
+                    pipeline_ok = false;
+                    failure_code = Some(JobFailureCode::RepairFailed);
+                }
+                stages.push(repair_result);
+            }
+        } else if config.articles_failed == 0 {
+            // Files are known-good from CRC checks during yEnc decode, so the
+            // expensive MD5 verification pass is skipped.
+            //
+            // PAR2-guided deobfuscation still has to run for every recovery set.
+            // Obfuscated posts arrive with meaningless filenames whether or not
+            // an article failed, and the PAR2 metadata is the only record of the
+            // real names. A *clean* download of an obfuscated post must be
+            // deobfuscated too, or it completes with raw volumes on disk — a
+            // damaged download self-heals while a healthy one would not (issue
+            // #87). Before this, only the first recovery set was ever renamed.
+            info!(
+                recovery_sets = file_sets.len(),
+                "Skipping PAR2 verification — zero article failures (CRC-verified)"
+            );
+            for file_set in &file_sets {
+                rename_to_par2_names(file_set, job_dir);
+            }
+            stages.push(StageResult {
+                name: "Verify".to_string(),
+                status: StageStatus::Skipped,
+                message: Some(format!(
+                    "Skipped — zero article failures (PAR2-guided rename applied to {} recovery set(s))",
+                    file_sets.len()
+                )),
+                duration_secs: started.elapsed().as_secs_f64(),
+            });
         } else {
-            None
-        };
-        let index_par2 = par2_files[0].clone();
+            let _repair_permit = if let Some(resources) = resources {
+                Some(resources.acquire_repair().await)
+            } else {
+                None
+            };
+            // Deobfuscate before verification so damaged obfuscated posts match
+            // their PAR2-expected names. Every distinct recovery set participates.
+            for file_set in &file_sets {
+                rename_to_par2_names(file_set, job_dir);
+            }
+            let recovery_set_count = file_sets.len();
+            let dir = job_dir.to_path_buf();
+            // Verify (and repair when needed) every set in a single
+            // spawn_blocking call. This keeps CPU-intensive work off the async
+            // runtime and keeps each non-Send VerifyResult on one thread so the
+            // repair can reuse it — no redundant second verification pass.
+            let outcomes = tokio::task::spawn_blocking(move || {
+                file_sets
+                    .iter()
+                    .map(|file_set| verify_repair_set(file_set, &dir))
+                    .collect::<Vec<_>>()
+            })
+            .await;
+            let duration = started.elapsed().as_secs_f64();
 
-        match rust_par2::parse(&index_par2) {
-            Ok(file_set) => {
-                // PAR2-guided deobfuscation: if files on disk don't match
-                // PAR2 expected names (common with obfuscated posts where
-                // NZB subjects have readable names but PAR2 references
-                // the original obfuscated filenames), rename them using
-                // MD5-16k hash matching before verification runs. The
-                // zero-failure branch above runs this too — verification is
-                // skipped there, but deobfuscation must not be.
-                rename_to_par2_names(&file_set, job_dir);
-
-                // Run verify (and repair if needed) in a single spawn_blocking call.
-                // This avoids two problems:
-                //   1. CPU-intensive verify/repair doesn't block the async runtime
-                //   2. VerifyResult (not Send) stays on one thread, so repair_from_verify
-                //      can reuse it — no redundant second verification pass
-                let dir = job_dir.to_path_buf();
-                let verify_repair_result = tokio::task::spawn_blocking(move || {
-                    let verify_result = rust_par2::verify(&file_set, &dir);
-
-                    if verify_result.all_correct() {
-                        VerifyRepairOutcome::AllCorrect {
-                            intact_count: verify_result.intact.len(),
-                        }
-                    } else {
-                        let intact = verify_result.intact.len();
-                        let damaged = verify_result.damaged.len();
-                        let missing = verify_result.missing.len();
-                        let blocks_needed = verify_result.blocks_needed();
-                        let blocks_available = verify_result.recovery_blocks_available;
-
-                        info!(
-                            intact,
-                            damaged,
-                            missing,
-                            blocks_needed,
-                            "Native PAR2 verify: damage detected, attempting native repair"
-                        );
-
-                        // Repair using the pre-computed verify result — no second verify pass
-                        info!("Running native PAR2 repair (with pre-computed verify)");
-                        let repair_result =
-                            rust_par2::repair_from_verify(&file_set, &dir, &verify_result);
-
-                        VerifyRepairOutcome::Damaged {
-                            intact,
-                            damaged,
-                            missing,
-                            blocks_needed,
-                            blocks_available,
-                            repair_result,
-                        }
-                    }
-                })
-                .await;
-
-                let verify_duration = verify_start.elapsed().as_secs_f64();
-
-                match verify_repair_result {
-                    Ok(VerifyRepairOutcome::AllCorrect { intact_count }) => {
-                        increment_counter("par2.verify_success");
-                        info!(
-                            files = intact_count,
-                            duration_secs = verify_duration,
-                            "Native PAR2 verify: all files correct"
-                        );
-                        stages.push(StageResult {
-                            name: "Verify".to_string(),
-                            status: StageStatus::Success,
-                            message: Some(format!(
-                                "All {intact_count} files correct (native verify, {verify_duration:.3}s)",
-                            )),
-                            duration_secs: verify_duration,
-                        });
-                    }
-                    Ok(VerifyRepairOutcome::Damaged {
-                        intact,
-                        damaged,
-                        missing,
-                        blocks_needed,
-                        blocks_available,
-                        repair_result,
-                    }) => {
-                        // Push the verify stage result
-                        stages.push(StageResult {
-                            name: "Verify".to_string(),
-                            status: StageStatus::Success,
-                            message: Some(format!(
-                                "{intact} intact, {damaged} damaged, {missing} missing — {blocks_needed} blocks needed (native verify)",
-                            )),
-                            duration_secs: verify_duration,
-                        });
-
-                        // Push the repair stage result
-                        match repair_result {
-                            Ok(result) => {
-                                increment_counter(if result.success {
-                                    "par2.repair_success"
-                                } else {
-                                    "par2.repair_failure"
-                                });
+            match outcomes {
+                Ok(outcomes) => {
+                    for (index, outcome) in outcomes.into_iter().enumerate() {
+                        let set_number = index + 1;
+                        match outcome {
+                            VerifyRepairOutcome::AllCorrect { intact_count } => {
+                                increment_counter("par2.verify_success");
                                 info!(
-                                    blocks_repaired = result.blocks_repaired,
-                                    files_repaired = result.files_repaired,
-                                    "Native PAR2 repair complete"
+                                    set_number,
+                                    recovery_set_count,
+                                    files = intact_count,
+                                    "Native PAR2 verify: all files correct"
                                 );
-                                if !result.success {
-                                    pipeline_ok = false;
-                                    failure_code = Some(JobFailureCode::RepairFailed);
-                                }
                                 stages.push(StageResult {
-                                    name: "Repair".to_string(),
-                                    status: if result.success {
-                                        StageStatus::Success
-                                    } else {
-                                        StageStatus::Failed
-                                    },
-                                    message: Some(result.message),
-                                    duration_secs: verify_duration,
+                                    name: "Verify".to_string(),
+                                    status: StageStatus::Success,
+                                    message: Some(format!(
+                                        "Recovery set {set_number}/{recovery_set_count}: all {intact_count} files correct"
+                                    )),
+                                    duration_secs: duration,
                                 });
                             }
-                            Err(e) => {
-                                increment_counter("par2.repair_failure");
-                                error!(
-                                    error = %e,
-                                    blocks_needed,
-                                    blocks_available,
-                                    damaged,
-                                    missing,
-                                    "Native PAR2 repair failed"
-                                );
-                                pipeline_ok = false;
-                                failure_code = Some(JobFailureCode::RepairFailed);
+                            VerifyRepairOutcome::Damaged {
+                                intact,
+                                damaged,
+                                missing,
+                                blocks_needed,
+                                blocks_available,
+                                repair_result,
+                            } => {
                                 stages.push(StageResult {
-                                    name: "Repair".to_string(),
-                                    status: StageStatus::Failed,
-                                    message: Some(format!("Repair failed: {e}")),
-                                    duration_secs: verify_duration,
+                                    name: "Verify".to_string(),
+                                    status: StageStatus::Success,
+                                    message: Some(format!(
+                                        "Recovery set {set_number}/{recovery_set_count}: {intact} intact, {damaged} damaged, {missing} missing — {blocks_needed} blocks needed"
+                                    )),
+                                    duration_secs: duration,
                                 });
+                                match repair_result {
+                                    Ok(result) => {
+                                        increment_counter(if result.success {
+                                            "par2.repair_success"
+                                        } else {
+                                            "par2.repair_failure"
+                                        });
+                                        info!(
+                                            set_number,
+                                            recovery_set_count,
+                                            blocks_repaired = result.blocks_repaired,
+                                            files_repaired = result.files_repaired,
+                                            "Native PAR2 repair complete"
+                                        );
+                                        if !result.success {
+                                            pipeline_ok = false;
+                                            failure_code = Some(JobFailureCode::RepairFailed);
+                                        }
+                                        stages.push(StageResult {
+                                            name: "Repair".to_string(),
+                                            status: if result.success {
+                                                StageStatus::Success
+                                            } else {
+                                                StageStatus::Failed
+                                            },
+                                            message: Some(format!(
+                                                "Recovery set {set_number}/{recovery_set_count}: {}",
+                                                result.message
+                                            )),
+                                            duration_secs: duration,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        increment_counter("par2.repair_failure");
+                                        error!(
+                                            error = %e,
+                                            blocks_needed,
+                                            blocks_available,
+                                            damaged,
+                                            missing,
+                                            set_number,
+                                            recovery_set_count,
+                                            "Native PAR2 repair failed"
+                                        );
+                                        pipeline_ok = false;
+                                        failure_code = Some(JobFailureCode::RepairFailed);
+                                        stages.push(StageResult {
+                                            name: "Repair".to_string(),
+                                            status: StageStatus::Failed,
+                                            message: Some(format!(
+                                                "Recovery set {set_number}/{recovery_set_count}: repair failed: {e}"
+                                            )),
+                                            duration_secs: duration,
+                                        });
+                                    }
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Verify/repair task panicked");
-                        pipeline_ok = false;
-                        failure_code = Some(JobFailureCode::RepairFailed);
-                        stages.push(StageResult {
-                            name: "Verify".to_string(),
-                            status: StageStatus::Failed,
-                            message: Some(format!("Verify task panicked: {e}")),
-                            duration_secs: verify_duration,
-                        });
                     }
                 }
-            }
-            Err(e) => {
-                // Native parse failed — try full repair path as fallback.
-                debug!(error = %e, "Native PAR2 parse failed");
-                let verify_duration = verify_start.elapsed().as_secs_f64();
-
-                if config.articles_failed == 0 {
-                    // No article failures, can't parse par2 — skip.
+                Err(e) => {
+                    error!(error = %e, "Verify/repair task panicked");
+                    pipeline_ok = false;
+                    failure_code = Some(JobFailureCode::RepairFailed);
                     stages.push(StageResult {
                         name: "Verify".to_string(),
-                        status: StageStatus::Skipped,
-                        message: Some(format!(
-                            "PAR2 parse failed ({e}), but zero article failures"
-                        )),
-                        duration_secs: verify_duration,
+                        status: StageStatus::Failed,
+                        message: Some(format!("Verify task panicked: {e}")),
+                        duration_secs: duration,
                     });
-                } else {
-                    // Articles failed and can't parse par2 — try repair with fresh parse.
-                    stages.push(StageResult {
-                        name: "Verify".to_string(),
-                        status: StageStatus::Skipped,
-                        message: Some(format!("PAR2 parse failed ({e}), attempting repair")),
-                        duration_secs: verify_duration,
-                    });
-
-                    let repair_result = run_repair_stage(job_dir).await;
-                    increment_counter(if repair_result.status == StageStatus::Failed {
-                        "par2.repair_failure"
-                    } else {
-                        "par2.repair_success"
-                    });
-                    if repair_result.status == StageStatus::Failed {
-                        pipeline_ok = false;
-                        failure_code = Some(JobFailureCode::RepairFailed);
-                    }
-                    stages.push(repair_result);
                 }
             }
         }

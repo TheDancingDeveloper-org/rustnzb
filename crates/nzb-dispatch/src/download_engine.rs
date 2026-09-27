@@ -1445,10 +1445,7 @@ impl WorkerPool {
         // Notify workers so any parked on notify.notified() wake up.
         self.work_queue.notify.notify_waiters();
 
-        let timeout = Duration::from_secs(10);
-        for h in handles {
-            let _ = tokio::time::timeout(timeout, h).await;
-        }
+        await_worker_shutdown(handles, Duration::from_secs(10)).await;
 
         if let Some(h) = self.supervisor_handle.lock().take() {
             h.abort();
@@ -1462,6 +1459,23 @@ impl WorkerPool {
     /// Whether this job still has an active context in the pool.
     pub fn has_job(&self, job_id: &str) -> bool {
         self.job_contexts.lock().contains_key(job_id)
+    }
+}
+
+async fn await_worker_shutdown(mut handles: Vec<JoinHandle<()>>, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    for handle in &mut handles {
+        if tokio::time::timeout_at(deadline, &mut *handle)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    for handle in handles {
+        if !handle.is_finished() {
+            handle.abort();
+        }
     }
 }
 
@@ -2931,6 +2945,20 @@ mod tests {
             Arc::new(ConnectionTracker::new()),
             0,
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_shutdown_uses_one_shared_deadline() {
+        let handles = (0..3)
+            .map(|_| tokio::spawn(std::future::pending()))
+            .collect();
+        let shutdown = tokio::spawn(await_worker_shutdown(handles, Duration::from_secs(10)));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        shutdown.await.unwrap();
     }
 
     fn test_job(job_id: &str, root: &std::path::Path) -> NzbJob {
