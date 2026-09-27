@@ -214,7 +214,7 @@ pub(super) fn article_availability_digest(message_ids: &[String]) -> String {
         digest.update((message_id.len() as u64).to_be_bytes());
         digest.update(message_id.as_bytes());
     }
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 pub(super) fn clear_search_predicate_digest(patterns: &[String]) -> String {
@@ -224,7 +224,7 @@ pub(super) fn clear_search_predicate_digest(patterns: &[String]) -> String {
         digest.update((pattern.len() as u64).to_be_bytes());
         digest.update(pattern.as_bytes());
     }
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 pub(super) fn now_unix_ms() -> Result<u64, &'static str> {

@@ -137,7 +137,7 @@ pub(crate) async fn h_article_head(
             "nntp_head_byte_limit_exceeded",
         ));
     }
-    let digest = format!("{:x}", Sha256::digest(&headers));
+    let digest = hex::encode(Sha256::digest(&headers));
     Ok(Json(json!({
         "status": "complete",
         "operation": "article_head",
@@ -177,7 +177,7 @@ fn digest_parts<'a>(prefix: &[u8], parts: impl IntoIterator<Item = &'a [u8]>) ->
         digest.update((part.len() as u64).to_be_bytes());
         digest.update(part);
     }
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 fn format_digest(format: &OverviewFormat) -> String {

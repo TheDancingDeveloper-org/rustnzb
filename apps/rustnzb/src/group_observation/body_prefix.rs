@@ -60,8 +60,8 @@ pub(crate) async fn h_article_body_prefix(
     };
     let _ = connection.quit().await;
     let decoded = decode_payload_prefix(&prefix.data, prefix.complete, input.max_payload_bytes);
-    let wire_sha256 = format!("{:x}", Sha256::digest(&prefix.data));
-    let payload_sha256 = format!("{:x}", Sha256::digest(&decoded.bytes));
+    let wire_sha256 = hex::encode(Sha256::digest(&prefix.data));
+    let payload_sha256 = hex::encode(Sha256::digest(&decoded.bytes));
     Ok(Json(json!({
         "status": "complete",
         "operation": "article_body_prefix",
