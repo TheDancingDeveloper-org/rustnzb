@@ -1,9 +1,10 @@
 import '@angular/compiler';
 
+import { signal } from '@angular/core';
 import { Subject, of } from 'rxjs';
 import { describe, expect, it, vi } from 'vitest';
 
-import { App, isDemoPath } from './app';
+import { App, isBareRoute, isDemoPath } from './app';
 import { AddNzbService } from './core/services/add-nzb.service';
 import { PauseStateService } from './core/services/pause-state.service';
 
@@ -13,10 +14,14 @@ function makeApp(postResult = new Subject<unknown>()) {
     post: vi.fn(() => postResult.asObservable()),
   };
   const auth = {
-    isLoggedIn: vi.fn(() => false),
+    authenticated: signal(false),
     logout: vi.fn(() => of({})),
   };
-  const router = { url: '/downloads', navigate: vi.fn(() => Promise.resolve(true)) };
+  const router = {
+    url: '/downloads',
+    events: new Subject<unknown>(),
+    navigate: vi.fn(() => Promise.resolve(true)),
+  };
   const pauseState = new PauseStateService();
   const app = new App(
     api as never,
@@ -62,5 +67,19 @@ describe('demo path detection', () => {
     expect(isDemoPath('/')).toBe(false);
     expect(isDemoPath('/downloads')).toBe(false);
     expect(isDemoPath('/demonstration')).toBe(false);
+  });
+});
+
+describe('bare route detection', () => {
+  it('keeps login and welcome full-screen', () => {
+    expect(isBareRoute('/login')).toBe(true);
+    expect(isBareRoute('/welcome')).toBe(true);
+    expect(isBareRoute('/login?returnUrl=%2Fsettings')).toBe(true);
+  });
+
+  it('shows chrome on application pages', () => {
+    expect(isBareRoute('/downloads')).toBe(false);
+    expect(isBareRoute('/settings')).toBe(false);
+    expect(isBareRoute('/welcomes')).toBe(false);
   });
 });

@@ -1,8 +1,8 @@
 import '@angular/compiler';
 
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { of } from 'rxjs';
+import { Subject, firstValueFrom, of, throwError } from 'rxjs';
 
 import { AuthService, TokenResponse } from './auth.service';
 
@@ -73,5 +73,69 @@ describe('AuthService', () => {
     expect(service.isLoggedIn()).toBe(false);
     localStorage.setItem('access_token', 'access');
     expect(service.isLoggedIn()).toBe(true);
+  });
+
+  it('shares one in-flight refresh between concurrent callers', () => {
+    const response = new Subject<TokenResponse>();
+    http.post.mockReturnValue(response);
+    localStorage.setItem('refresh_token', 'old-refresh');
+
+    const received: string[] = [];
+    service.refresh().subscribe((t) => received.push(t.access_token));
+    service.refresh().subscribe((t) => received.push(t.access_token));
+    response.next(TOKENS);
+    response.complete();
+
+    expect(http.post).toHaveBeenCalledTimes(1);
+    expect(received).toEqual(['access-1', 'access-1']);
+  });
+
+  it('does not treat a stored token as authenticated until the server confirms it', async () => {
+    localStorage.setItem('access_token', 'stored');
+    service = new AuthService(http as unknown as HttpClient);
+    expect(service.authenticated()).toBe(false);
+
+    await expect(firstValueFrom(service.ensureSession())).resolves.toBe(true);
+
+    expect(http.get).toHaveBeenCalledWith('/api/status');
+    expect(service.authenticated()).toBe(true);
+  });
+
+  it('clears a stored token the server rejects', async () => {
+    localStorage.setItem('access_token', 'stale');
+    localStorage.setItem('refresh_token', 'stale-refresh');
+    service = new AuthService(http as unknown as HttpClient);
+    http.get.mockReturnValue(throwError(() => new HttpErrorResponse({ status: 401 })));
+
+    await expect(firstValueFrom(service.ensureSession())).resolves.toBe(false);
+
+    expect(service.isLoggedIn()).toBe(false);
+    expect(service.authenticated()).toBe(false);
+    expect(localStorage.getItem('refresh_token')).toBeNull();
+  });
+
+  it('refreshes up front instead of probing with a known-expired token', async () => {
+    localStorage.setItem('access_token', 'expired');
+    localStorage.setItem('refresh_token', 'old-refresh');
+    localStorage.setItem('access_token_expires_at', String(Date.now() - 1000));
+    service = new AuthService(http as unknown as HttpClient);
+
+    await expect(firstValueFrom(service.ensureSession())).resolves.toBe(true);
+
+    expect(http.get).not.toHaveBeenCalled();
+    expect(http.post).toHaveBeenCalledWith('/api/auth/refresh', { refresh_token: 'old-refresh' });
+    expect(service.getAccessToken()).toBe('access-1');
+  });
+
+  it('reports no session without contacting the server when no token is stored', async () => {
+    await expect(firstValueFrom(service.ensureSession())).resolves.toBe(false);
+    expect(http.get).not.toHaveBeenCalled();
+  });
+
+  it('marks the session authenticated immediately after login', () => {
+    service.login('alice', 'secret').subscribe();
+    expect(service.authenticated()).toBe(true);
+    service.clearTokens();
+    expect(service.authenticated()).toBe(false);
   });
 });
