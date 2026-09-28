@@ -150,12 +150,19 @@ export class LoginComponent implements OnInit {
   ) {}
 
   ngOnInit(): void {
-    // If already logged in, go to downloads
-    if (this.authService.isLoggedIn()) {
-      this.router.navigate(['/downloads']);
-      return;
-    }
+    // Only a session the server accepts skips the form. A stale stored token
+    // is cleared here; redirecting on it would bounce straight back to this
+    // already-active route and leave the form stuck on "Checking status...".
+    this.authService.ensureSession().subscribe((ok) => {
+      if (ok) {
+        this.router.navigate(['/downloads']);
+      } else {
+        this.loadAuthStatus();
+      }
+    });
+  }
 
+  private loadAuthStatus(): void {
     this.authService.checkAuth().subscribe({
       next: (status) => {
         if (!status.auth_enabled && !status.setup_required) {

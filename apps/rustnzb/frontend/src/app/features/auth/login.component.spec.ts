@@ -16,7 +16,7 @@ const TOKENS: TokenResponse = {
 
 describe('LoginComponent', () => {
   let auth: {
-    isLoggedIn: ReturnType<typeof vi.fn>;
+    ensureSession: ReturnType<typeof vi.fn>;
     checkAuth: ReturnType<typeof vi.fn>;
     setup: ReturnType<typeof vi.fn>;
     login: ReturnType<typeof vi.fn>;
@@ -26,7 +26,7 @@ describe('LoginComponent', () => {
 
   beforeEach(() => {
     auth = {
-      isLoggedIn: vi.fn(() => false),
+      ensureSession: vi.fn(() => of(false)),
       checkAuth: vi.fn(() => of({ auth_enabled: true, setup_required: false })),
       setup: vi.fn(() => of(TOKENS)),
       login: vi.fn(() => of(TOKENS)),
@@ -38,8 +38,8 @@ describe('LoginComponent', () => {
     );
   });
 
-  it('redirects an existing session without checking server auth state', () => {
-    auth.isLoggedIn.mockReturnValue(true);
+  it('redirects a server-confirmed session without checking server auth state', () => {
+    auth.ensureSession.mockReturnValue(of(true));
     component.ngOnInit();
     expect(router.navigate).toHaveBeenCalledWith(['/downloads']);
     expect(auth.checkAuth).not.toHaveBeenCalled();

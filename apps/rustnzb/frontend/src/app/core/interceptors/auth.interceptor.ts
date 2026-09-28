@@ -1,10 +1,12 @@
-import { HttpInterceptorFn, HttpErrorResponse } from '@angular/common/http';
+import { HttpInterceptorFn, HttpErrorResponse, HttpRequest } from '@angular/common/http';
 import { inject } from '@angular/core';
 import { Router } from '@angular/router';
 import { catchError, switchMap, throwError } from 'rxjs';
 import { AuthService } from '../services/auth.service';
 
-let isRefreshing = false;
+function withToken<T>(req: HttpRequest<T>, token: string): HttpRequest<T> {
+  return req.clone({ setHeaders: { Authorization: `Bearer ${token}` } });
+}
 
 export const authInterceptor: HttpInterceptorFn = (req, next) => {
   // Don't intercept auth endpoints
@@ -15,29 +17,34 @@ export const authInterceptor: HttpInterceptorFn = (req, next) => {
   const authService = inject(AuthService);
   const router = inject(Router);
 
+  const token = authService.getAccessToken();
+  if (token && !req.headers.has('Authorization')) {
+    req = withToken(req, token);
+  }
+
   return next(req).pipe(
     catchError((error: HttpErrorResponse) => {
-      if (error.status === 401 && !isRefreshing) {
-        isRefreshing = true;
-
-        return authService.refresh().pipe(
-          switchMap((tokens) => {
-            isRefreshing = false;
-            const cloned = req.clone({
-              setHeaders: { Authorization: `Bearer ${tokens.access_token}` },
-            });
-            return next(cloned);
-          }),
-          catchError((refreshError) => {
-            isRefreshing = false;
-            authService.clearTokens();
-            router.navigate(['/login']);
-            return throwError(() => refreshError);
-          }),
-        );
+      if (error.status !== 401) {
+        return throwError(() => error);
       }
 
-      return throwError(() => error);
+      // Tokens already rotated while this request was in flight: retry with
+      // the current one rather than spending another single-use refresh token.
+      const current = authService.getAccessToken();
+      if (current && req.headers.get('Authorization') !== `Bearer ${current}`) {
+        return next(withToken(req, current));
+      }
+
+      // Every concurrent 401 waits on the same refresh and then retries, so
+      // parallel page loads all recover instead of only the first request.
+      return authService.refresh().pipe(
+        catchError((refreshError) => {
+          authService.clearTokens();
+          router.navigate(['/login']);
+          return throwError(() => refreshError);
+        }),
+        switchMap((tokens) => next(withToken(req, tokens.access_token))),
+      );
     }),
   );
 };

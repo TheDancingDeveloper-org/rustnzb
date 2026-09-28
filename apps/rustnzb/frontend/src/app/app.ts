@@ -3,13 +3,16 @@ import {
   ElementRef,
   OnInit,
   OnDestroy,
+  Signal,
   ViewChild,
+  computed,
   signal,
   WritableSignal,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { Router, RouterModule } from '@angular/router';
+import { NavigationEnd, Router, RouterModule } from '@angular/router';
+import { filter } from 'rxjs';
 import { ApiService } from './core/services/api.service';
 import { AuthService } from './core/services/auth.service';
 import { StatusResponse } from './core/models/queue.model';
@@ -23,13 +26,19 @@ export function isDemoPath(pathname: string): boolean {
   return pathname === '/demo' || pathname.startsWith('/demo/');
 }
 
+// Pages that render full-screen, without the app chrome, even when signed in.
+export function isBareRoute(url: string): boolean {
+  const path = url.split(/[?#]/)[0];
+  return path === '/login' || path === '/welcome';
+}
+
 @Component({
   selector: 'app-root',
   standalone: true,
   imports: [CommonModule, FormsModule, RouterModule, IconComponent],
   template: `
-    @if (!authenticated()) {
-      <!-- Full-screen login (no chrome) -->
+    @if (!showChrome()) {
+      <!-- Full-screen login / welcome (no chrome) -->
       <router-outlet />
     } @else {
       <div class="shell">
@@ -411,7 +420,12 @@ export class App implements OnInit, OnDestroy {
   queueCount = signal(0);
   diskFree = signal(0);
   webdavEnabled = signal(false);
-  authenticated = signal(false);
+  readonly authenticated: Signal<boolean>;
+  private readonly currentUrl = signal('');
+  // Keyed on the route as well as the session: swapping branches rebuilds the
+  // router outlet, and doing that under /login mid-submit would re-run the
+  // login page's redirect and race the navigation to /welcome.
+  readonly showChrome = computed(() => this.authenticated() && !isBareRoute(this.currentUrl()));
   pauseMenuOpen = false;
   customPauseMin: number | null = null;
   @ViewChild('pauseCaretBtn') pauseCaretBtn?: ElementRef<HTMLButtonElement>;
@@ -439,10 +453,14 @@ export class App implements OnInit, OnDestroy {
     pauseState: PauseStateService,
   ) {
     this.paused = pauseState.paused;
+    this.authenticated = authService.authenticated;
+    this.currentUrl.set(router.url);
+    router.events
+      .pipe(filter((e): e is NavigationEnd => e instanceof NavigationEnd))
+      .subscribe((e) => this.currentUrl.set(e.urlAfterRedirects));
   }
 
   ngOnInit(): void {
-    this.authenticated.set(this.authService.isLoggedIn());
     this.pollStatus();
     this.pollTimer = setInterval(() => this.pollStatus(), 2000);
     document.addEventListener('click', this.docClickHandler);
@@ -454,7 +472,6 @@ export class App implements OnInit, OnDestroy {
   }
 
   pollStatus(): void {
-    this.authenticated.set(this.authService.isLoggedIn());
     if (!this.authenticated()) return;
     this.api.get<StatusResponse>('/status').subscribe({
       next: (s) => {
@@ -470,7 +487,6 @@ export class App implements OnInit, OnDestroy {
   }
 
   onLogout(): void {
-    this.authenticated.set(false);
     this.authService.logout().subscribe({
       complete: () => this.router.navigate(['/login']),
       error: () => this.router.navigate(['/login']),
