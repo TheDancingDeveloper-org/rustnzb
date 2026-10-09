@@ -307,7 +307,7 @@ pub async fn h_queue_list(
         .take(limit)
         .map(|job| QueueJob {
             pause_reason: qm.pause_reason(&job.id),
-            job,
+            job: mask_job_password(job),
         })
         .collect();
 
@@ -318,6 +318,20 @@ pub async fn h_queue_list(
         paused,
         pause_reason,
     }))
+}
+
+/// Replace a job's archive password with [`PASSWORD_MASK`] (or `""` when it
+/// has none) for the native API, as server passwords are masked in config
+/// responses. The SABnzbd layer keeps the real value: its queue slot
+/// contract includes `password`. No native endpoint accepts a job password
+/// back, so the mask can never be stored in place of the real one.
+fn mask_job_password(mut job: NzbJob) -> NzbJob {
+    job.password = Some(if job.password.is_some_and(|pw| !pw.is_empty()) {
+        PASSWORD_MASK.to_string()
+    } else {
+        String::new()
+    });
+    job
 }
 
 /// One part of a `POST /api/queue/add` multipart body.
