@@ -468,6 +468,22 @@ fn fetch_policy(state: &AppState) -> FetchPolicy {
 
 /// Reject an RSS feed whose URL the fetch guard would refuse, so a blocked
 /// feed is reported when it is saved instead of failing on every poll.
+/// Reject a feed whose poll interval would hammer the indexer (and, at 0,
+/// spin the RSS monitor).
+fn validate_feed_poll_interval(feed: &RssFeedConfig) -> Result<(), ApiError> {
+    let min = nzb_web::rss_monitor::MIN_POLL_INTERVAL_SECS;
+    if feed.poll_interval_secs < min {
+        return Err(ApiError::from((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "poll_interval_secs must be at least {min} (got {})",
+                feed.poll_interval_secs
+            ),
+        )));
+    }
+    Ok(())
+}
+
 async fn validate_feed_url(state: &AppState, url: &str) -> Result<(), ApiError> {
     check_fetch_url_allowed(url, &fetch_policy(state))
         .await
@@ -1344,6 +1360,7 @@ pub async fn h_rss_feed_add(
     State(state): State<Arc<AppState>>,
     Json(feed): Json<RssFeedConfig>,
 ) -> Result<impl IntoResponse, ApiError> {
+    validate_feed_poll_interval(&feed)?;
     validate_feed_url(&state, &feed.url).await?;
     state.update_config_with(|config| {
         if config.rss_feeds.iter().any(|f| f.name == feed.name) {
@@ -1364,6 +1381,7 @@ pub async fn h_rss_feed_update(
     Path(name): Path<String>,
     Json(feed): Json<RssFeedConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_feed_poll_interval(&feed)?;
     validate_feed_url(&state, &feed.url).await?;
     state.update_config_with(|config| {
         let idx = config

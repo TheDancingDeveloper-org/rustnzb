@@ -461,6 +461,58 @@ async fn rss_feed_url_is_validated_when_saved() {
     );
 }
 
+#[tokio::test]
+async fn rss_feed_poll_interval_below_floor_is_rejected_when_saved() {
+    let app = start_app(false).await;
+    let client = reqwest::Client::new();
+    let access = setup_access(&app, &client).await;
+    let feed = |secs: u64| serde_json::json!({"name":"tight", "url":"https://example.test/feed", "poll_interval_secs": secs, "enabled": true});
+
+    for secs in [0, 1, 59] {
+        let rejected = client
+            .post(format!("{}/api/config/rss-feeds", app.base_url))
+            .bearer_auth(&access)
+            .json(&feed(secs))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{secs}s"
+        );
+        assert!(
+            rejected
+                .text()
+                .await
+                .unwrap()
+                .contains("poll_interval_secs")
+        );
+    }
+    assert!(app.state.config().rss_feeds.is_empty());
+
+    assert_eq!(
+        client
+            .post(format!("{}/api/config/rss-feeds", app.base_url))
+            .bearer_auth(&access)
+            .json(&feed(60))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let rejected = client
+        .put(format!("{}/api/config/rss-feeds/tight", app.base_url))
+        .bearer_auth(&access)
+        .json(&feed(0))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(app.state.config().rss_feeds[0].poll_interval_secs, 60);
+}
+
 async fn login(app: &ContractApp, client: &reqwest::Client) -> (String, String) {
     let tokens = client
         .post(format!("{}/api/auth/login", app.base_url))

@@ -439,6 +439,16 @@ impl RssMonitor {
 /// of RSS item history maintenance.
 const IDLE_INTERVAL: Duration = Duration::from_secs(900);
 
+/// Smallest accepted `poll_interval_secs`. The API rejects anything lower,
+/// and the monitor clamps lower values from existing or hand-edited configs
+/// so a `0` interval cannot spin the loop against the indexer.
+pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
+
+/// A feed's poll interval with [`MIN_POLL_INTERVAL_SECS`] applied.
+fn effective_poll_interval(feed: &RssFeedConfig) -> Duration {
+    Duration::from_secs(feed.poll_interval_secs.max(MIN_POLL_INTERVAL_SECS))
+}
+
 /// When each enabled feed was last checked, keyed by feed name.
 ///
 /// A feed's next due time is derived from its *current* `poll_interval_secs`
@@ -448,23 +458,47 @@ const IDLE_INTERVAL: Duration = Duration::from_secs(900);
 #[derive(Debug, Default)]
 struct FeedSchedule {
     last_checked: HashMap<String, (String, Instant)>,
+    /// Feeds already warned about for an interval below the floor.
+    clamped: HashSet<String>,
 }
 
 impl FeedSchedule {
-    /// Drop entries for feeds that are gone, disabled, or now point elsewhere.
-    fn sync(&mut self, feeds: &[RssFeedConfig]) {
+    /// Drop entries for feeds that are gone, disabled, or now point elsewhere,
+    /// and warn (once per feed) about intervals below the floor. Returns the
+    /// names newly warned about.
+    fn sync(&mut self, feeds: &[RssFeedConfig]) -> Vec<String> {
         self.last_checked.retain(|name, (url, _)| {
             feeds
                 .iter()
                 .any(|f| f.enabled && &f.name == name && &f.url == url)
         });
+
+        let too_fast: HashSet<&str> = feeds
+            .iter()
+            .filter(|f| f.enabled && f.poll_interval_secs < MIN_POLL_INTERVAL_SECS)
+            .map(|f| f.name.as_str())
+            .collect();
+        self.clamped.retain(|name| too_fast.contains(name.as_str()));
+        let mut warned = Vec::new();
+        for feed in feeds {
+            if too_fast.contains(feed.name.as_str()) && self.clamped.insert(feed.name.clone()) {
+                warn!(
+                    feed = %feed.name,
+                    poll_interval_secs = feed.poll_interval_secs,
+                    min_secs = MIN_POLL_INTERVAL_SECS,
+                    "RSS feed poll interval is below the minimum; using the minimum"
+                );
+                warned.push(feed.name.clone());
+            }
+        }
+        warned
     }
 
     fn due_at(&self, feed: &RssFeedConfig) -> Option<Instant> {
         self.last_checked.get(&feed.name).map(|(_, at)| {
             // An absurd interval must not overflow `Instant`; a year out
             // is effectively "never" for a poller.
-            at.checked_add(Duration::from_secs(feed.poll_interval_secs))
+            at.checked_add(effective_poll_interval(feed))
                 .unwrap_or(*at + Duration::from_secs(365 * 86_400))
         })
     }
@@ -692,14 +726,14 @@ mod tests {
         // Shortening the interval takes effect without waiting out the old 600 s.
         state
             .update_config_with(|config| {
-                config.rss_feeds[0].poll_interval_secs = 30;
+                config.rss_feeds[0].poll_interval_secs = 60;
                 Ok::<_, anyhow::Error>(())
             })
             .expect("edit feed");
         let refetched_at = requests.recv().await.expect("feed was re-fetched");
         let gap = refetched_at - fetched_at;
         assert!(
-            gap < std::time::Duration::from_secs(60),
+            gap < std::time::Duration::from_secs(120),
             "edited interval took {gap:?} to apply"
         );
 
@@ -767,9 +801,9 @@ mod tests {
         schedule.mark_checked(&feed, t0);
         assert_eq!(schedule.due_at(&feed), Some(t0 + Duration::from_secs(900)));
 
-        feed.poll_interval_secs = 15;
+        feed.poll_interval_secs = 120;
         schedule.sync(std::slice::from_ref(&feed));
-        assert_eq!(schedule.due_at(&feed), Some(t0 + Duration::from_secs(15)));
+        assert_eq!(schedule.due_at(&feed), Some(t0 + Duration::from_secs(120)));
 
         feed.poll_interval_secs = u64::MAX;
         assert!(
@@ -813,6 +847,37 @@ mod tests {
         assert!(
             schedule.is_due(&toggled, t0),
             "a re-enabled feed is checked at once"
+        );
+    }
+
+    #[test]
+    fn schedule_clamps_intervals_below_the_floor_and_warns_once_per_feed() {
+        let t0 = Instant::now();
+        let mut zero = schedule_feed("zero", "https://example.test/zero", 0);
+        let tiny = schedule_feed("tiny", "https://example.test/tiny", 5);
+        let ok = schedule_feed("ok", "https://example.test/ok", MIN_POLL_INTERVAL_SECS);
+        let mut schedule = FeedSchedule::default();
+
+        let feeds = vec![zero.clone(), tiny.clone(), ok.clone()];
+        let mut warned = schedule.sync(&feeds);
+        warned.sort();
+        assert_eq!(warned, vec!["tiny".to_string(), "zero".to_string()]);
+        assert!(schedule.sync(&feeds).is_empty(), "warns only once per feed");
+
+        let floor = Duration::from_secs(MIN_POLL_INTERVAL_SECS);
+        for feed in [&zero, &tiny, &ok] {
+            schedule.mark_checked(feed, t0);
+            assert_eq!(schedule.due_at(feed), Some(t0 + floor), "{}", feed.name);
+            assert!(!schedule.is_due(feed, t0), "{} must not spin", feed.name);
+        }
+
+        // Fixing the interval and then breaking it again warns afresh.
+        zero.poll_interval_secs = 900;
+        assert!(schedule.sync(std::slice::from_ref(&zero)).is_empty());
+        zero.poll_interval_secs = 0;
+        assert_eq!(
+            schedule.sync(std::slice::from_ref(&zero)),
+            vec!["zero".to_string()]
         );
     }
 }
