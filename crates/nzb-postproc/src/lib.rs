@@ -26,4 +26,4 @@ pub use pipeline::{
     run_pipeline_with_resources,
 };
 pub use resources::{PostProcLimits, PostProcResourcePool, PostProcResourceSnapshot};
-pub use unpack::{extract_tar, find_unrar};
+pub use unpack::{extract_tar, find_unrar, normalize_extracted_permissions};
