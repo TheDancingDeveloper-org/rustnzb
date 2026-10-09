@@ -185,6 +185,11 @@ pub struct NzbJob {
     /// Per-server download statistics
     #[serde(default)]
     pub server_stats: Vec<ServerArticleStats>,
+    /// Per-job post-processing level overriding the category's (0=none,
+    /// 1=repair, 2=unpack, 3=repair+unpack), e.g. SABnzbd's `pp` parameter.
+    /// `None` uses the category setting.
+    #[serde(default)]
+    pub pp_override: Option<u8>,
     /// Files in this job
     #[serde(skip)]
     pub files: Vec<NzbFile>,

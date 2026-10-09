@@ -283,6 +283,7 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
         password: meta_password,
         error_message: None,
         speed_bps: 0,
+        pp_override: None,
         server_stats: Vec::new(),
         files,
     })

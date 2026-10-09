@@ -51,6 +51,10 @@ pub struct SabApiRequest {
     pub del_files: Option<String>,
     /// Job name override for `addfile`/`addurl` (SABnzbd `nzbname`).
     pub nzbname: Option<String>,
+    /// Post-processing override for `addfile`/`addurl` (SABnzbd `pp`, 0-3).
+    /// SABnzbd's `script` parameter is accepted and ignored (unknown query
+    /// fields are not rejected); RustNZB has no per-job scripts.
+    pub pp: Option<String>,
 }
 
 /// Validate API key. Returns Err with JSON response on failure.
@@ -136,6 +140,7 @@ pub async fn h_sabnzbd_api_get(
             req.cat.clone(),
             req.priority.clone(),
             req.password.clone(),
+            req.pp.clone(),
         )
         .await;
     }
@@ -154,6 +159,7 @@ async fn handle_addurl(
     cat: Option<String>,
     priority: Option<String>,
     password: Option<String>,
+    pp: Option<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let url = url.unwrap_or_default();
 
@@ -232,6 +238,7 @@ async fn handle_addurl(
             if let Some(ref pw) = password {
                 job.password = Some(pw.clone());
             }
+            job.pp_override = sab_pp_override(pp.as_deref());
 
             let qm = &state.queue_manager;
             job.work_dir = qm.incomplete_dir().join(&job.id);
@@ -453,6 +460,9 @@ pub async fn h_sabnzbd_api_post(
             if form.nzbname.is_some() {
                 query_req.nzbname = form.nzbname;
             }
+            if form.pp.is_some() {
+                query_req.pp = form.pp;
+            }
         }
         SabPostBody::Multipart => {
             let mut multipart = Multipart::from_request(request, &()).await.map_err(|e| {
@@ -469,6 +479,7 @@ pub async fn h_sabnzbd_api_post(
                 &mut nzb_url,
                 &mut password,
                 &mut query_req.nzbname,
+                &mut query_req.pp,
             )
             .await?;
         }
@@ -502,6 +513,7 @@ async fn read_multipart_fields(
     nzb_url: &mut Option<String>,
     password: &mut Option<String>,
     nzbname: &mut Option<String>,
+    pp: &mut Option<String>,
 ) -> Result<(), ApiError> {
     while let Some(field) = multipart
         .next_field()
@@ -578,6 +590,11 @@ async fn read_multipart_fields(
                     *nzbname = Some(text);
                 }
             }
+            "pp" => {
+                if let Ok(text) = field.text().await {
+                    *pp = Some(text);
+                }
+            }
             _ => {
                 let _ = field.bytes().await;
             }
@@ -588,7 +605,8 @@ async fn read_multipart_fields(
 
 /// Dispatch a POST request once its parameters have been assembled from the
 /// query string and (optional) body. `query_req.nzbname` carries the merged
-/// `nzbname` job-name override.
+/// `nzbname` job-name override and `query_req.pp` the merged `pp`
+/// post-processing override.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_post(
     state: &AppState,
@@ -640,6 +658,7 @@ async fn dispatch_post(
                     if let Some(ref pw) = password {
                         job.password = Some(pw.clone());
                     }
+                    job.pp_override = sab_pp_override(query_req.pp.as_deref());
 
                     let qm = &state.queue_manager;
                     job.work_dir = qm.incomplete_dir().join(&job.id);
@@ -702,7 +721,16 @@ async fn dispatch_post(
         "addurl" => {
             // `value`/`url` (or `name`) is the URL to fetch, not a job name.
             let url = nzb_url.or_else(|| name.clone());
-            handle_addurl(state, url, query_req.nzbname, cat, priority, password).await
+            handle_addurl(
+                state,
+                url,
+                query_req.nzbname,
+                cat,
+                priority,
+                password,
+                query_req.pp,
+            )
+            .await
         }
 
         _ => {
@@ -731,6 +759,7 @@ async fn dispatch_post(
                 password,
                 del_files: query_req.del_files,
                 nzbname: query_req.nzbname,
+                pp: query_req.pp,
             };
             Ok(dispatch_mode(
                 state,
@@ -2126,6 +2155,21 @@ fn parse_sab_units(value: &str) -> Option<f64> {
         .map(|amount| amount * multiplier)
 }
 
+/// Map SABnzbd's `pp` add parameter onto RustNZB's post-processing level.
+/// SABnzbd's scale is cumulative (0=download only, 1=+repair,
+/// 2=+repair/unpack, 3=+repair/unpack/delete); RustNZB's is 0=none,
+/// 1=repair, 2=unpack only, 3=repair+unpack, with source cleanup governed
+/// separately. So SABnzbd 2 and 3 both map to 3. Anything else (absent,
+/// `-1`/default, out of range) leaves the category's setting in force.
+fn sab_pp_override(pp: Option<&str>) -> Option<u8> {
+    match pp?.trim().parse::<i32>().ok()? {
+        0 => Some(0),
+        1 => Some(1),
+        2 | 3 => Some(3),
+        _ => None,
+    }
+}
+
 /// Convert arr-protocol priority string to our Priority enum.
 fn sab_priority_to_priority(s: &str) -> Priority {
     match s.trim() {
@@ -2569,6 +2613,7 @@ mod tests {
             password: Some("secret".into()),
             error_message: None,
             speed_bps: 0,
+            pp_override: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }
@@ -2629,6 +2674,7 @@ mod tests {
             password: None,
             error_message: None,
             speed_bps: 0,
+            pp_override: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }
@@ -3053,6 +3099,7 @@ mod tests {
             password: None,
             error_message: None,
             speed_bps: 0,
+            pp_override: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         };
@@ -3181,6 +3228,7 @@ mod tests {
             password: None,
             error_message: None,
             speed_bps: 0,
+            pp_override: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         };
@@ -3212,6 +3260,7 @@ mod tests {
             password: None,
             error_message: None,
             speed_bps: 0,
+            pp_override: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         };
@@ -3869,6 +3918,75 @@ mod tests {
         assert_eq!(format_sab_age(3599), "59m");
         assert_eq!(format_sab_age(3600), "1h");
         assert_eq!(format_sab_age(2 * 86_400 + 5), "2d");
+    }
+
+    /// Run a multipart `mode=addfile` with `query` as the query string and
+    /// `fields` as extra text fields, returning the queued job.
+    async fn addfile_multipart(query: SabApiRequest, fields: &[(&str, &str)]) -> NzbJob {
+        let TestState { state, _tempdir } = test_state();
+        let state = Arc::new(state);
+        let boundary = "sabboundary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"mode\"\r\n\r\naddfile\r\n"
+        );
+        for (name, value) in fields {
+            body.push_str(&format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        body.push_str(&format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"upload.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n{SAMPLE_NZB}\r\n--{boundary}--\r\n"
+        ));
+        let query = SabApiRequest {
+            apikey: Some("contract-api-key".into()),
+            ..query
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/sabnzbd/api")
+            .header(
+                CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .expect("build request");
+        let response = h_sabnzbd_api_post(State(state.clone()), Query(query), request)
+            .await
+            .expect("addfile over multipart")
+            .into_response();
+        let value = json_body(response).await;
+        assert_eq!(value["status"], serde_json::json!(true), "resp={value}");
+        let mut jobs = state.queue_manager.get_jobs();
+        assert_eq!(jobs.len(), 1);
+        jobs.remove(0)
+    }
+
+    /// SABnzbd's `pp` (0-3) overrides the category's post-processing for
+    /// the added job; `script` is accepted and ignored.
+    #[tokio::test]
+    async fn addfile_applies_pp_override_and_ignores_script() {
+        let from_query = addfile_multipart(
+            SabApiRequest {
+                pp: Some("1".into()),
+                ..SabApiRequest::default()
+            },
+            &[("script", "Notify.py")],
+        )
+        .await;
+        assert_eq!(from_query.pp_override, Some(1));
+
+        let from_field = addfile_multipart(SabApiRequest::default(), &[("pp", "0")]).await;
+        assert_eq!(from_field.pp_override, Some(0));
+
+        // SABnzbd's cumulative 2 (+repair/unpack) is RustNZB's 3.
+        let repair_unpack = addfile_multipart(SabApiRequest::default(), &[("pp", "2")]).await;
+        assert_eq!(repair_unpack.pp_override, Some(3));
+
+        let invalid = addfile_multipart(SabApiRequest::default(), &[("pp", "7")]).await;
+        assert_eq!(invalid.pp_override, None);
+
+        let absent = addfile_multipart(SabApiRequest::default(), &[]).await;
+        assert_eq!(absent.pp_override, None);
     }
 
     /// SABnzbd's real `_api_queue_delete` accepts a comma-separated `value`
