@@ -3406,6 +3406,7 @@ mod tests {
             password: None,
             error_message: None,
             speed_bps: 0,
+            pp_override: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }

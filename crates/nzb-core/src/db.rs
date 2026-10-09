@@ -384,6 +384,27 @@ impl Database {
             )?;
         }
 
+        if version < 13 {
+            info!("Applying database migration v13: per-job post-processing override");
+            // Partial schemas (as built by migration tests) may lack the
+            // queue table; only add the column where the table exists.
+            let has_queue: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'queue'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_queue > 0 {
+                self.conn
+                    .execute_batch("ALTER TABLE queue ADD COLUMN pp_override INTEGER;")?;
+            }
+            self.conn.execute_batch(
+                "
+                DELETE FROM schema_version;
+                INSERT INTO schema_version (version) VALUES (13);
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -449,9 +470,9 @@ impl Database {
             "INSERT INTO queue (id, name, category, status, priority, total_bytes,
              downloaded_bytes, file_count, files_completed, article_count,
              articles_downloaded, articles_failed, added_at, work_dir, output_dir, password,
-             nzb_raw)
+             nzb_raw, pp_override)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-             ?16, ?17)",
+             ?16, ?17, ?18)",
             params![
                 job.id,
                 job.name,
@@ -470,6 +491,7 @@ impl Database {
                 job.output_dir.to_string_lossy().to_string(),
                 job.password,
                 nzb_data,
+                job.pp_override,
             ],
         )?;
 
@@ -577,8 +599,10 @@ impl Database {
         self.conn.execute(
             "INSERT INTO queue (id, name, category, status, priority, total_bytes,
              downloaded_bytes, file_count, files_completed, article_count,
-             articles_downloaded, articles_failed, added_at, work_dir, output_dir, password)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             articles_downloaded, articles_failed, added_at, work_dir, output_dir, password,
+             pp_override)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+             ?17)",
             params![
                 job.id,
                 job.name,
@@ -596,6 +620,7 @@ impl Database {
                 job.work_dir.to_string_lossy().to_string(),
                 job.output_dir.to_string_lossy().to_string(),
                 job.password,
+                job.pp_override,
             ],
         )?;
         Ok(())
@@ -660,7 +685,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, priority, total_bytes, downloaded_bytes,
              file_count, files_completed, article_count, articles_downloaded, articles_failed,
-             added_at, completed_at, work_dir, output_dir, password, error_message
+             added_at, completed_at, work_dir, output_dir, password, error_message, pp_override
              FROM queue ORDER BY priority DESC, added_at ASC",
         )?;
 
@@ -688,6 +713,7 @@ impl Database {
                     password: row.get(16)?,
                     error_message: row.get(17)?,
                     speed_bps: 0,
+                    pp_override: row.get(18)?,
                     server_stats: Vec::new(),
                     files: Vec::new(), // Loaded separately
                 })
@@ -1340,9 +1366,25 @@ mod tests {
             password: None,
             error_message: None,
             speed_bps: 0,
+            pp_override: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn queue_round_trips_post_processing_override() {
+        let db = Database::open_memory().unwrap();
+        let mut overridden = make_job("pp-job", "PP Job");
+        overridden.pp_override = Some(1);
+        db.queue_insert(&overridden).unwrap();
+        db.queue_insert(&make_job("plain-job", "Plain Job"))
+            .unwrap();
+
+        let jobs = db.queue_list().unwrap();
+        let pp = |id: &str| jobs.iter().find(|job| job.id == id).unwrap().pp_override;
+        assert_eq!(pp("pp-job"), Some(1));
+        assert_eq!(pp("plain-job"), None);
     }
 
     fn make_history(id: &str, name: &str) -> HistoryEntry {

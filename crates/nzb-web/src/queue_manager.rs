@@ -1119,6 +1119,19 @@ impl QueueManager {
     }
 
     /// Update category configs (e.g. after config reload).
+    /// Post-processing level for a job: its own override (e.g. SABnzbd's
+    /// `pp`), else its category's setting, else repair+unpack (3).
+    pub fn post_processing_level(&self, job: &NzbJob) -> u8 {
+        job.pp_override.unwrap_or_else(|| {
+            self.categories
+                .lock()
+                .iter()
+                .find(|c| c.name == job.category)
+                .map(|c| c.post_processing)
+                .unwrap_or(3) // default: repair+unpack
+        })
+    }
+
     pub fn set_categories(&self, categories: Vec<CategoryConfig>) {
         *self.categories.lock() = categories;
     }
@@ -2339,13 +2352,7 @@ impl QueueManager {
             }
 
             let cat = state.job.category.clone();
-            let pp = self
-                .categories
-                .lock()
-                .iter()
-                .find(|c| c.name == cat)
-                .map(|c| c.post_processing)
-                .unwrap_or(3); // default: repair+unpack
+            let pp = self.post_processing_level(&state.job);
             let du = state.direct_unpacker.take();
             let pw = state.job.password.clone();
             let content_failed = state
@@ -4505,9 +4512,28 @@ mod global_pause_tests {
             password: None,
             error_message: None,
             speed_bps: 0,
+            pp_override: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn post_processing_level_prefers_the_job_override() {
+        let (manager, tempdir) = manager();
+        manager.set_categories(vec![CategoryConfig {
+            post_processing: 2,
+            ..CategoryConfig::default()
+        }]);
+        let mut job = job("pp-level", JobStatus::Queued, tempdir.path());
+        assert_eq!(manager.post_processing_level(&job), 2);
+
+        job.pp_override = Some(0);
+        assert_eq!(manager.post_processing_level(&job), 0);
+
+        job.pp_override = None;
+        job.category = "unconfigured".into();
+        assert_eq!(manager.post_processing_level(&job), 3);
     }
 
     fn manager() -> (Arc<QueueManager>, tempfile::TempDir) {
