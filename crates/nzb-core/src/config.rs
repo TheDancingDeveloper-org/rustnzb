@@ -329,7 +329,8 @@ pub struct RssFeedConfig {
     pub name: String,
     /// Feed URL (RSS 2.0 or Atom)
     pub url: String,
-    /// How often to poll, in seconds (default 900 = 15 minutes)
+    /// How often to poll, in seconds (default 900 = 15 minutes, minimum 60;
+    /// lower values are rejected by the API and clamped by the RSS monitor)
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
     /// Category to assign to downloaded NZBs
