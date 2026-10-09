@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -18,12 +19,17 @@ const REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60); // 3
 
 struct TokenEntry {
     expires_at: Instant,
+    /// Login session the token belongs to. Every access and refresh token
+    /// issued from one login (including refresh rotations) shares it, so
+    /// logout can revoke the whole session.
+    session: u64,
 }
 
 #[derive(Default)]
 pub struct TokenStore {
     access_tokens: RwLock<HashMap<String, TokenEntry>>,
     refresh_tokens: RwLock<HashMap<String, TokenEntry>>,
+    next_session: AtomicU64,
 }
 
 #[derive(Serialize)]
@@ -45,9 +51,10 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct LogoutRequest {
-    pub refresh_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
 }
 
 fn generate_token() -> String {
@@ -60,10 +67,17 @@ impl TokenStore {
         Self {
             access_tokens: RwLock::new(HashMap::new()),
             refresh_tokens: RwLock::new(HashMap::new()),
+            next_session: AtomicU64::new(0),
         }
     }
 
+    /// Issue tokens for a new login session.
     pub fn create_tokens(&self) -> TokenResponse {
+        let session = self.next_session.fetch_add(1, Ordering::Relaxed);
+        self.issue_tokens(session)
+    }
+
+    fn issue_tokens(&self, session: u64) -> TokenResponse {
         let access_token = generate_token();
         let refresh_token = generate_token();
         let now = Instant::now();
@@ -72,12 +86,14 @@ impl TokenStore {
             access_token.clone(),
             TokenEntry {
                 expires_at: now + ACCESS_TOKEN_TTL,
+                session,
             },
         );
         self.refresh_tokens.write().insert(
             refresh_token.clone(),
             TokenEntry {
                 expires_at: now + REFRESH_TOKEN_TTL,
+                session,
             },
         );
 
@@ -97,25 +113,50 @@ impl TokenStore {
     }
 
     pub fn refresh(&self, refresh_token: &str) -> Option<TokenResponse> {
-        let valid = {
-            let tokens = self.refresh_tokens.read();
-            tokens
-                .get(refresh_token)
-                .is_some_and(|entry| entry.expires_at > Instant::now())
+        // Remove the old refresh token (rotation) under the same lock that
+        // checks it, so it can be redeemed only once.
+        let session = {
+            let mut tokens = self.refresh_tokens.write();
+            let entry = tokens.remove(refresh_token)?;
+            if entry.expires_at <= Instant::now() {
+                return None;
+            }
+            entry.session
         };
 
-        if !valid {
-            return None;
-        }
-
-        // Revoke the old refresh token (rotation)
-        self.refresh_tokens.write().remove(refresh_token);
-
-        Some(self.create_tokens())
+        Some(self.issue_tokens(session))
     }
 
     pub fn revoke_refresh_token(&self, refresh_token: &str) {
         self.refresh_tokens.write().remove(refresh_token);
+    }
+
+    /// End the login session that `token` (an access or refresh token)
+    /// belongs to: every access and refresh token issued for that session,
+    /// including earlier rotations, stops working.
+    pub fn revoke_session_of(&self, token: &str) {
+        let session = self
+            .access_tokens
+            .read()
+            .get(token)
+            .map(|entry| entry.session)
+            .or_else(|| {
+                self.refresh_tokens
+                    .read()
+                    .get(token)
+                    .map(|entry| entry.session)
+            });
+        // Always drop the presented token itself, even if it is unknown.
+        self.access_tokens.write().remove(token);
+        self.refresh_tokens.write().remove(token);
+        if let Some(session) = session {
+            self.access_tokens
+                .write()
+                .retain(|_, entry| entry.session != session);
+            self.refresh_tokens
+                .write()
+                .retain(|_, entry| entry.session != session);
+        }
     }
 
     /// Revoke every session after credentials change.
@@ -425,11 +466,25 @@ pub async fn h_auth_refresh(
 
 // --- Logout ---
 
+/// Revoke the caller's session: the refresh token in the body and the
+/// access token in the `Authorization: Bearer` header (if any), together
+/// with every other token issued for the same login.
 pub async fn h_auth_logout(
     State(state): State<ApiState>,
-    Json(req): Json<LogoutRequest>,
+    headers: http::HeaderMap,
+    req: Option<Json<LogoutRequest>>,
 ) -> impl IntoResponse {
-    state.token_store.revoke_refresh_token(&req.refresh_token);
+    let req = req.map(|Json(req)| req).unwrap_or_default();
+    if let Some(refresh_token) = req.refresh_token.as_deref() {
+        state.token_store.revoke_session_of(refresh_token);
+    }
+    if let Some(access_token) = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+    {
+        state.token_store.revoke_session_of(access_token);
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -452,6 +507,34 @@ mod tests {
 
         store.revoke_refresh_token(&second.refresh_token);
         assert!(store.refresh(&second.refresh_token).is_none());
+    }
+
+    #[test]
+    fn revoking_a_session_revokes_its_access_tokens_and_rotations() {
+        let store = TokenStore::new();
+        let first = store.create_tokens();
+        let rotated = store.refresh(&first.refresh_token).unwrap();
+        let other = store.create_tokens();
+
+        store.revoke_session_of(&rotated.refresh_token);
+
+        assert!(!store.validate_access_token(&first.access_token));
+        assert!(!store.validate_access_token(&rotated.access_token));
+        assert!(store.refresh(&rotated.refresh_token).is_none());
+        // Another login is unaffected.
+        assert!(store.validate_access_token(&other.access_token));
+        assert!(store.refresh(&other.refresh_token).is_some());
+    }
+
+    #[test]
+    fn revoking_by_access_token_ends_the_session() {
+        let store = TokenStore::new();
+        let tokens = store.create_tokens();
+        store.revoke_session_of(&tokens.access_token);
+        assert!(!store.validate_access_token(&tokens.access_token));
+        assert!(store.refresh(&tokens.refresh_token).is_none());
+        // Unknown tokens are a no-op.
+        store.revoke_session_of("not-a-token");
     }
 
     #[test]
