@@ -248,7 +248,7 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
 
     Ok(NzbJob {
         id: uuid::Uuid::new_v4().to_string(),
-        name: name.nfc().collect(),
+        name: crate::path::sanitize_job_name(name),
         category: "Default".into(),
         status: JobStatus::Queued,
         priority: Priority::Normal,
@@ -873,6 +873,29 @@ mod tests {
         let job = parse_nzb("caf\u{0065}\u{0301}", nzb_data).unwrap();
         // Job name should be NFC
         assert_eq!(job.name, "caf\u{00E9}");
+    }
+
+    #[test]
+    fn test_parse_nzb_sanitizes_job_name() {
+        let nzb_data = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p@x.com" date="100" subject="test.rar (1/1)">
+    <groups><group>alt.test</group></groups>
+    <segments>
+      <segment number="1" bytes="100">s@x</segment>
+    </segments>
+  </file>
+</nzb>"#;
+
+        for (input, expected) in [
+            ("a:b*c?d", "a-b_c_d"),
+            (".", "unnamed"),
+            ("Trailing.Dot.", "Trailing.Dot"),
+            (" padded ", "padded"),
+            ("CON", "_CON"),
+        ] {
+            assert_eq!(parse_nzb(input, nzb_data).unwrap().name, expected);
+        }
     }
 
     #[test]

@@ -3195,20 +3195,20 @@ impl QueueManager {
     }
 
     /// Rename a job in the queue.
+    ///
+    /// The new name is sanitized the same way as names taken from uploaded
+    /// NZB filenames (see [`crate::nzb_core::path::sanitize_job_name`]), so
+    /// `Show: Part 1` is stored as `Show - Part 1` rather than rejected.
     pub fn rename_job(&self, id: &str, new_name: &str) -> crate::nzb_core::Result<()> {
+        let new_name = crate::nzb_core::path::sanitize_job_name(new_name);
         let mut jobs = self.jobs.lock();
         let state = jobs
             .iter_mut()
             .find(|(_, s)| s.job.id == id || s.job.id.starts_with(id));
         match state {
             Some((_, s)) => {
-                crate::nzb_core::path::safe_component(new_name).ok_or_else(|| {
-                    crate::nzb_core::NzbError::Other(
-                        "job name must be a single safe path component".to_string(),
-                    )
-                })?;
-                let output_dir = self.output_dir_for(&s.job.category, new_name)?;
-                s.job.name = new_name.to_string();
+                let output_dir = self.output_dir_for(&s.job.category, &new_name)?;
+                s.job.name = new_name.clone();
                 s.job.output_dir = output_dir;
                 info!(job_id = %id, new_name = %new_name, "Job renamed");
                 Ok(())
@@ -4467,6 +4467,34 @@ mod global_pause_tests {
             },
         );
         manager.job_order.lock().push(id);
+    }
+
+    #[tokio::test]
+    async fn rename_job_sanitizes_instead_of_rejecting() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("renamed", JobStatus::Queued, tempdir.path()));
+
+        for (input, expected) in [
+            ("Star Trek: Discovery", "Star Trek - Discovery"),
+            ("a:b*c?d", "a-b_c_d"),
+            ("..", "unnamed"),
+            ("../escape", "_escape"),
+            ("Trailing.Dot.", "Trailing.Dot"),
+            ("CON", "_CON"),
+        ] {
+            manager.rename_job("renamed", input).expect(input);
+            let job = manager.get_job("renamed").unwrap();
+            assert_eq!(job.name, expected, "{input}");
+            assert_eq!(
+                job.output_dir,
+                tempdir
+                    .path()
+                    .join("complete")
+                    .join("Default")
+                    .join(expected),
+                "{input}"
+            );
+        }
     }
 
     #[tokio::test]
