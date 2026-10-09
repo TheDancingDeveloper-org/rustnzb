@@ -239,7 +239,7 @@ async fn handle_addurl(
                 }
             };
 
-            let nzo_id = format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())]);
+            let nzo_id = format!("SABnzbd_nzo_{}", sab_id_prefix(&job.id));
             let job_name = job.name.clone();
             let job_id = job.id.clone();
             let file_count = job.file_count;
@@ -547,7 +547,7 @@ async fn dispatch_post(
                         }
                     };
 
-                    let nzo_id = format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())]);
+                    let nzo_id = format!("SABnzbd_nzo_{}", sab_id_prefix(&job.id));
                     let job_name = job.name.clone();
                     let job_id = job.id.clone();
                     let file_count = job.file_count;
@@ -1347,14 +1347,12 @@ fn history_slot_matches(slot: &SabHistorySlot, req: &SabApiRequest) -> bool {
     req.nzo_ids.as_deref().is_none_or(|ids| {
         ids.is_empty()
             || ids.split(',').map(str::trim).any(|id| {
-                id == slot.nzo_id
-                    || slot
-                        .nzo_id
-                        .strip_prefix("SABnzbd_nzo_")
-                        .is_some_and(|raw| raw == id)
-                    || id
-                        .strip_prefix("SABnzbd_nzo_")
-                        .is_some_and(|raw| !raw.is_empty() && slot.nzo_id.ends_with(raw))
+                let raw = slot
+                    .nzo_id
+                    .strip_prefix("SABnzbd_nzo_")
+                    .unwrap_or(&slot.nzo_id);
+                let query = id.strip_prefix("SABnzbd_nzo_").unwrap_or(id);
+                id == slot.nzo_id || job_id_matches(raw, query)
             })
     })
 }
@@ -1391,13 +1389,14 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
     let del_files = req.del_files.as_deref().is_some_and(sab_query_bool);
 
     if target.eq_ignore_ascii_case("all") {
-        if del_files {
-            for entry in qm.history_list(i64::MAX as usize).unwrap_or_default() {
-                let _ = std::fs::remove_dir_all(&entry.output_dir);
-            }
-        }
+        let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
         return match qm.history_clear() {
-            Ok(()) => Json(serde_json::json!({ "status": true })),
+            Ok(()) => {
+                if del_files {
+                    delete_history_files(qm, &entries, &[]);
+                }
+                Json(serde_json::json!({ "status": true }))
+            }
             Err(error) => Json(serde_json::json!({
                 "status": false,
                 "error": error.to_string()
@@ -1415,43 +1414,109 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
         None
     };
     if let Some(status) = status_filter {
-        for entry in qm
-            .history_list(i64::MAX as usize)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|entry| entry.status == status)
-        {
-            if del_files {
-                let _ = std::fs::remove_dir_all(&entry.output_dir);
-            }
+        let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
+        let (removed, kept): (Vec<_>, Vec<_>) = entries
+            .iter()
+            .cloned()
+            .partition(|entry| entry.status == status);
+        let mut removed_ok = Vec::new();
+        for entry in &removed {
             if let Err(error) = qm.history_remove(&entry.id) {
+                if del_files {
+                    delete_history_files(qm, &removed_ok, &kept);
+                }
                 return Json(serde_json::json!({
                     "status": false,
                     "error": error.to_string()
                 }));
             }
+            removed_ok.push(entry.clone());
+        }
+        if del_files {
+            delete_history_files(qm, &removed, &kept);
         }
         return Json(serde_json::json!({ "status": true }));
     }
 
     let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
-    let mut removed_ids: Vec<String> = Vec::new();
+    let mut removed = Vec::new();
     for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
         let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
         if let Some(entry) = entries
             .iter()
             .find(|entry| job_id_matches(&entry.id, search_id))
+            && qm.history_remove(&entry.id).is_ok()
         {
-            if del_files {
-                let _ = std::fs::remove_dir_all(&entry.output_dir);
-            }
-            let _ = qm.history_remove(&entry.id);
             tracing::info!(id = %entry.id, "Entry removed from history via arr API (mode=history)");
-            removed_ids.push(entry.id.clone());
+            removed.push(entry.clone());
         }
+    }
+    let removed_ids: Vec<String> = removed.iter().map(|entry| entry.id.clone()).collect();
+    let kept: Vec<_> = entries
+        .iter()
+        .filter(|entry| !removed_ids.contains(&entry.id))
+        .cloned()
+        .collect();
+    if del_files {
+        delete_history_files(qm, &removed, &kept);
     }
 
     Json(serde_json::json!({ "status": !removed_ids.is_empty() }))
+}
+
+/// Remove the output directories of `removed`, but never a directory that a
+/// surviving history entry or a queued job still uses, and never a path that
+/// is not strictly inside the complete directory or a category directory.
+fn delete_history_files(
+    qm: &crate::queue_manager::QueueManager,
+    removed: &[crate::nzb_core::models::HistoryEntry],
+    kept: &[crate::nzb_core::models::HistoryEntry],
+) {
+    let mut protected: Vec<std::path::PathBuf> = kept
+        .iter()
+        .map(|entry| entry.output_dir.clone())
+        .chain(qm.get_jobs().into_iter().map(|job| job.output_dir))
+        .collect();
+    for entry in removed {
+        if !history_output_dir_is_deletable(qm, &entry.output_dir, &protected) {
+            tracing::warn!(
+                dir = %entry.output_dir.display(),
+                "Skipping history file deletion: directory is shared or outside the download roots"
+            );
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&entry.output_dir) {
+            tracing::warn!(dir = %entry.output_dir.display(), %error, "History file deletion failed");
+        }
+        protected.push(entry.output_dir.clone());
+    }
+}
+
+fn history_output_dir_is_deletable(
+    qm: &crate::queue_manager::QueueManager,
+    dir: &std::path::Path,
+    protected: &[std::path::PathBuf],
+) -> bool {
+    if dir.as_os_str().is_empty() || protected.iter().any(|used| used == dir) {
+        return false;
+    }
+    let Ok(canonical) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    let mut roots = vec![qm.complete_dir()];
+    for category in qm.categories() {
+        if let Some(root) = category.output_dir {
+            roots.push(if root.is_absolute() {
+                root
+            } else {
+                qm.complete_dir().join(root)
+            });
+        }
+    }
+    roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .is_ok_and(|root| canonical.starts_with(&root) && canonical != root)
+    })
 }
 
 fn handle_get_config(state: &AppState) -> Json<serde_json::Value> {
@@ -1644,7 +1709,7 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         }
     };
 
-    let nzo_id = format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())]);
+    let nzo_id = format!("SABnzbd_nzo_{}", sab_id_prefix(&job.id));
     if let Err(error) = state.queue_manager.add_job(job, Some(data)) {
         return Json(serde_json::json!({ "status": false, "error": error.to_string() }));
     }
@@ -2054,7 +2119,7 @@ impl SabQueueSlot {
 }
 
 fn queue_nzo_id(job: &NzbJob) -> String {
-    format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())])
+    format!("SABnzbd_nzo_{}", sab_id_prefix(&job.id))
 }
 
 fn remaining_bytes(job: &NzbJob) -> u64 {
@@ -2243,8 +2308,17 @@ fn sab_nzo_id(id: &str) -> String {
     if id.starts_with("SABnzbd_nzo_") {
         id.to_string()
     } else {
-        format!("SABnzbd_nzo_{}", &id[..12.min(id.len())])
+        format!("SABnzbd_nzo_{}", sab_id_prefix(id))
     }
+}
+
+/// The first 12 bytes of an id, without splitting a multibyte character.
+fn sab_id_prefix(id: &str) -> &str {
+    let mut end = 12.min(id.len());
+    while !id.is_char_boundary(end) {
+        end -= 1;
+    }
+    &id[..end]
 }
 
 /// Format bytes to human-readable size string.
@@ -3749,6 +3823,7 @@ mod tests {
             .config()
             .general
             .complete_dir
+            .join("tv")
             .join("del-files-job");
         std::fs::create_dir_all(&output_dir).expect("create fixture output dir");
         std::fs::write(output_dir.join("file.mkv"), b"data").expect("write fixture file");
@@ -3784,6 +3859,72 @@ mod tests {
             .collect();
         ids.sort();
         ids
+    }
+
+    /// A Failed entry and a Completed entry (a retry of the same release) share
+    /// one output directory. Clearing failed history with `del_files=1` must
+    /// not remove the completed payload.
+    #[tokio::test]
+    async fn history_delete_failed_keeps_directory_shared_with_completed_entry() {
+        let test_state = test_state();
+        let shared = test_state
+            .state
+            .config()
+            .general
+            .complete_dir
+            .join("tv")
+            .join("same-release");
+        std::fs::create_dir_all(&shared).expect("create shared output dir");
+        std::fs::write(shared.join("file.mkv"), b"payload").expect("write payload");
+
+        let mut failed = history_entry("job-failed", "same-release", "tv", JobStatus::Failed, 2);
+        failed.output_dir = shared.clone();
+        let mut completed =
+            history_entry("job-done", "same-release", "tv", JobStatus::Completed, 1);
+        completed.output_dir = shared.clone();
+        test_state.state.queue_manager.with_db(|database| {
+            database.history_insert(&failed).expect("insert failed");
+            database
+                .history_insert(&completed)
+                .expect("insert completed");
+        });
+
+        let response = handle_history_delete(
+            &test_state.state,
+            &SabApiRequest {
+                value: Some("failed".into()),
+                del_files: Some("1".into()),
+                ..SabApiRequest::default()
+            },
+        )
+        .0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert!(
+            shared.join("file.mkv").is_file(),
+            "completed payload survives"
+        );
+        assert_eq!(history_ids(&test_state), vec!["job-done".to_string()]);
+    }
+
+    /// `mode=config&name=set_pause` with a value past chrono's range must clamp
+    /// instead of panicking, and still pause.
+    #[tokio::test]
+    async fn config_set_pause_clamps_huge_duration() {
+        let test_state = test_state();
+        let response = dispatch_mode(
+            &test_state.state,
+            "config",
+            &config_request("set_pause", &u64::MAX.to_string()),
+        )
+        .0;
+        assert_eq!(response, serde_json::json!({ "status": true }));
+        let qm = &test_state.state.queue_manager;
+        assert!(qm.is_paused());
+        let remaining = qm.pause_remaining_secs().expect("timed pause");
+        assert!(
+            (364 * 86_400..365 * 86_400).contains(&remaining),
+            "remaining={remaining}"
+        );
     }
 
     /// SABnzbd's `_api_history_delete` accepts `value=failed` and
