@@ -6,10 +6,10 @@ import { MatButtonModule } from '@angular/material/button';
 import { MatIconModule } from '@angular/material/icon';
 import { MatProgressBarModule } from '@angular/material/progress-bar';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
-import { HttpErrorResponse } from '@angular/common/http';
 import { GroupService } from '../../core/services/group.service';
 import { GroupRow } from '../../core/models/group.model';
 import { IconComponent } from '../../shared/icon.component';
+import { showHttpError } from '../../core/http/http-error';
 
 @Component({
   selector: 'app-group-browser-dialog',
@@ -100,12 +100,9 @@ export class GroupBrowserDialogComponent implements OnInit {
     this.refreshing.set(true);
     this.svc.refresh().subscribe({
       next: r => { this.refreshing.set(false); this.snack.open(r.message, 'Close', { duration: 3000 }); this.loadGroups(); },
-      error: (e: HttpErrorResponse) => {
+      error: (e) => {
         this.refreshing.set(false);
-        const msg = e.status === 400
-          ? (e.error?.human_readable || 'No servers configured — add one in Settings first.')
-          : 'Refresh failed';
-        this.snack.open(msg, 'Close', { duration: 5000 });
+        showHttpError(this.snack, e, 'Refresh failed');
       },
     });
   }
@@ -132,11 +129,11 @@ export class GroupBrowserDialogComponent implements OnInit {
         );
         clearPending();
       },
-      error: () => {
-        this.snack.open(
+      error: (err) => {
+        showHttpError(
+          this.snack,
+          err,
           `Failed to ${wasSubscribed ? 'unsubscribe from' : 'subscribe to'} ${g.name}`,
-          'Close',
-          { duration: 4000 },
         );
         clearPending();
       },

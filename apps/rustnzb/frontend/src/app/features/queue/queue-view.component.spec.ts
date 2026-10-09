@@ -1,5 +1,6 @@
 import '@angular/compiler';
 
+import { HttpErrorResponse } from '@angular/common/http';
 import { Observable, of, Subject, throwError } from 'rxjs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { convertToParamMap, ParamMap } from '@angular/router';
@@ -236,14 +237,26 @@ describe('QueueViewComponent', () => {
 
   it('reloads queue and shows feedback after a failed row action', () => {
     const { component, snackBar } = makeComponent({
-      delete: vi.fn(() => throwError(() => new Error('Delete failed'))),
+      delete: vi.fn(() =>
+        throwError(
+          () =>
+            new HttpErrorResponse({
+              status: 409,
+              error: { error_kind: 'conflict', human_readable: 'Job is post-processing', status: 409 },
+            }),
+        ),
+      ),
     });
     const loadQueue = vi.spyOn(component, 'loadQueue').mockImplementation(() => {});
 
     component.deleteJob(makeJob({ id: 'job-1' }));
 
     expect(loadQueue).toHaveBeenCalledTimes(1);
-    expect(snackBar.open).toHaveBeenCalledWith('Delete failed', 'Close', { duration: 4000 });
+    expect(snackBar.open).toHaveBeenCalledWith(
+      'Failed to remove job: Job is post-processing',
+      'Close',
+      { duration: 5000 },
+    );
   });
 
   it('reorders jobs before the target row', () => {
@@ -317,5 +330,39 @@ describe('QueueViewComponent', () => {
     component.toggleHistory();
     expect(component.historyCollapsed()).toBe(false);
     expect(localStorage.getItem(component.HISTORY_KEY)).toBe('false');
+  });
+
+  it('reports bulk action failures once with the server message', () => {
+    const notFound = new HttpErrorResponse({
+      status: 404,
+      error: { error_kind: 'job_not_found', human_readable: 'Job not found: job-2', status: 404 },
+    });
+    const { component, snackBar } = makeComponent({
+      post: vi.fn((path: string) => (path.includes('job-2') ? throwError(() => notFound) : of({}))),
+    });
+    const loadQueue = vi.spyOn(component, 'loadQueue').mockImplementation(() => {});
+    component.selectedIds.set(new Set(['job-1', 'job-2']));
+
+    component.bulkPause();
+
+    expect(snackBar.open).toHaveBeenCalledTimes(1);
+    expect(snackBar.open).toHaveBeenCalledWith(
+      'Failed to pause 1 of 2 job(s): Job not found: job-2',
+      'Close',
+      { duration: 5000 },
+    );
+    expect(loadQueue).toHaveBeenCalledTimes(1);
+    expect(component.selectedIds().size).toBe(0);
+  });
+
+  it('does not toast a 401 that the auth interceptor is handling', () => {
+    const { component, snackBar } = makeComponent({
+      post: vi.fn(() => throwError(() => new HttpErrorResponse({ status: 401 }))),
+    });
+    vi.spyOn(component, 'loadQueue').mockImplementation(() => {});
+
+    component.pauseJob('job-1');
+
+    expect(snackBar.open).not.toHaveBeenCalled();
   });
 });

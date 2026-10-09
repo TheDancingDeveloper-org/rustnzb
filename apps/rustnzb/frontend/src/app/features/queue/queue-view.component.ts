@@ -4,7 +4,7 @@ import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router, RouterModule } from '@angular/router';
 import { HttpClient } from '@angular/common/http';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
-import { Observable, Subscription, finalize } from 'rxjs';
+import { Observable, Subscription, catchError, finalize, forkJoin, map, of } from 'rxjs';
 import { ApiService } from '../../core/services/api.service';
 import { AddNzbService } from '../../core/services/add-nzb.service';
 import { PauseStateService } from '../../core/services/pause-state.service';
@@ -12,6 +12,7 @@ import { NzbJob, QueueResponse, StatusResponse } from '../../core/models/queue.m
 import { HistoryViewComponent } from '../history/history-view.component';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
+import { isAuthHandledError, showHttpError } from '../../core/http/http-error';
 
 interface CategoryConfig {
   name: string;
@@ -1441,12 +1442,9 @@ export class QueueViewComponent implements OnInit, OnDestroy {
         this.loadQueue();
       },
       error: (err) => {
-        const msg =
-          err.error?.message ||
-          (err.status === 413 ? 'Upload too large' : err.statusText) ||
-          'Upload failed';
-        this.snackBar.open('Failed: ' + msg, 'Close', { duration: 5000 });
         this.uploading = false;
+        const fallback = err?.status === 413 ? 'Upload too large' : 'Upload failed';
+        showHttpError(this.snackBar, err, fallback);
       },
     });
   }
@@ -1465,10 +1463,9 @@ export class QueueViewComponent implements OnInit, OnDestroy {
         this.showAddPanel = false;
         this.loadQueue();
       },
-      error: (err: any) => {
-        const msg = err.error?.message || err.statusText || 'Failed';
-        this.snackBar.open('Failed: ' + msg, 'Close', { duration: 5000 });
+      error: (err) => {
         this.uploading = false;
+        showHttpError(this.snackBar, err, 'Failed to add NZB from URL');
       },
     });
   }
@@ -1483,6 +1480,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     id: string,
     actionFactory: () => Observable<unknown>,
     successMessage?: string,
+    failureMessage = 'Action failed',
   ): void {
     if (this.isActionPending(id)) return;
 
@@ -1505,16 +1503,20 @@ export class QueueViewComponent implements OnInit, OnDestroy {
           }
           this.loadQueue();
         },
-        error: (err: any) => {
-          const msg = err?.error?.message || err?.message || 'Action failed. Please try again.';
-          this.snackBar.open(msg, 'Close', { duration: 4000 });
+        error: (err) => {
+          showHttpError(this.snackBar, err, failureMessage);
           this.loadQueue();
         },
       });
   }
 
   pauseJob(id: string): void {
-    this.withPendingJobAction(id, () => this.api.post(`/queue/${id}/pause`), 'Job paused');
+    this.withPendingJobAction(
+      id,
+      () => this.api.post(`/queue/${id}/pause`),
+      'Job paused',
+      'Failed to pause job',
+    );
   }
 
   resumeJob(id: string): void {
@@ -1522,13 +1524,21 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     // a misleading request/toast if stale DOM or keyboard input fires while
     // the global pause state is active.
     if (this.paused()) return;
-    this.withPendingJobAction(id, () => this.api.post(`/queue/${id}/resume`), 'Job resumed');
+    this.withPendingJobAction(
+      id,
+      () => this.api.post(`/queue/${id}/resume`),
+      'Job resumed',
+      'Failed to resume job',
+    );
   }
 
   setPriority(job: NzbJob, priority: number): void {
     this.api.put(`/queue/${job.id}/priority`, { priority }).subscribe({
       next: () => this.loadQueue(),
-      error: () => {},
+      error: (err) => {
+        showHttpError(this.snackBar, err, 'Failed to change priority');
+        this.loadQueue();
+      },
     });
   }
 
@@ -1545,7 +1555,12 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       })
       .subscribe((ok) => {
         if (!ok) return;
-        this.withPendingJobAction(job.id, () => this.api.delete(`/queue/${job.id}`));
+        this.withPendingJobAction(
+          job.id,
+          () => this.api.delete(`/queue/${job.id}`),
+          undefined,
+          'Failed to remove job',
+        );
       });
   }
 
@@ -1609,12 +1624,10 @@ export class QueueViewComponent implements OnInit, OnDestroy {
         this.reorderPending.set(false);
         this.loadQueue();
       },
-      error: (err: any) => {
+      error: (err) => {
         this.reorderPending.set(false);
         this.jobs.set(previousJobs);
-        const msg =
-          err?.error?.message || err?.message || 'Unable to reorder queue. Please try again.';
-        this.snackBar.open(msg, 'Close', { duration: 4000 });
+        showHttpError(this.snackBar, err, 'Unable to reorder queue');
       },
     });
   }
@@ -1668,17 +1681,50 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       this.clearSelection();
     }
   }
-  bulkResume(): void {
-    Array.from(this.selectedIds()).forEach((id) =>
-      this.api.post(`/queue/${id}/resume`).subscribe(),
-    );
+
+  /**
+   * Run one request per selected job and report failures once, with the
+   * first server message, instead of silently dropping them.
+   */
+  private runBulk(
+    ids: string[],
+    request: (id: string) => Observable<unknown>,
+    verb: string,
+  ): void {
     this.clearSelection();
-    setTimeout(() => this.loadQueue(), 300);
+    if (ids.length === 0) return;
+    forkJoin(
+      ids.map((id) =>
+        request(id).pipe(
+          map(() => null),
+          catchError((err: unknown) => of(err)),
+        ),
+      ),
+    ).subscribe((results) => {
+      const failures = results.filter((r) => r !== null && !isAuthHandledError(r));
+      if (failures.length > 0) {
+        showHttpError(
+          this.snackBar,
+          failures[0],
+          `Failed to ${verb} ${failures.length} of ${ids.length} job(s)`,
+        );
+      }
+      this.loadQueue();
+    });
+  }
+  bulkResume(): void {
+    this.runBulk(
+      Array.from(this.selectedIds()),
+      (id) => this.api.post(`/queue/${id}/resume`),
+      'resume',
+    );
   }
   bulkPause(): void {
-    Array.from(this.selectedIds()).forEach((id) => this.api.post(`/queue/${id}/pause`).subscribe());
-    this.clearSelection();
-    setTimeout(() => this.loadQueue(), 300);
+    this.runBulk(
+      Array.from(this.selectedIds()),
+      (id) => this.api.post(`/queue/${id}/pause`),
+      'pause',
+    );
   }
   bulkDelete(): void {
     const ids = Array.from(this.selectedIds());
@@ -1692,9 +1738,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       })
       .subscribe((ok) => {
         if (!ok) return;
-        ids.forEach((id) => this.api.delete(`/queue/${id}`).subscribe());
-        this.clearSelection();
-        setTimeout(() => this.loadQueue(), 300);
+        this.runBulk(ids, (id) => this.api.delete(`/queue/${id}`), 'remove');
       });
   }
 

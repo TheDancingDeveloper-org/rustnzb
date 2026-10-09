@@ -3,6 +3,7 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import { AuthService } from '../../core/services/auth.service';
+import { httpErrorDetail } from '../../core/http/http-error';
 
 @Component({
   selector: 'app-login',
@@ -210,10 +211,8 @@ export class LoginComponent implements OnInit {
           this.errorMessage.set('Invalid username or password.');
         } else if (err.status === 409) {
           this.errorMessage.set('An account already exists. Please sign in instead.');
-        } else if (err.error?.message) {
-          this.errorMessage.set(err.error.message);
         } else {
-          this.errorMessage.set('An error occurred. Please try again.');
+          this.errorMessage.set(httpErrorDetail(err) ?? 'An error occurred. Please try again.');
         }
       },
     });

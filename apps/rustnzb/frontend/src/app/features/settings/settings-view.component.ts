@@ -8,6 +8,7 @@ import { StatusResponse } from '../../core/models/queue.model';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
 import { AppTheme, ThemeService } from '../../core/services/theme.service';
+import { showHttpError } from '../../core/http/http-error';
 
 interface ServerConfig {
   id: string;
@@ -1524,7 +1525,7 @@ export class SettingsViewComponent implements OnInit {
           this.cancelServerEdit();
           this.loadServers();
         },
-        error: () => this.snack.open('Failed to update server', 'Close', { duration: 3000 }),
+        error: (err) => showHttpError(this.snack, err, 'Failed to update server'),
       });
     } else {
       server.id = '';
@@ -1534,7 +1535,7 @@ export class SettingsViewComponent implements OnInit {
           this.cancelServerEdit();
           this.loadServers();
         },
-        error: () => this.snack.open('Failed to add server', 'Close', { duration: 3000 }),
+        error: (err) => showHttpError(this.snack, err, 'Failed to add server'),
       });
     }
   }
@@ -1542,7 +1543,7 @@ export class SettingsViewComponent implements OnInit {
   testServer(id: string): void {
     this.api.post<{ success: boolean; message: string }>(`/config/servers/${id}/test`).subscribe({
       next: (r) => this.snack.open(r.message, 'Close', { duration: 3000 }),
-      error: () => this.snack.open('Test failed', 'Close', { duration: 3000 }),
+      error: (err) => showHttpError(this.snack, err, 'Test failed'),
     });
   }
 
@@ -1559,7 +1560,7 @@ export class SettingsViewComponent implements OnInit {
       .post<{ success: boolean; message: string }>(`/config/servers/test-config`, body)
       .subscribe({
         next: (r) => this.snack.open(r.message, 'Close', { duration: 4000 }),
-        error: () => this.snack.open('Test failed', 'Close', { duration: 3000 }),
+        error: (err) => showHttpError(this.snack, err, 'Test failed'),
       });
   }
 
@@ -1574,7 +1575,7 @@ export class SettingsViewComponent implements OnInit {
           duration: 2000,
         });
       },
-      error: () => this.snack.open('Failed to update server', 'Close', { duration: 3000 }),
+      error: (err) => showHttpError(this.snack, err, 'Failed to update server'),
     });
   }
 
@@ -1593,7 +1594,7 @@ export class SettingsViewComponent implements OnInit {
             this.loadServers();
             this.snack.open('Server removed', 'Close', { duration: 2000 });
           },
-          error: () => this.snack.open('Failed to delete server', 'Close', { duration: 3000 }),
+          error: (err) => showHttpError(this.snack, err, 'Failed to delete server'),
         });
       });
   }
@@ -1635,7 +1636,7 @@ export class SettingsViewComponent implements OnInit {
           this.cancelCategoryEdit();
           this.loadCategories();
         },
-        error: () => this.snack.open('Failed to update category', 'Close', { duration: 3000 }),
+        error: (err) => showHttpError(this.snack, err, 'Failed to update category'),
       });
     } else {
       this.api.post('/config/categories', cat).subscribe({
@@ -1644,7 +1645,7 @@ export class SettingsViewComponent implements OnInit {
           this.cancelCategoryEdit();
           this.loadCategories();
         },
-        error: () => this.snack.open('Failed to add category', 'Close', { duration: 3000 }),
+        error: (err) => showHttpError(this.snack, err, 'Failed to add category'),
       });
     }
   }
@@ -1665,7 +1666,7 @@ export class SettingsViewComponent implements OnInit {
             this.loadCategories();
             this.snack.open('Category removed', 'Close', { duration: 2000 });
           },
-          error: () => this.snack.open('Failed to delete category', 'Close', { duration: 3000 }),
+          error: (err) => showHttpError(this.snack, err, 'Failed to delete category'),
         });
       });
   }
@@ -1718,7 +1719,7 @@ export class SettingsViewComponent implements OnInit {
   loadSabApiKey(): void {
     this.api.get<SabApiKeyResponse>('/config/sabnzbd-api-key').subscribe({
       next: (response) => (this.sabApiKey = response.api_key),
-      error: () => this.snack.open('Failed to load SABnzbd API key', 'Close', { duration: 3000 }),
+      error: (err) => showHttpError(this.snack, err, 'Failed to load SABnzbd API key'),
     });
   }
 
@@ -1741,7 +1742,7 @@ export class SettingsViewComponent implements OnInit {
             this.showSabApiKey = true;
             this.snack.open(`SABnzbd API key ${action.toLowerCase()}d`, 'Close', { duration: 2500 });
           },
-          error: () => this.snack.open(`Failed to ${action.toLowerCase()} SABnzbd API key`, 'Close', { duration: 3000 }),
+          error: (err) => showHttpError(this.snack, err, `Failed to ${action.toLowerCase()} SABnzbd API key`),
         });
       });
   }
@@ -1754,14 +1755,14 @@ export class SettingsViewComponent implements OnInit {
       })
       .subscribe({
         next: () => this.snack.open('Disk guards saved', 'Close', { duration: 2000 }),
-        error: () => this.snack.open('Failed to save disk guards', 'Close', { duration: 3000 }),
+        error: (err) => showHttpError(this.snack, err, 'Failed to save disk guards'),
       });
   }
 
   saveSpeedLimit(): void {
     this.api.put('/config/speed-limit', { speed_limit_bps: this.speedLimit }).subscribe({
       next: () => this.snack.open('Speed limit saved', 'Close', { duration: 2000 }),
-      error: () => this.snack.open('Failed to save speed limit', 'Close', { duration: 3000 }),
+      error: (err) => showHttpError(this.snack, err, 'Failed to save speed limit'),
     });
   }
 
@@ -1770,14 +1771,14 @@ export class SettingsViewComponent implements OnInit {
       .put('/config/max-active-downloads', { max_active_downloads: this.maxActiveDownloads })
       .subscribe({
         next: () => this.snack.open('Max downloads saved', 'Close', { duration: 2000 }),
-        error: () => this.snack.open('Failed to save max downloads', 'Close', { duration: 3000 }),
+        error: (err) => showHttpError(this.snack, err, 'Failed to save max downloads'),
       });
   }
 
   saveRetention(): void {
     this.api.put('/config/history-retention', { retention: this.historyRetention }).subscribe({
       next: () => this.snack.open('History retention saved', 'Close', { duration: 2000 }),
-      error: () => this.snack.open('Failed to save retention', 'Close', { duration: 3000 }),
+      error: (err) => showHttpError(this.snack, err, 'Failed to save retention'),
     });
   }
 
@@ -1825,8 +1826,7 @@ export class SettingsViewComponent implements OnInit {
           'Close',
           { duration: 2500 },
         ),
-      error: () =>
-        this.snack.open('Failed to save Media Library settings', 'Close', { duration: 3000 }),
+      error: (err) => showHttpError(this.snack, err, 'Failed to save Media Library settings'),
     });
   }
 

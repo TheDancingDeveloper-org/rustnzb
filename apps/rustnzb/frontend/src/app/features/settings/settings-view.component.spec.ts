@@ -72,12 +72,29 @@ describe('SettingsViewComponent', () => {
     });
     component.speedLimit = 999;
     component.saveSpeedLimit();
-    expect(snack.open).toHaveBeenCalledWith('Failed to save speed limit', 'Close', { duration: 3000 });
+    expect(snack.open).toHaveBeenCalledWith('Failed to save speed limit', 'Close', { duration: 5000 });
 
     component.rotateSabApiKey();
     expect(confirm.confirm).toHaveBeenCalledWith(expect.objectContaining({ title: 'Generate SABnzbd API key?' }));
     expect(api.post).toHaveBeenCalledWith('/config/sabnzbd-api-key/rotate', {});
     expect(component.sabApiKey).toBe('rotated');
     expect(component.showSabApiKey).toBe(true);
+  });
+
+  it('shows the server explanation when a settings save is rejected', () => {
+    const { component, snack } = makeComponent({
+      put: vi.fn(() =>
+        throwError(() => ({
+          status: 400,
+          error: { error_kind: 'bad_request', human_readable: 'speed_limit_bps must be >= 0', status: 400 },
+        })),
+      ),
+    });
+    component.saveSpeedLimit();
+    expect(snack.open).toHaveBeenCalledWith(
+      'Failed to save speed limit: speed_limit_bps must be >= 0',
+      'Close',
+      { duration: 5000 },
+    );
   });
 });

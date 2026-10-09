@@ -3,6 +3,7 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import { ApiService } from '../../core/services/api.service';
+import { httpErrorDetail } from '../../core/http/http-error';
 
 type Step = 'landing' | 'connect' | 'preview' | 'applying';
 type ImportMethod = 'api' | 'ini';
@@ -468,7 +469,7 @@ export class WelcomeComponent implements OnInit {
         error: (err) => {
           this.fetching.set(false);
           this.connectError.set(
-            err.error?.message ?? err.error?.error ?? 'Failed to connect to SABnzbd. Check the URL and API key.'
+            httpErrorDetail(err) ?? 'Failed to connect to SABnzbd. Check the URL and API key.'
           );
         },
       });
@@ -492,7 +493,7 @@ export class WelcomeComponent implements OnInit {
         error: (err) => {
           this.fetching.set(false);
           this.connectError.set(
-            err.error?.message ?? err.error?.error ?? 'Failed to parse the ini file.'
+            httpErrorDetail(err) ?? 'Failed to parse the ini file.'
           );
         },
       });
@@ -535,7 +536,7 @@ export class WelcomeComponent implements OnInit {
       },
       error: (err) => {
         this.applyError.set(
-          err.error?.message ?? err.error?.error ?? 'Failed to apply settings.'
+          httpErrorDetail(err) ?? 'Failed to apply settings.'
         );
         this.step.set('preview');
       },
