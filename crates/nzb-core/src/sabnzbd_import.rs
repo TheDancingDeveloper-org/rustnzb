@@ -216,15 +216,29 @@ pub fn parse_sabnzbd_ini(content: &str) -> SabnzbdImportPreview {
     let servers: Vec<ImportedServer> = sections
         .iter()
         .filter(|((section, subsection), _)| section == "servers" && !subsection.is_empty())
-        .map(|((_, _), kv)| build_imported_server(kv, false))
+        .map(|((_, subsection), kv)| {
+            let mut server = build_imported_server(kv, false);
+            // SABnzbd keys servers by their `[[section]]` header; fall back to
+            // it when the INI carries no (or an empty) inner name.
+            if server.name.is_empty() {
+                server.name = subsection.clone();
+            }
+            server
+        })
         .collect();
 
     // --- Categories (from [categories] → [[name]]) ---
     let categories: Vec<CategoryConfig> = sections
         .iter()
         .filter(|((section, subsection), _)| section == "categories" && !subsection.is_empty())
-        .map(|((_, _), kv)| {
-            let name = kv.get("name").map(|s| s.as_str()).unwrap_or("*");
+        .map(|((_, subsection), kv)| {
+            // The `[[section]]` header is SABnzbd's key for the category;
+            // use it when the inner `name` is absent or empty.
+            let name = kv
+                .get("name")
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(subsection);
             let name = if name == "*" { "Default" } else { name };
 
             // Check for scripts
@@ -461,6 +475,7 @@ fn build_imported_server(kv: &HashMap<String, String>, from_api: bool) -> Import
     ImportedServer {
         name: kv
             .get("displayname")
+            .filter(|s| !s.is_empty())
             .or(kv.get("name"))
             .cloned()
             .unwrap_or_default(),
@@ -553,6 +568,53 @@ mod tests {
                 .iter()
                 .any(|field| field.contains("Duplicate"))
         );
+    }
+
+    /// The `[[section]]` header is the key SABnzbd stores categories and
+    /// servers under; an INI without an inner `name =` must fall back to it
+    /// instead of importing every category as "Default" and nameless servers.
+    #[test]
+    fn ini_import_falls_back_to_section_header_for_names() {
+        let preview = parse_sabnzbd_ini(
+            r#"
+            [servers]
+            [[news.example.test]]
+            host = news.example.test
+            [[backup]]
+            name = ""
+            displayname = ""
+            host = backup.example.test
+            [categories]
+            [[*]]
+            pp = 3
+            [[tv]]
+            dir = /complete/tv
+            [[movies]]
+            name = ""
+            "#,
+        );
+
+        let mut servers: Vec<_> = preview
+            .servers
+            .iter()
+            .map(|server| (server.name.as_str(), server.host.as_str()))
+            .collect();
+        servers.sort();
+        assert_eq!(
+            servers,
+            vec![
+                ("backup", "backup.example.test"),
+                ("news.example.test", "news.example.test"),
+            ]
+        );
+
+        let mut categories: Vec<_> = preview
+            .categories
+            .iter()
+            .map(|category| category.name.as_str())
+            .collect();
+        categories.sort();
+        assert_eq!(categories, vec!["Default", "movies", "tv"]);
     }
 
     #[test]
