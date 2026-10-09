@@ -185,6 +185,54 @@ fn reject_symlinked_path(root: &Path, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Give everything an external extractor wrote below `root` the same modes
+/// as any other file this process creates, except the other-write bit is
+/// always cleared: files `(0o666 & !umask) & !0o002` and directories
+/// `(0o777 & !umask) & !0o002`. A container running with umask 0 would
+/// otherwise get 0666 and 0777.
+///
+/// unrar and 7z restore the mode bits stored in the archive, which are
+/// often owner-only (0700). That makes extracted media unreadable by a
+/// media server running as another user. `root` itself and symlinks are
+/// left untouched. No-op on non-Unix platforms.
+pub fn normalize_extracted_permissions(root: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let umask = process_umask(root.parent().unwrap_or(root));
+        // Always clear other-write, even when the process umask is 0.
+        let file_mode = (0o666 & !umask) & !0o002;
+        let dir_mode = (0o777 & !umask) & !0o002;
+        let mut directories = vec![root.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory)? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                let path = entry.path();
+                if file_type.is_dir() {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(dir_mode))?;
+                    directories.push(path);
+                } else if file_type.is_file() {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(file_mode))?;
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+    Ok(())
+}
+
+/// Read the process umask and restore it before returning. `umask(2)` is
+/// process-global, so the window is only the two calls.
+#[cfg(unix)]
+fn process_umask(_dir: &Path) -> u32 {
+    let current = unsafe { libc::umask(0) };
+    unsafe { libc::umask(current) };
+    current
+}
+
 /// Extract RAR archives in a directory.
 ///
 /// If `password` is `Some`, it is passed to the extractor (`-p<pw>` for unrar,
@@ -205,7 +253,16 @@ pub async fn extract_rar(
     } else {
         anyhow::bail!("No RAR extractor found (tried unrar, unrar-free, rar, 7z)");
     };
+    extract_rar_with(&bin, use_7z, rar_file, output_dir, password).await
+}
 
+async fn extract_rar_with(
+    bin: &str,
+    use_7z: bool,
+    rar_file: &Path,
+    output_dir: &Path,
+    password: Option<&str>,
+) -> anyhow::Result<UnpackResult> {
     info!(file = %rar_file.display(), dest = %output_dir.display(), extractor = %bin, "Extracting RAR");
 
     std::fs::create_dir_all(output_dir)?;
@@ -215,7 +272,7 @@ pub async fn extract_rar(
         // Do not pass `-p-` to 7z when no password is set. p7zip's built-in
         // RAR handler treats it like a passworded archive hint and fails on
         // valid multi-volume RAR sets.
-        Command::new(&bin)
+        Command::new(bin)
             .args(rar_extract_args_with_7z(rar_file, output_dir, password))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -223,7 +280,7 @@ pub async fn extract_rar(
             .output()
             .await?
     } else {
-        Command::new(&bin)
+        Command::new(bin)
             .args(rar_extract_args_with_unrar(rar_file, output_dir, password))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -239,6 +296,7 @@ pub async fn extract_rar(
 
     if success {
         validate_extraction_tree(output_dir)?;
+        normalize_extracted_permissions(output_dir)?;
     }
 
     if !success {
@@ -311,6 +369,7 @@ pub async fn extract_7z(
 
     if success {
         validate_extraction_tree(output_dir)?;
+        normalize_extracted_permissions(output_dir)?;
     }
 
     if !success {
@@ -768,6 +827,87 @@ mod tests {
             sevenz_password_arg(Some("secret")).as_deref(),
             Some("-psecret")
         );
+    }
+
+    /// A stand-in for unrar that, like the real one, restores the archive's
+    /// stored owner-only modes on what it extracts.
+    #[cfg(unix)]
+    fn owner_only_fake_unrar(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-unrar");
+        fs::write(
+            &path,
+            "#!/bin/sh\nfor a; do out=$a; done\nmkdir -p \"$out/Season 1\"\n\
+             printf x > \"$out/Season 1/episode.mkv\"\nprintf y > \"$out/movie.mkv\"\n\
+             chmod 700 \"$out/Season 1/episode.mkv\" \"$out/movie.mkv\" \"$out/Season 1\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rar_extraction_normalises_owner_only_modes() {
+        let tools = tempfile::tempdir().unwrap();
+        let unrar = owner_only_fake_unrar(tools.path());
+        let work = tempfile::tempdir().unwrap();
+        let rar = work.path().join("release.rar");
+        fs::write(&rar, b"Rar!").unwrap();
+        let out = work.path().join("out");
+
+        let result = extract_rar_with(unrar.to_str().unwrap(), false, &rar, &out, None)
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.error_output);
+        assert_eq!(result.files_extracted.len(), 2);
+
+        // umask 077 is common in CI, so compare against the computed mode
+        // rather than a freshly created probe file.
+        let umask = process_umask(&out);
+        assert_eq!(mode(&out.join("movie.mkv")), (0o666 & !umask) & !0o002);
+        assert_eq!(
+            mode(&out.join("Season 1/episode.mkv")),
+            (0o666 & !umask) & !0o002
+        );
+        assert_eq!(mode(&out.join("Season 1")), (0o777 & !umask) & !0o002);
+        assert_eq!(
+            mode(&out.join("movie.mkv")) & 0o002,
+            0,
+            "never world-writable"
+        );
+    }
+
+    /// umask 0 must not produce 0666/0777. The process umask is global, so it
+    /// is set only for this call and restored before the assert can panic.
+    #[cfg(unix)]
+    #[test]
+    fn extracted_permissions_clear_other_write_even_with_umask_zero() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestoreUmask(u32);
+        impl Drop for RestoreUmask {
+            fn drop(&mut self) {
+                unsafe { libc::umask(self.0) };
+            }
+        }
+        let _restore = RestoreUmask(unsafe { libc::umask(0) });
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().join("out");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("dir/file.bin"), b"x").unwrap();
+        fs::set_permissions(root.join("dir"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(root.join("dir/file.bin"), fs::Permissions::from_mode(0o600)).unwrap();
+        normalize_extracted_permissions(&root).unwrap();
+        assert_eq!(mode(&root.join("dir/file.bin")), 0o664);
+        assert_eq!(mode(&root.join("dir")), 0o775);
     }
 
     #[test]

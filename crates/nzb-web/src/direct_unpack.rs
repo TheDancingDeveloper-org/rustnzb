@@ -19,7 +19,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use nzb_postproc::find_unrar;
+use nzb_postproc::{find_unrar, normalize_extracted_permissions};
 
 /// Error strings from unrar output that indicate an unrecoverable failure.
 const UNRAR_ERROR_PATTERNS: &[&str] = &[
@@ -310,6 +310,14 @@ fn unpack_set(
     let _ = child.kill();
     let _ = child.wait();
 
+    // unrar restores the archive's stored (often owner-only) modes; give the
+    // output the same permissions as every other file we write.
+    if result.success
+        && let Err(e) = normalize_extracted_permissions(output_dir)
+    {
+        warn!(set = %set_name, error = %e, "Failed to normalise extracted file permissions");
+    }
+
     result
 }
 
@@ -590,6 +598,52 @@ mod tests {
         );
 
         assert!(result.success, "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_unpack_normalises_owner_only_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (script_dir, unrar) = fake_unrar(
+            "#!/bin/sh\nfor a; do out=$a; done\nmkdir -p \"$out/extras\"\nprintf x > \"$out/extras/movie.mkv\"\nchmod 700 \"$out/extras/movie.mkv\" \"$out/extras\"\nprintf 'All OK\\n'\n",
+        );
+        let output_dir = tempfile::tempdir().unwrap();
+        let first_volume = script_dir.path().join("movie.part001.rar");
+        std::fs::write(&first_volume, b"first").unwrap();
+        let state = Mutex::new(DirectUnpackState {
+            sets: BTreeMap::from([(
+                "movie".to_string(),
+                RarSetState {
+                    set_name: "movie".to_string(),
+                    volumes: BTreeMap::from([(0, first_volume.clone())]),
+                },
+            )]),
+            download_finished: true,
+        });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = unpack_set(
+            unrar.to_str().unwrap(),
+            "movie",
+            &first_volume,
+            output_dir.path(),
+            None,
+            &state,
+            &Notify::new(),
+            &AtomicBool::new(false),
+            runtime.handle(),
+        );
+        assert!(result.success, "{result:?}");
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let probe = script_dir.path().join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        let probe_dir = script_dir.path().join("probe-dir");
+        std::fs::create_dir(&probe_dir).unwrap();
+        assert_eq!(
+            mode(&output_dir.path().join("extras/movie.mkv")),
+            mode(&probe)
+        );
+        assert_eq!(mode(&output_dir.path().join("extras")), mode(&probe_dir));
     }
 
     #[cfg(unix)]
