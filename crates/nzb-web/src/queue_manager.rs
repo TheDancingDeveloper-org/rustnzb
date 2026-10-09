@@ -4948,12 +4948,14 @@ impl QueueManager {
         //    progress-handler task handles so they can be aborted after the
         //    pool drains.
         let mut handles = Vec::new();
+        let mut interrupted: HashSet<String> = HashSet::new();
         {
             let mut jobs = self.jobs.lock();
             for (id, state) in jobs.iter_mut() {
                 if state.job.status == JobStatus::Downloading {
                     info!(job_id = %id, "Marking download for shutdown");
                     state.job.status = JobStatus::Queued; // Will resume on restart
+                    interrupted.insert(id.clone());
                 }
                 if let Some(handle) = state.progress_handle.take() {
                     handles.push(handle);
@@ -4986,6 +4988,30 @@ impl QueueManager {
                     state.job.files_completed,
                 ) {
                     error!(job_id = %id, error = %e, "Failed to persist job state on shutdown");
+                }
+            }
+        }
+
+        // 5. Flush per-file article checkpoints for downloads that were
+        //    mid-flight, so a restart resumes from the last completed
+        //    article instead of re-downloading whole files.
+        if !interrupted.is_empty() {
+            let jobs = self.jobs.lock();
+            let db = self.db.lock();
+            for id in &interrupted {
+                let Some(state) = jobs.get(id) else {
+                    continue;
+                };
+                let checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
+                match serde_json::to_vec(&checkpoint) {
+                    Ok(data) => {
+                        if let Err(e) = db.queue_store_job_data(id, &data) {
+                            error!(job_id = %id, error = %e, "Failed to flush article checkpoint on shutdown");
+                        }
+                    }
+                    Err(e) => {
+                        error!(job_id = %id, error = %e, "Failed to serialize article checkpoint on shutdown");
+                    }
                 }
             }
         }
@@ -5258,6 +5284,11 @@ mod global_pause_tests {
 
     fn insert_job(manager: &QueueManager, job: NzbJob) {
         let id = job.id.clone();
+        manager
+            .db
+            .lock()
+            .queue_insert(&job)
+            .expect("insert queue row");
         manager.jobs.lock().insert(
             id.clone(),
             JobState {
@@ -5574,6 +5605,58 @@ mod global_pause_tests {
         assert_eq!(manager.get_active_jobs().len(), 1);
         assert_eq!(manager.get_active_jobs()[0].id, "downloading");
         assert_eq!(manager.queue_size(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_article_checkpoint_for_active_downloads() {
+        let (manager, tempdir) = manager();
+        let mut jb = job("drain-checkpoint", JobStatus::Downloading, tempdir.path());
+        jb.downloaded_bytes = 5;
+        jb.articles_downloaded = 1;
+        jb.file_count = 1;
+        jb.article_count = 1;
+        jb.files.push(NzbFile {
+            id: "f1".to_string(),
+            filename: "file.bin".to_string(),
+            bytes: 5,
+            bytes_downloaded: 5,
+            is_par2: false,
+            par2_setname: None,
+            par2_vol: None,
+            par2_blocks: None,
+            assembled: false,
+            groups: Vec::new(),
+            articles: vec![Article {
+                message_id: "<t@x>".to_string(),
+                segment_number: 1,
+                bytes: 5,
+                downloaded: true,
+                data_begin: None,
+                data_size: None,
+                crc32: None,
+                tried_servers: Vec::new(),
+                tries: 0,
+            }],
+        });
+        insert_job(&manager, jb);
+
+        manager.shutdown().await;
+
+        assert_eq!(
+            manager.get_job("drain-checkpoint").unwrap().status,
+            JobStatus::Queued
+        );
+        let data = manager
+            .db
+            .lock()
+            .queue_load_job_data("drain-checkpoint")
+            .expect("checkpoint persisted");
+        let checkpoint: JobCheckpoint =
+            serde_json::from_slice(data.as_deref().expect("checkpoint bytes"))
+                .expect("valid checkpoint");
+        assert_eq!(checkpoint.articles_downloaded, 1);
+        assert_eq!(checkpoint.downloaded_bytes, 5);
+        assert_eq!(checkpoint.files.get("file.bin"), Some(&vec![1u32]));
     }
 
     #[tokio::test]
