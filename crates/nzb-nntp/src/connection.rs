@@ -1020,7 +1020,7 @@ impl NntpConnection {
                 self.state = ConnectionState::Ready;
                 Err(NntpError::NoSuchGroup(status.message))
             }
-            412 | 420 => {
+            412 | 420 | 423 => {
                 self.state = ConnectionState::Ready;
                 Err(NntpError::NoArticleSelected(status.message))
             }
@@ -1778,7 +1778,7 @@ impl NntpConnection {
                 self.state = ConnectionState::Ready;
                 Err(NntpError::ArticleNotFound(mid))
             }
-            412 | 420 => {
+            412 | 420 | 423 => {
                 self.state = ConnectionState::Ready;
                 Err(NntpError::NoArticleSelected(status.message))
             }
@@ -1861,7 +1861,7 @@ impl NntpConnection {
                 self.state = ConnectionState::Ready;
                 Err(NntpError::ArticleNotFound(mid))
             }
-            412 | 420 => {
+            412 | 420 | 423 => {
                 self.state = ConnectionState::Ready;
                 Err(NntpError::NoArticleSelected(status.message))
             }

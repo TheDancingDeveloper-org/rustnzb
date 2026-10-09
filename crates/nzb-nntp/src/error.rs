@@ -39,7 +39,8 @@ pub enum NntpError {
     #[error("No such group: {0}")]
     NoSuchGroup(String),
 
-    /// No article selected / no article in group (412, 420).
+    /// No article selected / no article in group / no article with that
+    /// number (412, 420, 423).
     #[error("No article selected: {0}")]
     NoArticleSelected(String),
 

@@ -46,7 +46,7 @@ use nzb_core::models::NzbJob;
 use nzb_decode::FileAssembler;
 use nzb_decode::yenc::decode_yenc;
 use nzb_nntp::Pipeline;
-use nzb_nntp::connection::NntpConnection;
+use nzb_nntp::connection::{ConnectionState, NntpConnection};
 use nzb_nntp::error::NntpError;
 
 use crate::bandwidth::BandwidthLimiter;
@@ -1798,7 +1798,17 @@ async fn run_worker_serial(
                             "Connection stalled — no response within {}s, reconnecting",
                             timeout.as_secs()
                         );
-                        pool.work_queue.push_front(item);
+                        if retry_or_fail_over(
+                            item,
+                            primary_server,
+                            pool,
+                            &ctx,
+                            worker_id,
+                            crate::article_failure::ArticleFailureKind::Timeout,
+                            "connection stalled",
+                        ) {
+                            last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                        }
                         return WorkerExit::Reconnect;
                     }
                 }
@@ -1906,6 +1916,14 @@ async fn run_worker_serial(
                 pool.report_provider_outage();
                 pool.work_queue.push_front(item);
                 return WorkerExit::Reconnect;
+            }
+            Err(ArticleError::ServerError { kind, message }) => {
+                if retry_or_fail_over(item, primary_server, pool, &ctx, worker_id, kind, &message) {
+                    last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                }
+                if conn.state != ConnectionState::Ready {
+                    return WorkerExit::Reconnect;
+                }
             }
             Err(ArticleError::DecodeError(msg)) => {
                 if handle_article_not_available(
@@ -2258,7 +2276,13 @@ async fn run_worker_pipelined(
                             Err(_) => {}
                         }
                     }
-                    Err(NntpError::ArticleNotFound(_)) => {
+                    Err(
+                        NntpError::ArticleNotFound(_)
+                        | NntpError::NoSuchGroup(_)
+                        | NntpError::NoArticleSelected(_),
+                    ) => {
+                        // 430 and 411/412/420/423 are article-level "not
+                        // here" answers; the pipelined connection stays usable.
                         if handle_article_not_available(
                             &mut item,
                             primary_server,
@@ -2324,7 +2348,17 @@ async fn run_worker_pipelined(
                             .or_default()
                             .record_failure(is_auth, &e.to_string());
                         pool.report_provider_outage();
-                        pool.work_queue.push_front(item);
+                        if retry_or_fail_over(
+                            item,
+                            primary_server,
+                            pool,
+                            &ctx,
+                            worker_id,
+                            failure.kind,
+                            &e.to_string(),
+                        ) {
+                            last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                        }
                         requeue_all(&mut in_flight_items, &pool.work_queue);
                         return WorkerExit::Reconnect;
                     }
@@ -2574,6 +2608,42 @@ fn handle_article_not_available(
     }
 }
 
+/// Handle a non-connection error for `item` on `primary_server`: retry it on
+/// the same server up to [`MAX_TRIES_PER_SERVER`] times, then record the
+/// error as this server's definitive outcome so the article fails over to
+/// the next server (or fails once every server has an outcome). Without the
+/// cap such errors were re-queued for the same server forever.
+///
+/// Returns `true` when the article was resolved as failed.
+fn retry_or_fail_over(
+    mut item: WorkItem,
+    primary_server: &ServerConfig,
+    pool: &Arc<WorkerPool>,
+    ctx: &Arc<JobContext>,
+    worker_id: &str,
+    kind: crate::article_failure::ArticleFailureKind,
+    message: &str,
+) -> bool {
+    item.tries_on_current += 1;
+    if item.tries_on_current < MAX_TRIES_PER_SERVER {
+        pool.work_queue.push_front(item);
+        return false;
+    }
+    handle_article_not_available(
+        &mut item,
+        primary_server,
+        &pool.servers,
+        &pool.server_health,
+        ctx,
+        &pool.work_queue,
+        worker_id,
+        kind,
+        &format!(
+            "Article failed on every server; last error after {MAX_TRIES_PER_SERVER} attempts: {message}"
+        ),
+    )
+}
+
 fn all_enabled_providers_definitive(
     servers: &[ServerConfig],
     outcomes: &HashMap<String, crate::article_failure::ArticleFailureKind>,
@@ -2756,118 +2826,117 @@ async fn fetch_article_with_retry(
     _server: &ServerConfig,
     worker_id: &str,
 ) -> Result<ProcessResult, ArticleError> {
-    let mut last_error = None;
-
-    for attempt in 1..=MAX_TRIES_PER_SERVER {
-        let fetch_start = Instant::now();
-        match conn.fetch_article(&item.message_id).await {
-            Ok(response) => {
-                let fetch_us = fetch_start.elapsed().as_micros();
-                let raw_data = response.data.unwrap_or_default();
-                debug!(
-                    worker = %worker_id,
-                    article = %item.message_id,
-                    raw_bytes = raw_data.len(),
-                    fetch_us,
-                    "NNTP fetch complete"
-                );
-                let result = decode_and_assemble(item, &raw_data, assembler);
-                // Return the buffer to the connection's pool so the next
-                // article's fetch reuses it instead of allocating fresh.
-                conn.release_body_buffer(raw_data);
-                return result;
-            }
-            Err(NntpError::ArticleNotFound(_)) => {
-                debug!(
-                    worker = %worker_id,
-                    article = %item.message_id,
-                    "Article not found (430) — will try next server"
-                );
-                return Err(ArticleError::ArticleNotFound);
-            }
-            Err(e @ (NntpError::Connection(_) | NntpError::Io(_))) => {
-                warn!(
-                    worker = %worker_id,
-                    article = %item.message_id,
-                    attempt,
-                    error = %e,
-                    conn_state = ?conn.state,
-                    "Connection/IO error during fetch — connection lost"
-                );
-                return Err(ArticleError::ConnectionLost(format!(
-                    "Connection error on attempt {attempt}: {e}"
-                )));
-            }
-            Err(e @ NntpError::Tls(_)) => {
-                warn!(
-                    worker = %worker_id,
-                    article = %item.message_id,
-                    attempt,
-                    error = %e,
-                    "TLS error during fetch — connection lost"
-                );
-                return Err(ArticleError::ConnectionLost(format!("TLS error: {e}")));
-            }
-            Err(e @ NntpError::ServiceUnavailable(_)) => {
-                warn!(
-                    worker = %worker_id,
-                    article = %item.message_id,
-                    attempt,
-                    error = %e,
-                    "Service unavailable (502) during article fetch — likely rate limited or blocked"
-                );
-                return Err(ArticleError::ProviderUnavailable {
-                    kind: crate::article_failure::ArticleFailureKind::ServerDown,
-                    message: e.to_string(),
-                });
-            }
-            Err(e @ (NntpError::AuthRequired(_) | NntpError::Auth(_))) => {
-                warn!(
-                    worker = %worker_id,
-                    article = %item.message_id,
-                    attempt,
-                    error = %e,
-                    "Auth required (480) during article fetch — session expired or rate limited"
-                );
-                return Err(ArticleError::ProviderUnavailable {
-                    kind: crate::article_failure::ArticleFailureKind::AuthFailed,
-                    message: e.to_string(),
-                });
-            }
-            Err(e @ NntpError::PermissionDenied(_)) => {
-                return Err(ArticleError::ProviderUnavailable {
-                    kind: crate::article_failure::ArticleFailureKind::PermissionDenied,
-                    message: e.to_string(),
-                });
-            }
-            Err(e) => {
-                last_error = Some(format!("{e}"));
-                if attempt < MAX_TRIES_PER_SERVER {
-                    warn!(
-                        worker = %worker_id,
-                        article = %item.message_id,
-                        attempt,
-                        max_tries = MAX_TRIES_PER_SERVER,
-                        error = %e,
-                        "Transient fetch error, retrying in 500ms"
-                    );
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                } else {
-                    warn!(
-                        worker = %worker_id,
-                        article = %item.message_id,
-                        attempt,
-                        error = %e,
-                        "All retries on this server exhausted"
-                    );
-                }
-            }
+    // Retries of article-level errors are counted per item by the caller
+    // (`WorkItem::tries_on_current`), so each call makes a single attempt.
+    let attempt = item.tries_on_current + 1;
+    let fetch_start = Instant::now();
+    match conn.fetch_article(&item.message_id).await {
+        Ok(response) => {
+            let fetch_us = fetch_start.elapsed().as_micros();
+            let raw_data = response.data.unwrap_or_default();
+            debug!(
+                worker = %worker_id,
+                article = %item.message_id,
+                raw_bytes = raw_data.len(),
+                fetch_us,
+                "NNTP fetch complete"
+            );
+            let result = decode_and_assemble(item, &raw_data, assembler);
+            // Return the buffer to the connection's pool so the next
+            // article's fetch reuses it instead of allocating fresh.
+            conn.release_body_buffer(raw_data);
+            result
+        }
+        Err(NntpError::ArticleNotFound(_)) => {
+            debug!(
+                worker = %worker_id,
+                article = %item.message_id,
+                "Article not found (430) — will try next server"
+            );
+            Err(ArticleError::ArticleNotFound)
+        }
+        Err(e @ (NntpError::NoSuchGroup(_) | NntpError::NoArticleSelected(_))) => {
+            // 411/412/420/423: an article-level "not here" answer. Retrying on
+            // this server cannot change it.
+            debug!(
+                worker = %worker_id,
+                article = %item.message_id,
+                error = %e,
+                "Article unavailable on this server — will try next server"
+            );
+            Err(ArticleError::ArticleNotFound)
+        }
+        Err(e @ (NntpError::Connection(_) | NntpError::Io(_))) => {
+            warn!(
+                worker = %worker_id,
+                article = %item.message_id,
+                attempt,
+                error = %e,
+                conn_state = ?conn.state,
+                "Connection/IO error during fetch — connection lost"
+            );
+            Err(ArticleError::ConnectionLost(format!(
+                "Connection error on attempt {attempt}: {e}"
+            )))
+        }
+        Err(e @ NntpError::Tls(_)) => {
+            warn!(
+                worker = %worker_id,
+                article = %item.message_id,
+                attempt,
+                error = %e,
+                "TLS error during fetch — connection lost"
+            );
+            Err(ArticleError::ConnectionLost(format!("TLS error: {e}")))
+        }
+        Err(e @ NntpError::ServiceUnavailable(_)) => {
+            warn!(
+                worker = %worker_id,
+                article = %item.message_id,
+                attempt,
+                error = %e,
+                "Service unavailable (502) during article fetch — likely rate limited or blocked"
+            );
+            Err(ArticleError::ProviderUnavailable {
+                kind: crate::article_failure::ArticleFailureKind::ServerDown,
+                message: e.to_string(),
+            })
+        }
+        Err(e @ (NntpError::AuthRequired(_) | NntpError::Auth(_))) => {
+            warn!(
+                worker = %worker_id,
+                article = %item.message_id,
+                attempt,
+                error = %e,
+                "Auth required (480) during article fetch — session expired or rate limited"
+            );
+            Err(ArticleError::ProviderUnavailable {
+                kind: crate::article_failure::ArticleFailureKind::AuthFailed,
+                message: e.to_string(),
+            })
+        }
+        Err(e @ NntpError::PermissionDenied(_)) => Err(ArticleError::ProviderUnavailable {
+            kind: crate::article_failure::ArticleFailureKind::PermissionDenied,
+            message: e.to_string(),
+        }),
+        Err(e) => {
+            // Protocol / unexpected response / timeout and the like. The caller
+            // retries up to MAX_TRIES_PER_SERVER times on this server, then
+            // records a definitive outcome so the article fails over.
+            warn!(
+                worker = %worker_id,
+                article = %item.message_id,
+                attempt,
+                max_tries = MAX_TRIES_PER_SERVER,
+                error = %e,
+                "Article fetch error on this server"
+            );
+            Err(ArticleError::ServerError {
+                kind: crate::article_failure::ArticleFailure::from_nntp(&e, "").kind,
+                message: e.to_string(),
+            })
         }
     }
-
-    Err(ArticleError::ConnectionLost(
-        last_error.unwrap_or_else(|| "Unknown error after retries".into()),
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2889,6 +2958,14 @@ enum ArticleError {
     ArticleNotFound,
     #[error("Connection lost: {0}")]
     ConnectionLost(String),
+    /// A non-connection error for this article on this server (protocol
+    /// error, unexpected response, timeout). Retried a bounded number of
+    /// times per server, then treated as a definitive outcome.
+    #[error("Server error ({kind:?}): {message}")]
+    ServerError {
+        kind: crate::article_failure::ArticleFailureKind,
+        message: String,
+    },
     #[error("Provider unavailable ({kind:?}): {message}")]
     ProviderUnavailable {
         kind: crate::article_failure::ArticleFailureKind,
