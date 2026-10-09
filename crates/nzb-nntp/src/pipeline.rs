@@ -309,15 +309,24 @@ impl StatPipeline {
                 } else {
                     format!("<{mid}>")
                 };
+                // An I/O failure anywhere in the batch leaves the stream
+                // misaligned with the outstanding STATs, so the connection
+                // must not be reused.
                 conn.send_command_no_flush(&format!("STAT {normalized}"))
-                    .await?;
+                    .await
+                    .inspect_err(|_| conn.state = ConnectionState::Error)?;
                 trace!(mid = %normalized, "StatPipeline sent STAT");
             }
-            conn.flush().await?;
+            conn.flush()
+                .await
+                .inspect_err(|_| conn.state = ConnectionState::Error)?;
 
             // Read responses in order
             for mid in batch {
-                let resp = conn.read_response_line().await?;
+                let resp = conn
+                    .read_response_line()
+                    .await
+                    .inspect_err(|_| conn.state = ConnectionState::Error)?;
                 match resp.code {
                     223 => {
                         results.push(StatResult {
@@ -736,6 +745,31 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].exists);
         assert!(results[1].exists);
+    }
+
+    #[tokio::test]
+    async fn test_stat_pipeline_io_failure_marks_connection_error() {
+        // The server answers the connect handshake and the first STAT, then
+        // drops the socket, so a later read in the batch fails mid-stream.
+        let mut articles = HashMap::new();
+        for i in 0..4 {
+            articles.insert(format!("a{i}@test"), b"body".to_vec());
+        }
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            close_after_n_commands: Some(2),
+            ..MockConfig::default()
+        })
+        .await;
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&test_config(server.port())).await.unwrap();
+
+        let mut stat = StatPipeline::new();
+        for i in 0..4 {
+            stat.add(format!("a{i}@test"));
+        }
+        assert!(stat.execute(&mut conn).await.is_err());
+        assert_eq!(conn.state, ConnectionState::Error);
     }
 
     #[tokio::test]
