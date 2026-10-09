@@ -962,6 +962,22 @@ impl SharedWorkQueue {
         drained
     }
 
+    /// Remove and return every queued item matching `predicate`.
+    fn take_where(&self, mut predicate: impl FnMut(&WorkItem) -> bool) -> Vec<WorkItem> {
+        let mut q = self.inner.lock();
+        let mut kept = VecDeque::with_capacity(q.items.len());
+        let mut taken = Vec::new();
+        while let Some(item) = q.items.pop_front() {
+            if predicate(&item) {
+                taken.push(item);
+            } else {
+                kept.push_back(item);
+            }
+        }
+        q.items = kept;
+        taken
+    }
+
     pub fn len(&self) -> usize {
         self.inner.lock().items.len()
     }
@@ -1393,7 +1409,10 @@ impl WorkerPool {
             // Reconcile fills any gaps left by reaped workers.
             self.reconcile_servers();
 
-            // ---------- 3. Starvation diagnostic ----------
+            // ---------- 3. Resolve articles no longer waiting on a required server ----------
+            self.resolve_items_not_waiting_on_required_providers();
+
+            // ---------- 4. Starvation diagnostic ----------
             // For each enabled server: if the queue has items but none are
             // workable for this server, log once per minute. "Not workable"
             // can mean either (a) every item has already been tried here, or
@@ -1425,6 +1444,49 @@ impl WorkerPool {
                     }
                 }
             }
+        }
+    }
+
+    /// Fail queued articles that every required provider has already
+    /// answered definitively.
+    ///
+    /// An item is normally resolved by the worker that records the last
+    /// outcome. When an optional server becomes unavailable after the other
+    /// servers have answered, the item is left in the queue waiting for that
+    /// server, whose workers no longer pull work. Since the optional server is
+    /// no longer required, resolve such items here.
+    fn resolve_items_not_waiting_on_required_providers(&self) {
+        let taken = {
+            let servers = self.servers.lock();
+            let health = self.server_health.lock();
+            self.work_queue.take_where(|item| {
+                !item.provider_outcomes.is_empty()
+                    && all_enabled_providers_definitive(&servers, &health, &item.provider_outcomes)
+            })
+        };
+        for item in taken {
+            let ctx = self.job_contexts.lock().get(&item.job_id).cloned();
+            let Some(ctx) = ctx else {
+                continue;
+            };
+            if ctx.cancelled.load(Ordering::Relaxed) {
+                ctx.resolve_one();
+                continue;
+            }
+            let last_server = item.tried_servers.last().cloned().unwrap_or_default();
+            let last_kind = item
+                .provider_outcomes
+                .get(&last_server)
+                .copied()
+                .unwrap_or(crate::article_failure::ArticleFailureKind::NotFound);
+            fail_article_everywhere(
+                &item,
+                &last_server,
+                &ctx,
+                "supervisor",
+                last_kind,
+                "Article unavailable on every required server (optional servers unavailable)",
+            );
         }
     }
 
@@ -2526,7 +2588,7 @@ fn handle_article_not_available(
     item: &mut WorkItem,
     primary_server: &ServerConfig,
     all_servers: &Arc<Mutex<Vec<ServerConfig>>>,
-    _server_health: &ServerHealthMap,
+    server_health: &ServerHealthMap,
     ctx: &Arc<JobContext>,
     work_queue: &Arc<SharedWorkQueue>,
     worker_id: &str,
@@ -2540,8 +2602,11 @@ fn handle_article_not_available(
     }
     item.tries_on_current = 0;
 
-    let all_definitive =
-        all_enabled_providers_definitive(&all_servers.lock(), &item.provider_outcomes);
+    let all_definitive = all_enabled_providers_definitive(
+        &all_servers.lock(),
+        &server_health.lock(),
+        &item.provider_outcomes,
+    );
 
     debug!(
         article = %item.message_id,
@@ -2554,57 +2619,7 @@ fn handle_article_not_available(
 
     // (debug log immediately below was added for observability)
     if all_definitive {
-        let mut provider_outcomes = item
-            .provider_outcomes
-            .iter()
-            .map(|(server, outcome)| format!("{server}={}", outcome.as_str()))
-            .collect::<Vec<_>>();
-        provider_outcomes.sort_unstable();
-        let outcomes = provider_outcomes.join(",");
-        let all_not_found = item
-            .provider_outcomes
-            .values()
-            .all(|outcome| *outcome == crate::article_failure::ArticleFailureKind::NotFound);
-        let final_kind = if all_not_found {
-            crate::article_failure::ArticleFailureKind::NotFound
-        } else {
-            crate::article_failure::ArticleFailureKind::DecodeError
-        };
-        warn!(
-            job_id = %item.job_id,
-            file_id = %item.file_id,
-            segment_number = item.segment_number,
-        message_id = %item.message_id,
-        server_id = %primary_server.id,
-        worker_id = %worker_id,
-        original_failure_kind = kind.as_str(),
-        terminal_failure_kind = final_kind.as_str(),
-        attempt = item.tried_servers.len(),
-            provider_outcomes = %outcomes,
-            "{error_msg}"
-        );
-        let final_failure = if final_kind == crate::article_failure::ArticleFailureKind::DecodeError
-        {
-            crate::article_failure::ArticleFailure::decode_error(
-                &primary_server.id,
-                format!("{error_msg}; provider outcomes: {outcomes}"),
-            )
-        } else {
-            increment_counter("articles.explicit_global_absence");
-            crate::article_failure::ArticleFailure::not_found_anywhere(&primary_server.id, outcomes)
-        };
-        try_send_progress(
-            &ctx.progress_tx,
-            &item.job_id,
-            ProgressUpdate::ArticleFailed {
-                job_id: item.job_id.clone(),
-                file_id: item.file_id.clone(),
-                segment_number: item.segment_number,
-                failure: final_failure,
-            },
-        );
-        ctx.articles_failed.fetch_add(1, Ordering::Relaxed);
-        ctx.resolve_one();
+        fail_article_everywhere(item, &primary_server.id, ctx, worker_id, kind, error_msg);
         true
     } else {
         // push_FRONT (not push_back): put the failed item at the front of the
@@ -2655,13 +2670,87 @@ fn retry_or_fail_over(
     )
 }
 
+/// Resolve an article as failed: every required provider has given a
+/// definitive outcome. `server_id` is the provider that answered last.
+fn fail_article_everywhere(
+    item: &WorkItem,
+    server_id: &str,
+    ctx: &Arc<JobContext>,
+    worker_id: &str,
+    kind: crate::article_failure::ArticleFailureKind,
+    error_msg: &str,
+) {
+    let mut provider_outcomes = item
+        .provider_outcomes
+        .iter()
+        .map(|(server, outcome)| format!("{server}={}", outcome.as_str()))
+        .collect::<Vec<_>>();
+    provider_outcomes.sort_unstable();
+    let outcomes = provider_outcomes.join(",");
+    let all_not_found = item
+        .provider_outcomes
+        .values()
+        .all(|outcome| *outcome == crate::article_failure::ArticleFailureKind::NotFound);
+    let final_kind = if all_not_found {
+        crate::article_failure::ArticleFailureKind::NotFound
+    } else {
+        crate::article_failure::ArticleFailureKind::DecodeError
+    };
+    warn!(
+        job_id = %item.job_id,
+        file_id = %item.file_id,
+        segment_number = item.segment_number,
+        message_id = %item.message_id,
+        server_id = %server_id,
+        worker_id = %worker_id,
+        original_failure_kind = kind.as_str(),
+        terminal_failure_kind = final_kind.as_str(),
+        attempt = item.tried_servers.len(),
+        provider_outcomes = %outcomes,
+        "{error_msg}"
+    );
+    let final_failure = if final_kind == crate::article_failure::ArticleFailureKind::DecodeError {
+        crate::article_failure::ArticleFailure::decode_error(
+            server_id,
+            format!("{error_msg}; provider outcomes: {outcomes}"),
+        )
+    } else {
+        increment_counter("articles.explicit_global_absence");
+        crate::article_failure::ArticleFailure::not_found_anywhere(server_id, outcomes)
+    };
+    try_send_progress(
+        &ctx.progress_tx,
+        &item.job_id,
+        ProgressUpdate::ArticleFailed {
+            job_id: item.job_id.clone(),
+            file_id: item.file_id.clone(),
+            segment_number: item.segment_number,
+            failure: final_failure,
+        },
+    );
+    ctx.articles_failed.fetch_add(1, Ordering::Relaxed);
+    ctx.resolve_one();
+}
+
+/// Whether every provider whose answer is required has given a definitive
+/// outcome for an article.
+///
+/// Every enabled server is required, except an `optional` server that is
+/// currently unavailable (circuit open, e.g. it cannot be reached). A
+/// required server that is down still blocks the decision: an outage is not
+/// evidence that the article is missing. An optional server is a best-effort
+/// extra, so it must not hold articles hostage while it is down.
 fn all_enabled_providers_definitive(
     servers: &[ServerConfig],
+    health: &HashMap<String, ServerHealth>,
     outcomes: &HashMap<String, crate::article_failure::ArticleFailureKind>,
 ) -> bool {
     servers
         .iter()
         .filter(|server| server.enabled)
+        .filter(|server| {
+            !(server.optional && health.get(&server.id).is_some_and(|h| !h.is_available()))
+        })
         .all(|server| outcomes.contains_key(&server.id))
 }
 
@@ -3638,12 +3727,96 @@ mod tests {
             crate::article_failure::ArticleFailureKind::NotFound,
         );
 
-        assert!(!all_enabled_providers_definitive(&servers, &outcomes));
+        let health = HashMap::new();
+        assert!(!all_enabled_providers_definitive(
+            &servers, &health, &outcomes
+        ));
         outcomes.insert(
             "srv2".to_string(),
             crate::article_failure::ArticleFailureKind::NotFound,
         );
-        assert!(all_enabled_providers_definitive(&servers, &outcomes));
+        assert!(all_enabled_providers_definitive(
+            &servers, &health, &outcomes
+        ));
+    }
+
+    #[test]
+    fn unavailable_optional_provider_is_not_required() {
+        let mut optional = ServerConfig::new("fill", "fill.invalid");
+        optional.optional = true;
+        let servers = vec![ServerConfig::new("main", "main.invalid"), optional];
+        let mut outcomes = HashMap::new();
+        outcomes.insert(
+            "main".to_string(),
+            crate::article_failure::ArticleFailureKind::NotFound,
+        );
+        let mut health = HashMap::new();
+
+        // A healthy optional server is still asked.
+        assert!(!all_enabled_providers_definitive(
+            &servers, &health, &outcomes
+        ));
+
+        let mut down = ServerHealth::new();
+        down.record_failure(true, "502 on connect");
+        health.insert("fill".to_string(), down);
+        assert!(all_enabled_providers_definitive(
+            &servers, &health, &outcomes
+        ));
+
+        // A required server that is down still blocks the decision.
+        let mut main_down = ServerHealth::new();
+        main_down.record_failure(true, "502 on connect");
+        health.insert("main".to_string(), main_down);
+        outcomes.clear();
+        assert!(!all_enabled_providers_definitive(
+            &servers, &health, &outcomes
+        ));
+    }
+
+    #[tokio::test]
+    async fn supervisor_sweep_fails_items_left_waiting_on_down_optional_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = worker_pool_without_servers();
+        let mut optional = ServerConfig::new("fill", "fill.invalid");
+        optional.optional = true;
+        *pool.servers.lock() = vec![ServerConfig::new("main", "main.invalid"), optional];
+
+        let job = test_job("sweep", temp.path());
+        let (progress_tx, mut progress_rx) = mpsc::channel(8);
+        let ctx = Arc::new(JobContext::new(
+            &job,
+            Arc::new(FileAssembler::new()),
+            progress_tx,
+            1,
+        ));
+        pool.job_contexts.lock().insert(job.id.clone(), ctx.clone());
+        let mut item = make_item("sweep", "missing@test", "payload.bin");
+        item.tried_servers.push("main".into());
+        item.provider_outcomes.insert(
+            "main".into(),
+            crate::article_failure::ArticleFailureKind::NotFound,
+        );
+        pool.work_queue.push_front(item);
+
+        // Optional server still healthy: the item keeps waiting for it.
+        pool.resolve_items_not_waiting_on_required_providers();
+        assert_eq!(pool.work_queue.len(), 1);
+
+        // It goes down after the main server answered.
+        let mut down = ServerHealth::new();
+        down.record_failure(true, "502 on connect");
+        pool.server_health.lock().insert("fill".into(), down);
+        pool.resolve_items_not_waiting_on_required_providers();
+
+        assert_eq!(pool.work_queue.len(), 0);
+        assert_eq!(ctx.articles_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(ctx.articles_remaining.load(Ordering::Relaxed), 0);
+        let mut saw_failure = false;
+        while let Ok(update) = progress_rx.try_recv() {
+            saw_failure |= matches!(update, ProgressUpdate::ArticleFailed { .. });
+        }
+        assert!(saw_failure);
     }
 
     #[tokio::test]
