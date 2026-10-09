@@ -81,3 +81,101 @@ async fn existing_gzip_nzb_is_imported_once_and_moved_to_processed() {
     assert!(!input.exists());
     assert_eq!(queue.get_jobs()[0].status, JobStatus::Downloading);
 }
+
+fn watch_queue(temp: &Path) -> std::sync::Arc<QueueManager> {
+    QueueManager::new(
+        Vec::new(),
+        Database::open_memory().unwrap(),
+        temp.join("incomplete"),
+        temp.join("complete"),
+        LogBuffer::default(),
+        1,
+        Vec::new(),
+        0,
+        0,
+        false,
+        5,
+        true,
+        true,
+        100.0,
+        2,
+    )
+}
+
+fn fixture_nzb(subject: &str) -> Vec<u8> {
+    format!(
+        r#"<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file subject="{subject}" date="0" poster="test@test"><groups><group>alt.test</group></groups><segments><segment number="1" bytes="5">{subject}-1@test</segment></segments></file></nzb>"#
+    )
+    .into_bytes()
+}
+
+async fn wait_for_queue_size(queue: &QueueManager, expected: usize) -> bool {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if queue.queue_size() == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+async fn existing_zip_of_nzbs_is_imported_and_moved_to_processed() {
+    use zip::write::SimpleFileOptions;
+
+    let temp = tempfile::tempdir().unwrap();
+    let watch_dir = temp.path().join("watch");
+    std::fs::create_dir_all(&watch_dir).unwrap();
+
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, subject) in [("first.nzb", "first.bin"), ("second.nzb", "second.bin")] {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(&fixture_nzb(subject)).unwrap();
+    }
+    writer.start_file("readme.txt", options).unwrap();
+    writer.write_all(b"not an nzb").unwrap();
+    let archive = writer.finish().unwrap().into_inner();
+    let input = watch_dir.join("bundle.zip");
+    std::fs::write(&input, archive).unwrap();
+
+    let queue = watch_queue(temp.path());
+    let watcher_task = tokio::spawn(DirWatcher::new(watch_dir.clone(), queue.clone()).run());
+    let imported = wait_for_queue_size(&queue, 2).await;
+    watcher_task.abort();
+
+    assert!(
+        imported,
+        "watch folder did not enqueue both NZBs from the zip"
+    );
+    let mut names: Vec<String> = queue.get_jobs().into_iter().map(|job| job.name).collect();
+    names.sort();
+    assert_eq!(names, ["first", "second"]);
+    assert!(watch_dir.join("processed/bundle.zip").exists());
+    assert!(!input.exists());
+}
+
+#[tokio::test]
+async fn existing_bzip2_nzb_is_imported_and_moved_to_processed() {
+    let temp = tempfile::tempdir().unwrap();
+    let watch_dir = temp.path().join("watch");
+    std::fs::create_dir_all(&watch_dir).unwrap();
+
+    let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+    encoder.write_all(&fixture_nzb("bz.bin")).unwrap();
+    let input = watch_dir.join("packed.nzb.bz2");
+    std::fs::write(&input, encoder.finish().unwrap()).unwrap();
+
+    let queue = watch_queue(temp.path());
+    let watcher_task = tokio::spawn(DirWatcher::new(watch_dir.clone(), queue.clone()).run());
+    let imported = wait_for_queue_size(&queue, 1).await;
+    watcher_task.abort();
+
+    assert!(imported, "watch folder did not enqueue the bzip2 NZB");
+    assert_eq!(queue.get_jobs()[0].name, "packed");
+    assert!(watch_dir.join("processed/packed.nzb.bz2").exists());
+    assert!(!input.exists());
+}
