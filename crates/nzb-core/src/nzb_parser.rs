@@ -338,6 +338,9 @@ fn sanitize_filename(name: &str) -> String {
             '<' | '>' | ':' | '"' | '|' | '?' | '*' => {}
             // Control characters (including null)
             c if c.is_control() => {}
+            // Bidi overrides/isolates/marks and zero-width spaces enable
+            // RTL-override filename spoofing; ZWJ/ZWNJ are kept.
+            c if crate::path::is_bidi_or_invisible_control(c) => {}
             // Backslash → forward slash is also risky; strip it
             '\\' => {}
             _ => out.push(ch),
@@ -926,6 +929,31 @@ mod tests {
         let nfd = "caf\u{0065}\u{0301}.rar";
         // Should produce NFC: precomposed 'é' (U+00E9)
         assert_eq!(sanitize_filename(nfd), "caf\u{00E9}.rar");
+    }
+
+    #[test]
+    fn test_sanitize_strips_bidi_and_invisible_controls() {
+        assert_eq!(sanitize_filename("clip\u{202E}4pm.exe"), "clip4pm.exe");
+        assert_eq!(
+            sanitize_filename("\u{FEFF}\u{2066}a\u{200B}b\u{200E}.mkv\u{2069}"),
+            "ab.mkv"
+        );
+        assert_eq!(sanitize_filename("\u{202E}\u{200F}"), "unnamed");
+    }
+
+    #[test]
+    fn test_sanitize_keeps_joiners_cjk_and_accents() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}.jpg";
+        assert_eq!(sanitize_filename(family), family);
+        let persian = "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}.txt";
+        assert_eq!(sanitize_filename(persian), persian);
+        for text in [
+            "進撃の巨人 第1話.mkv",
+            "Amélie.Poulain.mkv",
+            "Ñandú über straße.rar",
+        ] {
+            assert_eq!(sanitize_filename(text), text);
+        }
     }
 
     #[test]
