@@ -962,12 +962,11 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
         "retry" => handle_retry(state, req),
 
         // SABnzbd `_api_warnings`. RustNZB does not keep a SABnzbd-style
-        // warnings list (queue/fullstatus report `have_warnings: "0"` and
-        // `warnings: []`), so this is the same empty list; `name=clear`
-        // is accepted.
+        // warnings log; the only warning reported is the live disk-space
+        // hold (see `sab_warnings`). `name=clear` is accepted.
         "warnings" => match req.name.as_deref() {
             Some("clear") => Json(serde_json::json!({ "status": true })),
-            _ => Json(serde_json::json!({ "warnings": Vec::<serde_json::Value>::new() })),
+            _ => Json(serde_json::json!({ "warnings": sab_warnings(&state.queue_manager) })),
         },
 
         _ => Json(serde_json::json!({
@@ -1016,6 +1015,7 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
     let pause_int = qm.pause_remaining_secs().unwrap_or(0).max(0).to_string();
     let (free1, total1, free1_norm) = sab_disk_space(&qm.incomplete_dir());
     let (free2, total2, free2_norm) = sab_disk_space(&qm.complete_dir());
+    let warnings = sab_warnings(qm);
 
     Json(serde_json::json!({
         "status": {
@@ -1042,7 +1042,7 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
             "finishaction": serde_json::Value::Null,
             "folders": Vec::<String>::new(),
             "have_quota": false,
-            "have_warnings": "0",
+            "have_warnings": warnings.len().to_string(),
             "internetbandwidth": 0,
             "ipv6": serde_json::Value::Null,
             "left_quota": "0 B",
@@ -1074,7 +1074,7 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
             "uptime": format_sab_age(state.started_at.elapsed().as_secs()),
             "url_base": "",
             "version": SABNZBD_COMPAT_VERSION,
-            "warnings": Vec::<serde_json::Value>::new(),
+            "warnings": warnings,
             "webdir": "",
             "weblogfile": serde_json::Value::Null,
             "windows": cfg!(target_os = "windows"),
@@ -1201,7 +1201,27 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     queue["diskspace2"] = free2.into();
     queue["diskspacetotal2"] = total2.into();
     queue["diskspace2_norm"] = free2_norm.into();
+    queue["have_warnings"] = sab_warnings(qm).len().to_string().into();
     Json(response)
+}
+
+/// SABnzbd-shaped warnings (`GUIHandler` entries: `type`, `text`, `time`).
+///
+/// SABnzbd logs "Too little diskspace forcing PAUSE" when its free-space
+/// check pauses the downloader; RustNZB reports the equivalent warning for
+/// as long as its disk-space guard is holding downloads.
+fn sab_warnings(qm: &crate::queue_manager::QueueManager) -> Vec<serde_json::Value> {
+    qm.disk_space_hold_since()
+        .filter(|_| qm.is_paused())
+        .map(|since| {
+            serde_json::json!({
+                "type": "WARNING",
+                "text": "Too little diskspace forcing PAUSE",
+                "time": since.timestamp(),
+            })
+        })
+        .into_iter()
+        .collect()
 }
 
 /// SABnzbd's `speedlimit` is a percentage of the configured maximum
