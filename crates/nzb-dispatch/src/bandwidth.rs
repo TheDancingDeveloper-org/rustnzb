@@ -13,15 +13,25 @@ pub struct BandwidthConfig {
     pub download_bps: Option<NonZeroU32>,
 }
 
+/// A rate limiter together with its burst size, swapped as one unit so a
+/// concurrent reconfiguration can never pair a limiter with the wrong burst.
+struct Bucket {
+    limiter: RateLimiter,
+    burst: NonZeroU32,
+}
+
 struct Limit {
-    limiter: ArcSwapOption<RateLimiter>,
+    limiter: ArcSwapOption<Bucket>,
     current_bps: AtomicU32,
 }
 
 impl Limit {
-    fn new_inner(bps: Option<NonZeroU32>) -> Option<Arc<RateLimiter>> {
+    fn new_inner(bps: Option<NonZeroU32>) -> Option<Arc<Bucket>> {
         let bps = bps?;
-        Some(Arc::new(RateLimiter::direct(Quota::per_second(bps))))
+        Some(Arc::new(Bucket {
+            limiter: RateLimiter::direct(Quota::per_second(bps)),
+            burst: bps,
+        }))
     }
 
     fn new(bps: Option<NonZeroU32>) -> Self {
@@ -33,8 +43,23 @@ impl Limit {
 
     async fn acquire(&self, size: NonZeroU32) -> anyhow::Result<()> {
         let lim = self.limiter.load().clone();
-        if let Some(rl) = lim.as_ref() {
-            rl.until_n_ready(size).await?;
+        if let Some(bucket) = lim.as_ref() {
+            // `Quota::per_second(bps)` gives a burst of `bps` cells, and
+            // governor rejects any single request larger than the burst with
+            // `InsufficientCapacity`. A decoded article (~750 KB) exceeds the
+            // burst for every limit below that, so acquire in burst-sized
+            // chunks rather than in one call.
+            let burst = bucket.burst.get();
+            let mut remaining = size.get();
+            while remaining > 0 {
+                let chunk = remaining.min(burst);
+                // `chunk` is non-zero: `remaining > 0` and `burst >= 1`.
+                bucket
+                    .limiter
+                    .until_n_ready(NonZeroU32::new(chunk).expect("chunk > 0"))
+                    .await?;
+                remaining -= chunk;
+            }
         }
         Ok(())
     }
@@ -84,6 +109,28 @@ impl BandwidthLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: with `Quota::per_second(bps)` the burst equals `bps`, so a
+    /// single request larger than the per-second limit (one decoded article
+    /// is ~750 KB) used to fail with `InsufficientCapacity` and the callers
+    /// discarded the error — the limit was silently ignored.
+    #[tokio::test]
+    async fn request_larger_than_burst_is_throttled_not_rejected() {
+        let limiter = BandwidthLimiter::new(BandwidthConfig {
+            download_bps: NonZeroU32::new(200_000),
+        });
+        let start = std::time::Instant::now();
+        limiter
+            .acquire_download(NonZeroU32::new(500_000).unwrap())
+            .await
+            .expect("oversized request must be throttled, not rejected");
+        // 200 KB of burst is free; the remaining 300 KB must wait ~1.5 s.
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(1_000),
+            "500 KB at 200 KB/s returned after {:?}",
+            start.elapsed()
+        );
+    }
 
     #[tokio::test]
     async fn limiter_can_be_reconfigured_without_recreation() {

@@ -1068,11 +1068,8 @@ impl QueueManager {
     ) -> Arc<Self> {
         use std::num::NonZeroU32;
 
-        let download_bps = if speed_limit_bps > 0 {
-            NonZeroU32::new(speed_limit_bps as u32)
-        } else {
-            None
-        };
+        // Saturate rather than wrap: `as u32` turns 4 GiB/s + 1 into 1 B/s.
+        let download_bps = NonZeroU32::new(u32::try_from(speed_limit_bps).unwrap_or(u32::MAX));
         let bandwidth = Arc::new(BandwidthLimiter::new(BandwidthConfig { download_bps }));
 
         let servers_arc = Arc::new(Mutex::new(servers));
@@ -1327,11 +1324,8 @@ impl QueueManager {
     /// Set the download speed limit in bytes per second (0 = unlimited).
     pub fn set_speed_limit(&self, bps: u64) {
         use std::num::NonZeroU32;
-        let limit = if bps > 0 {
-            NonZeroU32::new(bps as u32)
-        } else {
-            None
-        };
+        // Saturate rather than wrap: `as u32` turns 4 GiB/s + 1 into 1 B/s.
+        let limit = NonZeroU32::new(u32::try_from(bps).unwrap_or(u32::MAX));
         self.bandwidth.set_download_bps(limit);
     }
 
@@ -4552,6 +4546,18 @@ mod global_pause_tests {
                 .collect::<Vec<_>>(),
             vec!["third", "first", "second"]
         );
+    }
+
+    #[tokio::test]
+    async fn speed_limit_above_u32_saturates_instead_of_wrapping() {
+        let (manager, _tempdir) = manager();
+        // 4 GiB + 1 B/s used to wrap to 1 B/s via `as u32`.
+        manager.set_speed_limit(u32::MAX as u64 + 2);
+        assert_eq!(manager.get_speed_limit(), u32::MAX as u64);
+        manager.set_speed_limit(1_000);
+        assert_eq!(manager.get_speed_limit(), 1_000);
+        manager.set_speed_limit(0);
+        assert_eq!(manager.get_speed_limit(), 0);
     }
 
     #[test]
