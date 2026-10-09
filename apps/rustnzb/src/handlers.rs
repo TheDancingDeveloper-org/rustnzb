@@ -34,7 +34,8 @@ use nzb_web::nzb_core::sabnzbd_import;
 
 use nzb_web::error::ApiError;
 use nzb_web::fetch_guard::{
-    MAX_FETCH_BODY_BYTES, build_fetch_client, read_response_bytes_limited, validate_fetch_url,
+    FetchPolicy, MAX_FETCH_BODY_BYTES, build_fetch_client, check_fetch_url_allowed,
+    read_response_bytes_limited, validate_fetch_url_with,
 };
 use nzb_web::log_buffer::LogEntry;
 use nzb_web::state::AppState;
@@ -514,6 +515,20 @@ pub async fn h_queue_sort(
 // Add URL handler
 // ---------------------------------------------------------------------------
 
+/// SSRF policy for server-side fetches, from `general.fetch_allow_private`
+/// and `general.fetch_allowed_hosts`.
+fn fetch_policy(state: &AppState) -> FetchPolicy {
+    FetchPolicy::from_config(&state.config().general)
+}
+
+/// Reject an RSS feed whose URL the fetch guard would refuse, so a blocked
+/// feed is reported when it is saved instead of failing on every poll.
+async fn validate_feed_url(state: &AppState, url: &str) -> Result<(), ApiError> {
+    check_fetch_url_allowed(url, &fetch_policy(state))
+        .await
+        .map_err(|e| ApiError::from((StatusCode::BAD_REQUEST, format!("Feed URL rejected: {e}"))))
+}
+
 #[derive(Deserialize)]
 pub struct AddUrlBody {
     pub url: String,
@@ -531,7 +546,7 @@ pub async fn h_queue_add_url(
         return Err(ApiError::from(anyhow::anyhow!("No URL provided")));
     }
 
-    let fetch_plan = validate_fetch_url(&body.url).await?;
+    let fetch_plan = validate_fetch_url_with(&body.url, &fetch_policy(&state)).await?;
     tracing::info!(url = %body.url, "Fetching NZB from URL");
 
     let client = if fetch_plan.requires_pinned_client() {
@@ -1298,6 +1313,7 @@ pub async fn h_rss_feed_add(
     State(state): State<Arc<AppState>>,
     Json(feed): Json<RssFeedConfig>,
 ) -> Result<impl IntoResponse, ApiError> {
+    validate_feed_url(&state, &feed.url).await?;
     let mut config = (*state.config()).clone();
     if config.rss_feeds.iter().any(|f| f.name == feed.name) {
         return Err(ApiError::from(anyhow::anyhow!(
@@ -1316,6 +1332,7 @@ pub async fn h_rss_feed_update(
     Path(name): Path<String>,
     Json(feed): Json<RssFeedConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_feed_url(&state, &feed.url).await?;
     let mut config = (*state.config()).clone();
     let idx = config
         .rss_feeds
@@ -1382,7 +1399,7 @@ pub async fn h_rss_item_download(
         .ok_or_else(|| ApiError::from(anyhow::anyhow!("No download URL for this item")))?;
 
     // Fetch the NZB
-    let fetch_plan = validate_fetch_url(url).await?;
+    let fetch_plan = validate_fetch_url_with(url, &fetch_policy(&state)).await?;
     let client = if fetch_plan.requires_pinned_client() {
         build_fetch_client(&fetch_plan)?
     } else {
@@ -1996,11 +2013,12 @@ pub struct ImportApiRequest {
 }
 
 pub async fn h_import_sabnzbd_api(
+    State(state): State<Arc<AppState>>,
     Json(req): Json<ImportApiRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let base_url = req.url.trim_end_matches('/');
 
-    let fetch_plan = validate_fetch_url(base_url).await?;
+    let fetch_plan = validate_fetch_url_with(base_url, &fetch_policy(&state)).await?;
     let client = if fetch_plan.requires_pinned_client() {
         build_fetch_client(&fetch_plan)?
     } else {

@@ -129,6 +129,20 @@ pub struct GeneralConfig {
     /// Maximum captured output retained from a post-processing script.
     #[serde(default = "default_script_output_bytes")]
     pub script_max_output_bytes: usize,
+    /// Allow server-side URL fetches (add-url, SABnzbd `addurl`, RSS feeds,
+    /// SABnzbd import) to reach private LAN addresses: RFC 1918,
+    /// carrier-grade NAT (100.64.0.0/10) and IPv6 unique-local. Loopback and
+    /// link-local addresses (127.0.0.1, ::1, the 169.254.169.254
+    /// cloud-metadata endpoint) stay blocked unless listed in
+    /// `fetch_allowed_hosts`. Default: false.
+    #[serde(default)]
+    pub fetch_allow_private: bool,
+    /// Hosts that server-side URL fetches may always reach, even when they
+    /// resolve to a non-public address. Each entry is an IP address, a CIDR
+    /// block (`172.16.0.0/12`, `fd00::/8`) or a hostname matched exactly
+    /// against the URL host (`prowlarr`, `nzbhydra.lan`). Default: empty.
+    #[serde(default)]
+    pub fetch_allowed_hosts: Vec<String>,
 }
 
 fn default_rss_history_limit() -> Option<usize> {
@@ -215,6 +229,8 @@ impl Default for GeneralConfig {
             script_failure: None,
             script_timeout_secs: default_script_timeout_secs(),
             script_max_output_bytes: default_script_output_bytes(),
+            fetch_allow_private: false,
+            fetch_allowed_hosts: Vec::new(),
         }
     }
 }

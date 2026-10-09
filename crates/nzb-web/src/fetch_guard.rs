@@ -8,10 +8,132 @@
 //! [`build_fetch_client`] pins the connection to the exact addresses that were
 //! validated so a hostname cannot re-resolve to an internal address between
 //! the check and the request (DNS rebinding).
+//!
+//! Self-hosted indexers (NZBHydra2, Prowlarr) usually live on the LAN or a
+//! Docker network, so the guard can be relaxed with a [`FetchPolicy`] built
+//! from `general.fetch_allow_private` and `general.fetch_allowed_hosts`. The
+//! default policy is strict. `fetch_allow_private` admits RFC 1918, CGNAT and
+//! IPv6 ULA only: loopback and link-local addresses (the 169.254.169.254
+//! cloud-metadata endpoint) stay blocked unless explicitly listed.
 
 use std::net::{IpAddr, SocketAddr};
 
 use crate::error::ApiError;
+use crate::nzb_core::config::GeneralConfig;
+
+/// Which non-public destinations a server-side fetch may reach.
+#[derive(Debug, Clone, Default)]
+pub struct FetchPolicy {
+    allow_private: bool,
+    allowed_hostnames: Vec<String>,
+    allowed_networks: Vec<(IpAddr, u8)>,
+}
+
+impl FetchPolicy {
+    /// The default policy: only globally routable addresses are allowed.
+    pub fn strict() -> Self {
+        Self::default()
+    }
+
+    /// Build a policy from `fetch_allow_private` and `fetch_allowed_hosts`.
+    /// Entries that parse as an IP address or CIDR block become networks;
+    /// anything else is matched case-insensitively against the URL host.
+    pub fn from_config(general: &GeneralConfig) -> Self {
+        Self::new(general.fetch_allow_private, &general.fetch_allowed_hosts)
+    }
+
+    pub fn new(allow_private: bool, allowed_hosts: &[String]) -> Self {
+        let mut policy = Self {
+            allow_private,
+            ..Self::default()
+        };
+        for entry in allowed_hosts {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            match parse_network(entry) {
+                Some(network) => policy.allowed_networks.push(network),
+                None => policy
+                    .allowed_hostnames
+                    .push(entry.trim_end_matches('.').to_ascii_lowercase()),
+            }
+        }
+        policy
+    }
+
+    fn host_is_listed(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.allowed_hostnames.contains(&host)
+    }
+
+    fn ip_is_allowed(&self, ip: IpAddr) -> bool {
+        is_globally_routable(ip)
+            || self
+                .allowed_networks
+                .iter()
+                .any(|(net, prefix)| network_contains(*net, *prefix, ip))
+            || (self.allow_private && is_private_lan(ip))
+    }
+}
+
+/// Parse `addr` or `addr/prefix` into a network. Returns `None` for
+/// anything that is not an IP address (treated as a hostname).
+fn parse_network(entry: &str) -> Option<(IpAddr, u8)> {
+    let (addr, prefix) = match entry.split_once('/') {
+        Some((addr, prefix)) => (addr, Some(prefix)),
+        None => (entry, None),
+    };
+    let addr = addr.trim_start_matches('[').trim_end_matches(']');
+    let ip: IpAddr = addr.parse().ok()?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let prefix = match prefix {
+        Some(p) => p.parse::<u8>().ok().filter(|p| *p <= max)?,
+        None => max,
+    };
+    Some((ip, prefix))
+}
+
+fn network_contains(net: IpAddr, prefix: u8, ip: IpAddr) -> bool {
+    let ip = match (net, ip) {
+        // Let an IPv4 network match an IPv4-mapped IPv6 address.
+        (IpAddr::V4(_), IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => return false,
+        },
+        _ => ip,
+    };
+    match (net, ip) {
+        (IpAddr::V4(net), IpAddr::V4(ip)) => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+            u32::from(net) & mask == u32::from(ip) & mask
+        }
+        (IpAddr::V6(net), IpAddr::V6(ip)) => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+            u128::from(net) & mask == u128::from(ip) & mask
+        }
+        _ => false,
+    }
+}
+
+/// Private LAN ranges a self-hosted indexer may live on: RFC 1918,
+/// carrier-grade NAT and IPv6 unique-local. Loopback is not included:
+/// `fetch_allow_private` must not open 127.0.0.0/8 or ::1, which are
+/// reachable only through an explicit `fetch_allowed_hosts` entry.
+/// Link-local (cloud metadata), multicast, broadcast and unspecified stay
+/// out as well.
+fn is_private_lan(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [first, second, ..] = v4.octets();
+            v4.is_private() || (first == 100 && (64..=127).contains(&second))
+        }
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_private_lan(IpAddr::V4(v4)),
+            None => v6.is_unique_local(),
+        },
+    }
+}
 
 /// Maximum body size accepted by URL-backed NZB and feed workflows.
 pub const MAX_FETCH_BODY_BYTES: usize = 100 * 1024 * 1024;
@@ -33,15 +155,51 @@ impl FetchUrlPlan {
 }
 
 /// Returns `Err` if `raw_url` is not http/https or resolves to a
-/// private/reserved address.
+/// private/reserved address. Uses the strict default policy; see
+/// [`validate_fetch_url_with`] to honour the configured allow-list.
 pub async fn validate_fetch_url(raw_url: &str) -> Result<FetchUrlPlan, ApiError> {
-    let url = reqwest::Url::parse(raw_url)
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid URL: {e}")))?;
+    validate_fetch_url_with(raw_url, &FetchPolicy::strict()).await
+}
+
+/// Returns `Err` if `raw_url` is not http/https or resolves to an address
+/// that `policy` does not allow.
+pub async fn validate_fetch_url_with(
+    raw_url: &str,
+    policy: &FetchPolicy,
+) -> Result<FetchUrlPlan, ApiError> {
+    match validate_inner(raw_url, policy).await {
+        Ok(plan) => Ok(plan),
+        Err(GuardError::Rejected(e) | GuardError::Unresolved(e)) => Err(e),
+    }
+}
+
+/// Check that `raw_url` is permitted by `policy` without requiring that it
+/// resolve right now. Used when saving a URL (an RSS feed) that will be
+/// fetched later: a policy violation is an error, a transient DNS failure is
+/// not, because the fetch re-validates on every poll anyway.
+pub async fn check_fetch_url_allowed(raw_url: &str, policy: &FetchPolicy) -> Result<(), ApiError> {
+    match validate_inner(raw_url, policy).await {
+        Ok(_) | Err(GuardError::Unresolved(_)) => Ok(()),
+        Err(GuardError::Rejected(e)) => Err(e),
+    }
+}
+
+enum GuardError {
+    /// The URL is not permitted.
+    Rejected(ApiError),
+    /// The hostname could not be resolved; permission is undetermined.
+    Unresolved(ApiError),
+}
+
+async fn validate_inner(raw_url: &str, policy: &FetchPolicy) -> Result<FetchUrlPlan, GuardError> {
+    let reject = |e: anyhow::Error| GuardError::Rejected(ApiError::from(e));
+    let url =
+        reqwest::Url::parse(raw_url).map_err(|e| reject(anyhow::anyhow!("Invalid URL: {e}")))?;
 
     match url.scheme() {
         "http" | "https" => {}
         s => {
-            return Err(ApiError::from(anyhow::anyhow!(
+            return Err(reject(anyhow::anyhow!(
                 "URL scheme '{s}' not allowed (must be http or https)"
             )));
         }
@@ -49,14 +207,16 @@ pub async fn validate_fetch_url(raw_url: &str) -> Result<FetchUrlPlan, ApiError>
 
     let host = url
         .host_str()
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("URL has no host")))?
+        .ok_or_else(|| reject(anyhow::anyhow!("URL has no host")))?
         .to_string();
 
     // IP literal: validate directly without a DNS round-trip.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if !is_globally_routable(ip) {
-            return Err(ApiError::from(anyhow::anyhow!(
-                "URL targets a private/reserved address"
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = literal.parse::<IpAddr>() {
+        if !policy.ip_is_allowed(ip) {
+            return Err(reject(anyhow::anyhow!(
+                "URL targets a private/reserved address (allow it with \
+                 general.fetch_allow_private or general.fetch_allowed_hosts)"
             )));
         }
         return Ok(FetchUrlPlan {
@@ -65,24 +225,33 @@ pub async fn validate_fetch_url(raw_url: &str) -> Result<FetchUrlPlan, ApiError>
         });
     }
 
-    // Hostname: resolve and check every returned address.
+    // Hostname: resolve and check every returned address. An explicitly
+    // listed hostname may resolve anywhere, but the connection is still
+    // pinned to the addresses resolved here.
     let port = url.port_or_known_default().unwrap_or(80);
     let addrs: Vec<_> = tokio::net::lookup_host(format!("{host}:{port}"))
         .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!("DNS resolution failed for '{host}': {e}")))?
+        .map_err(|e| {
+            GuardError::Unresolved(ApiError::from(anyhow::anyhow!(
+                "DNS resolution failed for '{host}': {e}"
+            )))
+        })?
         .collect();
 
     if addrs.is_empty() {
-        return Err(ApiError::from(anyhow::anyhow!(
+        return Err(GuardError::Unresolved(ApiError::from(anyhow::anyhow!(
             "DNS resolution returned no addresses for '{host}'"
-        )));
+        ))));
     }
 
-    for addr in &addrs {
-        if !is_globally_routable(addr.ip()) {
-            return Err(ApiError::from(anyhow::anyhow!(
-                "URL resolves to a private/reserved address"
-            )));
+    if !policy.host_is_listed(&host) {
+        for addr in &addrs {
+            if !policy.ip_is_allowed(addr.ip()) {
+                return Err(reject(anyhow::anyhow!(
+                    "URL resolves to a private/reserved address (allow it with \
+                     general.fetch_allow_private or general.fetch_allowed_hosts)"
+                )));
+            }
         }
     }
 
@@ -236,6 +405,126 @@ mod tests {
                 "{url}: {error}"
             );
         }
+    }
+
+    fn hosts(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|e| e.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn strict_policy_rejects_lan_and_docker_addresses() {
+        for url in ["http://192.168.1.10/api", "http://172.17.0.2:9696/api"] {
+            let error = validate_fetch_url_with(url, &FetchPolicy::strict())
+                .await
+                .expect_err("strict policy must reject private address");
+            assert!(error.to_string().contains("private/reserved"), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_private_admits_lan_indexers_but_not_metadata() {
+        let policy = FetchPolicy::new(true, &[]);
+        for url in [
+            "http://192.168.1.10/api",
+            "http://172.17.0.2:9696/api",
+            "http://10.0.0.5/api",
+            "http://100.100.1.1/api",
+            "http://[fd00::1]/api",
+        ] {
+            validate_fetch_url_with(url, &policy)
+                .await
+                .unwrap_or_else(|e| panic!("{url} must be allowed: {e}"));
+        }
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[fe80::1]/",
+            "http://127.0.0.1:5076/api",
+            "http://[::1]/api",
+            "http://224.0.0.1/",
+            "http://0.0.0.0/",
+            "http://255.255.255.255/",
+        ] {
+            let error = validate_fetch_url_with(url, &policy)
+                .await
+                .expect_err("non-LAN special address must stay blocked");
+            assert!(error.to_string().contains("private/reserved"), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_hosts_admit_only_listed_networks_and_names() {
+        let policy = FetchPolicy::new(false, &hosts(&["172.16.0.0/12", "10.1.2.3", "LocalHost"]));
+        for url in [
+            "http://172.20.0.5/api",
+            "http://10.1.2.3/api",
+            "http://localhost:9696/api",
+        ] {
+            validate_fetch_url_with(url, &policy)
+                .await
+                .unwrap_or_else(|e| panic!("{url} must be allowed: {e}"));
+        }
+        for url in [
+            "http://192.168.1.1/api",
+            "http://10.1.2.4/api",
+            "http://127.0.0.1/api",
+            "http://169.254.169.254/",
+        ] {
+            validate_fetch_url_with(url, &policy)
+                .await
+                .expect_err("unlisted private address must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_endpoint_requires_explicit_listing() {
+        let policy = FetchPolicy::new(true, &hosts(&["169.254.169.254/32"]));
+        validate_fetch_url_with("http://169.254.169.254/", &policy)
+            .await
+            .expect("explicitly listed metadata address is allowed");
+    }
+
+    #[tokio::test]
+    async fn hostname_plan_stays_pinned_when_allowed() {
+        let policy = FetchPolicy::new(false, &hosts(&["localhost"]));
+        let plan = validate_fetch_url_with("http://localhost:5076/api", &policy)
+            .await
+            .expect("listed hostname allowed");
+        assert!(plan.requires_pinned_client());
+    }
+
+    #[test]
+    fn policy_from_config_reads_general_settings() {
+        let general = GeneralConfig {
+            fetch_allow_private: false,
+            fetch_allowed_hosts: hosts(&["192.168.0.0/16", "prowlarr", "bogus/99"]),
+            ..GeneralConfig::default()
+        };
+        let policy = FetchPolicy::from_config(&general);
+        assert!(policy.ip_is_allowed("192.168.4.4".parse().unwrap()));
+        assert!(!policy.ip_is_allowed("10.0.0.1".parse().unwrap()));
+        assert!(policy.host_is_listed("Prowlarr."));
+        assert!(
+            !FetchPolicy::from_config(&GeneralConfig::default())
+                .ip_is_allowed("192.168.4.4".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn check_fetch_url_allowed_rejects_policy_violations_only() {
+        let strict = FetchPolicy::strict();
+        check_fetch_url_allowed("http://192.168.1.10/rss", &strict)
+            .await
+            .expect_err("private feed must be rejected at save time");
+        check_fetch_url_allowed("ftp://example.com/rss", &strict)
+            .await
+            .expect_err("bad scheme must be rejected at save time");
+        // Unresolvable names are not a policy violation; polling re-validates.
+        check_fetch_url_allowed("https://feed.invalid/rss", &strict)
+            .await
+            .expect("unresolvable host is accepted at save time");
+        check_fetch_url_allowed("http://192.168.1.10/rss", &FetchPolicy::new(true, &[]))
+            .await
+            .expect("private feed allowed by policy");
     }
 
     async fn one_shot_http_response(response: &'static str) -> reqwest::Url {

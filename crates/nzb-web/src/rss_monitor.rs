@@ -7,7 +7,8 @@ use chrono::Utc;
 use tracing::{info, warn};
 
 use crate::fetch_guard::{
-    MAX_FETCH_BODY_BYTES, build_fetch_client, read_response_bytes_limited, validate_fetch_url,
+    FetchPolicy, MAX_FETCH_BODY_BYTES, build_fetch_client, read_response_bytes_limited,
+    validate_fetch_url_with,
 };
 use crate::nzb_core::config::{AppConfig, RssFeedConfig};
 use crate::nzb_core::models::{Priority, RssItem};
@@ -134,10 +135,14 @@ impl RssMonitor {
         }
     }
 
+    fn fetch_policy(&self) -> FetchPolicy {
+        FetchPolicy::from_config(&self.config.load().general)
+    }
+
     async fn check_feed(&self, feed: &RssFeedConfig) -> anyhow::Result<()> {
         info!(feed = %feed.name, url = %feed.url, "Checking RSS feed");
 
-        let feed_plan = validate_fetch_url(&feed.url)
+        let feed_plan = validate_fetch_url_with(&feed.url, &self.fetch_policy())
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let feed_client =
@@ -355,7 +360,7 @@ impl RssMonitor {
         category: Option<&str>,
         priority: i32,
     ) -> anyhow::Result<()> {
-        let plan = validate_fetch_url(url)
+        let plan = validate_fetch_url_with(url, &self.fetch_policy())
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let client =

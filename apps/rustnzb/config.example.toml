@@ -26,6 +26,14 @@ max_nested_archive_depth = 5  # 0=outer archive only; protects against unbounded
 # script_failure = "on-failure.sh"
 script_timeout_secs = 300
 script_max_output_bytes = 1048576
+# Server-side URL fetches (add-url, SABnzbd addurl, RSS feeds) refuse private
+# and reserved addresses by default. To reach a self-hosted indexer such as
+# NZBHydra2 or Prowlarr on your LAN or a Docker network, either allow private
+# ranges wholesale or list the specific hosts/CIDRs. Loopback and link-local
+# addresses (127.0.0.1, ::1, the 169.254.169.254 cloud-metadata endpoint) stay
+# blocked unless listed in fetch_allowed_hosts.
+# fetch_allow_private = false
+# fetch_allowed_hosts = ["prowlarr", "192.168.1.0/24", "172.16.0.0/12"]
 
 # NNTP servers — add as many as needed, ordered by priority
 # Use the web UI "Servers" tab to add/edit servers, or uncomment below:
