@@ -255,3 +255,97 @@ async fn restart_restores_checkpoint_and_skips_completed_article() {
     assert_eq!(history.status, JobStatus::Completed);
     assert_eq!(history.downloaded_bytes, history.total_bytes);
 }
+
+#[tokio::test]
+async fn resuming_paused_jobs_respects_active_download_limit() {
+    let first = NzbFixture::new("limit-first")
+        .add_file(
+            "first.bin",
+            &[
+                ("limit-first-1", b"first-one"),
+                ("limit-first-2", b"first-two"),
+                ("limit-first-3", b"first-three"),
+                ("limit-first-4", b"first-four"),
+            ],
+        )
+        .build();
+    let second = NzbFixture::new("limit-second")
+        .add_file(
+            "second.bin",
+            &[
+                ("limit-second-1", b"second-one"),
+                ("limit-second-2", b"second-two"),
+                ("limit-second-3", b"second-three"),
+                ("limit-second-4", b"second-four"),
+            ],
+        )
+        .build();
+    let triples = first
+        .articles
+        .iter()
+        .chain(second.articles.iter())
+        .map(|(id, bytes, name)| (*id, *bytes, name.as_str()))
+        .collect::<Vec<_>>();
+    let server = ServerProfile::start(
+        "limit",
+        MockConfig {
+            articles: yenc_articles(&triples),
+            response_delay: Some(Duration::from_millis(150)),
+            ..MockConfig::default()
+        },
+        1,
+    )
+    .await;
+    // max_active_downloads = 1
+    let engine = HarnessBuilder::pause_resume(server)
+        .article_timeout(10)
+        .build();
+    let first_id = engine
+        .submit_nzb_xml("limit-first", first.xml)
+        .expect("submit first");
+    let second_id = engine
+        .submit_nzb_xml("limit-second", second.xml)
+        .expect("submit second");
+    assert!(
+        engine
+            .wait_for_status(&first_id, Duration::from_secs(5), &[JobStatus::Downloading])
+            .await
+    );
+    assert_eq!(engine.job(&second_id).unwrap().status, JobStatus::Queued);
+
+    // Pausing the active job hands its slot to the queued one; pause that too
+    // so both jobs hold a paused context in the worker pool.
+    engine.queue_manager.pause_job(&first_id).unwrap();
+    assert!(
+        engine
+            .wait_for_status(
+                &second_id,
+                Duration::from_secs(5),
+                &[JobStatus::Downloading]
+            )
+            .await
+    );
+    engine.queue_manager.pause_job(&second_id).unwrap();
+
+    engine.queue_manager.resume_job(&first_id).unwrap();
+    engine.queue_manager.resume_job(&second_id).unwrap();
+    let snapshot = engine.snapshot();
+    let downloading = snapshot
+        .jobs
+        .iter()
+        .filter(|job| job.status == JobStatus::Downloading)
+        .count();
+    assert_eq!(downloading, 1, "max_active_downloads=1 must hold on resume");
+    assert_eq!(engine.job(&second_id).unwrap().status, JobStatus::Queued);
+
+    // The queued job must still be started (from its paused pool context)
+    // once the active one finishes.
+    for id in [&first_id, &second_id] {
+        assert!(
+            engine
+                .wait_for_status(id, Duration::from_secs(15), &[JobStatus::Completed])
+                .await,
+            "job {id} did not complete"
+        );
+    }
+}
