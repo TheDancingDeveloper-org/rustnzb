@@ -1,6 +1,6 @@
 [package]
 name = "nzb-decode"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "yEnc decoding, file assembly, and article cache for NZB download clients"
 license = "MIT"

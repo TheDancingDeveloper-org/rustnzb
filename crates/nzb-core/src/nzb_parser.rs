@@ -140,6 +140,23 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
                             );
                         }
 
+                        // Segment numbers are the article identity used by the
+                        // assembler. Sort by number (stable, so the first
+                        // declaration of a duplicated number wins) and drop
+                        // re-declarations: a duplicate would otherwise be
+                        // counted twice and the file could never complete.
+                        current_segments.sort_by_key(|s| s.number);
+                        let before_dedup = current_segments.len();
+                        current_segments.dedup_by_key(|s| s.number);
+                        let duplicates = before_dedup - current_segments.len();
+                        if duplicates > 0 {
+                            warn!(
+                                filename = %filename,
+                                duplicates,
+                                "Dropped {duplicates} duplicate segment number(s); kept the first declaration"
+                            );
+                        }
+
                         let total_bytes: u64 = current_segments.iter().map(|s| s.bytes).sum();
                         let articles: Vec<Article> = current_segments
                             .drain(..)
@@ -715,10 +732,63 @@ mod tests {
         let job = parse_nzb("order", nzb_data).unwrap();
         let articles = &job.files[0].articles;
         assert_eq!(articles.len(), 3);
-        // Segments should be in the order they appear in the XML
-        assert_eq!(articles[0].segment_number, 3);
-        assert_eq!(articles[1].segment_number, 1);
-        assert_eq!(articles[2].segment_number, 2);
+        // Segments are sorted by segment number regardless of XML order,
+        // and each keeps the message-ID it was declared with.
+        assert_eq!(articles[0].segment_number, 1);
+        assert_eq!(articles[0].message_id, "seg1@x");
+        assert_eq!(articles[1].segment_number, 2);
+        assert_eq!(articles[1].message_id, "seg2@x");
+        assert_eq!(articles[2].segment_number, 3);
+        assert_eq!(articles[2].message_id, "seg3@x");
+    }
+
+    #[test]
+    fn test_parse_nzb_duplicate_segment_numbers_keep_first() {
+        let nzb_data = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p@x.com" date="100" subject="test.rar (1/1)">
+    <groups><group>alt.test</group></groups>
+    <segments>
+      <segment number="2" bytes="200">seg2@x</segment>
+      <segment number="1" bytes="100">seg1-first@x</segment>
+      <segment number="1" bytes="999">seg1-repost@x</segment>
+    </segments>
+  </file>
+</nzb>"#;
+
+        let job = parse_nzb("dups", nzb_data).unwrap();
+        let file = &job.files[0];
+        let numbers: Vec<u32> = file.articles.iter().map(|a| a.segment_number).collect();
+        assert_eq!(numbers, vec![1, 2]);
+        assert_eq!(file.articles[0].message_id, "seg1-first@x");
+        assert_eq!(file.articles[0].bytes, 100);
+        // File size and job counters must not include the dropped duplicate.
+        assert_eq!(file.bytes, 300);
+        assert_eq!(job.total_bytes, 300);
+        assert_eq!(job.article_count, 2);
+    }
+
+    #[test]
+    fn test_parse_nzb_segment_gaps_are_preserved_sorted() {
+        let nzb_data = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p@x.com" date="100" subject="test.rar (1/1)">
+    <groups><group>alt.test</group></groups>
+    <segments>
+      <segment number="4" bytes="100">seg4@x</segment>
+      <segment number="1" bytes="100">seg1@x</segment>
+      <segment number="2" bytes="100">seg2@x</segment>
+    </segments>
+  </file>
+</nzb>"#;
+
+        let job = parse_nzb("gaps", nzb_data).unwrap();
+        let numbers: Vec<u32> = job.files[0]
+            .articles
+            .iter()
+            .map(|a| a.segment_number)
+            .collect();
+        assert_eq!(numbers, vec![1, 2, 4]);
     }
 
     #[test]
