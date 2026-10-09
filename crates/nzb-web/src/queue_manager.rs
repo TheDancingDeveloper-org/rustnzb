@@ -3556,6 +3556,11 @@ impl QueueManager {
         *self.complete_dir.lock() = dir;
     }
 
+    /// Configured categories, including any per-category output directory.
+    pub fn categories(&self) -> Vec<crate::nzb_core::config::CategoryConfig> {
+        self.categories.lock().clone()
+    }
+
     /// Resolve a category and job name to the configured output directory.
     /// Both values originate from API/NZB input, so they must remain single
     /// path components before they are joined to a trusted configured root.
