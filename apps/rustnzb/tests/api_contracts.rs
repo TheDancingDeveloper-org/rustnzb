@@ -1246,3 +1246,151 @@ async fn bad_input_on_add_browse_and_rss_download_is_a_client_error() {
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["error_kind"], "conflict");
 }
+
+/// BUG-80: PUT /api/config/general used to answer `{"status":true}` for
+/// fields it silently dropped and for nonsensical values.
+#[tokio::test]
+async fn general_config_rejects_unknown_fields_and_out_of_range_values() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let (access, _) = login(&app, &client).await;
+    let url = format!("{}/api/config/general", app.base_url);
+    let before = AppConfig::load(&app.config_path).unwrap();
+
+    let rejected = [
+        // Unknown / non-editable fields name the offending key.
+        (serde_json::json!({"no_such_setting": 1}), "no_such_setting"),
+        (serde_json::json!({"log_level": "debug"}), "log_level"),
+        (
+            serde_json::json!({"abort_hopeless": false}),
+            "abort_hopeless",
+        ),
+        // Out-of-range values.
+        (serde_json::json!({"cache_size": 0}), "cache_size"),
+        (serde_json::json!({"cache_size": 1_u64 << 40}), "cache_size"),
+        (
+            serde_json::json!({"max_active_downloads": 99_999}),
+            "max_active_downloads",
+        ),
+        (
+            serde_json::json!({"max_post_processing_jobs": 999}),
+            "max_post_processing_jobs",
+        ),
+        (
+            serde_json::json!({"max_repair_workers": 999}),
+            "max_repair_workers",
+        ),
+        (
+            serde_json::json!({"max_extract_workers": 999}),
+            "max_extract_workers",
+        ),
+        (
+            serde_json::json!({"required_completion_pct": 99.0}),
+            "required_completion_pct",
+        ),
+        (
+            serde_json::json!({"required_completion_pct": 250.0}),
+            "required_completion_pct",
+        ),
+        (
+            serde_json::json!({"article_timeout_secs": 86_400}),
+            "article_timeout_secs",
+        ),
+        (
+            serde_json::json!({"max_nested_archive_depth": 11}),
+            "max_nested_archive_depth",
+        ),
+        (serde_json::json!({"direct_unpack": "yes"}), "direct_unpack"),
+    ];
+    for (payload, field) in rejected {
+        let (status, body) = call(client.put(&url).bearer_auth(&access).json(&payload)).await;
+        assert_eq!(status, 400, "{payload} -> {body}");
+        assert_eq!(body["error_kind"], "bad_request", "{payload} -> {body}");
+        assert!(
+            body["human_readable"]
+                .as_str()
+                .unwrap_or("")
+                .contains(field),
+            "{payload}: error should name `{field}`: {body}"
+        );
+    }
+
+    // A rejected request must not apply any part of itself: the valid
+    // `direct_unpack` change is discarded along with the bad cache size.
+    let (status, body) = call(
+        client
+            .put(&url)
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"direct_unpack": false, "cache_size": 0})),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+
+    let after = AppConfig::load(&app.config_path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&after.general).unwrap(),
+        serde_json::to_value(&before.general).unwrap(),
+        "rejected updates must not change the saved config"
+    );
+    assert_eq!(app.state.queue_manager.get_max_active_downloads(), 1);
+}
+
+/// BUG-80: settings that previously had no API path can now be edited, and
+/// the documented sentinel values (0 = unlimited / no timeout / outer
+/// archive only) are accepted.
+#[tokio::test]
+async fn general_config_persists_previously_unreachable_settings() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let (access, _) = login(&app, &client).await;
+    let url = format!("{}/api/config/general", app.base_url);
+
+    let (status, body) = call(
+        client
+            .put(&url)
+            .bearer_auth(&access)
+            .json(&serde_json::json!({
+                "required_completion_pct": 150.0,
+                "article_timeout_secs": 0,
+                "max_nested_archive_depth": 0,
+                "direct_unpack": false,
+                "early_failure_check": false,
+                "cache_size": 16 * 1024 * 1024,
+                "max_active_downloads": 0,
+                "max_post_processing_jobs": 64,
+                "max_repair_workers": 2,
+                "max_extract_workers": 3,
+            })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], true);
+
+    for general in [
+        AppConfig::load(&app.config_path).unwrap().general,
+        app.state.config().general.clone(),
+    ] {
+        assert_eq!(general.required_completion_pct, 150.0);
+        assert_eq!(general.article_timeout_secs, 0);
+        assert_eq!(general.max_nested_archive_depth, 0);
+        assert!(!general.direct_unpack);
+        assert!(!general.early_failure_check);
+        assert_eq!(general.cache_size, 16 * 1024 * 1024);
+        assert_eq!(general.max_active_downloads, 0);
+        assert_eq!(general.max_post_processing_jobs, 64);
+        assert_eq!(general.max_repair_workers, 2);
+        assert_eq!(general.max_extract_workers, 3);
+    }
+    assert_eq!(app.state.queue_manager.get_max_active_downloads(), 0);
+
+    // The dedicated endpoint shares the same bound.
+    let (status, body) = call(
+        client
+            .put(format!("{}/api/config/max-active-downloads", app.base_url))
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"max_active_downloads": 99_999})),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(app.state.queue_manager.get_max_active_downloads(), 0);
+}
