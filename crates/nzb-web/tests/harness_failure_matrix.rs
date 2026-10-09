@@ -516,3 +516,56 @@ async fn repeated_502_then_recovery_completes_with_no_failures() {
     let job = engine.job(&id);
     assert_eq!(job.map(|j| j.articles_failed).unwrap_or(0), 0);
 }
+
+#[tokio::test]
+async fn one_article_always_rejected_does_not_block_the_job() {
+    let body = b"healthy";
+    let fixture = NzbFixture::new("poison")
+        .add_file(
+            "payload.bin",
+            &[("poison-good", body), ("poison-bad", body)],
+        )
+        .build();
+    let triples = fixture
+        .articles
+        .iter()
+        .map(|(id, bytes, name)| (*id, *bytes, name.as_str()))
+        .collect::<Vec<_>>();
+    // One article is refused on every attempt while the server keeps serving
+    // the other. It must reach a definitive failure instead of being retried
+    // at the head of the queue forever, and the rest of the job completes.
+    let mut overrides = HashMap::new();
+    overrides.insert("poison-bad".to_string(), 400);
+    let server = ServerProfile::start(
+        "poison",
+        MockConfig {
+            articles: yenc_articles(&triples),
+            article_response_overrides: overrides,
+            ..MockConfig::default()
+        },
+        1,
+    )
+    .await;
+    let engine = HarnessBuilder::new().with_server(server).build();
+    let id = engine.submit_nzb_xml("poison", fixture.xml).unwrap();
+    assert!(
+        engine
+            .wait_for_status(
+                &id,
+                Duration::from_secs(30),
+                &[JobStatus::Completed, JobStatus::Failed],
+            )
+            .await,
+        "job did not finish while one article was refused forever"
+    );
+    let history = engine
+        .queue_manager
+        .history_get(&id)
+        .expect("history query")
+        .expect("finished history");
+    assert!(
+        history.downloaded_bytes > 0,
+        "the good article was not written"
+    );
+    assert!(history.downloaded_bytes < history.total_bytes);
+}

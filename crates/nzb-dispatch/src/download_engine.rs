@@ -65,6 +65,11 @@ fn increment_counter(name: &'static str) {
 
 /// Max times to retry an article on the SAME server before trying the next.
 const MAX_TRIES_PER_SERVER: u32 = 3;
+/// How many timeouts, dropped connections or unclassified errors one article
+/// absorbs on a server that is otherwise up, before the error counts as that
+/// server's definitive outcome. A server-wide outage (502, 480, 403) is not
+/// counted: the circuit breaker handles those.
+const MAX_OUTAGE_TRIES_PER_SERVER: u32 = 10;
 /// Delay between reconnection attempts.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Max reconnect attempts before giving up on a server for this session.
@@ -527,6 +532,9 @@ pub(crate) struct WorkItem {
     pub(crate) provider_outcomes: HashMap<String, crate::article_failure::ArticleFailureKind>,
     /// Number of attempts on the current server.
     pub(crate) tries_on_current: u32,
+    /// Timeouts and dropped connections seen for this article while the
+    /// server was otherwise healthy. Reset when the article moves server.
+    pub(crate) outage_tries: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -563,9 +571,11 @@ pub(crate) struct JobContext {
     active_elapsed: Mutex<Duration>,
     /// Total bytes across all files (for perf summary throughput).
     pub total_bytes: u64,
-    /// The first `size=` seen per file, pinned so later articles for the same
-    /// file cannot claim a different size.
-    pinned_file_sizes: Mutex<HashMap<String, Option<u64>>>,
+    /// The first `size=` seen per file. Only a present size is pinned, and it
+    /// is a cross-check rather than an authority: the NZB-declared size is
+    /// the bound, so one article with a wrong or missing `size=` must not
+    /// make every later article of the file fail.
+    pinned_file_sizes: Mutex<HashMap<String, u64>>,
     /// Ensures JobFinished/JobAborted is only emitted once.
     finished: AtomicBool,
     /// Avoid repeatedly reporting the same all-provider outage while the
@@ -2446,24 +2456,43 @@ async fn run_worker_pipelined(
                             .or_default()
                             .record_failure(is_auth, &e.to_string());
                         pool.report_provider_outage();
-                        // An outage (502, 480, 403, TLS, timeout) says nothing
-                        // about the article, so it must not spend one of the
-                        // article's tries: after MAX_TRIES_PER_SERVER the
-                        // article would be failed permanently and a resume
-                        // would skip it. Re-queue it untouched and reconnect.
-                        // Only an article-specific error is a definitive
-                        // outcome for this server.
-                        let is_outage = matches!(
+                        // A server-wide outage (502, 480, 403) says nothing
+                        // about the article, so it is re-queued without
+                        // spending a try: the circuit breaker decides when the
+                        // server is unusable. A timeout or a dropped
+                        // connection on a server that is otherwise serving
+                        // articles may be this one article, so those are
+                        // capped — otherwise one poison article is retried at
+                        // the head of the queue forever.
+                        let server_wide = matches!(
                             failure.kind,
                             crate::article_failure::ArticleFailureKind::ServerDown
                                 | crate::article_failure::ArticleFailureKind::AuthFailed
                                 | crate::article_failure::ArticleFailureKind::PermissionDenied
-                                | crate::article_failure::ArticleFailureKind::Timeout
+                        );
+                        let article_outage = matches!(
+                            failure.kind,
+                            crate::article_failure::ArticleFailureKind::Timeout
                                 | crate::article_failure::ArticleFailureKind::ConnectionClosed
                                 | crate::article_failure::ArticleFailureKind::Other
                         );
-                        if is_outage {
+                        if server_wide {
                             pool.work_queue.push_front(item);
+                        } else if article_outage {
+                            item.outage_tries += 1;
+                            if item.outage_tries < MAX_OUTAGE_TRIES_PER_SERVER {
+                                pool.work_queue.push_front(item);
+                            } else if retry_or_fail_over(
+                                item,
+                                primary_server,
+                                pool,
+                                &ctx,
+                                worker_id,
+                                failure.kind,
+                                &e.to_string(),
+                            ) {
+                                last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                            }
                         } else if retry_or_fail_over(
                             item,
                             primary_server,
@@ -2644,6 +2673,7 @@ fn handle_article_not_available(
         item.tried_servers.push(primary_server.id.clone());
     }
     item.tries_on_current = 0;
+    item.outage_tries = 0;
 
     let all_definitive = all_enabled_providers_definitive(
         &all_servers.lock(),
@@ -2901,13 +2931,23 @@ pub(crate) fn build_job_submission(
             .iter()
             .map(|article| article.segment_number)
             .collect();
+        // Only trust the NZB size when every segment reported one. The parser
+        // turns a missing or unparsable `bytes` attribute into 0, so a file
+        // whose segments omit it sums to 0 (or to an understatement) and
+        // every article would then be rejected as past the declared size.
+        // With no bound, the write check falls back to the article's size=.
+        let declared_bytes = file
+            .articles
+            .iter()
+            .all(|article| article.bytes > 0)
+            .then_some(file.bytes);
         if let Err(e) = assembler.register_file_with_segment_numbers(
             &job.id,
             &file.id,
             output_path,
             &segment_numbers,
             &completed_segments,
-            Some(file.bytes),
+            declared_bytes,
         ) {
             error!(file = %file.filename, "Failed to register file for assembly: {e}");
         }
@@ -2948,6 +2988,7 @@ pub(crate) fn build_job_submission(
                     tried_servers: article.tried_servers.clone(),
                     provider_outcomes: HashMap::new(),
                     tries_on_current: 0,
+                    outage_tries: 0,
                 })
         })
         .collect();
@@ -3217,7 +3258,7 @@ fn decode_and_assemble(
     item: &WorkItem,
     raw_data: &[u8],
     assembler: &FileAssembler,
-    pinned_file_sizes: Option<&Mutex<HashMap<String, Option<u64>>>>,
+    pinned_file_sizes: Option<&Mutex<HashMap<String, u64>>>,
 ) -> Result<ProcessResult, ArticleError> {
     let decode_start = Instant::now();
     let decoded = decode_yenc(raw_data).map_err(|e| {
@@ -3228,27 +3269,46 @@ fn decode_and_assemble(
     })?;
     let decode_us = decode_start.elapsed().as_micros();
 
-    // Pin the first size= seen for this file. Later articles must agree with
-    // it, so one article cannot inflate the bound the others are checked
-    // against. The caller's bound is the size the NZB declared.
-    let pinned_size = match pinned_file_sizes {
-        Some(sizes) => {
+    // Remember the first size= seen for this file, but only a real one: an
+    // article that omits size= must not become the pin. The pin is a
+    // cross-check. The NZB-declared size is what bounds the write, so when it
+    // is known a disagreement is logged and the article is still written.
+    let declared = assembler.declared_bytes(&item.job_id, &item.file_id);
+    let pinned_size = match (pinned_file_sizes, decoded.file_size) {
+        (Some(sizes), Some(size)) => {
             let mut sizes = sizes.lock();
             match sizes.entry(item.file_id.clone()) {
-                std::collections::hash_map::Entry::Occupied(existing) => *existing.get(),
-                std::collections::hash_map::Entry::Vacant(slot) => *slot.insert(decoded.file_size),
+                std::collections::hash_map::Entry::Occupied(existing) => Some(*existing.get()),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(size);
+                    Some(size)
+                }
             }
         }
-        None => decoded.file_size,
+        (Some(sizes), None) => sizes.lock().get(&item.file_id).copied(),
+        (None, size) => size,
     };
+    if declared.is_some() && decoded.file_size != pinned_size {
+        warn!(
+            file_id = %item.file_id,
+            segment_number = item.segment_number,
+            article_size = ?decoded.file_size,
+            pinned_size = ?pinned_size,
+            "yEnc size= disagrees with the size pinned for this file; the NZB-declared size is the bound"
+        );
+    }
 
     let decoded_len = decoded.data.len() as u64;
     let data_begin = validated_write_offset(
         item.segment_number,
         &decoded,
         decoded_len,
-        assembler.declared_bytes(&item.job_id, &item.file_id),
-        pinned_size,
+        declared,
+        if declared.is_some() {
+            decoded.file_size
+        } else {
+            pinned_size
+        },
     )
     .map_err(|reason| {
         ArticleError::DecodeError(format!(
@@ -3395,6 +3455,57 @@ mod tests {
                 .map(|item| (item.message_id.as_str(), item.segment_number))
                 .collect::<Vec<_>>(),
             vec![("third", 3), ("first", 1)]
+        );
+    }
+
+    #[test]
+    fn file_without_segment_bytes_still_assembles() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = test_job("no-bytes", temp.path());
+        let article = |message_id: &str, segment_number: u32| nzb_nntp::Article {
+            message_id: message_id.to_string(),
+            segment_number,
+            bytes: 0,
+            downloaded: false,
+            data_begin: None,
+            data_size: None,
+            crc32: None,
+            tried_servers: Vec::new(),
+            tries: 0,
+        };
+        job.files.push(nzb_core::models::NzbFile {
+            id: "file-1".into(),
+            filename: "out.bin".into(),
+            bytes: 0,
+            bytes_downloaded: 0,
+            is_par2: false,
+            par2_setname: None,
+            par2_vol: None,
+            par2_blocks: None,
+            assembled: false,
+            groups: Vec::new(),
+            articles: vec![article("seg1", 1), article("seg2", 2)],
+        });
+        let (tx, _rx) = mpsc::channel(4);
+        let (ctx, _items) = build_job_submission(&job, tx, &["srv1".into()]);
+        // A missing bytes= attribute parses as 0, so there is no NZB bound.
+        assert_eq!(ctx.assembler.declared_bytes(&job.id, "file-1"), None);
+
+        let (seg1, _) = yenc_simd::encode_article(b"AAAA", "out.bin", 1, 2, 0, 8);
+        let (seg2, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 4, 8);
+        let item = |segment_number| {
+            let mut item = make_item(&job.id, "msg@test", "out.bin");
+            item.file_id = "file-1".into();
+            item.segment_number = segment_number;
+            item
+        };
+        decode_and_assemble(&item(1), &seg1, &ctx.assembler, None).unwrap();
+        let second = decode_and_assemble(&item(2), &seg2, &ctx.assembler, None).unwrap();
+
+        assert!(second.file_complete);
+        assert_eq!(
+            std::fs::read(temp.path().join("out.bin")).unwrap(),
+            b"AAAABBBB"
         );
     }
 
@@ -3777,6 +3888,7 @@ mod tests {
             tried_servers: Vec::new(),
             provider_outcomes: HashMap::new(),
             tries_on_current: 0,
+            outage_tries: 0,
         }
     }
 
