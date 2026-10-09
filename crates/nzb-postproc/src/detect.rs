@@ -427,7 +427,35 @@ fn is_cleanup_candidate_at(path: &Path, name_lower: &str) -> bool {
     if is_cleanup_candidate(name_lower) {
         return true;
     }
+    // Old-style continuation volume (.r00 ... .z99). `.r00` is also a
+    // plausible name for ordinary payload, so only treat it as a volume when
+    // it belongs to a RAR set present alongside it or is itself a RAR file.
+    if !name_lower.ends_with(".rar")
+        && let Some(info) = parse_rar_volume(name_lower)
+    {
+        return has_rar_first_volume(path, &info.set_name) || has_rar_signature(path);
+    }
     split_numeric_volume(name_lower).is_some() && has_rar_signature(path)
+}
+
+/// Returns true if the directory containing `path` holds the first volume
+/// (`<set>.rar` or `<set>.partNN.rar`) of the RAR set named `set_lower`.
+/// Matching is case-insensitive; `set_lower` must already be lowercased.
+fn has_rar_first_volume(path: &Path, set_lower: &str) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let Some(name) = entry.file_name().to_str().map(str::to_lowercase) else {
+            return false;
+        };
+        name.ends_with(".rar")
+            && parse_rar_volume(&name).is_some_and(|info| info.set_name == set_lower)
+            && entry.file_type().is_ok_and(|t| t.is_file())
+    })
 }
 
 /// Determine whether a file (by its lowercased name alone) is safe to clean up
@@ -451,21 +479,9 @@ fn is_cleanup_candidate(name: &str) -> bool {
         return true;
     }
 
-    // Old-style RAR split volumes: .r00, .r01, ..., .r99, .s00, ...
-    // Pattern: ends with .rNN or .sNN (or any letter + two digits)
-    if name.len() > 4 {
-        let last4 = &name[name.len() - 4..];
-        if last4.starts_with('.')
-            && last4.as_bytes()[1].is_ascii_lowercase()
-            && last4.as_bytes()[2].is_ascii_digit()
-            && last4.as_bytes()[3].is_ascii_digit()
-        {
-            return true;
-        }
-    }
-
-    // Extended old-style volumes beyond .r99: .s00, .t00, etc. are caught above.
-    // Also handle three-digit extensions: .part001.rar already covered.
+    // Old-style RAR split volumes (.r00, .s00, ...) are deliberately not
+    // matched here: the same name shape is used by unrelated payload, so they
+    // need on-disk evidence — see `is_cleanup_candidate_at`.
 
     // Split 7z volumes: .7z.001, .7z.002, etc.
     if is_split_7z_volume(name) {
@@ -637,11 +653,55 @@ mod tests {
 
     #[test]
     fn test_cleanup_old_style_volumes() {
-        assert!(is_cleanup_candidate("archive.r00"));
-        assert!(is_cleanup_candidate("archive.r99"));
-        assert!(is_cleanup_candidate("archive.s00"));
-        assert!(!is_cleanup_candidate("readme.txt"));
-        assert!(!is_cleanup_candidate("movie.mkv"));
+        let dir = make_test_dir(&[
+            "archive.rar",
+            "archive.r00",
+            "archive.r99",
+            "archive.s00",
+            "readme.txt",
+            "movie.mkv",
+        ]);
+        let candidate = |name: &str| {
+            is_cleanup_candidate_at(&dir.path().join(name), &name.to_ascii_lowercase())
+        };
+        assert!(candidate("archive.r00"));
+        assert!(candidate("archive.r99"));
+        assert!(candidate("archive.s00"));
+        assert!(!candidate("readme.txt"));
+        assert!(!candidate("movie.mkv"));
+    }
+
+    #[test]
+    fn test_cleanup_keeps_letter_digit_payload_without_rar_set() {
+        // No archive anywhere: these are payload (N64 ROM, C64 disk image,
+        // and an orphan .r00 that is not a RAR volume) and must survive.
+        let dir = make_test_dir(&["Game.n64", "disk.d64", "notes.r00", "readme.txt"]);
+        let results = find_cleanup_files(dir.path());
+        assert!(
+            results.is_empty(),
+            "payload marked for cleanup: {results:?}"
+        );
+        assert!(has_usable_output(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn test_cleanup_old_style_volume_matches_set_case_insensitively() {
+        let dir = make_test_dir(&["Movie.RAR", "Movie.R00", "movie.r01", "Game.n64"]);
+        let names: Vec<String> = find_cleanup_files(dir.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["Movie.R00", "Movie.RAR", "movie.r01"]);
+    }
+
+    #[test]
+    fn test_cleanup_orphan_old_style_volume_with_rar_signature() {
+        // A continuation volume whose first volume is gone is still a RAR
+        // volume when its content says so.
+        let dir = make_test_dir(&[]);
+        fs::write(dir.path().join("movie.r00"), b"Rar!\x1a\x07\x00rest").unwrap();
+        let results = find_cleanup_files(dir.path());
+        assert_eq!(results.len(), 1, "{results:?}");
     }
 
     // -----------------------------------------------------------------------

@@ -1148,6 +1148,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_keeps_letter_digit_payload_when_no_archive_exists() {
+        let job_dir = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::write(job_dir.path().join("Game.n64"), b"rom").unwrap();
+        fs::write(job_dir.path().join("disk.d64"), b"disk").unwrap();
+
+        let config = PostProcConfig {
+            output_dir: Some(output.path().to_path_buf()),
+            ..Default::default()
+        };
+        let result = run_pipeline(job_dir.path(), &config).await;
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(fs::read(job_dir.path().join("Game.n64")).unwrap(), b"rom");
+        assert_eq!(fs::read(job_dir.path().join("disk.d64")).unwrap(), b"disk");
+    }
+
+    #[tokio::test]
     async fn direct_unpack_still_extracts_nested_archives() {
         let job_dir = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
