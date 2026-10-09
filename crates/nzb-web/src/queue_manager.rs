@@ -3866,6 +3866,11 @@ impl QueueManager {
             .collect()
     }
 
+    /// Whether a job with exactly this id is in the queue.
+    pub fn contains_job(&self, job_id: &str) -> bool {
+        self.jobs.lock().contains_key(job_id)
+    }
+
     /// Get a single job by ID (with files included).
     pub fn get_job(&self, job_id: &str) -> Option<NzbJob> {
         let jobs = self.jobs.lock();
