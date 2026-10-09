@@ -10,6 +10,7 @@ cache_size = 524288000  # 500 MB
 log_level = "info"
 # log_file = "data/rustnzb.log"
 # history_retention = 100  # Number of NZBs to keep in history (omit or 0 = keep all)
+max_active_downloads = 1  # NZBs downloading simultaneously (0 = unlimited)
 # auto_sort_remaining_pct = false  # Keep queued items ordered by remaining work
 # rss_downloaded_item_expiry_days = 30  # Remove downloaded RSS records after this many days
 # Independent post-processing jobs overlap downloads. Separate repair and
