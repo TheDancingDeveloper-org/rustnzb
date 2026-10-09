@@ -1,6 +1,6 @@
 [package]
 name = "nzb-web"
-version = "0.4.23"
+version = "0.4.24"
 edition = "2024"
 description = "Usenet download engine: queue management, download orchestration, and background services"
 license = "MIT"
@@ -56,6 +56,7 @@ all = { level = "warn", priority = -1 }
 unused = "warn"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3.27.0"
 nzb-nntp = { version = "0.2.24", path = "../nzb-nntp", features = ["test-support"] }
 yenc-simd = { version = "0.1" }
