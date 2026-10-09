@@ -27,21 +27,172 @@ pub struct UnpackResult {
     pub error_output: String,
 }
 
-fn unrar_password_flag(password: Option<&str>) -> String {
-    match password {
-        Some(pw) => format!("-p{pw}"),
-        None => "-p-".to_string(),
+/// How an archive password reaches the extractor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PasswordArg {
+    /// No password is known.
+    None,
+    /// Written to the extractor's stdin (one line, then EOF), so it never
+    /// appears in `ps` or `/proc/<pid>/cmdline`.
+    Stdin,
+    /// Passed as `-p<password>`, visible to other local users through `ps`
+    /// and `/proc/<pid>/cmdline`. Used only for extractors that are not known
+    /// to read a piped password (see `docs/KNOWN_ISSUES.md`).
+    Argv(String),
+}
+
+impl PasswordArg {
+    /// The password to write to stdin, if any.
+    fn stdin_password<'a>(&self, password: Option<&'a str>) -> Option<&'a str> {
+        match self {
+            Self::Stdin => password,
+            _ => None,
+        }
+    }
+
+    /// How many password prompts the caller answers itself.
+    fn answered_prompts(&self) -> usize {
+        usize::from(*self == Self::Stdin)
     }
 }
 
-fn sevenz_password_arg(password: Option<&str>) -> Option<String> {
-    password.map(|pw| format!("-p{pw}"))
+/// Choose how to hand `password` to the extractor `bin`.
+async fn password_arg_for(bin: &str, password: Option<&str>) -> PasswordArg {
+    let Some(password) = password.filter(|pw| !pw.is_empty()) else {
+        return PasswordArg::None;
+    };
+    // A password is read as one line, so one containing a line break can only
+    // be passed as an argument.
+    if !password.contains(['\n', '\r']) {
+        let probe_bin = bin.to_string();
+        if tokio::task::spawn_blocking(move || extractor_reads_password_from_stdin(&probe_bin))
+            .await
+            .unwrap_or(false)
+        {
+            return PasswordArg::Stdin;
+        }
+    }
+    PasswordArg::Argv(password.to_string())
+}
+
+/// Whether the extractor `bin` reads a password from a piped stdin when it
+/// prompts for one (unrar given `-p` with no value; 7-Zip on an encrypted
+/// archive), instead of from the terminal.
+///
+/// Decided from the banner it prints when run with no arguments, and cached
+/// per binary. Verified behaviour: rarlab UNRAR 6.21 and 7.20 and 7-Zip 25.01
+/// read the piped line even with a controlling terminal. Older unrar
+/// releases, unrar-free and p7zip 16.02 (which uses `getpass`, i.e. the
+/// terminal) are treated as unsupported and get the password as an argument.
+pub fn extractor_reads_password_from_stdin(bin: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&known) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(bin) {
+        return known;
+    }
+    let supported = std::process::Command::new(bin)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map(|output| {
+            let mut banner = String::from_utf8_lossy(&output.stdout).into_owned();
+            banner.push('\n');
+            banner.push_str(&String::from_utf8_lossy(&output.stderr));
+            banner_reads_password_from_stdin(&banner)
+        })
+        .unwrap_or(false);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(bin.to_string(), supported);
+    supported
+}
+
+/// Parse an extractor banner: rarlab `UNRAR`/`RAR` 6 or later, or 7-Zip 21
+/// or later (the first 7-Zip release for Linux; not p7zip).
+fn banner_reads_password_from_stdin(banner: &str) -> bool {
+    if banner.contains("p7zip") {
+        return false;
+    }
+    for line in banner.lines() {
+        let line = line.trim();
+        let (rest, min_major) = if let Some(rest) = line
+            .strip_prefix("UNRAR ")
+            .or_else(|| line.strip_prefix("RAR "))
+        {
+            (rest, 6)
+        } else if let Some(rest) = line.strip_prefix("7-Zip") {
+            (rest, 21)
+        } else {
+            continue;
+        };
+        let major = rest.split_whitespace().find_map(|token| {
+            token
+                .split_once('.')
+                .and_then(|(major, _)| major.parse::<u32>().ok())
+        });
+        if let Some(major) = major {
+            return major >= min_major;
+        }
+    }
+    false
+}
+
+/// Run an extractor, writing `stdin_password` (if any) as a single line to
+/// its stdin and then closing it. Closing matters: a wrong password makes the
+/// extractor fail or hit EOF on a re-prompt instead of waiting for input.
+async fn run_extractor(
+    bin: &str,
+    args: Vec<String>,
+    stdin_password: Option<&str>,
+) -> std::io::Result<std::process::Output> {
+    let mut command = Command::new(bin);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let Some(password) = stdin_password else {
+        return command.stdin(Stdio::null()).output().await;
+    };
+    let mut child = command.stdin(Stdio::piped()).kill_on_drop(true).spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        // The line is far below the pipe buffer size, so this cannot block on
+        // an extractor that is busy writing output. An extractor that never
+        // asks (an unencrypted 7z) may already have exited: ignore EPIPE.
+        let _ = stdin.write_all(format!("{password}\n").as_bytes()).await;
+        let _ = stdin.shutdown().await;
+    }
+    child.wait_with_output().await
+}
+
+/// The `-p` switch for unrar: `-p-` (never prompt) without a password, bare
+/// `-p` (prompt, answered on stdin) or `-p<pw>`.
+fn unrar_password_flag(password: &PasswordArg) -> String {
+    match password {
+        PasswordArg::None => "-p-".to_string(),
+        PasswordArg::Stdin => "-p".to_string(),
+        PasswordArg::Argv(pw) => format!("-p{pw}"),
+    }
+}
+
+/// The `-p` switch for 7z. Without a password and in stdin mode there is
+/// none: 7z prompts by itself when the archive turns out to be encrypted.
+fn sevenz_password_arg(password: &PasswordArg) -> Option<String> {
+    match password {
+        PasswordArg::Argv(pw) => Some(format!("-p{pw}")),
+        PasswordArg::None | PasswordArg::Stdin => None,
+    }
 }
 
 fn rar_extract_args_with_7z(
     rar_file: &Path,
     output_dir: &Path,
-    password: Option<&str>,
+    password: &PasswordArg,
 ) -> Vec<String> {
     let mut args = vec![
         "x".to_string(),
@@ -58,7 +209,7 @@ fn rar_extract_args_with_7z(
 fn rar_extract_args_with_unrar(
     rar_file: &Path,
     output_dir: &Path,
-    password: Option<&str>,
+    password: &PasswordArg,
 ) -> Vec<String> {
     vec![
         "x".to_string(),
@@ -75,7 +226,7 @@ fn rar_extract_args_with_unrar(
 fn sevenz_extract_args(
     archive_file: &Path,
     output_dir: &Path,
-    password: Option<&str>,
+    password: &PasswordArg,
 ) -> Vec<String> {
     let mut args = vec![
         "x".to_string(),
@@ -87,6 +238,30 @@ fn sevenz_extract_args(
         args.insert(2, flag);
     }
     args
+}
+
+/// Whether the extractor asked for a password more often than we answered:
+/// with `-p` on stdin, unrar and 7z always print one prompt we answer.
+fn unanswered_password_prompt(output: &str, password: &PasswordArg) -> bool {
+    output.matches("Enter password").count() > password.answered_prompts()
+}
+
+/// Whether a failed unrar run was a missing or wrong password. unrar 6/7
+/// print `Incorrect password for <file>` and exit with code 11 (RARX_BADPWD).
+fn unrar_password_failure(exit_code: Option<i32>, output: &str, password: &PasswordArg) -> bool {
+    exit_code == Some(11)
+        || output.contains("Incorrect password")
+        || output.contains("password is incorrect")
+        || output.contains("Encrypted file")
+        || unanswered_password_prompt(output, password)
+}
+
+/// Whether a failed 7z run was a missing or wrong password.
+fn sevenz_password_failure(output: &str, password: &PasswordArg) -> bool {
+    SEVENZ_PASSWORD_PATTERNS
+        .iter()
+        .any(|pattern| output.contains(pattern))
+        || unanswered_password_prompt(output, password)
 }
 
 /// Return the regular files currently present below an extraction directory.
@@ -257,8 +432,10 @@ fn read_process_umask() -> u32 {
 
 /// Extract RAR archives in a directory.
 ///
-/// If `password` is `Some`, it is passed to the extractor (`-p<pw>` for unrar,
-/// `-p<pw>` for 7z). When `None`, `-p-` is used to suppress password prompts.
+/// If `password` is `Some`, it is written to the extractor's stdin when the
+/// extractor is known to read it from there (unrar 6+, 7-Zip 21+), so it is
+/// not visible in the process list; older extractors get `-p<pw>`. When
+/// `None`, unrar gets `-p-` to suppress password prompts.
 pub async fn extract_rar(
     rar_file: &Path,
     output_dir: &Path,
@@ -290,26 +467,16 @@ async fn extract_rar_with(
     std::fs::create_dir_all(output_dir)?;
     let before = output_files(output_dir)?;
 
-    let output = if use_7z {
+    let password_arg = password_arg_for(bin, password).await;
+    let args = if use_7z {
         // Do not pass `-p-` to 7z when no password is set. p7zip's built-in
         // RAR handler treats it like a passworded archive hint and fails on
         // valid multi-volume RAR sets.
-        Command::new(bin)
-            .args(rar_extract_args_with_7z(rar_file, output_dir, password))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await?
+        rar_extract_args_with_7z(rar_file, output_dir, &password_arg)
     } else {
-        Command::new(bin)
-            .args(rar_extract_args_with_unrar(rar_file, output_dir, password))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await?
+        rar_extract_args_with_unrar(rar_file, output_dir, &password_arg)
     };
+    let output = run_extractor(bin, args, password_arg.stdin_password(password)).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -322,10 +489,11 @@ async fn extract_rar_with(
     }
 
     if !success {
-        // Detect password-protected archives (unrar exit code 255 + password prompt)
-        let is_encrypted = combined.contains("Enter password")
-            || combined.contains("password is incorrect")
-            || combined.contains("Encrypted file");
+        let is_encrypted = if use_7z {
+            sevenz_password_failure(&combined, &password_arg)
+        } else {
+            unrar_password_failure(output.status.code(), &combined, &password_arg)
+        };
         if is_encrypted {
             warn!(
                 file = %rar_file.display(),
@@ -353,16 +521,19 @@ async fn extract_rar_with(
     })
 }
 
-/// Strings in 7z stderr/stdout that indicate a password-protected archive.
+/// Strings in 7z stderr/stdout that indicate a missing or wrong password.
+/// The `Enter password` prompt is handled separately: in stdin mode 7z
+/// prints it once for every encrypted archive, whatever the outcome.
 const SEVENZ_PASSWORD_PATTERNS: &[&str] = &[
     "Wrong password",
     "Can not open encrypted archive",
-    "Enter password",
+    "Cannot open encrypted archive",
     "ERROR: Data Error in encrypted file",
     "password is incorrect",
 ];
 
-/// Extract 7z archives by shelling out to the 7z binary.
+/// Extract 7z archives by shelling out to the 7z binary. A password is fed
+/// on stdin where the binary supports it, as for [`extract_rar`].
 pub async fn extract_7z(
     archive_file: &Path,
     output_dir: &Path,
@@ -370,19 +541,27 @@ pub async fn extract_7z(
 ) -> anyhow::Result<UnpackResult> {
     let sevenz_bin =
         find_7z().ok_or_else(|| anyhow::anyhow!("7z/7zz/7za binary not found on PATH"))?;
+    extract_7z_with(&sevenz_bin, archive_file, output_dir, password).await
+}
 
+async fn extract_7z_with(
+    sevenz_bin: &str,
+    archive_file: &Path,
+    output_dir: &Path,
+    password: Option<&str>,
+) -> anyhow::Result<UnpackResult> {
     info!(file = %archive_file.display(), dest = %output_dir.display(), "Extracting 7z");
 
     std::fs::create_dir_all(output_dir)?;
     let before = output_files(output_dir)?;
 
-    let output = Command::new(&sevenz_bin)
-        .args(sevenz_extract_args(archive_file, output_dir, password))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
+    let password_arg = password_arg_for(sevenz_bin, password).await;
+    let output = run_extractor(
+        sevenz_bin,
+        sevenz_extract_args(archive_file, output_dir, &password_arg),
+        password_arg.stdin_password(password),
+    )
+    .await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -395,10 +574,7 @@ pub async fn extract_7z(
     }
 
     if !success {
-        let is_encrypted = SEVENZ_PASSWORD_PATTERNS
-            .iter()
-            .any(|p| combined.contains(p));
-        if is_encrypted {
+        if sevenz_password_failure(&combined, &password_arg) {
             warn!(
                 file = %archive_file.display(),
                 "7z extraction failed — archive is password-protected"
@@ -844,9 +1020,10 @@ mod tests {
 
     #[test]
     fn sevenz_password_arg_is_omitted_without_password() {
-        assert_eq!(sevenz_password_arg(None), None);
+        assert_eq!(sevenz_password_arg(&PasswordArg::None), None);
+        assert_eq!(sevenz_password_arg(&PasswordArg::Stdin), None);
         assert_eq!(
-            sevenz_password_arg(Some("secret")).as_deref(),
+            sevenz_password_arg(&PasswordArg::Argv("secret".into())).as_deref(),
             Some("-psecret")
         );
     }
@@ -930,10 +1107,10 @@ mod tests {
         let rar = Path::new("/tmp/test.rar");
         let out = Path::new("/tmp/out");
 
-        let sevenz_args = rar_extract_args_with_7z(rar, out, None);
+        let sevenz_args = rar_extract_args_with_7z(rar, out, &PasswordArg::None);
         assert!(!sevenz_args.iter().any(|arg| arg == "-p-"));
 
-        let unrar_args = rar_extract_args_with_unrar(rar, out, None);
+        let unrar_args = rar_extract_args_with_unrar(rar, out, &PasswordArg::None);
         assert!(unrar_args.iter().any(|arg| arg == "-p-"));
     }
 
@@ -942,10 +1119,10 @@ mod tests {
         let archive = Path::new("/tmp/test.7z");
         let out = Path::new("/tmp/out");
 
-        let args = sevenz_extract_args(archive, out, None);
+        let args = sevenz_extract_args(archive, out, &PasswordArg::None);
         assert!(!args.iter().any(|arg| arg == "-p-"));
 
-        let args = sevenz_extract_args(archive, out, Some("secret"));
+        let args = sevenz_extract_args(archive, out, &PasswordArg::Argv("secret".into()));
         assert!(args.iter().any(|arg| arg == "-psecret"));
     }
 
@@ -953,5 +1130,258 @@ mod tests {
     fn password_failure_survives_as_a_typed_error() {
         let error: anyhow::Error = ArchivePasswordRequired.into();
         assert!(error.downcast_ref::<ArchivePasswordRequired>().is_some());
+    }
+
+    // -- Archive passwords stay off the command line ----------------------
+
+    /// A stand-in extractor. Invoked with no arguments it prints `banner`
+    /// (the version probe); otherwise it runs `body`. `$secret_in_argv` is
+    /// `yes` when any argument contains the test password.
+    #[cfg(unix)]
+    fn fake_extractor(dir: &Path, name: &str, banner: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ $# -eq 0 ]; then printf '%s\\n' '{banner}'; exit 0; fi\n\
+                 secret_in_argv=no\nfor a; do case \"$a\" in *s3cr3t*) secret_in_argv=yes;; esac; out=$a; done\n\
+                 {body}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Reads the password from stdin like unrar >= 6 / 7-Zip >= 21 do, and
+    /// fails if it was also passed as an argument.
+    #[cfg(unix)]
+    const STDIN_PASSWORD_BODY: &str = "[ \"$secret_in_argv\" = no ] || { echo 'password leaked into argv' >&2; exit 7; }\n\
+         printf 'Enter password (will not be echoed): ' >&2\n\
+         IFS= read -r pw\n\
+         if [ \"$pw\" = 's3cr3t pw' ]; then mkdir -p \"$out\"; printf x > \"$out/movie.mkv\"; echo 'All OK'; exit 0; fi\n\
+         echo 'Incorrect password for movie.mkv' >&2; exit 11";
+
+    #[cfg(unix)]
+    async fn run_rar(
+        unrar: &Path,
+        use_7z: bool,
+        password: Option<&str>,
+    ) -> anyhow::Result<UnpackResult> {
+        let work = tempfile::tempdir().unwrap();
+        let rar = work.path().join("release.rar");
+        fs::write(&rar, b"Rar!").unwrap();
+        let out = work.path().join("out");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            extract_rar_with(unrar.to_str().unwrap(), use_7z, &rar, &out, password),
+        )
+        .await
+        .expect("extractor must not hang waiting for a password")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrar_password_is_fed_on_stdin_not_argv() {
+        let tools = tempfile::tempdir().unwrap();
+        let unrar = fake_extractor(
+            tools.path(),
+            "unrar",
+            "UNRAR 7.20 freeware      Copyright (c) 1993-2025 Alexander Roshal",
+            STDIN_PASSWORD_BODY,
+        );
+        let result = run_rar(&unrar, false, Some("s3cr3t pw")).await.unwrap();
+        assert!(result.success, "{}", result.error_output);
+        assert_eq!(result.files_extracted.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sevenz_password_is_fed_on_stdin_not_argv() {
+        let tools = tempfile::tempdir().unwrap();
+        let sevenz = fake_extractor(
+            tools.path(),
+            "7zz",
+            "7-Zip (z) 25.01 (arm64) : Copyright (c) 1999-2025 Igor Pavlov : 2025-08-03",
+            STDIN_PASSWORD_BODY,
+        );
+        let result = run_rar(&sevenz, true, Some("s3cr3t pw")).await.unwrap();
+        assert!(result.success, "{}", result.error_output);
+    }
+
+    /// unrar 7 reports a missing or wrong password as `Incorrect password
+    /// for ...` with exit code 11; that must stay a typed error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrong_password_on_stdin_is_typed_and_does_not_hang() {
+        let tools = tempfile::tempdir().unwrap();
+        // Asks twice: the second read must see EOF, not block.
+        let body = "IFS= read -r pw\nIFS= read -r again\n\
+                    echo 'Incorrect password for movie.mkv' >&2; exit 11";
+        let unrar = fake_extractor(tools.path(), "unrar", "UNRAR 7.20 freeware", body);
+        let error = run_rar(&unrar, false, Some("wrong")).await.unwrap_err();
+        assert!(
+            error.downcast_ref::<ArchivePasswordRequired>().is_some(),
+            "{error:#}"
+        );
+
+        let sevenz = fake_extractor(
+            tools.path(),
+            "7zz",
+            "7-Zip (z) 25.01 (arm64)",
+            "printf 'Enter password:' ; IFS= read -r pw\n\
+             echo 'ERROR: Data Error in encrypted file. Wrong password? : movie.mkv' >&2; exit 2",
+        );
+        let error = run_rar(&sevenz, true, Some("wrong")).await.unwrap_err();
+        assert!(
+            error.downcast_ref::<ArchivePasswordRequired>().is_some(),
+            "{error:#}"
+        );
+    }
+
+    /// The prompt we answer ourselves is not evidence of a password problem:
+    /// any other failure stays an ordinary failed extraction.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn answered_prompt_does_not_turn_other_failures_into_password_errors() {
+        let tools = tempfile::tempdir().unwrap();
+        let body = "printf 'Enter password (will not be echoed): ' >&2\nIFS= read -r pw\n\
+                    echo 'movie.mkv - CRC failed' >&2; exit 3";
+        let unrar = fake_extractor(tools.path(), "unrar", "UNRAR 7.20 freeware", body);
+        let result = run_rar(&unrar, false, Some("s3cr3t pw")).await.unwrap();
+        assert!(!result.success);
+    }
+
+    /// Extractors that are not known to read a piped password (old unrar,
+    /// unrar-free, p7zip) still get it as an argument.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unknown_extractors_fall_back_to_the_password_argument() {
+        let tools = tempfile::tempdir().unwrap();
+        let body = "[ \"$secret_in_argv\" = yes ] || exit 7\nmkdir -p \"$out\"; printf x > \"$out/movie.mkv\"; echo 'All OK'";
+        for (name, banner) in [
+            (
+                "unrar",
+                "UNRAR 5.61 beta 1 freeware      Copyright (c) 1993-2018 Alexander Roshal",
+            ),
+            ("unrar-free", "unrar-free 0.3.1"),
+            (
+                "7z",
+                "7-Zip [64] 16.02 : Copyright (c) 1999-2016 Igor Pavlov : 2016-05-21\np7zip Version 16.02",
+            ),
+        ] {
+            let bin = fake_extractor(tools.path(), name, banner, body);
+            let result = run_rar(&bin, name == "7z", Some("s3cr3t")).await.unwrap();
+            assert!(result.success, "{name}: {}", result.error_output);
+        }
+    }
+
+    #[test]
+    fn stdin_password_support_is_read_from_the_banner() {
+        for (banner, expected) in [
+            (
+                "UNRAR 7.20 beta 3 freeware      Copyright (c) 1993-2025 Alexander Roshal",
+                true,
+            ),
+            (
+                "UNRAR 6.21 freeware      Copyright (c) 1993-2023 Alexander Roshal",
+                true,
+            ),
+            ("RAR 7.01   Copyright (c) 1993-2024 Alexander Roshal", true),
+            ("UNRAR 5.61 beta 1 freeware", false),
+            ("unrar-free 0.3.1", false),
+            (
+                "7-Zip (z) 25.01 (arm64) : Copyright (c) 1999-2025 Igor Pavlov : 2025-08-03",
+                true,
+            ),
+            (
+                "7-Zip 23.01 (x64) : Copyright (c) 1999-2023 Igor Pavlov : 2023-06-20",
+                true,
+            ),
+            (
+                "7-Zip [64] 16.02 : Copyright (c) 1999-2016 Igor Pavlov\np7zip Version 16.02",
+                false,
+            ),
+            ("", false),
+        ] {
+            assert_eq!(
+                banner_reads_password_from_stdin(banner),
+                expected,
+                "{banner}"
+            );
+        }
+    }
+
+    #[test]
+    fn password_args_never_carry_the_password_in_stdin_mode() {
+        let rar = Path::new("/tmp/test.rar");
+        let out = Path::new("/tmp/out");
+        let stdin = PasswordArg::Stdin;
+        assert!(
+            rar_extract_args_with_unrar(rar, out, &stdin)
+                .iter()
+                .any(|a| a == "-p")
+        );
+        assert!(
+            !rar_extract_args_with_7z(rar, out, &stdin)
+                .iter()
+                .any(|a| a.starts_with("-p"))
+        );
+        assert!(
+            !sevenz_extract_args(rar, out, &stdin)
+                .iter()
+                .any(|a| a.starts_with("-p"))
+        );
+    }
+
+    /// End to end against a real 7z, when one is installed: an encrypted
+    /// archive (with encrypted headers) extracts with the right password and
+    /// reports a typed error for a wrong or missing one, without hanging.
+    #[tokio::test]
+    async fn real_7z_encrypted_archive_round_trip() {
+        let Some(sevenz) = find_7z() else {
+            eprintln!("skipping: no 7z/7zz/7za on PATH");
+            return;
+        };
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("movie.mkv"), b"payload").unwrap();
+        let archive = work.path().join("release.7z");
+        let created = std::process::Command::new(&sevenz)
+            .current_dir(work.path())
+            .args(["a", "-pp4ss word", "-mhe=on", "release.7z", "movie.mkv"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{created:?}");
+
+        let run = |password: Option<&'static str>, out: &'static str| {
+            let sevenz = sevenz.clone();
+            let archive = archive.clone();
+            let out = work.path().join(out);
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    extract_7z_with(&sevenz, &archive, &out, password),
+                )
+                .await
+                .expect("7z must not hang waiting for a password")
+            }
+        };
+
+        let ok = run(Some("p4ss word"), "ok").await.unwrap();
+        assert!(ok.success, "{}", ok.error_output);
+        assert_eq!(
+            fs::read(work.path().join("ok/movie.mkv")).unwrap(),
+            b"payload"
+        );
+
+        for (password, out) in [(Some("wrong"), "wrong"), (None, "none")] {
+            let error = run(password, out).await.unwrap_err();
+            assert!(
+                error.downcast_ref::<ArchivePasswordRequired>().is_some(),
+                "{password:?}: {error:#}"
+            );
+        }
     }
 }
