@@ -464,6 +464,17 @@ pub async fn run_pipeline_with_cleanup(
         } else {
             job_dir
         };
+        // Direct unpack only handles RAR sets. Any ZIP/7z/TAR posted alongside
+        // them is still in the job directory and must be extracted here, or
+        // cleanup would delete it without its contents ever reaching output.
+        let job_dir_archives: Vec<_> = if config.skip_extract && source_dir != job_dir {
+            find_archives(job_dir)
+                .into_iter()
+                .filter(|(archive_type, _)| *archive_type != ArchiveType::Rar)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let _extract_permit = if let Some(resources) = resources {
             Some(resources.acquire_extract().await)
         } else {
@@ -471,6 +482,7 @@ pub async fn run_pipeline_with_cleanup(
         };
         let (result, processed_archives, extract_failure_code) = run_extract_stage(
             source_dir,
+            job_dir_archives,
             output_dir,
             config.password.as_deref(),
             config.max_nested_archive_depth,
@@ -668,8 +680,12 @@ async fn run_repair_stage(job_dir: &Path) -> StageResult {
     }
 }
 
+/// `extra_archives` are extracted alongside the first-level archives found in
+/// `source_dir` (used for non-RAR archives left in the job directory after
+/// direct unpack).
 async fn run_extract_stage(
     source_dir: &Path,
+    extra_archives: Vec<(ArchiveType, PathBuf)>,
     output_dir: &Path,
     password: Option<&str>,
     max_nested_archive_depth: u8,
@@ -693,10 +709,12 @@ async fn run_extract_stage(
     let mut scan_dir = source_dir;
     let mut extracted_any = false;
     let mut failure_code = None;
+    let mut extra_archives = Some(extra_archives);
 
     for depth in 0..=max_nested_archive_depth {
         let archives: Vec<_> = find_archives(scan_dir)
             .into_iter()
+            .chain(extra_archives.take().unwrap_or_default())
             .filter(|(_, path)| processed.insert(path.clone()))
             .collect();
         if archives.is_empty() {
@@ -1070,7 +1088,7 @@ mod tests {
         fs::remove_file(inner).unwrap();
 
         let (result, _, failure_code) =
-            run_extract_stage(source.path(), output.path(), None, 1).await;
+            run_extract_stage(source.path(), Vec::new(), output.path(), None, 1).await;
 
         assert_eq!(result.status, StageStatus::Success, "{result:?}");
         assert_eq!(failure_code, None);
@@ -1091,7 +1109,7 @@ mod tests {
         fs::remove_file(inner).unwrap();
 
         let (result, _, failure_code) =
-            run_extract_stage(source.path(), output.path(), None, 0).await;
+            run_extract_stage(source.path(), Vec::new(), output.path(), None, 0).await;
 
         assert_eq!(result.status, StageStatus::Failed, "{result:?}");
         assert_eq!(failure_code, Some(JobFailureCode::ArchiveInvalid));
@@ -1185,6 +1203,52 @@ mod tests {
             b"nested payload"
         );
         assert!(!nested.exists());
+    }
+
+    #[tokio::test]
+    async fn direct_unpack_still_extracts_non_rar_archives_in_job_dir() {
+        // Direct unpack only handles RAR sets. A ZIP posted alongside the RAR
+        // set must still be extracted before cleanup removes it.
+        let job_dir = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::write(job_dir.path().join("movie.part01.rar"), b"already unpacked").unwrap();
+        fs::write(output.path().join("movie.mkv"), b"movie").unwrap();
+        let subs = job_dir.path().join("Subs.zip");
+        write_zip(&subs, &[("movie.en.srt", b"subtitles")]);
+
+        let config = PostProcConfig {
+            output_dir: Some(output.path().to_path_buf()),
+            skip_extract: true,
+            ..Default::default()
+        };
+        let result = run_pipeline(job_dir.path(), &config).await;
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            fs::read(output.path().join("movie.en.srt")).unwrap(),
+            b"subtitles"
+        );
+        assert_eq!(fs::read(output.path().join("movie.mkv")).unwrap(), b"movie");
+        assert!(!subs.exists());
+    }
+
+    #[tokio::test]
+    async fn direct_unpack_keeps_non_rar_archive_that_fails_to_extract() {
+        let job_dir = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::write(output.path().join("movie.mkv"), b"movie").unwrap();
+        let broken = job_dir.path().join("Subs.zip");
+        fs::write(&broken, b"not a zip").unwrap();
+
+        let config = PostProcConfig {
+            output_dir: Some(output.path().to_path_buf()),
+            skip_extract: true,
+            ..Default::default()
+        };
+        let result = run_pipeline(job_dir.path(), &config).await;
+
+        assert!(!result.success, "{result:?}");
+        assert!(broken.exists(), "unextracted archive must not be deleted");
     }
 
     #[tokio::test]
