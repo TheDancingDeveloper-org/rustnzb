@@ -413,7 +413,11 @@ pub async fn h_queue_set_priority(
 ) -> Result<Json<SimpleResponse>, ApiError> {
     let priority = match body.priority {
         0..=3 => priority_from_i32(body.priority),
-        _ => return Err(ApiError::from(anyhow::anyhow!("Invalid priority value"))),
+        _ => {
+            return Err(ApiError::bad_request(
+                "Invalid priority value (expected 0-3)",
+            ));
+        }
     };
     state
         .queue_manager
@@ -665,7 +669,7 @@ pub async fn h_history_retry(
         .queue_manager
         .history_get(&id)
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("History entry not found")))?;
+        .ok_or(ApiError::not_found("History entry not found"))?;
 
     // Get the raw NZB data
     let nzb_data = state
@@ -1090,6 +1094,14 @@ pub async fn h_history_logs(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<LogResponse>, ApiError> {
+    if state
+        .queue_manager
+        .history_get(&id)
+        .map_err(ApiError::from)?
+        .is_none()
+    {
+        return Err(ApiError::not_found("History entry not found"));
+    }
     let logs_json = state
         .queue_manager
         .history_get_logs(&id)
@@ -1487,15 +1499,18 @@ const MAX_RSS_REGEX_LEN: usize = 512;
 /// pattern cannot consume unbounded memory/CPU at compile time.
 fn compile_rss_regex(pattern: &str) -> Result<regex::Regex, ApiError> {
     if pattern.len() > MAX_RSS_REGEX_LEN {
-        return Err(ApiError::from(anyhow::anyhow!(
-            "Regex too long ({} bytes, max {MAX_RSS_REGEX_LEN})",
-            pattern.len()
+        return Err(ApiError::from((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Regex too long ({} bytes, max {MAX_RSS_REGEX_LEN})",
+                pattern.len()
+            ),
         )));
     }
     regex::RegexBuilder::new(pattern)
         .size_limit(1 << 20) // 1 MiB compiled-program cap
         .build()
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid regex: {e}")))
+        .map_err(|e| ApiError::from((StatusCode::BAD_REQUEST, format!("Invalid regex: {e}"))))
 }
 
 /// GET /api/rss/rules -- List RSS download rules.
@@ -1509,11 +1524,43 @@ pub async fn h_rss_rules_list(
     Ok(Json(rules))
 }
 
+/// Names in `feed_names` that match no configured RSS feed. Such a rule is
+/// still saved (the feed may be added later) but can never match yet.
+fn unknown_rule_feeds(state: &AppState, feed_names: &[String]) -> Vec<String> {
+    let config = state.config();
+    feed_names
+        .iter()
+        .filter(|name| !config.rss_feeds.iter().any(|f| &f.name == *name))
+        .cloned()
+        .collect()
+}
+
+/// `{"status": true}`, plus a `warnings` array when a rule references feeds
+/// that are not configured.
+fn rss_rule_saved_response(state: &AppState, rule: &RssRule) -> serde_json::Value {
+    let unknown = unknown_rule_feeds(state, &rule.feed_names);
+    if unknown.is_empty() {
+        return serde_json::json!({ "status": true });
+    }
+    tracing::warn!(
+        rule = %rule.name,
+        feeds = ?unknown,
+        "RSS rule references feeds that are not configured"
+    );
+    let warnings: Vec<String> = unknown
+        .iter()
+        .map(|name| {
+            format!("feed '{name}' is not configured; the rule will not match until it is added")
+        })
+        .collect();
+    serde_json::json!({ "status": true, "warnings": warnings })
+}
+
 /// POST /api/rss/rules -- Add an RSS download rule.
 pub async fn h_rss_rule_add(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RssRuleBody>,
-) -> Result<Json<SimpleResponse>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     // Validate and bound the user-supplied regex.
     compile_rss_regex(&body.match_regex)?;
 
@@ -1530,17 +1577,28 @@ pub async fn h_rss_rule_add(
         .queue_manager
         .rss_rule_insert(&rule)
         .map_err(ApiError::from)?;
-    Ok(Json(SimpleResponse { status: true }))
+    Ok(Json(rss_rule_saved_response(&state, &rule)))
 }
 
-/// PUT /api/rss/rules/{id} -- Update an RSS download rule.
+/// PUT /api/rss/rules/{id} -- Update an RSS download rule. 404 if the rule
+/// does not exist.
 pub async fn h_rss_rule_update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<RssRuleBody>,
-) -> Result<Json<SimpleResponse>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     // Validate and bound the user-supplied regex.
     compile_rss_regex(&body.match_regex)?;
+
+    let exists = state
+        .queue_manager
+        .rss_rule_list()
+        .map_err(ApiError::from)?
+        .iter()
+        .any(|rule| rule.id == id);
+    if !exists {
+        return Err(ApiError::not_found("RSS rule not found"));
+    }
 
     let rule = RssRule {
         id,
@@ -1555,7 +1613,7 @@ pub async fn h_rss_rule_update(
         .queue_manager
         .rss_rule_update(&rule)
         .map_err(ApiError::from)?;
-    Ok(Json(SimpleResponse { status: true }))
+    Ok(Json(rss_rule_saved_response(&state, &rule)))
 }
 
 /// DELETE /api/rss/rules/{id} -- Delete an RSS download rule.

@@ -125,11 +125,25 @@ impl Serialize for ApiError {
 
         let serr = SerializedError {
             error_kind: match &self.kind {
-                ApiErrorKind::JobNotFound(_) => "job_not_found",
-                ApiErrorKind::ServerNotFound(_) => "server_not_found",
+                ApiErrorKind::JobNotFound(_)
+                | ApiErrorKind::Core(crate::nzb_core::NzbError::JobNotFound(_)) => "job_not_found",
+                ApiErrorKind::ServerNotFound(_)
+                | ApiErrorKind::Core(crate::nzb_core::NzbError::ServerNotFound(_)) => {
+                    "server_not_found"
+                }
                 ApiErrorKind::Unauthorized => "unauthorized",
-                ApiErrorKind::AdmissionConflict => "admission_conflict",
-                _ => "internal_error",
+                ApiErrorKind::AdmissionConflict
+                | ApiErrorKind::Core(crate::nzb_core::NzbError::AdmissionConflict) => {
+                    "admission_conflict"
+                }
+                // Otherwise classify by status so clients can tell a bad
+                // request or missing resource from a server fault.
+                _ => match self.status() {
+                    StatusCode::BAD_REQUEST => "bad_request",
+                    StatusCode::NOT_FOUND => "not_found",
+                    StatusCode::CONFLICT => "conflict",
+                    _ => "internal_error",
+                },
             },
             human_readable: format!("{:#}", self.kind),
             status: self.status().as_u16(),
@@ -148,9 +162,21 @@ impl From<anyhow::Error> for ApiError {
 }
 
 impl From<crate::nzb_core::NzbError> for ApiError {
+    /// Map domain errors to the HTTP status that describes them: missing
+    /// resources are 404, malformed input 400, conflicts 409, and only
+    /// genuine server-side failures 500.
     fn from(e: crate::nzb_core::NzbError) -> Self {
+        use crate::nzb_core::NzbError;
+        let status = match &e {
+            NzbError::JobNotFound(_)
+            | NzbError::ServerNotFound(_)
+            | NzbError::CategoryNotFound(_) => StatusCode::NOT_FOUND,
+            NzbError::ParseError(_) | NzbError::InvalidNzb(_) => StatusCode::BAD_REQUEST,
+            NzbError::AdmissionConflict => StatusCode::CONFLICT,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
         Self {
-            status: Some(StatusCode::INTERNAL_SERVER_ERROR),
+            status: Some(status),
             kind: ApiErrorKind::Core(e),
         }
     }
@@ -188,5 +214,43 @@ impl IntoResponse for ApiError {
         let mut response = axum::Json(&self).into_response();
         *response.status_mut() = status;
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nzb_core::NzbError;
+
+    #[test]
+    fn domain_errors_map_to_client_statuses() {
+        let cases = [
+            (NzbError::JobNotFound("j".into()), 404, "job_not_found"),
+            (
+                NzbError::ServerNotFound("s".into()),
+                404,
+                "server_not_found",
+            ),
+            (NzbError::CategoryNotFound("c".into()), 404, "not_found"),
+            (NzbError::InvalidNzb("x".into()), 400, "bad_request"),
+            (NzbError::ParseError("x".into()), 400, "bad_request"),
+            (NzbError::AdmissionConflict, 409, "admission_conflict"),
+            (NzbError::Other("boom".into()), 500, "internal_error"),
+        ];
+        for (error, status, kind) in cases {
+            let api = ApiError::from(error);
+            assert_eq!(api.status().as_u16(), status);
+            let json = serde_json::to_value(&api).unwrap();
+            assert_eq!(json["error_kind"], kind);
+            assert_eq!(json["status"], status);
+        }
+    }
+
+    #[test]
+    fn text_errors_are_classified_by_status() {
+        let json = serde_json::to_value(ApiError::not_found("gone")).unwrap();
+        assert_eq!(json["error_kind"], "not_found");
+        let json = serde_json::to_value(ApiError::bad_request("bad")).unwrap();
+        assert_eq!(json["error_kind"], "bad_request");
     }
 }

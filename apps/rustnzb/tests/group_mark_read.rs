@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use nzb_web::auth::{CredentialStore, TokenStore};
 use nzb_web::nzb_core::config::AppConfig;
 use nzb_web::nzb_core::db::Database;
 use nzb_web::nzb_core::models::MarkReadInput;
 use nzb_web::nzb_core::nzb_nntp::XoverEntry;
 use nzb_web::{AppState, QueueManager};
-use rustnzb::group_handlers::h_header_mark_read;
+use rustnzb::group_handlers::{IdPath, h_header_mark_read};
 use tempfile::TempDir;
 
 fn build_test_state() -> (Arc<AppState>, TempDir) {
@@ -119,7 +119,7 @@ async fn mark_read_marks_requested_headers_in_one_handler_call() {
 
     let Json(payload) = h_header_mark_read(
         State(state.clone()),
-        Path(group_id),
+        IdPath(group_id),
         Json(MarkReadInput {
             header_ids: header_ids[..2].to_vec(),
         }),
