@@ -336,3 +336,127 @@ async fn config_routes_validate_duplicates_and_persist_successful_updates() {
     assert_eq!(saved.general.speed_limit_bps, 1234);
     assert_eq!(app.state.config().general.speed_limit_bps, 1234);
 }
+
+async fn setup_access(app: &ContractApp, client: &reqwest::Client) -> String {
+    let setup = client
+        .post(format!("{}/api/auth/setup", app.base_url))
+        .json(&serde_json::json!({"username":"owner","password":"secret"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(setup.status(), reqwest::StatusCode::OK);
+    setup.json::<serde_json::Value>().await.unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn set_fetch_policy(app: &ContractApp, allow_private: bool, allowed_hosts: &[&str]) {
+    let mut config = (*app.state.config()).clone();
+    config.general.fetch_allow_private = allow_private;
+    config.general.fetch_allowed_hosts = allowed_hosts.iter().map(|h| h.to_string()).collect();
+    app.state.update_config(config).unwrap();
+}
+
+/// Serve one HTTP response with `body` on a loopback port and return its URL.
+async fn serve_once(body: Vec<u8>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 2048];
+        let _ = socket.read(&mut request).await;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.write_all(head.as_bytes()).await;
+        let _ = socket.write_all(&body).await;
+        let _ = socket.shutdown().await;
+    });
+    format!("http://{address}/release.nzb")
+}
+
+#[tokio::test]
+async fn add_url_reaches_lan_indexer_only_when_allowed() {
+    let app = start_app(false).await;
+    let client = reqwest::Client::new();
+    let access = setup_access(&app, &client).await;
+
+    // Default policy: a loopback/LAN indexer is refused before any request.
+    let refused = client
+        .post(format!("{}/api/queue/add-url", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({"url": "http://127.0.0.1:9/release.nzb"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!refused.status().is_success());
+    assert!(refused.text().await.unwrap().contains("private/reserved"));
+
+    set_fetch_policy(&app, false, &["127.0.0.0/8"]);
+    let url = serve_once(support::sample_nzb_bytes()).await;
+    let added = client
+        .post(format!("{}/api/queue/add-url", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({ "url": url }))
+        .send()
+        .await
+        .unwrap();
+    let status = added.status();
+    assert!(
+        status.is_success(),
+        "{status}: {}",
+        added.text().await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn rss_feed_url_is_validated_when_saved() {
+    let app = start_app(false).await;
+    let client = reqwest::Client::new();
+    let access = setup_access(&app, &client).await;
+    let feed = |url: &str| serde_json::json!({"name":"lan", "url": url, "enabled": true});
+
+    let rejected = client
+        .post(format!("{}/api/config/rss-feeds", app.base_url))
+        .bearer_auth(&access)
+        .json(&feed("http://192.168.1.10/api?t=rss"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(rejected.text().await.unwrap().contains("Feed URL rejected"));
+    assert!(app.state.config().rss_feeds.is_empty());
+
+    set_fetch_policy(&app, true, &[]);
+    assert_eq!(
+        client
+            .post(format!("{}/api/config/rss-feeds", app.base_url))
+            .bearer_auth(&access)
+            .json(&feed("http://192.168.1.10/api?t=rss"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    // Link-local metadata stays blocked even with private ranges allowed.
+    assert_eq!(
+        client
+            .put(format!("{}/api/config/rss-feeds/lan", app.base_url))
+            .bearer_auth(&access)
+            .json(&feed("http://169.254.169.254/latest"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        app.state.config().rss_feeds[0].url,
+        "http://192.168.1.10/api?t=rss"
+    );
+}

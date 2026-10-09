@@ -123,7 +123,12 @@ async fn handle_addurl(
     // the connection to the validated address (shared with the native URL-add
     // path in the app crate). Rejects non-http(s) schemes and private/reserved
     // hosts such as 169.254.169.254. See rustnzb#129 review.
-    let fetch_plan = match crate::fetch_guard::validate_fetch_url(&url).await {
+    let fetch_plan = match crate::fetch_guard::validate_fetch_url_with(
+        &url,
+        &crate::fetch_guard::FetchPolicy::from_config(&state.config().general),
+    )
+    .await
+    {
         Ok(plan) => plan,
         Err(error) => {
             tracing::warn!(url = %url, %error, "Refusing addurl fetch (SSRF guard)");
