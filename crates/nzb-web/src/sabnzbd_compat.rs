@@ -69,11 +69,50 @@ fn validate_api_key(
     Ok(())
 }
 
+/// Answer the modes SABnzbd serves without an API key. Clients probe
+/// `version` and `auth` before they have been given a key, so real SABnzbd
+/// exempts both from the key check (`sabnzbd/interface.py`, `api.py::_api_auth`).
+fn keyless_response(
+    state: &AppState,
+    mode: &str,
+    provided: Option<&str>,
+) -> Option<Json<serde_json::Value>> {
+    match mode {
+        "version" => Some(Json(serde_json::json!({
+            "version": SABNZBD_COMPAT_VERSION
+        }))),
+        "auth" => {
+            let config = state.config();
+            let auth = match config.general.api_key.as_deref() {
+                None => "None",
+                Some(configured) => match provided.filter(|key| !key.is_empty()) {
+                    None => "apikey",
+                    Some(key)
+                        if crate::auth::constant_time_eq(key.as_bytes(), configured.as_bytes()) =>
+                    {
+                        "apikey"
+                    }
+                    Some(_) => "badkey",
+                },
+            };
+            Some(Json(serde_json::json!({ "auth": auth })))
+        }
+        _ => None,
+    }
+}
+
 /// GET /sabnzbd/api -- Handle GET requests.
 pub async fn h_sabnzbd_api_get(
     State(state): State<Arc<AppState>>,
     Query(req): Query<SabApiRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if let Some(resp) = keyless_response(
+        &state,
+        req.mode.as_deref().unwrap_or(""),
+        req.apikey.as_deref(),
+    ) {
+        return Ok(resp);
+    }
     if let Err(resp) = validate_api_key(&state, req.apikey.as_deref()) {
         return Ok(resp);
     }
@@ -339,6 +378,10 @@ pub async fn h_sabnzbd_api_post(
             )
             .await?;
         }
+    }
+
+    if let Some(resp) = keyless_response(&state, &mode, apikey.as_deref()) {
+        return Ok(resp);
     }
 
     // Validate API key
@@ -3390,6 +3433,66 @@ mod tests {
                 .contains("private/reserved"),
             "expected SSRF rejection, resp={value:?}"
         );
+    }
+
+    async fn get_without_key(state: AppState, mode: &str) -> serde_json::Value {
+        let req = SabApiRequest {
+            mode: Some(mode.into()),
+            ..SabApiRequest::default()
+        };
+        let response = h_sabnzbd_api_get(State(Arc::new(state)), Query(req))
+            .await
+            .expect("GET response")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await
+    }
+
+    /// SABnzbd answers `mode=version` and `mode=auth` without an API key so
+    /// clients can probe the server before they are configured
+    /// (`sabnzbd/interface.py` exempts both from the key check).
+    #[tokio::test]
+    async fn version_and_auth_do_not_require_api_key() {
+        let version = get_without_key(test_state().state, "version").await;
+        assert_eq!(
+            version["version"],
+            serde_json::json!(SABNZBD_COMPAT_VERSION)
+        );
+
+        let auth = get_without_key(test_state().state, "auth").await;
+        assert_eq!(auth, serde_json::json!({ "auth": "apikey" }));
+
+        let keyless = test_state();
+        let mut config = (*keyless.state.config()).clone();
+        config.general.api_key = None;
+        keyless.state.config.store(Arc::new(config));
+        let auth = get_without_key(keyless.state, "auth").await;
+        assert_eq!(auth, serde_json::json!({ "auth": "None" }));
+
+        // Every other mode still requires the key.
+        let queue = get_without_key(test_state().state, "queue").await;
+        assert_eq!(queue["status"], serde_json::json!(false));
+        assert_eq!(queue["error"], "API Key Incorrect");
+    }
+
+    #[tokio::test]
+    async fn version_over_bare_post_does_not_require_api_key() {
+        let test_state = test_state();
+        let req = SabApiRequest {
+            mode: Some("version".into()),
+            ..SabApiRequest::default()
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/sabnzbd/api")
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let response = h_sabnzbd_api_post(State(Arc::new(test_state.state)), Query(req), request)
+            .await
+            .expect("version over bare POST")
+            .into_response();
+        let value = json_body(response).await;
+        assert_eq!(value["version"], serde_json::json!(SABNZBD_COMPAT_VERSION));
     }
 
     /// Non-upload modes must also work over a bare POST.
