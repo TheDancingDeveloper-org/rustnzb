@@ -2836,8 +2836,10 @@ fn all_enabled_providers_definitive(
 }
 
 /// Whether a fetch error says the provider itself is unhealthy, and so should
-/// count against its circuit breaker: connection/TLS, auth, permission and
-/// 502. Article-level answers never do.
+/// count against its circuit breaker: connection/TLS, auth, permission, 502
+/// and timeouts. A server that accepts the connection and then black-holes
+/// the read is as unhealthy as one that refuses it. Article-level answers
+/// never count.
 fn counts_against_circuit_breaker(e: &NntpError) -> bool {
     matches!(
         e,
@@ -2848,6 +2850,7 @@ fn counts_against_circuit_breaker(e: &NntpError) -> bool {
             | NntpError::AuthRequired(_)
             | NntpError::PermissionDenied(_)
             | NntpError::ServiceUnavailable(_)
+            | NntpError::Timeout(_)
     )
 }
 
@@ -4452,6 +4455,7 @@ mod tests {
             NntpError::AuthRequired(s()),
             NntpError::PermissionDenied(s()),
             NntpError::ServiceUnavailable(s()),
+            NntpError::Timeout(s()),
         ] {
             assert!(counts_against_circuit_breaker(&e), "{e}");
         }
@@ -4460,7 +4464,6 @@ mod tests {
             NntpError::NoSuchGroup(s()),
             NntpError::NoArticleSelected(s()),
             NntpError::Protocol(s()),
-            NntpError::Timeout(s()),
         ] {
             assert!(!counts_against_circuit_breaker(&e), "{e}");
         }

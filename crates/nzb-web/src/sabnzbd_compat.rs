@@ -375,7 +375,11 @@ fn addurl_job_name(
 /// path component, without a `.nzb` extension. `None` if nothing is left.
 fn clean_nzb_name(raw: &str) -> Option<String> {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw).trim();
-    let name = if base.len() > 4 && base[base.len() - 4..].eq_ignore_ascii_case(".nzb") {
+    let name = if base.len() > 4
+        && base
+            .get(base.len() - 4..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".nzb"))
+    {
         &base[..base.len() - 4]
     } else {
         base
@@ -2744,6 +2748,21 @@ mod tests {
     const QUEUE_GOLDEN: &str = include_str!("../tests/fixtures/sabnzbd-5.0.4/queue.json");
     const HISTORY_GOLDEN: &str = include_str!("../tests/fixtures/sabnzbd-5.0.4/history.json");
     const FULLSTATUS_GOLDEN: &str = include_str!("../tests/fixtures/sabnzbd-5.0.4/fullstatus.json");
+
+    #[test]
+    fn clean_nzb_name_does_not_panic_on_non_ascii() {
+        // The last four bytes of each fall inside the final multibyte
+        // character, so a byte slice at `len - 4` panics.
+        for name in ["Amélie", "Pokémon", "Amélie.nzb", "Pokémon.nzb"] {
+            let cleaned = clean_nzb_name(name);
+            assert!(cleaned.is_some(), "{name}");
+            assert!(
+                !cleaned.unwrap().to_ascii_lowercase().ends_with(".nzb"),
+                "{name}"
+            );
+        }
+        assert_eq!(clean_nzb_name("Show.nzb").as_deref(), Some("Show"));
+    }
 
     struct TestState {
         state: AppState,
