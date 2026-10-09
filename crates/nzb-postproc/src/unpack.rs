@@ -198,39 +198,61 @@ fn reject_symlinked_path(root: &Path, path: &Path) -> anyhow::Result<()> {
 pub fn normalize_extracted_permissions(root: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
-        let umask = process_umask(root.parent().unwrap_or(root));
-        // Always clear other-write, even when the process umask is 0.
-        let file_mode = (0o666 & !umask) & !0o002;
-        let dir_mode = (0o777 & !umask) & !0o002;
-        let mut directories = vec![root.to_path_buf()];
-        while let Some(directory) = directories.pop() {
-            for entry in std::fs::read_dir(&directory)? {
-                let entry = entry?;
-                let file_type = entry.file_type()?;
-                let path = entry.path();
-                if file_type.is_dir() {
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(dir_mode))?;
-                    directories.push(path);
-                } else if file_type.is_file() {
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(file_mode))?;
-                }
-            }
-        }
+        normalize_with_umask(root, read_process_umask())?;
     }
     #[cfg(not(unix))]
     let _ = root;
     Ok(())
 }
 
-/// Read the process umask and restore it before returning. `umask(2)` is
-/// process-global, so the window is only the two calls.
+/// Apply `umask` to the modes of files and directories under `root`.
+///
+/// Split out from [`normalize_extracted_permissions`] so tests can pass an
+/// umask without calling `umask(2)`, which is process-global and would let
+/// another thread create a world-writable file in the window.
 #[cfg(unix)]
-fn process_umask(_dir: &Path) -> u32 {
-    let current = unsafe { libc::umask(0) };
-    unsafe { libc::umask(current) };
-    current
+pub fn normalize_with_umask(root: &Path, umask: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Always clear other-write, even when the process umask is 0.
+    let file_mode = (0o666 & !umask) & !0o002;
+    let dir_mode = (0o777 & !umask) & !0o002;
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(dir_mode))?;
+                directories.push(path);
+            } else if file_type.is_file() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(file_mode))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The process umask, read from `/proc/self/status` so `umask(2)` is never
+/// called after startup. Falls back to `0o022` when the file is unreadable
+/// or has no `Umask:` line (non-Linux Unix).
+#[cfg(unix)]
+fn read_process_umask() -> u32 {
+    const FALLBACK: u32 = 0o022;
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return FALLBACK;
+    };
+    for line in status.lines() {
+        let Some(value) = line.strip_prefix("Umask:") else {
+            continue;
+        };
+        let value = value.trim();
+        if let Ok(mask) = u32::from_str_radix(value, 8) {
+            return mask & 0o777;
+        }
+    }
+    FALLBACK
 }
 
 /// Extract RAR archives in a directory.
@@ -870,7 +892,7 @@ mod tests {
 
         // umask 077 is common in CI, so compare against the computed mode
         // rather than a freshly created probe file.
-        let umask = process_umask(&out);
+        let umask = read_process_umask();
         assert_eq!(mode(&out.join("movie.mkv")), (0o666 & !umask) & !0o002);
         assert_eq!(
             mode(&out.join("Season 1/episode.mkv")),
@@ -884,20 +906,13 @@ mod tests {
         );
     }
 
-    /// umask 0 must not produce 0666/0777. The process umask is global, so it
-    /// is set only for this call and restored before the assert can panic.
+    /// umask 0 must not produce 0666/0777. The umask is passed in, so the test
+    /// never calls `umask(2)` and cannot change it for other threads.
     #[cfg(unix)]
     #[test]
     fn extracted_permissions_clear_other_write_even_with_umask_zero() {
         use std::os::unix::fs::PermissionsExt;
 
-        struct RestoreUmask(u32);
-        impl Drop for RestoreUmask {
-            fn drop(&mut self) {
-                unsafe { libc::umask(self.0) };
-            }
-        }
-        let _restore = RestoreUmask(unsafe { libc::umask(0) });
         let work = tempfile::tempdir().unwrap();
         let root = work.path().join("out");
         fs::create_dir(&root).unwrap();
@@ -905,7 +920,7 @@ mod tests {
         fs::write(root.join("dir/file.bin"), b"x").unwrap();
         fs::set_permissions(root.join("dir"), fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(root.join("dir/file.bin"), fs::Permissions::from_mode(0o600)).unwrap();
-        normalize_extracted_permissions(&root).unwrap();
+        normalize_with_umask(&root, 0).unwrap();
         assert_eq!(mode(&root.join("dir/file.bin")), 0o664);
         assert_eq!(mode(&root.join("dir")), 0o775);
     }

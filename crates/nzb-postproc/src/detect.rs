@@ -73,7 +73,7 @@ pub struct RarVolumeInfo {
 ///   - New-style: `"movie.part001.rar"` → `("movie", 0)`, `"movie.part002.rar"` → `("movie", 1)`
 ///   - Old-style: `"movie.rar"` → `("movie", 0)`, `"movie.r00"` → `("movie", 1)`, `"movie.r01"` → `("movie", 2)`
 pub fn parse_rar_volume(filename: &str) -> Option<RarVolumeInfo> {
-    let name_lower = filename.to_lowercase();
+    let name_lower = filename.to_ascii_lowercase();
 
     // New-style: .partNNN.rar
     if let Some(stem) = name_lower.strip_suffix(".rar") {
@@ -101,26 +101,25 @@ pub fn parse_rar_volume(filename: &str) -> Option<RarVolumeInfo> {
 
     // Old-style continuation: .r00, .r01, ..., .s00, etc. The letter runs
     // r..=z only; .n64, .a52, .c01 and friends are unrelated formats.
-    if name_lower.len() > 4 {
-        let last4 = &name_lower[name_lower.len() - 4..];
-        if last4.starts_with('.')
-            && (b'r'..=b'z').contains(&last4.as_bytes()[1])
-            && last4.as_bytes()[2].is_ascii_digit()
-            && last4.as_bytes()[3].is_ascii_digit()
-        {
-            let letter = last4.as_bytes()[1];
-            let tens = (last4.as_bytes()[2] - b'0') as u32;
-            let ones = (last4.as_bytes()[3] - b'0') as u32;
-            // .r00 = volume 1, .r01 = volume 2, ..., .r99 = volume 100
-            // .s00 = volume 101, .s01 = volume 102, etc.
-            let letter_offset = (letter - b'r') as u32 * 100;
-            let vol = letter_offset + tens * 10 + ones + 1;
-            let set_name = &filename[..filename.len() - 4];
-            return Some(RarVolumeInfo {
-                set_name: set_name.to_string(),
-                volume_number: vol,
-            });
-        }
+    if name_lower.len() > 4
+        && let Some(last4) = name_lower.get(name_lower.len() - 4..)
+        && last4.starts_with('.')
+        && (b'r'..=b'z').contains(&last4.as_bytes()[1])
+        && last4.as_bytes()[2].is_ascii_digit()
+        && last4.as_bytes()[3].is_ascii_digit()
+    {
+        let letter = last4.as_bytes()[1];
+        let tens = (last4.as_bytes()[2] - b'0') as u32;
+        let ones = (last4.as_bytes()[3] - b'0') as u32;
+        // .r00 = volume 1, .r01 = volume 2, ..., .r99 = volume 100
+        // .s00 = volume 101, .s01 = volume 102, etc.
+        let letter_offset = (letter - b'r') as u32 * 100;
+        let vol = letter_offset + tens * 10 + ones + 1;
+        let set_name = &filename[..filename.len() - 4];
+        return Some(RarVolumeInfo {
+            set_name: set_name.to_string(),
+            volume_number: vol,
+        });
     }
 
     None
@@ -824,6 +823,19 @@ mod tests {
         assert!(parse_rar_volume("movie.7z").is_none());
         assert!(parse_rar_volume("movie.zip").is_none());
         assert!(parse_rar_volume("readme.txt").is_none());
+    }
+
+    #[test]
+    fn parse_rar_volume_does_not_panic_on_multibyte_names() {
+        assert!(parse_rar_volume("テスト").is_none());
+        assert!(parse_rar_volume("file.日本").is_none());
+        assert!(parse_rar_volume(".r0").is_none());
+        assert!(parse_rar_volume(".r00").is_none());
+        assert!(parse_rar_volume("r0").is_none());
+        assert!(parse_rar_volume("").is_none());
+        let v = parse_rar_volume("İSTANBUL.part01.rar").unwrap();
+        assert_eq!(v.set_name, "İSTANBUL");
+        assert_eq!(v.volume_number, 0);
     }
 
     #[test]
