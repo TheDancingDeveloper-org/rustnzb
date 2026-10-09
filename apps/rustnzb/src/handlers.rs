@@ -320,6 +320,76 @@ pub async fn h_queue_list(
     }))
 }
 
+/// A parsed `POST /api/queue/add` multipart body.
+#[derive(Default)]
+struct UploadForm {
+    files: Vec<(String, Vec<u8>)>,
+    /// The optional archive `password` text field.
+    password: Option<String>,
+    category: Option<String>,
+    priority: Option<i32>,
+    name: Option<String>,
+}
+
+impl UploadForm {
+    /// The query options with any form fields laid over them.
+    fn options(&self, q: &AddNzbQuery) -> AddNzbQuery {
+        AddNzbQuery {
+            category: self.category.clone().or_else(|| q.category.clone()),
+            priority: self.priority.or(q.priority),
+            name: self.name.clone().or_else(|| q.name.clone()),
+        }
+    }
+}
+
+/// Read a whole `POST /api/queue/add` body. Parts that carry a file name
+/// (or are named `file`) are NZB uploads; text fields `password`, `category` (alias `cat`), `priority`
+/// and `name` (alias `nzbname`) set job options, in any order relative to
+/// the files. Other text fields are ignored.
+async fn read_upload(multipart: &mut Multipart) -> Result<UploadForm, ApiError> {
+    let mut form = UploadForm::default();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!("Multipart error: {error}")))?
+    {
+        let key = field.name().unwrap_or_default().to_string();
+        // A part with a file name is an upload. So is a bare `file` part
+        // (curl's `-F "file=<x.nzb"` sends the contents without a name).
+        let file_name = match field.file_name() {
+            Some(file_name) => Some(file_name.to_string()),
+            None if key == "file" => Some("unknown.nzb".to_string()),
+            None => None,
+        };
+        if let Some(file_name) = file_name {
+            let data = field
+                .bytes()
+                .await
+                .map_err(|error| ApiError::from(anyhow::anyhow!("Read error: {error}")))?;
+            form.files.push((file_name, data.to_vec()));
+            continue;
+        }
+        let text = field
+            .text()
+            .await
+            .map_err(|error| ApiError::from(anyhow::anyhow!("Read error: {error}")))?;
+        match key.as_str() {
+            "password" => form.password = Some(text),
+            "category" | "cat" => form.category = Some(text),
+            "name" | "nzbname" => form.name = Some(text),
+            "priority" => {
+                form.priority = Some(
+                    text.trim()
+                        .parse()
+                        .map_err(|_| ApiError::bad_request("priority must be an integer"))?,
+                )
+            }
+            _ => {}
+        }
+    }
+    Ok(form)
+}
+
 /// Replace a job's archive password with [`PASSWORD_MASK`] (or `""` when it
 /// has none) for the native API, as server passwords are masked in config
 /// responses. The SABnzbd layer keeps the real value: its queue slot
@@ -334,61 +404,10 @@ fn mask_job_password(mut job: NzbJob) -> NzbJob {
     job
 }
 
-/// One part of a `POST /api/queue/add` multipart body.
-enum UploadPart {
-    File(String, Vec<u8>),
-    /// The optional archive `password` text field.
-    Password(String),
-}
-
-/// Read the next multipart part. A text field named `password` (no file
-/// name) is the job's archive password; every other part is an NZB upload.
-async fn next_upload_part(multipart: &mut Multipart) -> Result<Option<UploadPart>, ApiError> {
-    let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| ApiError::from(anyhow::anyhow!("Multipart error: {error}")))?
-    else {
-        return Ok(None);
-    };
-    if field.name() == Some("password") && field.file_name().is_none() {
-        let password = field
-            .text()
-            .await
-            .map_err(|error| ApiError::from(anyhow::anyhow!("Read error: {error}")))?;
-        return Ok(Some(UploadPart::Password(password)));
-    }
-    let file_name = field
-        .file_name()
-        .map(str::to_string)
-        .unwrap_or_else(|| "unknown.nzb".to_string());
-    let data = field
-        .bytes()
-        .await
-        .map_err(|error| ApiError::from(anyhow::anyhow!("Read error: {error}")))?;
-    Ok(Some(UploadPart::File(file_name, data.to_vec())))
-}
-
 /// An archive that cannot be unpacked into NZBs (corrupt, empty, over the
 /// size or count limits) is bad input, not a server fault.
 fn bad_upload(error: anyhow::Error) -> ApiError {
     ApiError::from((StatusCode::BAD_REQUEST, error))
-}
-
-/// Read a whole `POST /api/queue/add` body: the uploaded files and the
-/// optional `password` field (which may come before or after the files).
-async fn read_upload(
-    multipart: &mut Multipart,
-) -> Result<(Vec<(String, Vec<u8>)>, Option<String>), ApiError> {
-    let mut files = Vec::new();
-    let mut password = None;
-    while let Some(part) = next_upload_part(multipart).await? {
-        match part {
-            UploadPart::File(file_name, data) => files.push((file_name, data)),
-            UploadPart::Password(text) => password = Some(text),
-        }
-    }
-    Ok((files, password))
 }
 
 /// Split SABnzbd's inline job password (`name{{pw}}`, `name/pw`) off a
@@ -400,8 +419,8 @@ fn take_inline_password(raw: &str) -> (String, Option<String>) {
     }
 }
 
-/// Enqueue a single NZB from raw bytes, applying category/priority from
-/// query params. The archive password is the explicit `password` if given,
+/// Enqueue a single NZB from raw bytes, applying the category, priority and
+/// name override from `q`. The archive password is the explicit `password` if given,
 /// else an inline one from the `name` override or the file name (SABnzbd's
 /// `name{{password}}` / `name/password` convention), else the NZB's own
 /// `<meta type="password">`.
@@ -474,6 +493,9 @@ fn enqueue_nzb(
 /// POST /api/queue/add -- Add NZB file(s) to the queue.
 /// Accepts `.nzb` files directly, or `.zip`/`.gz`/`.bz2` archives containing `.nzb` files.
 /// Multiple files can be uploaded in a single multipart request.
+/// `category`/`cat`, `priority`, `name`/`nzbname` and `password` may be sent
+/// as multipart text fields or (except `password`) query parameters; a form
+/// field wins over the query parameter of the same name.
 pub async fn h_queue_add(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AddNzbQuery>,
@@ -485,10 +507,11 @@ pub async fn h_queue_add(
     if let Some(idempotency_key) = idempotency_key.as_ref() {
         // A keyed admission binds exactly one payload, so the request must carry
         // exactly one NZB — a multi-NZB upload has no single job to replay.
-        let (files, password) = read_upload(&mut multipart).await?;
+        let form = read_upload(&mut multipart).await?;
+        let q = form.options(&q);
         let mut uploaded_nzbs = Vec::new();
-        for (file_name, data) in files {
-            uploaded_nzbs.extend(extract_nzbs(&file_name, &data).map_err(bad_upload)?);
+        for (file_name, data) in &form.files {
+            uploaded_nzbs.extend(extract_nzbs(file_name, data).map_err(bad_upload)?);
         }
         if uploaded_nzbs.len() != 1 {
             return Err(ApiError::bad_request(
@@ -501,20 +524,21 @@ pub async fn h_queue_add(
             &q,
             &nzb_name,
             nzb_data,
-            password.as_deref(),
+            form.password.as_deref(),
             Some(idempotency_key),
         )?);
     } else {
-        let (files, password) = read_upload(&mut multipart).await?;
-        for (file_name, data) in files {
+        let form = read_upload(&mut multipart).await?;
+        let q = form.options(&q);
+        for (file_name, data) in &form.files {
             // Extract NZBs (handles zip/gz/bz2 archives or plain .nzb)
-            for (nzb_name, nzb_data) in extract_nzbs(&file_name, &data).map_err(bad_upload)? {
+            for (nzb_name, nzb_data) in extract_nzbs(file_name, data).map_err(bad_upload)? {
                 nzo_ids.push(enqueue_nzb(
                     &state,
                     &q,
                     &nzb_name,
                     nzb_data,
-                    password.as_deref(),
+                    form.password.as_deref(),
                     None,
                 )?);
             }
