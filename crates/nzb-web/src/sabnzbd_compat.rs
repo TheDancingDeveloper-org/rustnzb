@@ -875,7 +875,7 @@ fn build_queue_response(
     serde_json::json!({
         "queue": {
             "version": SABNZBD_COMPAT_VERSION,
-            "status": queue_status(paused, speed_bps),
+            "status": queue_status(paused, jobs),
             "paused": paused,
             "pause_int": "0",
             // SABnzbd uses `paused_all` for a distinct scheduler condition;
@@ -937,10 +937,13 @@ fn sab_priority_matches(priority: Priority, requested: &str) -> bool {
         || requested.eq_ignore_ascii_case(sab_priority_name(priority))
 }
 
-fn queue_status(paused: bool, speed_bps: u64) -> &'static str {
+/// Top-level queue status. Derived from job state rather than the
+/// instantaneous speed sample, which drops to 0 between bursts of an active
+/// download and made the status flap to `Idle`.
+fn queue_status(paused: bool, jobs: &[NzbJob]) -> &'static str {
     if paused {
         "Paused"
-    } else if speed_bps > 0 {
+    } else if jobs.iter().any(|job| job.status == JobStatus::Downloading) {
         "Downloading"
     } else {
         "Idle"
@@ -2237,9 +2240,9 @@ mod tests {
     }
 
     #[test]
-    fn queue_status_is_idle_when_unpaused_at_zero_speed() {
+    fn queue_status_is_idle_when_unpaused_and_nothing_downloads() {
         let response = build_queue_response(
-            &[queue_job("idle", "Idle job", "tv", JobStatus::Downloading)],
+            &[queue_job("idle", "Idle job", "tv", JobStatus::Queued)],
             false,
             0,
             0,
@@ -2247,6 +2250,39 @@ mod tests {
         );
         assert_eq!(response["queue"]["status"], "Idle");
         assert_eq!(response["queue"]["timeleft"], "0:00:00");
+    }
+
+    /// The instantaneous speed sample is routinely 0 between bursts of an
+    /// active download; the queue status must not flap to Idle then.
+    #[test]
+    fn queue_status_stays_downloading_at_zero_instantaneous_speed() {
+        let response = build_queue_response(
+            &[queue_job(
+                "active",
+                "Active job",
+                "tv",
+                JobStatus::Downloading,
+            )],
+            false,
+            0,
+            0,
+            &SabApiRequest::default(),
+        );
+        assert_eq!(response["queue"]["status"], "Downloading");
+
+        let paused = build_queue_response(
+            &[queue_job(
+                "active",
+                "Active job",
+                "tv",
+                JobStatus::Downloading,
+            )],
+            true,
+            0,
+            0,
+            &SabApiRequest::default(),
+        );
+        assert_eq!(paused["queue"]["status"], "Paused");
     }
 
     #[test]
