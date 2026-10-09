@@ -2698,13 +2698,28 @@ pub(crate) fn build_job_submission(
         }
     }
 
+    // `tried_servers` on a persisted article is only ever written when the
+    // article reached a terminal `ArticleFailed` (and was counted in
+    // `articles_failed`). Re-queuing it would hang: `pop_workable` never hands
+    // an item back to a server in `tried_servers`, and the item has no
+    // `provider_outcomes` for those servers, so it can never resolve. Treat it
+    // as already resolved instead and carry its failure into the context.
+    let is_previously_failed =
+        |article: &nzb_nntp::Article| !article.downloaded && !article.tried_servers.is_empty();
+    let previously_failed = job
+        .files
+        .iter()
+        .flat_map(|file| file.articles.iter())
+        .filter(|article| is_previously_failed(article))
+        .count();
+
     let work_items: Vec<WorkItem> = job
         .files
         .iter()
         .flat_map(|file| {
             file.articles
                 .iter()
-                .filter(|article| !article.downloaded)
+                .filter(|article| !article.downloaded && !is_previously_failed(article))
                 .map(move |article| WorkItem {
                     job_id: job.id.clone(),
                     file_id: file.id.clone(),
@@ -2725,6 +2740,8 @@ pub(crate) fn build_job_submission(
         progress_tx,
         total_remaining,
     ));
+    ctx.articles_failed
+        .store(previously_failed, Ordering::Relaxed);
     (ctx, work_items)
 }
 
@@ -3089,6 +3106,49 @@ mod tests {
         );
         assert!(asm.is_file_complete(&job.id, "file-1"));
         assert_eq!(asm.get_file_progress(&job.id, "file-1"), (3, 3));
+    }
+
+    #[test]
+    fn submission_does_not_requeue_previously_failed_articles() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = test_job("previously-failed", temp.path());
+        let article = |message_id: &str, segment_number: u32, tried: &[&str]| nzb_nntp::Article {
+            message_id: message_id.to_string(),
+            segment_number,
+            bytes: 100,
+            downloaded: false,
+            data_begin: None,
+            data_size: None,
+            crc32: None,
+            tried_servers: tried.iter().map(|s| s.to_string()).collect(),
+            tries: tried.len() as u32,
+        };
+        job.files.push(nzb_core::models::NzbFile {
+            id: "file-1".into(),
+            filename: "partial.bin".into(),
+            bytes: 200,
+            bytes_downloaded: 0,
+            is_par2: false,
+            par2_setname: None,
+            par2_vol: None,
+            par2_blocks: None,
+            assembled: false,
+            groups: Vec::new(),
+            articles: vec![article("pending", 1, &[]), article("failed", 2, &["srv1"])],
+        });
+        let (tx, _rx) = mpsc::channel(4);
+
+        let (ctx, items) = build_job_submission(&job, tx);
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pending"]
+        );
+        assert_eq!(ctx.articles_remaining.load(Ordering::Relaxed), 1);
+        assert_eq!(ctx.articles_failed.load(Ordering::Relaxed), 1);
     }
 
     #[cfg(target_os = "linux")]

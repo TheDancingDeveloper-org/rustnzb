@@ -349,3 +349,116 @@ async fn resuming_paused_jobs_respects_active_download_limit() {
         );
     }
 }
+
+#[tokio::test]
+async fn restart_does_not_requeue_article_that_already_failed() {
+    let fixture = NzbFixture::new("restart-failed")
+        .add_file(
+            "restart.bin",
+            &[
+                ("restart-failed-1", b"first"),
+                ("restart-failed-2", b"second"),
+            ],
+        )
+        .build();
+    let triples = fixture
+        .articles
+        .iter()
+        .map(|(id, bytes, name)| (*id, *bytes, name.as_str()))
+        .collect::<Vec<_>>();
+    let mut overrides = HashMap::new();
+    overrides.insert("restart-failed-2".to_string(), 430);
+    let server = ServerProfile::start(
+        "restart-failed",
+        MockConfig {
+            articles: yenc_articles(&triples),
+            article_response_overrides: overrides,
+            ..MockConfig::default()
+        },
+        1,
+    )
+    .await;
+    let state = tempfile::tempdir().expect("restart state");
+    let database_path = state.path().join("queue.sqlite");
+    let incomplete_dir = state.path().join("incomplete");
+    let complete_dir = state.path().join("complete");
+    std::fs::create_dir_all(&incomplete_dir).unwrap();
+    std::fs::create_dir_all(&complete_dir).unwrap();
+    let mut job = nzb_parser::parse_nzb("restart-failed", &fixture.xml).unwrap();
+    job.status = JobStatus::Downloading;
+    job.work_dir = incomplete_dir.join(&job.id);
+    job.output_dir = complete_dir.join(&job.name);
+    let job_id = job.id.clone();
+    let db = Database::open(&database_path).unwrap();
+    db.queue_insert(&job).unwrap();
+    db.queue_store_nzb_data(&job_id, &fixture.xml).unwrap();
+    // Checkpoint taken after segment 2 already failed on the only server:
+    // the failure recorded the server in `tried_servers` and was counted.
+    db.queue_store_job_data(
+        &job_id,
+        &serde_json::to_vec(&serde_json::json!({
+            "files": {"restart.bin": []},
+            "downloaded_bytes": 0,
+            "articles_downloaded": 0,
+            "articles_failed": 1,
+            "files_completed": 0,
+            "articles": {"restart.bin": [
+                {
+                    "message_id": "restart-failed-1",
+                    "segment_number": 1,
+                    "bytes": 5,
+                    "downloaded": false,
+                    "data_begin": null,
+                    "data_size": null,
+                    "crc32": null,
+                    "tried_servers": [],
+                    "tries": 0
+                },
+                {
+                    "message_id": "restart-failed-2",
+                    "segment_number": 2,
+                    "bytes": 6,
+                    "downloaded": false,
+                    "data_begin": null,
+                    "data_size": null,
+                    "crc32": null,
+                    "tried_servers": ["restart-failed"],
+                    "tries": 1
+                }
+            ]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let engine = HarnessBuilder::restart_recovery(server)
+        .with_database_path(database_path)
+        .with_state_dir(PathBuf::from(state.path()))
+        .build();
+    engine.queue_manager.restore_from_db().unwrap();
+
+    // Before the fix the failed article was re-queued with its only server
+    // already in `tried_servers`, so no worker could ever take it and the job
+    // stayed in Downloading forever.
+    assert!(
+        engine
+            .wait_for(Duration::from_secs(10), |snapshot| {
+                snapshot
+                    .job(&job_id)
+                    .is_none_or(|job| job.status != JobStatus::Downloading)
+            })
+            .await,
+        "restarted job hung on an article that had already failed"
+    );
+    let history = engine.queue_manager.history_get(&job_id).unwrap();
+    let job = engine.job(&job_id);
+    let (downloaded, failed) = match (history, job) {
+        (Some(entry), _) => (entry.downloaded_bytes, None),
+        (None, Some(job)) => (job.downloaded_bytes, Some(job.articles_failed)),
+        (None, None) => panic!("job vanished"),
+    };
+    assert!(downloaded > 0, "segment 1 must still be downloaded");
+    if let Some(failed) = failed {
+        assert_eq!(failed, 1, "the old failure must not be counted twice");
+    }
+}
