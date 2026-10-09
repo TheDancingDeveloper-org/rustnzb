@@ -150,9 +150,11 @@ impl ConnectionPool {
         let maybe_idle = { self.idle.lock().pop() };
 
         if let Some(mut pooled) = maybe_idle {
-            // Arm the drop guard so the permit is freed if this connection
-            // is dropped without release/discard.
-            pooled.semaphore = Some(Arc::clone(&self.semaphore));
+            // The drop guard stays disarmed until the connection is actually
+            // handed out: if it is discarded below, the owned `permit` is
+            // what carries the slot (to the new connection, or back to the
+            // semaphore on error). Arming it here would free a second permit
+            // when `pooled` drops on the fall-through path.
             // Health check: if the connection is in a bad state, discard and make new
             if pooled.conn.state == ConnectionState::Ready && pooled.conn.is_connected() {
                 // If idle too long, do a quick liveness check
@@ -174,6 +176,7 @@ impl ConnectionPool {
                             );
                             pooled.last_used = Instant::now();
                             permit.forget(); // slot is now checked out
+                            pooled.semaphore = Some(Arc::clone(&self.semaphore));
                             return Ok(pooled);
                         }
                         Err(e) => {
@@ -194,6 +197,7 @@ impl ConnectionPool {
                         "Pool: reusing idle connection"
                     );
                     permit.forget();
+                    pooled.semaphore = Some(Arc::clone(&self.semaphore));
                     return Ok(pooled);
                 }
             } else {
@@ -284,9 +288,10 @@ impl ConnectionPool {
             idle.drain(..).collect()
         };
         let count = conns.len();
+        // Idle connections do not hold a permit (`release` already returned
+        // it when parking them), so closing them frees nothing.
         for mut c in conns {
             let _ = c.conn.quit().await;
-            self.semaphore.add_permits(1);
         }
         if count > 0 {
             debug!(server = %self.config.name, count, "Closed idle connections");
@@ -367,8 +372,8 @@ impl ConnectionPool {
                 error = %e,
                 "Pool: new connection FAILED"
             );
-            // Free the semaphore slot since we failed
-            self.semaphore.add_permits(1);
+            // The caller's owned permit is dropped on this error path,
+            // which frees the slot; adding one here would double-count.
         })?;
 
         info!(
@@ -462,9 +467,53 @@ mod tests {
         pool.release(c2);
         assert_eq!(pool.idle_count(), 2);
 
+        assert_eq!(pool.available_permits(), 4);
+
         // Close all idle
         pool.close_idle().await;
         assert_eq!(pool.idle_count(), 0);
+        // Idle connections do not hold permits, so closing them must not
+        // add any: the pool still allows exactly `connections` slots.
+        assert_eq!(pool.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_pool_failed_connect_does_not_inflate_permits() {
+        // Bind then drop a listener so the port refuses connections.
+        let port = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let pool = ConnectionPool::new(Arc::new(test_config(port)));
+        assert_eq!(pool.available_permits(), 4);
+
+        for _ in 0..3 {
+            assert!(pool.acquire().await.is_err());
+            assert_eq!(pool.available_permits(), 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pool_bad_idle_connection_does_not_inflate_permits() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let pool = ConnectionPool::new(Arc::new(test_config(server.port())));
+
+        let c1 = pool.acquire().await.unwrap();
+        pool.release(c1);
+        assert_eq!(pool.idle_count(), 1);
+        assert_eq!(pool.available_permits(), 4);
+
+        // Poison the parked connection so acquire() must replace it.
+        pool.idle.lock()[0].conn.state = ConnectionState::Error;
+
+        let c2 = pool.acquire().await.unwrap();
+        assert_eq!(c2.conn.state, ConnectionState::Ready);
+        assert_eq!(pool.idle_count(), 0);
+        // Exactly one connection is checked out.
+        assert_eq!(pool.available_permits(), 3);
+
+        pool.release(c2);
+        assert_eq!(pool.available_permits(), 4);
     }
 
     #[tokio::test]
