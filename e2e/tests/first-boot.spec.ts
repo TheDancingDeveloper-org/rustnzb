@@ -156,7 +156,9 @@ test.describe.serial('First boot', () => {
     await page.getByRole('button', { name: 'Import from SABnzbd' }).click();
     await expect(page.getByRole('button', { name: /live instance/i })).toBeVisible();
 
-    // Fill in an unreachable URL and a dummy API key
+    // A loopback URL. The fetch guard refuses private addresses before any
+    // connection attempt, and the page shows that reason (human_readable)
+    // rather than the generic fallback.
     const urlField = page.getByPlaceholder(/http.*localhost.*8080/i);
     await urlField.fill('http://localhost:1');
 
@@ -166,7 +168,7 @@ test.describe.serial('First boot', () => {
     await page.getByRole('button', { name: /fetch config/i }).click();
 
     // Wait for the error — connecting to :1 will fail quickly
-    await expect(page.getByText(/failed to connect/i)).toBeVisible({ timeout: 15000 });
+    await expect(page.getByText(/private\/reserved address|failed to connect/i)).toBeVisible({ timeout: 15000 });
     // Still on connect step
     await expect(page.getByRole('button', { name: /fetch config/i })).toBeVisible();
   });
