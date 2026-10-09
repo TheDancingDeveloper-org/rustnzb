@@ -87,6 +87,101 @@ fn cleanup_terminal_work_dir(
     }
 }
 
+/// Upper bound on `<name>.<n>` suffixes tried when the complete directory
+/// already holds folders with a job's name.
+const MAX_OUTPUT_DIR_SUFFIX: u32 = 9999;
+
+/// Atomically reserve a complete-directory folder derived from `base`.
+///
+/// `base` is tried first, then `<name>.1`, `<name>.2`, ... like SABnzbd.
+/// `create_dir` either creates the folder or fails with `AlreadyExists`, so
+/// two jobs finishing at the same time can never reserve the same folder.
+fn claim_unique_output_dir(base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "output directory has no parent or name",
+        ));
+    };
+    std::fs::create_dir_all(parent)?;
+    for suffix in 0..=MAX_OUTPUT_DIR_SUFFIX {
+        let candidate = if suffix == 0 {
+            base.to_path_buf()
+        } else {
+            let mut suffixed = name.to_os_string();
+            suffixed.push(format!(".{suffix}"));
+            parent.join(suffixed)
+        };
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free output directory name",
+    ))
+}
+
+/// Reserve a unique complete-directory folder for a job that has not reserved
+/// one yet, recording the final path in `output_dir`.
+fn claim_output_dir_fields(job_id: &str, output_dir: &mut std::path::PathBuf, claimed: &mut bool) {
+    if *claimed {
+        return;
+    }
+    match claim_unique_output_dir(output_dir) {
+        Ok(dir) => {
+            if dir != *output_dir {
+                info!(
+                    job_id,
+                    requested = %output_dir.display(),
+                    output_dir = %dir.display(),
+                    "Output folder already exists; using a unique folder name"
+                );
+            }
+            *output_dir = dir;
+            *claimed = true;
+        }
+        Err(e) => warn!(
+            job_id,
+            output_dir = %output_dir.display(),
+            "Unable to reserve a unique output folder: {e}"
+        ),
+    }
+}
+
+/// Accept the output directory an earlier attempt of the same job reserved
+/// (an interrupted post-processing run, or a direct unpack before a pause),
+/// provided it is still a real directory named `<base>` or `<base>.<n>`
+/// beside the job's derived target.
+fn restore_claimed_output_dir(job: &mut NzbJob, checkpoint: &JobCheckpoint) -> bool {
+    let Some(claimed) = checkpoint.output_dir.as_ref() else {
+        return false;
+    };
+    let same_parent = claimed.parent().is_some() && claimed.parent() == job.output_dir.parent();
+    let same_base = match (claimed.file_name(), job.output_dir.file_name()) {
+        (Some(claimed), Some(base)) => {
+            let (claimed, base) = (claimed.to_string_lossy(), base.to_string_lossy());
+            claimed == base
+                || claimed
+                    .strip_prefix(&*base)
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        }
+        _ => false,
+    };
+    let is_dir = std::fs::symlink_metadata(claimed)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false);
+    if same_parent && same_base && is_dir {
+        job.output_dir = claimed.clone();
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStatsData {
     pub server_id: String,
@@ -329,6 +424,10 @@ struct JobCheckpoint {
     /// Retained partial work directory for missing-only history retry.
     #[serde(default)]
     work_dir: Option<std::path::PathBuf>,
+    /// Complete-directory folder this job already reserved, so a resumed
+    /// attempt keeps writing to its own folder instead of reserving another.
+    #[serde(default)]
+    output_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,7 +443,7 @@ struct ArticleCheckpoint {
     tries: u32,
 }
 
-fn checkpoint_for_job(job: &NzbJob) -> JobCheckpoint {
+fn checkpoint_for_job(job: &NzbJob, output_dir_claimed: bool) -> JobCheckpoint {
     JobCheckpoint {
         files: job
             .files
@@ -388,6 +487,7 @@ fn checkpoint_for_job(job: &NzbJob) -> JobCheckpoint {
             })
             .collect(),
         work_dir: Some(job.work_dir.clone()),
+        output_dir: output_dir_claimed.then(|| job.output_dir.clone()),
     }
 }
 
@@ -918,6 +1018,10 @@ struct JobState {
     /// Typed terminal failure code, tracked in memory until it is persisted to
     /// the terminal history row.
     failure_code: Option<JobFailureCode>,
+    /// Whether `job.output_dir` is a complete-directory folder this job
+    /// reserved for itself. Reserving happens when output is first written,
+    /// not at add time, so queued jobs never hold a name.
+    output_dir_claimed: bool,
 }
 
 /// Notification fired immediately when a job is accepted into the queue.
@@ -1588,6 +1692,7 @@ impl QueueManager {
                 hopeless_tracker: None,
                 download_time_secs: None,
                 failure_code: None,
+                output_dir_claimed: false,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             if !requested_paused {
@@ -1610,6 +1715,7 @@ impl QueueManager {
             hopeless_tracker: None,
             download_time_secs: None,
             failure_code: None,
+            output_dir_claimed: false,
         };
         self.jobs.lock().insert(job_id.clone(), state);
         self.job_order.lock().push(job_id);
@@ -1693,6 +1799,10 @@ impl QueueManager {
                                     serde_json::from_slice::<JobCheckpoint>(&cp_data)
                             {
                                 apply_checkpoint(&mut state.job, &checkpoint);
+                                if !state.output_dir_claimed {
+                                    state.output_dir_claimed =
+                                        restore_claimed_output_dir(&mut state.job, &checkpoint);
+                                }
                                 info!(
                                     job_id = %job_id,
                                     name = %state.job.name,
@@ -1991,6 +2101,15 @@ impl QueueManager {
                                             && let Some(vol_info) = parse_rar_volume(&file.filename)
                                         {
                                             if state.direct_unpacker.is_none() {
+                                                // Direct unpack writes into the
+                                                // complete folder, so reserve it now.
+                                                // (`state.job.files` is borrowed by
+                                                // the loop, so pass disjoint fields.)
+                                                claim_output_dir_fields(
+                                                    &state.job.id,
+                                                    &mut state.job.output_dir,
+                                                    &mut state.output_dir_claimed,
+                                                );
                                                 state.direct_unpacker = DirectUnpacker::new(
                                                     &state.job.work_dir,
                                                     &state.job.output_dir,
@@ -2353,6 +2472,8 @@ impl QueueManager {
 
             let cat = state.job.category.clone();
             let pp = self.post_processing_level(&state.job);
+            // Post-processing writes into the complete folder from here on.
+            Self::claim_output_dir(state);
             let du = state.direct_unpacker.take();
             let pw = state.job.password.clone();
             let content_failed = state
@@ -2369,6 +2490,8 @@ impl QueueManager {
                 content_failed,
             )
         };
+        // Record the reserved folder so a restart resumes into it.
+        self.persist_job_progress(job_id);
 
         // Repair and extraction can write to both the incomplete and the
         // category output volumes. Apply the same guard to both paths before
@@ -2717,6 +2840,7 @@ impl QueueManager {
 
         // Move files from work_dir to output_dir (if not already done by pipeline extract).
         if final_status == JobStatus::Completed {
+            Self::claim_output_dir(state);
             if let Err(e) = std::fs::create_dir_all(&state.job.output_dir) {
                 warn!(job_id = %state.job.id, "Failed to create output dir: {e}");
             }
@@ -2777,7 +2901,17 @@ impl QueueManager {
         state.job.status = final_status;
 
         // Insert into history with real stage results
-        let retry_data = serde_json::to_vec(&checkpoint_for_job(&state.job)).ok();
+        if final_status == JobStatus::Failed && state.output_dir_claimed {
+            // A failed job keeps nothing in its reserved folder unless
+            // extraction already wrote there; release an empty reservation so
+            // a retry can claim the plain name again.
+            if std::fs::remove_dir(&state.job.output_dir).is_ok() {
+                state.output_dir_claimed = false;
+            }
+        }
+
+        let retry_data =
+            serde_json::to_vec(&checkpoint_for_job(&state.job, state.output_dir_claimed)).ok();
         let history_entry = HistoryEntry {
             id: state.job.id.clone(),
             name: state.job.name.clone(),
@@ -2870,6 +3004,25 @@ impl QueueManager {
         }
     }
 
+    /// Reserve a unique complete-directory folder for this job if it has not
+    /// reserved one yet, and record the final path on the job.
+    fn claim_output_dir(state: &mut JobState) {
+        claim_output_dir_fields(
+            &state.job.id,
+            &mut state.job.output_dir,
+            &mut state.output_dir_claimed,
+        );
+    }
+
+    /// Drop a reservation before the job's target folder changes, removing
+    /// the reserved folder when nothing was written into it yet.
+    fn release_output_dir_claim(state: &mut JobState) {
+        if state.output_dir_claimed {
+            let _ = std::fs::remove_dir(&state.job.output_dir);
+            state.output_dir_claimed = false;
+        }
+    }
+
     /// Persist current job progress to the database, including article-level
     /// checkpoint data for resume support.
     fn persist_job_progress(&self, job_id: &str) {
@@ -2888,7 +3041,7 @@ impl QueueManager {
             }
 
             // Build and store checkpoint of downloaded article segments
-            let checkpoint = checkpoint_for_job(&state.job);
+            let checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
 
             if let Ok(data) = serde_json::to_vec(&checkpoint)
                 && let Err(e) = db.queue_store_job_data(job_id, &data)
@@ -3299,6 +3452,7 @@ impl QueueManager {
             Some((_, s)) => {
                 let output_dir = self.output_dir_for(&s.job.category, &new_name)?;
                 s.job.name = new_name.clone();
+                Self::release_output_dir_claim(s);
                 s.job.output_dir = output_dir;
                 info!(job_id = %id, new_name = %new_name, "Job renamed");
                 Ok(())
@@ -3328,6 +3482,7 @@ impl QueueManager {
             Some((_, s)) => {
                 s.job.category = category.to_string();
                 // Update the output directory to match the new category
+                Self::release_output_dir_claim(s);
                 s.job.output_dir = output_dir;
                 info!(job_id = %id, category = %category, "Job category changed");
                 Ok(())
@@ -4126,6 +4281,7 @@ impl QueueManager {
             // is loaded lazily in launch_download() when they reach the front of
             // the queue. This keeps memory low with large queues (hundreds of jobs).
             let was_active = job.status == JobStatus::Downloading;
+            let mut output_dir_claimed = false;
 
             let nzb_data = if was_active {
                 let db = self.db.lock();
@@ -4157,6 +4313,7 @@ impl QueueManager {
                     match serde_json::from_slice::<JobCheckpoint>(data) {
                         Ok(checkpoint) => {
                             apply_checkpoint(&mut job, &checkpoint);
+                            output_dir_claimed = restore_claimed_output_dir(&mut job, &checkpoint);
 
                             let remaining = job
                                 .article_count
@@ -4177,6 +4334,19 @@ impl QueueManager {
                             );
                         }
                     }
+                }
+            } else if was_post_processing {
+                // Interrupted post-processing resumes into the folder it had
+                // already reserved rather than reserving a second one.
+                let checkpoint_data = {
+                    let db = self.db.lock();
+                    db.queue_load_job_data(&job_id).unwrap_or(None)
+                };
+                if let Some(checkpoint) = checkpoint_data
+                    .as_deref()
+                    .and_then(|data| serde_json::from_slice::<JobCheckpoint>(data).ok())
+                {
+                    output_dir_claimed = restore_claimed_output_dir(&mut job, &checkpoint);
                 }
             }
 
@@ -4200,6 +4370,7 @@ impl QueueManager {
                 hopeless_tracker: None,
                 download_time_secs: None,
                 failure_code: None,
+                output_dir_claimed,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);
@@ -4572,6 +4743,7 @@ mod global_pause_tests {
                 hopeless_tracker: None,
                 download_time_secs: None,
                 failure_code: None,
+                output_dir_claimed: false,
             },
         );
         manager.job_order.lock().push(id);
@@ -5053,10 +5225,11 @@ mod global_pause_tests {
         let completed = job("completed-retain", JobStatus::Completed, tempdir.path());
         std::fs::create_dir_all(&completed.work_dir).unwrap();
         std::fs::write(completed.work_dir.join("unmoved.bin"), b"payload").unwrap();
-        // A regular file at output_dir makes both rename and copy fail, so the
-        // work directory must be retained instead of silently losing data.
-        std::fs::create_dir_all(completed.output_dir.parent().unwrap()).unwrap();
-        std::fs::write(&completed.output_dir, b"not a directory").unwrap();
+        // A regular file in place of the complete root makes reserving the
+        // output folder, rename and copy all fail, so the work directory must
+        // be retained instead of silently losing data. (A file at output_dir
+        // itself is now a name collision and resolves to `<name>.1`.)
+        std::fs::write(completed.output_dir.parent().unwrap(), b"not a directory").unwrap();
         let work_dir = completed.work_dir.clone();
         insert_job(&manager, completed);
 
@@ -5223,6 +5396,80 @@ mod global_pause_tests {
             .unwrap();
         assert_eq!(history.status, JobStatus::Completed);
         assert!(interrupted.output_dir.join("payload.mkv").exists());
+    }
+
+    #[tokio::test]
+    async fn interrupted_post_processing_resumes_into_its_reserved_output_dir() {
+        let (manager, tempdir) = manager();
+        let mut interrupted = job("SameName", JobStatus::PostProcessing, tempdir.path());
+        interrupted.id = "restart-claimed".to_string();
+        std::fs::create_dir_all(&interrupted.work_dir).unwrap();
+        std::fs::write(interrupted.work_dir.join("second.mkv"), b"second").unwrap();
+        // Another job already completed into the plain name; this job had
+        // reserved `SameName.1` (and extracted into it) before the restart.
+        let foreign = interrupted.output_dir.clone();
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("first.mkv"), b"first").unwrap();
+        let reserved = foreign.with_file_name("SameName.1");
+        std::fs::create_dir_all(&reserved).unwrap();
+        std::fs::write(reserved.join("extracted.mkv"), b"extracted").unwrap();
+        interrupted.output_dir = reserved.clone();
+        {
+            let db = manager.db.lock();
+            db.queue_insert(&interrupted).unwrap();
+            let checkpoint = checkpoint_for_job(&interrupted, true);
+            db.queue_store_job_data(&interrupted.id, &serde_json::to_vec(&checkpoint).unwrap())
+                .unwrap();
+        }
+
+        manager.restore_from_db().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager
+                .db
+                .lock()
+                .history_get("restart-claimed")
+                .unwrap()
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovered post-processing should reach terminal history");
+
+        let history = manager
+            .db
+            .lock()
+            .history_get("restart-claimed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.status, JobStatus::Completed);
+        assert_eq!(history.output_dir, reserved);
+        assert!(reserved.join("extracted.mkv").exists());
+        assert!(reserved.join("second.mkv").exists());
+        assert!(!foreign.join("second.mkv").exists());
+        assert!(!foreign.with_file_name("SameName.2").exists());
+    }
+
+    #[test]
+    fn stored_output_claim_outside_the_job_target_is_ignored() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut target = job("Name", JobStatus::PostProcessing, tempdir.path());
+        let elsewhere = tempdir.path().join("elsewhere").join("Name.1");
+        let unrelated = target.output_dir.with_file_name("Other");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+        for claimed in [elsewhere, unrelated] {
+            let mut stored = target.clone();
+            stored.output_dir = claimed;
+            let checkpoint = checkpoint_for_job(&stored, true);
+            assert!(!restore_claimed_output_dir(&mut target, &checkpoint));
+            assert_eq!(
+                target.output_dir,
+                tempdir.path().join("complete").join("Name")
+            );
+        }
     }
 }
 
