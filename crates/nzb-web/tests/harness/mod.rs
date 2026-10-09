@@ -430,12 +430,30 @@ impl From<NzbJob> for JobView {
 // Convenience: bundle yEnc-encoded fixture articles into a MockConfig.articles
 // ---------------------------------------------------------------------------
 
-/// Build a `MockConfig::articles` map from a list of `(message_id, body)`
-/// pairs by yEnc-encoding each body so the production decoder can parse it.
+/// Build a `MockConfig::articles` map from a list of
+/// `(message_id, body, filename)` triples by yEnc-encoding each body so the
+/// production decoder can parse it.
+///
+/// Triples sharing a filename are the segments of one file, in segment
+/// order. A file with several segments is encoded as a real multi-part yEnc
+/// post (`=ypart` with each segment's byte range), which the decoder
+/// requires to place every segment after the first.
 pub fn yenc_articles(articles: &[(&str, &[u8], &str)]) -> HashMap<String, Vec<u8>> {
+    let mut totals: HashMap<&str, (u32, u64)> = HashMap::new();
+    for &(_, body, filename) in articles {
+        let entry = totals.entry(filename).or_default();
+        entry.0 += 1;
+        entry.1 += body.len() as u64;
+    }
+    let mut next: HashMap<&str, (u32, u64)> = HashMap::new();
     let mut out = HashMap::new();
     for &(msg_id, body, filename) in articles {
-        let (encoded, _crc) = yenc_simd::encode_article(body, filename, 1, 1, 0, body.len() as u64);
+        let (parts, size) = totals[filename];
+        let (part, offset) = next.entry(filename).or_insert((1, 0));
+        let (encoded, _crc) =
+            yenc_simd::encode_article(body, filename, *part, parts, *offset, size);
+        *part += 1;
+        *offset += body.len() as u64;
         out.insert(msg_id.to_string(), encoded);
     }
     out
