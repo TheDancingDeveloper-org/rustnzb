@@ -170,6 +170,17 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+impl From<axum::extract::multipart::MultipartError> for ApiError {
+    /// A multipart body that cannot be read is the client's fault: axum
+    /// reports 400 for a malformed body and 413 for one over the limit.
+    fn from(e: axum::extract::multipart::MultipartError) -> Self {
+        Self {
+            status: Some(e.status()),
+            kind: ApiErrorKind::Message(format!("Multipart error: {}", e.body_text())),
+        }
+    }
+}
+
 impl From<crate::nzb_core::NzbError> for ApiError {
     /// Map domain errors to the HTTP status that describes them: missing
     /// resources are 404, malformed input 400, conflicts 409, and only

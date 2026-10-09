@@ -574,11 +574,7 @@ async fn read_multipart_fields(
     nzbname: &mut Option<String>,
     pp: &mut Option<String>,
 ) -> Result<(), ApiError> {
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Multipart error: {e}")))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(ApiError::from)? {
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
             "mode" => {
@@ -612,10 +608,7 @@ async fn read_multipart_fields(
                         .file_name()
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "unknown.nzb".into());
-                    let data = field
-                        .bytes()
-                        .await
-                        .map_err(|e| ApiError::from(anyhow::anyhow!("Read error: {e}")))?;
+                    let data = field.bytes().await.map_err(ApiError::from)?;
                     *nzb_data = Some((file_name, data.to_vec()));
                 } else if let Ok(text) = field.text().await {
                     *name = Some(text);
@@ -626,10 +619,7 @@ async fn read_multipart_fields(
                     .file_name()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown.nzb".into());
-                let data = field
-                    .bytes()
-                    .await
-                    .map_err(|e| ApiError::from(anyhow::anyhow!("Read error: {e}")))?;
+                let data = field.bytes().await.map_err(ApiError::from)?;
                 *nzb_data = Some((file_name, data.to_vec()));
             }
             "value" | "url" => {
