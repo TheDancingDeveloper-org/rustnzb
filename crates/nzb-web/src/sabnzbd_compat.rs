@@ -822,9 +822,9 @@ fn build_queue_response(
                 .as_ref()
                 .is_none_or(|term| job.name.to_lowercase().contains(term))
                 && (categories.is_empty()
-                    || categories
-                        .iter()
-                        .any(|category| category.eq_ignore_ascii_case(&job.category)))
+                    || categories.iter().any(|category| {
+                        sab_resolve_category(category).eq_ignore_ascii_case(&job.category)
+                    }))
                 && (priorities.is_empty()
                     || priorities
                         .iter()
@@ -1208,7 +1208,14 @@ fn history_slot_matches(slot: &SabHistorySlot, req: &SabApiRequest) -> bool {
     }
 
     let categories = req.cat.as_deref().or(req.category.as_deref());
-    if !matches_csv(categories, &slot.category) {
+    let category_matches = categories.is_none_or(|values| {
+        values.is_empty()
+            || values.split(',').map(str::trim).any(|value| {
+                sab_resolve_category(value)
+                    .eq_ignore_ascii_case(sab_resolve_category(&slot.category))
+            })
+    });
+    if !category_matches {
         return false;
     }
 
@@ -1605,6 +1612,16 @@ fn handle_get_cats(state: &AppState) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "categories": cats }))
 }
 
+/// Translate RustNZB's internal category name into the one SABnzbd reports
+/// in queue/history slots, mapping the default category to `"*"`.
+fn sab_category_label(category: &str) -> String {
+    if category.eq_ignore_ascii_case("Default") {
+        SAB_DEFAULT_CATEGORY_SENTINEL.to_string()
+    } else {
+        category.to_string()
+    }
+}
+
 /// Translate a client-supplied category into RustNZB's internal name,
 /// resolving SABnzbd's `"*"` default-category sentinel.
 fn sab_resolve_category(cat: &str) -> &str {
@@ -1754,7 +1771,7 @@ impl SabQueueSlot {
             cat: if job.category.is_empty() {
                 "None".into()
             } else {
-                job.category.clone()
+                sab_category_label(&job.category)
             },
             // RustNZB marks queued jobs Paused when the global gate is
             // applied. SABnzbd preserves their queue-facing `Queued` state
@@ -1879,7 +1896,7 @@ impl SabHistorySlot {
             completed: entry.completed_at.timestamp(),
             name: entry.name.clone(),
             nzb_name: format!("{}.nzb", entry.name),
-            category: entry.category.clone(),
+            category: sab_category_label(&entry.category),
             pp: "D".into(),
             script: String::new(),
             report: String::new(),
@@ -1936,7 +1953,7 @@ impl SabHistorySlot {
                 .timestamp(),
             name: job.name.clone(),
             nzb_name: format!("{}.nzb", job.name),
-            category: job.category.clone(),
+            category: sab_category_label(&job.category),
             pp: "D".into(),
             script: String::new(),
             report: String::new(),
@@ -2888,6 +2905,46 @@ mod tests {
         let response = handle_get_cats(&test_state.state).0;
         let cats = response["categories"].as_array().expect("categories array");
         assert_eq!(cats, &vec![serde_json::json!("*")]);
+    }
+
+    /// `get_cats` advertises the default category as `"*"`, so queue and
+    /// history slots must report it the same way, and `cat=*` must filter
+    /// on it.
+    #[test]
+    fn default_category_is_reported_and_filtered_as_sabnzbd_sentinel() {
+        let jobs = vec![
+            queue_job("default-job", "Default Job", "Default", JobStatus::Queued),
+            queue_job("tv-job", "TV Job", "tv", JobStatus::Queued),
+        ];
+        let all = build_queue_response(&jobs, false, 0, 0, &SabApiRequest::default());
+        assert_eq!(all["queue"]["slots"][0]["cat"], "*");
+        assert_eq!(all["queue"]["slots"][1]["cat"], "tv");
+
+        let star = SabApiRequest {
+            cat: Some("*".into()),
+            ..SabApiRequest::default()
+        };
+        let filtered = build_queue_response(&jobs, false, 0, 0, &star);
+        assert_eq!(filtered["queue"]["noofslots"], 1);
+        assert_eq!(filtered["queue"]["slots"][0]["filename"], "Default Job");
+
+        let entries = [
+            history_entry(
+                "default-hist",
+                "Default Hist",
+                "Default",
+                JobStatus::Completed,
+                1,
+            ),
+            history_entry("tv-hist", "TV Hist", "tv", JobStatus::Completed, 2),
+        ];
+        let history = build_history_response(&entries, &[], &SabApiRequest::default(), 1);
+        assert_eq!(history["history"]["slots"][0]["category"], "*");
+        assert_eq!(history["history"]["slots"][1]["category"], "tv");
+
+        let filtered = build_history_response(&entries, &[], &star, 1);
+        assert_eq!(filtered["history"]["noofslots"], 1);
+        assert_eq!(filtered["history"]["slots"][0]["name"], "Default Hist");
     }
 
     #[tokio::test]
