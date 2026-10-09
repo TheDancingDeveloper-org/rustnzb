@@ -25,6 +25,33 @@ pub fn safe_join(root: &Path, name: &str) -> Option<PathBuf> {
     output.starts_with(root).then_some(output)
 }
 
+/// Whether `ch` is an invisible bidirectional or zero-width formatting
+/// character that must not survive into a job or file name.
+///
+/// This covers the bidi embeddings and overrides (U+202A..=U+202E), the bidi
+/// isolates (U+2066..=U+2069), the directional marks LRM, RLM and ALM
+/// (U+200E, U+200F, U+061C), ZERO WIDTH SPACE (U+200B) and the byte order
+/// mark / ZERO WIDTH NO-BREAK SPACE (U+FEFF). An RTL override lets a name
+/// such as `clip\u{202E}4pm.exe` display as `clipexe.mp4`.
+///
+/// It deliberately does not cover every Unicode `Cf` character: ZERO WIDTH
+/// JOINER (U+200D) and ZERO WIDTH NON-JOINER (U+200C) are required by emoji
+/// sequences (family, flag and profession emoji) and by scripts such as
+/// Persian and the Indic scripts, so stripping them would corrupt
+/// legitimate names.
+pub(crate) fn is_bidi_or_invisible_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+            | '\u{200B}'
+            | '\u{FEFF}'
+    )
+}
+
 /// Validate a user supplied directory or category component.
 /// These values are intentionally a single path component.
 pub fn safe_component(value: &str) -> Option<&str> {
@@ -34,6 +61,7 @@ pub fn safe_component(value: &str) -> Option<&str> {
         || value.contains('/')
         || value.contains('\\')
         || value.chars().any(char::is_control)
+        || value.chars().any(is_bidi_or_invisible_control)
     {
         return None;
     }
@@ -73,6 +101,9 @@ pub const UNNAMED_JOB: &str = "unnamed";
 ///   `Star Trek: Discovery` reads `Star Trek - Discovery`.
 /// - The other Windows-illegal characters `< > " / \ | ? *` and control
 ///   characters become `_`.
+/// - Bidi controls and zero-width spaces (U+202A-202E, U+2066-2069,
+///   U+200E, U+200F, U+061C, U+200B, U+FEFF) are removed. ZWJ and ZWNJ
+///   are kept because emoji sequences and some scripts need them.
 /// - Leading and trailing whitespace and dots are trimmed.
 /// - Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
 ///   `LPT1`-`LPT9`, case-insensitive, with or without an extension) get a
@@ -97,6 +128,7 @@ pub fn sanitize_job_name(name: &str) -> String {
             }
             '<' | '>' | '"' | '/' | '\\' | '|' | '?' | '*' => replaced.push('_'),
             c if c.is_control() => replaced.push('_'),
+            c if is_bidi_or_invisible_control(c) => {}
             c => replaced.push(c),
         }
     }
@@ -454,5 +486,42 @@ mod tests {
             split_job_password("Show{{}}"),
             Some(("Show".to_string(), String::new()))
         );
+    }
+
+    #[test]
+    fn sanitize_job_name_strips_bidi_and_invisible_controls() {
+        // RTL override spoofing: "clip\u{202E}4pm.exe" displays as "clipexe.mp4".
+        assert_eq!(sanitize_job_name("clip\u{202E}4pm.exe"), "clip4pm.exe");
+        for ch in [
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{061C}', '\u{200B}', '\u{FEFF}',
+        ] {
+            let input = format!("a{ch}b");
+            assert_eq!(sanitize_job_name(&input), "ab", "{:04X}", ch as u32);
+        }
+        // A name made only of invisible characters falls back to the default.
+        assert_eq!(sanitize_job_name("\u{202E}\u{FEFF}"), UNNAMED_JOB);
+    }
+
+    #[test]
+    fn sanitize_job_name_keeps_joiners_cjk_and_accents() {
+        // ZWJ emoji sequence (family) and ZWNJ (Persian) must survive.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(sanitize_job_name(family), family);
+        let persian = "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}";
+        assert_eq!(sanitize_job_name(persian), persian);
+        for text in ["進撃の巨人 第1話", "Amélie Poulain", "Ñandú über straße"] {
+            assert_eq!(sanitize_job_name(text), text);
+        }
+    }
+
+    #[test]
+    fn safe_component_rejects_bidi_controls() {
+        assert!(safe_component("movies\u{202E}vka").is_none());
+        assert!(safe_component("\u{2066}tv\u{2069}").is_none());
+        assert!(safe_component("tv\u{200F}").is_none());
+        assert!(safe_component("tv\u{FEFF}").is_none());
+        assert!(safe_component("\u{1F468}\u{200D}\u{1F469}").is_some());
+        assert!(safe_component("映画").is_some());
     }
 }
