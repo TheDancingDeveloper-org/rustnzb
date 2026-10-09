@@ -1332,6 +1332,35 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
         };
     }
 
+    // `value=failed` / `value=completed` clear every entry with that status
+    // (SABnzbd `_api_history_delete`).
+    let status_filter = if target.eq_ignore_ascii_case("failed") {
+        Some(JobStatus::Failed)
+    } else if target.eq_ignore_ascii_case("completed") {
+        Some(JobStatus::Completed)
+    } else {
+        None
+    };
+    if let Some(status) = status_filter {
+        for entry in qm
+            .history_list(i64::MAX as usize)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| entry.status == status)
+        {
+            if del_files {
+                let _ = std::fs::remove_dir_all(&entry.output_dir);
+            }
+            if let Err(error) = qm.history_remove(&entry.id) {
+                return Json(serde_json::json!({
+                    "status": false,
+                    "error": error.to_string()
+                }));
+            }
+        }
+        return Json(serde_json::json!({ "status": true }));
+    }
+
     let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
     let mut removed_ids: Vec<String> = Vec::new();
     for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
@@ -1473,7 +1502,7 @@ fn handle_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
 
     // Also try history if not found in queue
     if !found {
-        let entries = qm.history_list(1000).unwrap_or_default();
+        let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
         for entry in &entries {
             if job_id_matches(&entry.id, search_id) {
                 let _ = qm.history_remove(&entry.id);
@@ -1499,7 +1528,7 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     let search_id = target_id.strip_prefix("SABnzbd_nzo_").unwrap_or(target_id);
     let Some(entry) = state
         .queue_manager
-        .history_list(1000)
+        .history_list(i64::MAX as usize)
         .unwrap_or_default()
         .into_iter()
         .find(|entry| job_id_matches(&entry.id, search_id))
@@ -3280,6 +3309,88 @@ mod tests {
         let response = handle_history_delete(&test_state.state, &req).0;
         assert_eq!(response["status"], serde_json::json!(true));
         assert!(!output_dir.exists());
+    }
+
+    fn insert_history_status(test_state: &TestState, id: &str, status: JobStatus, age_secs: i64) {
+        let mut entry = history_entry(id, id, "tv", status, age_secs);
+        entry.output_dir = test_state.state.config().general.complete_dir.join(id);
+        test_state
+            .state
+            .queue_manager
+            .with_db(|database| database.history_insert(&entry).expect("insert history"));
+    }
+
+    fn history_ids(test_state: &TestState) -> Vec<String> {
+        let mut ids: Vec<String> = test_state
+            .state
+            .queue_manager
+            .history_list(i64::MAX as usize)
+            .expect("list history")
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// SABnzbd's `_api_history_delete` accepts `value=failed` and
+    /// `value=completed` to clear every entry with that status.
+    #[tokio::test]
+    async fn history_delete_by_status_removes_only_matching_entries() {
+        for (value, kept) in [("failed", "job-done"), ("completed", "job-failed")] {
+            let test_state = test_state();
+            insert_history_status(&test_state, "job-done", JobStatus::Completed, 1);
+            insert_history_status(&test_state, "job-failed", JobStatus::Failed, 2);
+
+            let req = SabApiRequest {
+                value: Some(value.into()),
+                ..SabApiRequest::default()
+            };
+            let response = handle_history_delete(&test_state.state, &req).0;
+            assert_eq!(response["status"], serde_json::json!(true), "value={value}");
+            assert_eq!(
+                history_ids(&test_state),
+                vec![kept.to_string()],
+                "value={value}"
+            );
+        }
+    }
+
+    /// `mode=delete` and `mode=retry` must find history entries beyond the
+    /// most recent 1000.
+    #[tokio::test]
+    async fn delete_and_retry_find_history_entries_older_than_the_newest_thousand() {
+        let test_state = test_state();
+        insert_history_status(&test_state, "oldest-failed", JobStatus::Failed, 100_000);
+        for index in 0..1000 {
+            insert_history_status(
+                &test_state,
+                &format!("newer-{index:04}"),
+                JobStatus::Completed,
+                index,
+            );
+        }
+
+        let retry = handle_retry(
+            &test_state.state,
+            &SabApiRequest {
+                value: Some("SABnzbd_nzo_oldest-faile".into()),
+                ..SabApiRequest::default()
+            },
+        )
+        .0;
+        assert_ne!(retry["error"], "History job not found", "retry={retry}");
+
+        let delete = handle_delete(
+            &test_state.state,
+            &SabApiRequest {
+                value: Some("SABnzbd_nzo_oldest-faile".into()),
+                ..SabApiRequest::default()
+            },
+        )
+        .0;
+        assert_eq!(delete["status"], serde_json::json!(true));
+        assert!(!history_ids(&test_state).contains(&"oldest-failed".to_string()));
     }
 
     /// Without `del_files`, history delete only removes the DB record, as
