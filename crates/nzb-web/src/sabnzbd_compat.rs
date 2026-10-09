@@ -950,7 +950,9 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
 
         "priority" => handle_priority(state, req),
 
-        "fullstatus" | "server_stats" => handle_fullstatus(state),
+        "fullstatus" => handle_fullstatus(state),
+
+        "server_stats" => handle_server_stats(state),
 
         "pause" => handle_pause(state, req),
 
@@ -1069,6 +1071,55 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
             "weblogfile": serde_json::Value::Null,
             "windows": cfg!(target_os = "windows"),
         }
+    }))
+}
+
+/// `mode=server_stats`, in SABnzbd's shape (`api.py::_api_server_stats`):
+/// downloaded-byte totals overall and per server, keyed by server name.
+/// The data is the same as the native `GET /api/config/servers/stats`.
+/// RustNZB keeps rolling 1/7/30-day windows rather than calendar ones, and
+/// no per-day timeline, so `daily` is empty.
+fn handle_server_stats(state: &AppState) -> Json<serde_json::Value> {
+    let config = state.config();
+    let stats = state.queue_manager.server_stats_get_all(&config.servers);
+
+    let mut servers = serde_json::Map::new();
+    let (mut total, mut month, mut week, mut day) = (0_u64, 0_u64, 0_u64, 0_u64);
+    for server in &stats {
+        total = total.saturating_add(server.total_bytes);
+        month = month.saturating_add(server.month_bytes);
+        week = week.saturating_add(server.week_bytes);
+        day = day.saturating_add(server.today_bytes);
+
+        let mut key = if server.server_name.is_empty() {
+            server.server_id.clone()
+        } else {
+            server.server_name.clone()
+        };
+        if servers.contains_key(&key) {
+            // Two servers share a display name; keep both, keyed apart.
+            key = format!("{key} ({})", server.server_id);
+        }
+        servers.insert(
+            key,
+            serde_json::json!({
+                "total": server.total_bytes,
+                "month": server.month_bytes,
+                "week": server.week_bytes,
+                "day": server.today_bytes,
+                "daily": serde_json::Map::new(),
+                "articles_tried": server.total_ok.saturating_add(server.total_fail),
+                "articles_success": server.total_ok,
+            }),
+        );
+    }
+
+    Json(serde_json::json!({
+        "total": total,
+        "month": month,
+        "week": week,
+        "day": day,
+        "servers": servers,
     }))
 }
 
@@ -4279,6 +4330,48 @@ mod tests {
 
         let absent = addfile_multipart(SabApiRequest::default(), &[]).await;
         assert_eq!(absent.pp_override, None);
+    }
+
+    /// `mode=server_stats` has its own shape in SABnzbd
+    /// (`api.py::_api_server_stats`): byte totals plus a per-server map, not
+    /// the fullstatus envelope.
+    #[tokio::test]
+    async fn server_stats_uses_sabnzbd_shape() {
+        let test_state = test_state();
+        let mut config = (*test_state.state.config()).clone();
+        let mut server = crate::nzb_core::config::ServerConfig::new("srv-1", "news.example.com");
+        server.name = "Primary".into();
+        config.servers = vec![server];
+        test_state.state.config.store(Arc::new(config));
+
+        let mut entry = history_entry("stats-job", "Stats Job", "tv", JobStatus::Completed, 60);
+        entry.server_stats = vec![ServerArticleStats {
+            server_id: "srv-1".into(),
+            server_name: "Primary".into(),
+            articles_downloaded: 9,
+            articles_failed: 1,
+            bytes_downloaded: 4096,
+        }];
+        test_state
+            .state
+            .queue_manager
+            .with_db(|database| database.history_insert(&entry).expect("insert history"));
+
+        let stats = dispatch_mode(&test_state.state, "server_stats", &SabApiRequest::default()).0;
+        assert!(
+            stats.get("status").is_none(),
+            "not the fullstatus envelope: {stats}"
+        );
+        for field in ["total", "month", "week", "day"] {
+            assert_eq!(stats[field], 4096, "{field}");
+        }
+        let primary = &stats["servers"]["Primary"];
+        for field in ["total", "month", "week", "day"] {
+            assert_eq!(primary[field], 4096, "Primary.{field}");
+        }
+        assert!(primary["daily"].is_object());
+        assert_eq!(primary["articles_tried"], 10);
+        assert_eq!(primary["articles_success"], 9);
     }
 
     /// SABnzbd's real `_api_queue_delete` accepts a comma-separated `value`
