@@ -4214,10 +4214,14 @@ impl QueueManager {
     /// Canonical incomplete directories still referenced by a queue job or a
     /// history row. With `only_named`, retry checkpoints are parsed only when
     /// they mention that directory name, which keeps a single delete cheap.
+    ///
+    /// Fails closed: any error reading the queue, the history, or one row's
+    /// retry checkpoint is returned rather than treated as "nothing references
+    /// these directories", because callers use the result to decide deletion.
     fn referenced_work_dirs(
         &self,
         only_named: Option<&std::ffi::OsStr>,
-    ) -> HashSet<std::path::PathBuf> {
+    ) -> crate::nzb_core::Result<HashSet<std::path::PathBuf>> {
         let incomplete = self.incomplete_dir();
         // Terminal jobs linger in the queue view briefly after their history
         // row is written; their directory belongs to that row, not the queue.
@@ -4231,36 +4235,27 @@ impl QueueManager {
         let needle = only_named.map(|name| name.to_string_lossy().into_owned().into_bytes());
         {
             let db = self.db.lock();
-            match db.queue_list() {
-                Ok(jobs) => paths.extend(jobs.into_iter().map(|job| job.work_dir)),
-                Err(e) => warn!("Unable to list queue while checking work directories: {e}"),
-            }
-            match db.history_list(i64::MAX as usize) {
-                Ok(entries) => {
-                    for entry in entries {
-                        paths.push(incomplete.join(&entry.id));
-                        if entry.status != JobStatus::Failed {
-                            continue;
-                        }
-                        let Ok(Some(data)) = db.history_get_retry_data(&entry.id) else {
-                            continue;
-                        };
-                        let mentioned = needle.as_ref().is_none_or(|needle| {
-                            !needle.is_empty()
-                                && data.windows(needle.len()).any(|window| window == needle)
-                        });
-                        if mentioned && let Some(work_dir) = retry_checkpoint_work_dir(&data) {
-                            paths.push(work_dir);
-                        }
-                    }
+            paths.extend(db.queue_list()?.into_iter().map(|job| job.work_dir));
+            for entry in db.history_list(i64::MAX as usize)? {
+                paths.push(incomplete.join(&entry.id));
+                if entry.status != JobStatus::Failed {
+                    continue;
                 }
-                Err(e) => warn!("Unable to list history while checking work directories: {e}"),
+                let Some(data) = db.history_get_retry_data(&entry.id)? else {
+                    continue;
+                };
+                let mentioned = needle.as_ref().is_none_or(|needle| {
+                    !needle.is_empty() && data.windows(needle.len()).any(|window| window == needle)
+                });
+                if mentioned && let Some(work_dir) = retry_checkpoint_work_dir(&data) {
+                    paths.push(work_dir);
+                }
             }
         }
-        paths
+        Ok(paths
             .into_iter()
             .filter_map(|path| std::fs::canonicalize(path).ok())
-            .collect()
+            .collect())
     }
 
     /// Remove one retained incomplete work directory once nothing references
@@ -4273,10 +4268,14 @@ impl QueueManager {
         let Some(work_dir) = incomplete_child_dir(&root, candidate) else {
             return;
         };
-        if self
-            .referenced_work_dirs(work_dir.file_name())
-            .contains(&work_dir)
-        {
+        let Ok(referenced) = self.referenced_work_dirs(work_dir.file_name()) else {
+            warn!(
+                work_dir = %work_dir.display(),
+                "Keeping work directory: its references could not be read"
+            );
+            return;
+        };
+        if referenced.contains(&work_dir) {
             debug!(work_dir = %work_dir.display(), "Keeping work directory still in use");
             return;
         }
@@ -4309,7 +4308,10 @@ impl QueueManager {
         let Ok(entries) = std::fs::read_dir(&root) else {
             return;
         };
-        let referenced = self.referenced_work_dirs(None);
+        let Ok(referenced) = self.referenced_work_dirs(None) else {
+            warn!("Skipping orphan sweep: queue or history could not be read");
+            return;
+        };
         for entry in entries.flatten() {
             if !is_job_id_dir_name(&entry.file_name()) {
                 continue;

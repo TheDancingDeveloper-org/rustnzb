@@ -244,3 +244,58 @@ async fn startup_sweeps_unreferenced_incomplete_dirs_only() {
         "symlinks are not directories and are left alone"
     );
 }
+
+#[tokio::test]
+async fn startup_sweep_keeps_everything_when_a_queue_row_is_undecodable() {
+    let state = tempfile::tempdir().unwrap();
+    let database_path = state.path().join("rustnzb.db");
+    let incomplete = state.path().join("incomplete");
+    let complete = state.path().join("complete");
+    let orphan = incomplete.join("0b7c7f0e-3a51-4c4e-9a43-1f6f0c2b8d11");
+
+    let fixture = NzbFixture::new("queued")
+        .add_file("queued.bin", &[("undecodable-queued@test", b"queued")])
+        .build();
+    let mut queued: NzbJob = nzb_parser::parse_nzb("queued", &fixture.xml).unwrap();
+    queued.work_dir = incomplete.join(&queued.id);
+    queued.output_dir = complete.join("queued");
+    queued.status = JobStatus::Paused;
+    {
+        let db = Database::open(&database_path).unwrap();
+        db.queue_insert(&queued).unwrap();
+        db.queue_store_nzb_data(&queued.id, &fixture.xml).unwrap();
+        drop(db);
+        // One undecodable column makes queue_list() fail for the whole table.
+        let status = std::process::Command::new("sqlite3")
+            .arg(&database_path)
+            .arg(format!(
+                "UPDATE queue SET total_bytes = 'x' WHERE id = '{}'",
+                queued.id
+            ))
+            .status()
+            .expect("sqlite3");
+        assert!(status.success(), "corrupting the queue row failed");
+    }
+
+    dir_with_file(&queued.work_dir);
+    dir_with_file(&orphan);
+
+    let server = ServerProfile::start("sweep-bad-row", MockConfig::default(), 1).await;
+    let engine = HarnessBuilder::new()
+        .with_server(server)
+        .with_database_path(database_path)
+        .with_state_dir(state.path().to_path_buf())
+        .build();
+    // Restoration fails on the same undecodable row. The sweep must not have
+    // deleted anything first: a read error fails closed.
+    assert!(engine.queue_manager.restore_from_db().is_err());
+
+    assert!(
+        queued.work_dir.join("data.bin").exists(),
+        "the queued job's work dir survives an unreadable queue"
+    );
+    assert!(
+        orphan.join("data.bin").exists(),
+        "even an orphan survives when the reference set cannot be read"
+    );
+}
