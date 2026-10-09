@@ -109,13 +109,10 @@ fn fixture_nzb(subject: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-async fn wait_for_queue_size(queue: &QueueManager, expected: usize) -> bool {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if queue.queue_size() == expected {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+async fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+    tokio::time::timeout(timeout, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -144,7 +141,7 @@ async fn existing_zip_of_nzbs_is_imported_and_moved_to_processed() {
 
     let queue = watch_queue(temp.path());
     let watcher_task = tokio::spawn(DirWatcher::new(watch_dir.clone(), queue.clone()).run());
-    let imported = wait_for_queue_size(&queue, 2).await;
+    let imported = wait_until(Duration::from_secs(2), || queue.queue_size() == 2).await;
     watcher_task.abort();
 
     assert!(
@@ -171,11 +168,90 @@ async fn existing_bzip2_nzb_is_imported_and_moved_to_processed() {
 
     let queue = watch_queue(temp.path());
     let watcher_task = tokio::spawn(DirWatcher::new(watch_dir.clone(), queue.clone()).run());
-    let imported = wait_for_queue_size(&queue, 1).await;
+    let imported = wait_until(Duration::from_secs(2), || queue.queue_size() == 1).await;
     watcher_task.abort();
 
     assert!(imported, "watch folder did not enqueue the bzip2 NZB");
     assert_eq!(queue.get_jobs()[0].name, "packed");
     assert!(watch_dir.join("processed/packed.nzb.bz2").exists());
     assert!(!input.exists());
+}
+
+#[tokio::test]
+async fn unparseable_nzb_is_moved_to_failed() {
+    let temp = tempfile::tempdir().unwrap();
+    let watch_dir = temp.path().join("watch");
+    std::fs::create_dir_all(&watch_dir).unwrap();
+    let input = watch_dir.join("broken.nzb");
+    std::fs::write(&input, b"this is not xml").unwrap();
+
+    let queue = watch_queue(temp.path());
+    let watcher_task = tokio::spawn(DirWatcher::new(watch_dir.clone(), queue.clone()).run());
+    let moved = wait_until(Duration::from_secs(5), || {
+        watch_dir.join("failed/broken.nzb").exists()
+    })
+    .await;
+    watcher_task.abort();
+
+    assert!(moved, "unparseable NZB was not moved to failed/");
+    assert!(!input.exists());
+    assert_eq!(queue.queue_size(), 0);
+}
+
+#[tokio::test]
+async fn enqueued_nzb_is_not_enqueued_again_after_restart_when_move_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let watch_dir = temp.path().join("watch");
+    std::fs::create_dir_all(&watch_dir).unwrap();
+    // A regular file where processed/ should be makes the post-enqueue move fail.
+    std::fs::write(watch_dir.join("processed"), b"").unwrap();
+    std::fs::write(watch_dir.join("once.nzb"), fixture_nzb("once.bin")).unwrap();
+
+    let first = watch_queue(&temp.path().join("first"));
+    let task = tokio::spawn(DirWatcher::new(watch_dir.clone(), first.clone()).run());
+    let imported = wait_until(Duration::from_secs(5), || first.queue_size() == 1).await;
+    // Let the watcher finish its post-enqueue bookkeeping.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    task.abort();
+    assert!(imported, "first run did not enqueue the NZB");
+
+    // Simulated restart: a fresh watcher over the same folder must not pick
+    // the already-enqueued NZB up again.
+    let second = watch_queue(&temp.path().join("second"));
+    let task = tokio::spawn(DirWatcher::new(watch_dir.clone(), second.clone()).run());
+    let duplicated = wait_until(Duration::from_secs(2), || second.queue_size() > 0).await;
+    task.abort();
+    assert!(
+        !duplicated,
+        "restart re-enqueued an NZB that was already enqueued"
+    );
+}
+
+#[tokio::test]
+async fn slowly_written_nzb_is_parsed_only_once_complete() {
+    let temp = tempfile::tempdir().unwrap();
+    let watch_dir = temp.path().join("watch");
+    std::fs::create_dir_all(&watch_dir).unwrap();
+
+    let queue = watch_queue(temp.path());
+    let watcher_task = tokio::spawn(DirWatcher::new(watch_dir.clone(), queue.clone()).run());
+    // Give the watcher time to start watching.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let body = fixture_nzb("slow.bin");
+    let path = watch_dir.join("slow.nzb");
+    let mut file = std::fs::File::create(&path).unwrap();
+    for chunk in body.chunks(body.len() / 12 + 1) {
+        file.write_all(chunk).unwrap();
+        file.flush().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(file);
+
+    let imported = wait_until(Duration::from_secs(5), || queue.queue_size() == 1).await;
+    watcher_task.abort();
+
+    assert!(imported, "slowly written NZB was not enqueued");
+    assert!(!watch_dir.join("failed/slow.nzb").exists());
+    assert!(watch_dir.join("processed/slow.nzb").exists());
 }
