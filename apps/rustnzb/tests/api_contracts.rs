@@ -591,3 +591,64 @@ async fn server_update_keeps_password_unless_a_new_one_is_sent() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(stored_password().as_deref(), Some("rotated"));
 }
+
+#[tokio::test]
+async fn server_add_and_update_accept_partial_bodies() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let access = setup_access(&app, &client).await;
+
+    let added = client
+        .post(format!("{}/api/config/servers", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({
+            "name": "Primary", "host": "news.example.test", "username": "user",
+            "password": "secret", "retention": 3000
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = added.status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "{}",
+        added.text().await.unwrap()
+    );
+    let server = app.state.config().servers[0].clone();
+    assert!(!server.id.is_empty(), "server id must be generated");
+    assert!(server.ssl_verify);
+    assert!(server.enabled);
+    assert!(!server.optional);
+    assert_eq!(server.port, 563);
+
+    let updated = client
+        .put(format!("{}/api/config/servers/{}", app.base_url, server.id))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({ "connections": 4 }))
+        .send()
+        .await
+        .unwrap();
+    let status = updated.status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "{}",
+        updated.text().await.unwrap()
+    );
+    let saved = AppConfig::load(&app.config_path).unwrap().servers[0].clone();
+    assert_eq!(saved.id, server.id);
+    assert_eq!(saved.connections, 4);
+    assert_eq!(saved.host, "news.example.test");
+    assert_eq!(saved.retention, 3000);
+    assert_eq!(saved.password.as_deref(), Some("secret"));
+
+    let bad = client
+        .put(format!("{}/api/config/servers/{}", app.base_url, server.id))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({ "port": "not-a-port" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+}

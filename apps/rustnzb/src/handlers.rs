@@ -955,14 +955,14 @@ fn keep_unchanged_password(server: &mut ServerConfig, existing: &ServerConfig) {
 
 /// PUT /api/config/servers/{id} -- Update an existing server.
 ///
+/// The body may be partial: fields it omits keep their stored values.
 /// An empty or absent `password`, or the mask `********`, keeps the stored
 /// password; any other value replaces it.
 pub async fn h_server_update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(mut server): Json<ServerConfig>,
+    Json(patch): Json<serde_json::Value>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
-    sanitize_server_config(&mut server);
     let mut config = (*state.config()).clone();
 
     let idx = config
@@ -971,7 +971,12 @@ pub async fn h_server_update(
         .position(|s| s.id == id)
         .ok_or_else(|| ApiError::from(anyhow::anyhow!("Server not found: {id}")))?;
 
+    let mut server = merge_server_update(&config.servers[idx], patch)?;
     keep_unchanged_password(&mut server, &config.servers[idx]);
+    if server.id.is_empty() {
+        server.id = id;
+    }
+    sanitize_server_config(&mut server);
     config.servers[idx] = server;
     state
         .update_config(config.clone())
@@ -979,6 +984,22 @@ pub async fn h_server_update(
     state.queue_manager.update_servers(config.servers);
 
     Ok(Json(SimpleResponse { status: true }))
+}
+
+/// Overlay the fields present in `patch` onto `existing`.
+fn merge_server_update(
+    existing: &ServerConfig,
+    patch: serde_json::Value,
+) -> Result<ServerConfig, ApiError> {
+    let serde_json::Value::Object(patch) = patch else {
+        return Err(ApiError::bad_request("server update must be a JSON object"));
+    };
+    let mut merged = serde_json::to_value(existing).map_err(anyhow::Error::from)?;
+    if let serde_json::Value::Object(fields) = &mut merged {
+        fields.extend(patch);
+    }
+    serde_json::from_value(merged)
+        .map_err(|e| ApiError::from((StatusCode::BAD_REQUEST, format!("Invalid server: {e}"))))
 }
 
 /// DELETE /api/config/servers/{id} -- Delete a server.

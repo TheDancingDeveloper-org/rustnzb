@@ -36,7 +36,11 @@ script_max_output_bytes = 1048576
 # fetch_allowed_hosts = ["prowlarr", "192.168.1.0/24", "172.16.0.0/12"]
 
 # NNTP servers — add as many as needed, ordered by priority
-# Use the web UI "Servers" tab to add/edit servers, or uncomment below:
+# Use the web UI "Servers" tab to add/edit servers, or uncomment below.
+# Only `host` is required. Omitted fields default to: port 563, ssl = true,
+# ssl_verify = true, connections 8, priority 0, enabled = true, retention 0
+# (unlimited), optional = false, pipelining 4. A missing `id` is derived
+# from host and port.
 #
 # [[servers]]
 # id = "primary"
