@@ -19,6 +19,7 @@ static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::
         .expect("Failed to build shared HTTP client")
 });
 
+use nzb_web::nzb_core::NzbError;
 #[cfg(feature = "webdav")]
 use nzb_web::nzb_core::config::DavConfig;
 use nzb_web::nzb_core::config::{
@@ -900,6 +901,12 @@ pub async fn h_server_add(
     }
 
     state.update_config_with(|config| {
+        if config.servers.iter().any(|s| s.id == server.id) {
+            return Err(ApiError::conflict(format!(
+                "Server '{}' already exists",
+                server.id
+            )));
+        }
         config.servers.push(server);
         Ok::<_, ApiError>(())
     })?;
@@ -943,7 +950,7 @@ pub async fn h_server_update(
             .servers
             .iter()
             .position(|s| s.id == id)
-            .ok_or_else(|| ApiError::from(anyhow::anyhow!("Server not found: {id}")))?;
+            .ok_or_else(|| ApiError::from(NzbError::ServerNotFound(id.clone())))?;
 
         let mut server = merge_server_update(&config.servers[idx], patch)?;
         keep_unchanged_password(&mut server, &config.servers[idx]);
@@ -988,7 +995,7 @@ pub async fn h_server_delete(
         config.servers.retain(|s| s.id != id);
 
         if config.servers.len() == before {
-            return Err(ApiError::from(anyhow::anyhow!("Server not found: {id}")));
+            return Err(ApiError::from(NzbError::ServerNotFound(id.clone())));
         }
 
         Ok::<_, ApiError>(())
@@ -1011,7 +1018,7 @@ pub async fn h_server_test(
         .servers
         .iter()
         .find(|s| s.id == id)
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("Server not found: {id}")))?
+        .ok_or_else(|| ApiError::from(NzbError::ServerNotFound(id.clone())))?
         .clone();
 
     // Test connection in a spawned task with timeout
@@ -1162,9 +1169,10 @@ pub async fn h_category_add(
     State(state): State<Arc<AppState>>,
     Json(cat): Json<CategoryConfig>,
 ) -> Result<impl IntoResponse, ApiError> {
+    cat.validate().map_err(ApiError::bad_request)?;
     state.update_config_with(|config| {
         if config.categories.iter().any(|c| c.name == cat.name) {
-            return Err(ApiError::from(anyhow::anyhow!(
+            return Err(ApiError::conflict(format!(
                 "Category '{}' already exists",
                 cat.name
             )));
@@ -1184,12 +1192,13 @@ pub async fn h_category_update(
     Path(name): Path<String>,
     Json(cat): Json<CategoryConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    cat.validate().map_err(ApiError::bad_request)?;
     state.update_config_with(|config| {
         let idx = config
             .categories
             .iter()
             .position(|c| c.name == name)
-            .ok_or_else(|| ApiError::from(anyhow::anyhow!("Category not found")))?;
+            .ok_or_else(|| ApiError::from(NzbError::CategoryNotFound(name.clone())))?;
         config.categories[idx] = cat;
         state
             .queue_manager
@@ -1208,7 +1217,7 @@ pub async fn h_category_delete(
         let initial_len = config.categories.len();
         config.categories.retain(|c| c.name != name);
         if config.categories.len() == initial_len {
-            return Err(ApiError::from(anyhow::anyhow!("Category not found")));
+            return Err(ApiError::from(NzbError::CategoryNotFound(name.clone())));
         }
         state
             .queue_manager
@@ -1364,7 +1373,7 @@ pub async fn h_rss_feed_add(
     validate_feed_url(&state, &feed.url).await?;
     state.update_config_with(|config| {
         if config.rss_feeds.iter().any(|f| f.name == feed.name) {
-            return Err(ApiError::from(anyhow::anyhow!(
+            return Err(ApiError::conflict(format!(
                 "Feed '{}' already exists",
                 feed.name
             )));
@@ -1388,7 +1397,7 @@ pub async fn h_rss_feed_update(
             .rss_feeds
             .iter()
             .position(|f| f.name == name)
-            .ok_or_else(|| ApiError::from(anyhow::anyhow!("Feed not found")))?;
+            .ok_or_else(|| ApiError::not_found("Feed not found"))?;
         config.rss_feeds[idx] = feed;
         Ok::<_, ApiError>(())
     })?;
@@ -1404,7 +1413,7 @@ pub async fn h_rss_feed_delete(
         let len = config.rss_feeds.len();
         config.rss_feeds.retain(|f| f.name != name);
         if config.rss_feeds.len() == len {
-            return Err(ApiError::from(anyhow::anyhow!("Feed not found")));
+            return Err(ApiError::not_found("Feed not found"));
         }
         Ok::<_, ApiError>(())
     })?;
@@ -1443,7 +1452,7 @@ pub async fn h_rss_item_download(
         .queue_manager
         .rss_item_get(&id)
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("RSS item not found")))?;
+        .ok_or_else(|| ApiError::not_found("RSS item not found"))?;
 
     let url = item
         .url

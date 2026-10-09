@@ -1,6 +1,6 @@
 [package]
 name = "nzb-core"
-version = "0.2.18"
+version = "0.2.19"
 edition = "2024"
 description = "Shared models, config, NZB parser, and SQLite database for NZB clients"
 license = "MIT"

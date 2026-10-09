@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::nzb_core::config::AppConfig;
 use crate::nzb_core::db::Database;
@@ -49,6 +49,22 @@ fn env_flag_enabled(name: &str) -> Option<bool> {
 /// Create a data directory (e.g. `data_dir`/`incomplete_dir`/`complete_dir`), attaching
 /// the failing path and a permission hint to any error so failures are actionable
 /// instead of a bare `Permission denied (os error 13)`.
+/// A hand-edited config.toml can carry a category the API would refuse.
+/// Starting anyway keeps the rest of the service usable; the warning
+/// explains why jobs in that category fail to enqueue.
+fn warn_unsafe_categories(config: &AppConfig) {
+    for category in &config.categories {
+        if let Err(reason) = category.validate() {
+            warn!(
+                category = %category.name,
+                output_dir = ?category.output_dir,
+                reason,
+                "Unsafe category in config; jobs in it will fail to enqueue until it is fixed"
+            );
+        }
+    }
+}
+
 fn create_data_dir(path: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(path).with_context(|| {
         format!(
@@ -134,6 +150,8 @@ pub async fn initialize(
     if let Ok(val) = std::env::var("OTEL_SERVICE_NAME") {
         config.otel.service_name = val;
     }
+
+    warn_unsafe_categories(&config);
 
     // Ensure directories exist
     create_data_dir(&config.general.data_dir)?;

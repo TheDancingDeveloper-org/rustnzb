@@ -125,7 +125,7 @@ pub async fn h_group_get(
         .queue_manager
         .with_db(|db| db.group_get(id))
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("Group not found")))?;
+        .ok_or_else(|| ApiError::not_found("Group not found"))?;
     Ok(Json(serde_json::to_value(group).map_err(|e| {
         ApiError::from(anyhow::anyhow!("Serialisation error: {e}"))
     })?))
@@ -140,7 +140,7 @@ pub async fn h_group_status(
     let group = qm
         .with_db(|db| db.group_get(id))
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("Group not found")))?;
+        .ok_or_else(|| ApiError::not_found("Group not found"))?;
 
     let total_headers = qm
         .with_db(|db| db.header_count(id, None))
@@ -215,7 +215,7 @@ pub async fn h_header_fetch(
         .queue_manager
         .with_db(|db| db.group_get(group_id))
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("Group not found")))?;
+        .ok_or_else(|| ApiError::not_found("Group not found"))?;
 
     let servers = state.queue_manager.get_servers();
     let server = servers
@@ -422,7 +422,7 @@ pub async fn h_header_download(
         .queue_manager
         .with_db(|db| db.group_get(group_id))
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("Group not found")))?;
+        .ok_or_else(|| ApiError::not_found("Group not found"))?;
 
     let name = input
         .name

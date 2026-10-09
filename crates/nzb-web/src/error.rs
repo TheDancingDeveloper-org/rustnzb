@@ -67,6 +67,15 @@ impl ApiError {
         }
     }
 
+    /// 409 for a create that collides with an existing entry, such as a
+    /// category, server or feed that is already configured.
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: Some(StatusCode::CONFLICT),
+            kind: ApiErrorKind::Message(msg.into()),
+        }
+    }
+
     pub const fn admission_conflict() -> Self {
         Self {
             status: Some(StatusCode::CONFLICT),
@@ -252,5 +261,8 @@ mod tests {
         assert_eq!(json["error_kind"], "not_found");
         let json = serde_json::to_value(ApiError::bad_request("bad")).unwrap();
         assert_eq!(json["error_kind"], "bad_request");
+        let json = serde_json::to_value(ApiError::conflict("taken")).unwrap();
+        assert_eq!(json["error_kind"], "conflict");
+        assert_eq!(json["status"], 409);
     }
 }
