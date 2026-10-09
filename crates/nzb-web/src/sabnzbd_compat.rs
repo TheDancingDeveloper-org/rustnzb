@@ -774,7 +774,7 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
             "quota": "0 B",
             "rtl": false,
             "servers": Vec::<serde_json::Value>::new(),
-            "speedlimit": if speed_limit == 0 { "0" } else { "100" },
+            "speedlimit": sab_speedlimit_percent(speed_limit),
             "speedlimit_abs": speed_limit.to_string(),
             "uptime": "0m",
             "url_base": "",
@@ -824,13 +824,19 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     let speed_bps = qm.get_speed();
     let speed_limit_bps = qm.get_speed_limit();
 
-    Json(build_queue_response(
-        &jobs,
-        paused,
-        speed_bps,
-        speed_limit_bps,
-        req,
-    ))
+    let mut response = build_queue_response(&jobs, paused, speed_bps, speed_limit_bps, req);
+    // Seconds left of a timed pause (POST /api/queue/pause-for), else "0".
+    response["queue"]["pause_int"] =
+        serde_json::Value::from(qm.pause_remaining_secs().unwrap_or(0).max(0).to_string());
+    Json(response)
+}
+
+/// SABnzbd's `speedlimit` is a percentage of the configured maximum
+/// bandwidth. RustNZB has no maximum-bandwidth setting, so an active limit
+/// is reported as 100% and no limit as "0"; the absolute value is carried
+/// by `speedlimit_abs`.
+fn sab_speedlimit_percent(speed_limit_bps: u64) -> &'static str {
+    if speed_limit_bps == 0 { "0" } else { "100" }
 }
 
 fn build_queue_response(
@@ -924,7 +930,7 @@ fn build_queue_response(
             // SABnzbd uses `paused_all` for a distinct scheduler condition;
             // the ordinary global pause endpoint only sets `paused`.
             "paused_all": false,
-            "speedlimit": "0",
+            "speedlimit": sab_speedlimit_percent(speed_limit_bps),
             "speedlimit_abs": speed_limit_bps.to_string(),
             "speed": format_speed(speed_bps),
             "kbpersec": format!("{:.2}", speed_bps as f64 / 1024.0),
@@ -2390,6 +2396,38 @@ mod tests {
         );
         assert_eq!(paused["queue"]["status"], "Paused");
         assert_eq!(paused["queue"]["slots"][0]["timeleft"], "0:00:00");
+    }
+
+    /// The queue must report the live speed limit and the seconds left of
+    /// a timed pause, as fullstatus already does.
+    #[tokio::test]
+    async fn queue_reports_speed_limit_and_timed_pause_remaining() {
+        let test_state = test_state();
+        let qm = &test_state.state.queue_manager;
+        qm.set_speed_limit(2 * 1024 * 1024);
+        qm.pause_for(600);
+
+        let queue = dispatch_mode(&test_state.state, "queue", &SabApiRequest::default()).0;
+        let fullstatus =
+            dispatch_mode(&test_state.state, "fullstatus", &SabApiRequest::default()).0;
+        assert_eq!(queue["queue"]["speedlimit_abs"], "2097152");
+        assert_eq!(
+            queue["queue"]["speedlimit"],
+            fullstatus["status"]["speedlimit"]
+        );
+        assert_ne!(queue["queue"]["speedlimit"], "0");
+        let pause_int: i64 = queue["queue"]["pause_int"]
+            .as_str()
+            .expect("pause_int is a string")
+            .parse()
+            .expect("pause_int is numeric");
+        assert!((590..=600).contains(&pause_int), "pause_int={pause_int}");
+
+        qm.resume_all();
+        qm.set_speed_limit(0);
+        let queue = dispatch_mode(&test_state.state, "queue", &SabApiRequest::default()).0;
+        assert_eq!(queue["queue"]["pause_int"], "0");
+        assert_eq!(queue["queue"]["speedlimit"], "0");
     }
 
     #[test]
