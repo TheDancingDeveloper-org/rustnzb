@@ -348,11 +348,7 @@ impl UploadForm {
 /// the files. Other text fields are ignored.
 async fn read_upload(multipart: &mut Multipart) -> Result<UploadForm, ApiError> {
     let mut form = UploadForm::default();
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| ApiError::from(anyhow::anyhow!("Multipart error: {error}")))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(ApiError::from)? {
         let key = field.name().unwrap_or_default().to_string();
         // A part with a file name is an upload. So is a bare `file` part
         // (curl's `-F "file=<x.nzb"` sends the contents without a name).
@@ -362,17 +358,11 @@ async fn read_upload(multipart: &mut Multipart) -> Result<UploadForm, ApiError> 
             None => None,
         };
         if let Some(file_name) = file_name {
-            let data = field
-                .bytes()
-                .await
-                .map_err(|error| ApiError::from(anyhow::anyhow!("Read error: {error}")))?;
+            let data = field.bytes().await.map_err(ApiError::from)?;
             form.files.push((file_name, data.to_vec()));
             continue;
         }
-        let text = field
-            .text()
-            .await
-            .map_err(|error| ApiError::from(anyhow::anyhow!("Read error: {error}")))?;
+        let text = field.text().await.map_err(ApiError::from)?;
         match key.as_str() {
             "password" => form.password = Some(text),
             "category" | "cat" => form.category = Some(text),
@@ -628,7 +618,7 @@ fn validate_feed_poll_interval(feed: &RssFeedConfig) -> Result<(), ApiError> {
 async fn validate_feed_url(state: &AppState, url: &str) -> Result<(), ApiError> {
     check_fetch_url_allowed(url, &fetch_policy(state))
         .await
-        .map_err(|e| ApiError::url_rejected(format!("Feed URL rejected: {e}")))
+        .map_err(|e| ApiError::from((StatusCode::BAD_REQUEST, format!("Feed URL rejected: {e}"))))
 }
 
 #[derive(Deserialize)]
@@ -663,10 +653,10 @@ pub async fn h_queue_add_url(
         .get(fetch_plan.url.clone())
         .send()
         .await
-        .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch URL: {e}")))?;
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to fetch URL: {e}")))?;
 
     if !response.status().is_success() {
-        return Err(ApiError::bad_gateway(format!(
+        return Err(ApiError::from(anyhow::anyhow!(
             "URL returned HTTP {}",
             response.status()
         )));
@@ -1623,10 +1613,13 @@ pub async fn h_rss_item_download(
         .get(fetch_plan.url.clone())
         .send()
         .await
-        .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch NZB: {e}")))?;
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to fetch NZB: {e}")))?;
 
     if !response.status().is_success() {
-        return Err(ApiError::bad_gateway(format!("HTTP {}", response.status())));
+        return Err(ApiError::from(anyhow::anyhow!(
+            "HTTP {}",
+            response.status()
+        )));
     }
 
     let data = read_response_bytes_limited(response, MAX_FETCH_BODY_BYTES).await?;
@@ -2454,7 +2447,7 @@ pub async fn h_import_sabnzbd_api(
         }
 
         if !resp.status().is_success() {
-            return Err(ApiError::bad_gateway(format!(
+            return Err(ApiError::from(anyhow::anyhow!(
                 "SABnzbd returned HTTP {} — check your API key",
                 resp.status()
             )));
@@ -2462,13 +2455,13 @@ pub async fn h_import_sabnzbd_api(
 
         let body = read_response_bytes_limited(resp, MAX_FETCH_BODY_BYTES).await?;
         let json: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| ApiError::bad_gateway(format!("Invalid JSON from SABnzbd: {e}")))?;
+            .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid JSON from SABnzbd: {e}")))?;
 
         let preview = sabnzbd_import::parse_sabnzbd_api_response(&json);
         return Ok(Json(preview));
     }
 
-    Err(ApiError::bad_gateway(format!(
+    Err(ApiError::from(anyhow::anyhow!(
         "Could not reach SABnzbd API — {last_err}"
     )))
 }
