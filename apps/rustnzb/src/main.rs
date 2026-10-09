@@ -31,9 +31,11 @@ struct Args {
     #[arg(long, env = "RUSTNZB_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(long, default_value = "info", env = "RUSTNZB_LOG_LEVEL")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). No clap default: when
+    /// neither this flag nor RUSTNZB_LOG_LEVEL is given, config.toml's
+    /// `general.log_level` applies (falling back to "info").
+    #[arg(long, env = "RUSTNZB_LOG_LEVEL")]
+    log_level: Option<String>,
 
     /// Log file path
     #[arg(long, env = "RUSTNZB_LOG_FILE")]
@@ -103,6 +105,64 @@ fn init_otel_metrics(
         .build();
 
     Some(provider)
+}
+
+const LOG_LEVEL_NAMES: [&str; 6] = ["trace", "debug", "info", "warn", "error", "off"];
+
+/// Whether `spec` is a usable log filter: either a bare level name or a full
+/// `EnvFilter` directive list (e.g. `info,nzb_nntp=debug`). A bare word that
+/// is not a level is rejected, because `EnvFilter` would otherwise read it as
+/// a target name and silently enable every level for that target only.
+fn is_valid_log_filter(spec: &str) -> bool {
+    if EnvFilter::try_new(spec).is_err() {
+        return false;
+    }
+    spec.split(',').map(str::trim).all(|d| {
+        d.is_empty()
+            || d.contains('=')
+            || d.contains('[')
+            || LOG_LEVEL_NAMES.iter().any(|l| l.eq_ignore_ascii_case(d))
+    })
+}
+
+/// Resolve the tracing filter. Precedence, highest first:
+///
+/// 1. `RUST_LOG` (full filter override)
+/// 2. `--log-level`, then `RUSTNZB_LOG_LEVEL` (clap lets the flag win)
+/// 3. config.toml `general.log_level`
+/// 4. `"info"`
+///
+/// Empty values count as unset. An invalid value falls back to `"info"`, and
+/// an invalid `RUST_LOG` falls through to the next source; either way a
+/// warning is returned for the caller to log once tracing is up.
+fn resolve_log_filter(
+    rust_log: Option<&str>,
+    cli_or_env: Option<&str>,
+    toml_level: &str,
+) -> (String, Option<String>) {
+    let mut warning = None;
+    if let Some(rust_log) = rust_log.map(str::trim).filter(|s| !s.is_empty()) {
+        if EnvFilter::try_new(rust_log).is_ok() {
+            return (rust_log.to_string(), None);
+        }
+        warning = Some(format!("ignoring invalid RUST_LOG filter {rust_log:?}"));
+    }
+    let chosen = [cli_or_env, Some(toml_level)]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty());
+    match chosen {
+        Some(spec) if is_valid_log_filter(spec) => (spec.to_string(), warning),
+        Some(spec) => (
+            "info".to_string(),
+            Some(format!(
+                "invalid log level {spec:?} (expected one of {}); falling back to \"info\"",
+                LOG_LEVEL_NAMES.join(", ")
+            )),
+        ),
+        None => ("info".to_string(), warning),
+    }
 }
 
 /// Verify that all external tools work in the current environment.
@@ -214,8 +274,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize logging (must happen before startup::initialize)
     let log_buffer = LogBuffer::new();
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+    let rust_log = std::env::var(EnvFilter::DEFAULT_ENV).ok();
+    let (filter_spec, log_filter_warning) = resolve_log_filter(
+        rust_log.as_deref(),
+        args.log_level.as_deref(),
+        &config.general.log_level,
+    );
+    let filter = EnvFilter::new(&filter_spec);
     let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
     let log_layer = LogBufferLayer::new(log_buffer.clone());
 
@@ -278,6 +343,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("rustnzb v{}", env!("RUSTNZB_BUILD_VERSION"));
+    if let Some(warning) = log_filter_warning {
+        tracing::warn!("{warning}");
+    }
 
     // Initialize the engine (config, DB, queue manager, background services)
     let result = nzb_web::startup::initialize(
@@ -286,7 +354,7 @@ async fn main() -> anyhow::Result<()> {
             listen_addr: args.listen_addr,
             port: args.port,
             data_dir: args.data_dir,
-            log_level: Some(args.log_level),
+            log_level: Some(filter_spec),
         },
         Some(log_buffer),
     )
@@ -392,7 +460,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{Args, resolve_log_filter};
     use clap::Parser;
     use serial_test::serial;
 
@@ -438,5 +506,95 @@ mod tests {
         let args = Args::parse_from(["rustnzb"]);
 
         assert_eq!(args.port, None);
+    }
+
+    // BUG-81: general.log_level in config.toml must take effect. Precedence is
+    // RUST_LOG > --log-level > RUSTNZB_LOG_LEVEL > TOML general.log_level > "info".
+
+    #[test]
+    fn rust_log_wins_over_everything() {
+        let (f, w) = resolve_log_filter(Some("nzb_nntp=trace"), Some("warn"), "debug");
+        assert_eq!(f, "nzb_nntp=trace");
+        assert!(w.is_none());
+    }
+
+    #[test]
+    fn explicit_level_wins_over_toml() {
+        let (f, w) = resolve_log_filter(None, Some("warn"), "debug");
+        assert_eq!(f, "warn");
+        assert!(w.is_none());
+    }
+
+    #[test]
+    fn toml_level_used_when_no_cli_or_env() {
+        let (f, w) = resolve_log_filter(None, None, "debug");
+        assert_eq!(f, "debug");
+        assert!(w.is_none());
+    }
+
+    #[test]
+    fn defaults_to_info_when_nothing_set() {
+        let (f, w) = resolve_log_filter(None, None, "");
+        assert_eq!(f, "info");
+        assert!(w.is_none());
+        let (f, _) = resolve_log_filter(Some("  "), Some(""), "  ");
+        assert_eq!(f, "info");
+    }
+
+    #[test]
+    fn full_filter_directives_are_accepted() {
+        let (f, w) = resolve_log_filter(None, None, "info,nzb_nntp=debug");
+        assert_eq!(f, "info,nzb_nntp=debug");
+        assert!(w.is_none());
+    }
+
+    #[test]
+    fn invalid_level_falls_back_to_info_with_warning() {
+        let (f, w) = resolve_log_filter(None, None, "verbose");
+        assert_eq!(f, "info");
+        assert!(w.unwrap().contains("verbose"));
+
+        let (f, w) = resolve_log_filter(None, Some("loud"), "debug");
+        assert_eq!(f, "info");
+        assert!(w.unwrap().contains("loud"));
+    }
+
+    #[test]
+    fn invalid_rust_log_falls_through_to_next_source() {
+        let (f, w) = resolve_log_filter(Some("=[bad"), None, "debug");
+        assert_eq!(f, "debug");
+        assert!(w.unwrap().contains("RUST_LOG"));
+    }
+
+    #[test]
+    fn level_names_are_case_insensitive() {
+        let (f, w) = resolve_log_filter(None, None, "DEBUG");
+        assert_eq!(f, "DEBUG");
+        assert!(w.is_none());
+    }
+
+    #[test]
+    #[serial(rustnzb_log_level_env)]
+    fn log_level_arg_has_no_clap_default() {
+        unsafe {
+            std::env::remove_var("RUSTNZB_LOG_LEVEL");
+        }
+        let args = Args::parse_from(["rustnzb"]);
+        assert_eq!(args.log_level, None);
+    }
+
+    #[test]
+    #[serial(rustnzb_log_level_env)]
+    fn log_level_env_var_is_used_and_explicit_flag_wins() {
+        unsafe {
+            std::env::set_var("RUSTNZB_LOG_LEVEL", "debug");
+        }
+        let from_env = Args::parse_from(["rustnzb"]);
+        let from_flag = Args::parse_from(["rustnzb", "--log-level", "warn"]);
+        unsafe {
+            std::env::remove_var("RUSTNZB_LOG_LEVEL");
+        }
+        assert_eq!(from_env.log_level.as_deref(), Some("debug"));
+        assert_eq!(from_flag.log_level.as_deref(), Some("warn"));
     }
 }

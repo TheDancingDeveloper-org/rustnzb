@@ -7,9 +7,11 @@ complete_dir = "/downloads/complete"
 data_dir = "/data"
 speed_limit_bps = 0  # 0 = unlimited
 cache_size = 524288000  # 500 MB; the API accepts 16 MiB to 64 GiB
-# The log filter is set at startup by RUST_LOG, --log-level or
-# RUSTNZB_LOG_LEVEL (default "info"); this key does not change it and is not
-# editable through the API.
+# Log level: trace, debug, info, warn, error, or off. A full filter such as
+# "info,nzb_nntp=debug" is also accepted. Precedence, highest first:
+#   RUST_LOG env (full filter override) > --log-level CLI flag >
+#   RUSTNZB_LOG_LEVEL env > this setting > "info".
+# An invalid value logs a warning and falls back to "info". Applied at start.
 log_level = "info"
 # max_active_downloads = 1  # 0 = unlimited; the API accepts at most 100
 # log_file = "data/rustnzb.log"
