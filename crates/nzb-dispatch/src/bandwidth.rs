@@ -42,24 +42,27 @@ impl Limit {
     }
 
     async fn acquire(&self, size: NonZeroU32) -> anyhow::Result<()> {
-        let lim = self.limiter.load().clone();
-        if let Some(bucket) = lim.as_ref() {
+        let mut remaining = size.get();
+        while remaining > 0 {
+            // Reload per chunk: a limit change mid-article takes effect at
+            // the next chunk instead of after the whole article.
+            let lim = self.limiter.load().clone();
+            let Some(bucket) = lim.as_ref() else {
+                return Ok(());
+            };
             // `Quota::per_second(bps)` gives a burst of `bps` cells, and
             // governor rejects any single request larger than the burst with
             // `InsufficientCapacity`. A decoded article (~750 KB) exceeds the
             // burst for every limit below that, so acquire in burst-sized
             // chunks rather than in one call.
             let burst = bucket.burst.get();
-            let mut remaining = size.get();
-            while remaining > 0 {
-                let chunk = remaining.min(burst);
-                // `chunk` is non-zero: `remaining > 0` and `burst >= 1`.
-                bucket
-                    .limiter
-                    .until_n_ready(NonZeroU32::new(chunk).expect("chunk > 0"))
-                    .await?;
-                remaining -= chunk;
-            }
+            let chunk = remaining.min(burst);
+            // `chunk` is non-zero: `remaining > 0` and `burst >= 1`.
+            bucket
+                .limiter
+                .until_n_ready(NonZeroU32::new(chunk).expect("chunk > 0"))
+                .await?;
+            remaining -= chunk;
         }
         Ok(())
     }
