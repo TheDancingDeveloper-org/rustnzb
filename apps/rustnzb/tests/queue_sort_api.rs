@@ -107,6 +107,7 @@ async fn start_app() -> App {
             server_stats: Vec::new(),
             pp_override: None,
             files: Vec::new(),
+            delete_archives: None,
         };
         state.queue_manager.add_job(job, None).unwrap();
     }
