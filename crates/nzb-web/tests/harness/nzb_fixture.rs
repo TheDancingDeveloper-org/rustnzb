@@ -63,15 +63,12 @@ pub struct FixtureCatalog;
 
 impl FixtureCatalog {
     fn from_fixture(fixture: BuiltFixture<'_>, name: &str) -> FixtureCase {
-        let articles = fixture
+        let triples: Vec<(&str, &[u8], &str)> = fixture
             .articles
             .iter()
-            .map(|(id, body, filename)| {
-                let (encoded, _) =
-                    yenc_simd::encode_article(body, filename, 1, 1, 0, body.len() as u64);
-                ((*id).to_string(), encoded)
-            })
+            .map(|(id, body, filename)| (*id, *body, filename.as_str()))
             .collect();
+        let articles = super::yenc_articles(&triples);
         FixtureCase {
             name: name.into(),
             xml: fixture.xml,

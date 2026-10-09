@@ -2977,6 +2977,42 @@ enum ArticleError {
     AssemblyError(String),
 }
 
+/// Choose the file offset a decoded article is written at, rejecting headers
+/// that would place it outside the file.
+///
+/// The offset comes from `=ypart begin=` and is used directly as the `pwrite`
+/// position, so it must be checked: an unchecked huge `begin` creates an
+/// enormous sparse file, and a missing `=ypart` on a later segment would
+/// overwrite the start of the file. Both are treated as a corrupt article.
+fn validated_write_offset(
+    segment_number: u32,
+    part_begin: Option<u64>,
+    file_size: Option<u64>,
+    data_len: u64,
+) -> Result<u64, String> {
+    let begin = match part_begin {
+        Some(begin) => begin,
+        // A single-part article (no =ypart) can only be the first segment.
+        None if segment_number <= 1 => 0,
+        None => {
+            return Err(format!(
+                "no =ypart header on segment {segment_number} of a multi-part file"
+            ));
+        }
+    };
+    if let Some(size) = file_size {
+        match begin.checked_add(data_len) {
+            Some(end) if end <= size => {}
+            _ => {
+                return Err(format!(
+                    "part range begin={begin} len={data_len} exceeds declared file size {size}"
+                ));
+            }
+        }
+    }
+    Ok(begin)
+}
+
 fn decode_and_assemble(
     item: &WorkItem,
     raw_data: &[u8],
@@ -2991,9 +3027,20 @@ fn decode_and_assemble(
     })?;
     let decode_us = decode_start.elapsed().as_micros();
 
-    let yenc_filename = decoded.filename;
-    let data_begin = decoded.part_begin.unwrap_or(0);
     let decoded_len = decoded.data.len() as u64;
+    let data_begin = validated_write_offset(
+        item.segment_number,
+        decoded.part_begin,
+        decoded.file_size,
+        decoded_len,
+    )
+    .map_err(|reason| {
+        ArticleError::DecodeError(format!(
+            "Corrupt yEnc article for {} seg {}: {reason}",
+            item.filename, item.segment_number
+        ))
+    })?;
+    let yenc_filename = decoded.filename;
 
     let assemble_start = Instant::now();
     let file_complete = assembler
@@ -3226,6 +3273,109 @@ mod tests {
         );
         assert_eq!(ctx.articles_remaining.load(Ordering::Relaxed), 1);
         assert_eq!(ctx.articles_failed.load(Ordering::Relaxed), 1);
+    }
+
+    fn decode_test_item(job_id: &str, segment_number: u32) -> WorkItem {
+        let mut item = make_item(job_id, "msg@test", "out.bin");
+        item.segment_number = segment_number;
+        item
+    }
+
+    #[test]
+    fn decode_rejects_ypart_offset_beyond_declared_file_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file("j1", "f1", path.clone(), 2)
+            .unwrap();
+
+        // Part 2 of an 8-byte file claims to start at ~1 TB.
+        let (raw, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 1_000_000_000_000, 8);
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &raw, &assembler);
+
+        assert!(
+            matches!(result, Err(ArticleError::DecodeError(_))),
+            "expected corrupt-article error, got {result:?}"
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() <= 8);
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 2));
+    }
+
+    #[test]
+    fn decode_rejects_ypart_range_overrunning_declared_file_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file("j1", "f1", temp.path().join("out.bin"), 2)
+            .unwrap();
+
+        // Begins inside the file but runs 2 bytes past its declared end.
+        let (raw, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 6, 8);
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &raw, &assembler);
+
+        assert!(matches!(result, Err(ArticleError::DecodeError(_))));
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 2));
+    }
+
+    #[test]
+    fn decode_rejects_missing_ypart_on_non_first_segment() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file("j1", "f1", path.clone(), 2)
+            .unwrap();
+
+        let (seg1, _) = yenc_simd::encode_article(b"AAAA", "out.bin", 1, 2, 0, 8);
+        decode_and_assemble(&decode_test_item("j1", 1), &seg1, &assembler).unwrap();
+
+        // Segment 2 arrives as a single-part article (no =ypart). Writing it
+        // at offset 0 would overwrite segment 1.
+        let (seg2, _) = yenc_simd::encode_article(b"ZZZZ", "out.bin", 1, 1, 0, 4);
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &seg2, &assembler);
+
+        assert!(matches!(result, Err(ArticleError::DecodeError(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), b"AAAA");
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (1, 2));
+    }
+
+    #[test]
+    fn decode_accepts_valid_parts_and_single_part_articles() {
+        let temp = tempfile::tempdir().unwrap();
+        let multi = temp.path().join("multi.bin");
+        let single = temp.path().join("single.bin");
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file("j1", "f1", multi.clone(), 2)
+            .unwrap();
+        assembler
+            .register_file("j1", "f2", single.clone(), 1)
+            .unwrap();
+
+        let (seg2, _) = yenc_simd::encode_article(b"BBBB", "multi.bin", 2, 2, 4, 8);
+        let (seg1, _) = yenc_simd::encode_article(b"AAAA", "multi.bin", 1, 2, 0, 8);
+        assert!(
+            !decode_and_assemble(&decode_test_item("j1", 2), &seg2, &assembler)
+                .unwrap()
+                .file_complete
+        );
+        assert!(
+            decode_and_assemble(&decode_test_item("j1", 1), &seg1, &assembler)
+                .unwrap()
+                .file_complete
+        );
+        assert_eq!(std::fs::read(&multi).unwrap(), b"AAAABBBB");
+
+        let (whole, _) = yenc_simd::encode_article(b"ONE", "single.bin", 1, 1, 0, 3);
+        let mut item = decode_test_item("j1", 1);
+        item.file_id = "f2".into();
+        assert!(
+            decode_and_assemble(&item, &whole, &assembler)
+                .unwrap()
+                .file_complete
+        );
+        assert_eq!(std::fs::read(&single).unwrap(), b"ONE");
     }
 
     #[cfg(target_os = "linux")]
