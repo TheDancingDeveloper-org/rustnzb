@@ -1636,6 +1636,19 @@ impl QueueManager {
         {
             apply_checkpoint(&mut job, &checkpoint);
             job.articles_failed = 0;
+            // A retry re-attempts every missing article. Forget the servers
+            // that failed it last time: the dispatcher treats an article with
+            // `tried_servers` as an already-resolved failure.
+            for article in job
+                .files
+                .iter_mut()
+                .flat_map(|file| file.articles.iter_mut())
+            {
+                if !article.downloaded {
+                    article.tried_servers.clear();
+                    article.tries = 0;
+                }
+            }
             job.work_dir = work_dir.clone();
         }
 
@@ -4591,6 +4604,72 @@ mod global_pause_tests {
         assert_eq!(manager.get_speed_limit(), 1_000);
         manager.set_speed_limit(0);
         assert_eq!(manager.get_speed_limit(), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_forgets_servers_that_failed_missing_articles() {
+        let (manager, _tempdir) = manager();
+        let nzb = br#"<?xml version="1.0" encoding="utf-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p" date="0" subject="&quot;retry.bin&quot; yEnc (1/2)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="5" number="1">retry-1@test</segment>
+      <segment bytes="6" number="2">retry-2@test</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let work_dir = manager.incomplete_dir().join("retry-partial");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let parsed = nzb_parser::parse_nzb("retry", nzb).unwrap();
+        let filename = parsed.files[0].filename.clone();
+        let checkpoint = serde_json::json!({
+            "files": {},
+            "downloaded_bytes": 5,
+            "articles_downloaded": 1,
+            "articles_failed": 1,
+            "files_completed": 0,
+            "articles": {filename: [
+                {"message_id": "retry-1@test", "segment_number": 1, "bytes": 5,
+                 "downloaded": true, "data_begin": null, "data_size": null,
+                 "crc32": null, "tried_servers": [], "tries": 0},
+                {"message_id": "retry-2@test", "segment_number": 2, "bytes": 6,
+                 "downloaded": false, "data_begin": null, "data_size": null,
+                 "crc32": null, "tried_servers": ["srv"], "tries": 1}
+            ]},
+            "work_dir": work_dir,
+        });
+        let entry = HistoryEntry {
+            id: "retry".into(),
+            name: "retry".into(),
+            category: "Default".into(),
+            status: JobStatus::Failed,
+            total_bytes: 11,
+            downloaded_bytes: 5,
+            added_at: Utc::now(),
+            completed_at: Utc::now(),
+            download_time_secs: None,
+            output_dir: manager.complete_dir().join("retry"),
+            stages: Vec::new(),
+            error_message: None,
+            failure_code: None,
+            server_stats: Vec::new(),
+            nzb_data: None,
+            retry_data: None,
+        };
+        let retry_data = serde_json::to_vec(&checkpoint).unwrap();
+
+        let job = manager
+            .prepare_retry_job(&entry, nzb, Some(&retry_data))
+            .unwrap();
+
+        let articles = &job.files[0].articles;
+        assert!(articles[0].downloaded);
+        assert!(!articles[1].downloaded);
+        // A missing article keeping its old `tried_servers` would be treated
+        // as an already-resolved failure and never re-attempted.
+        assert!(articles[1].tried_servers.is_empty());
+        assert_eq!(job.articles_failed, 0);
     }
 
     #[test]
