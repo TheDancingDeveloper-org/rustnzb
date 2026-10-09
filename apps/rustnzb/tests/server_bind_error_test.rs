@@ -69,8 +69,6 @@ async fn serve_reports_context_on_bind_failure() {
 
     let state = build_state(config).await;
     let router = build_router(state.clone());
-    #[cfg(feature = "webdav")]
-    let router = router.layer(axum::Extension(None::<Arc<rustnzb::dav::DavHandle>>));
 
     let result = rustnzb::server::serve(state, router).await;
     let err = match result {
@@ -103,8 +101,6 @@ async fn serve_succeeds_on_free_port() {
 
     let state = build_state(config).await;
     let router = build_router(state.clone());
-    #[cfg(feature = "webdav")]
-    let router = router.layer(axum::Extension(None::<Arc<rustnzb::dav::DavHandle>>));
 
     let handle = tokio::spawn(async move { rustnzb::server::serve(state, router).await });
 
