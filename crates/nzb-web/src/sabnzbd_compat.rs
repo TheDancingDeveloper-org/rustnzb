@@ -16,6 +16,7 @@ use crate::nzb_core::models::*;
 use crate::nzb_core::nzb_parser;
 
 use crate::error::ApiError;
+use crate::queue_manager::job_id_matches;
 use crate::state::AppState;
 
 /// SABnzbd release whose public response contract this compatibility layer
@@ -921,14 +922,19 @@ fn comma_separated(value: Option<&str>) -> Vec<&str> {
         .collect()
 }
 
+/// SABnzbd's numeric code for a priority (`sabnzbd/constants.py`).
+fn sab_priority_code(priority: Priority) -> i32 {
+    match priority {
+        Priority::Low => -1,
+        Priority::Normal => 0,
+        Priority::High => 1,
+        Priority::Force => 2,
+    }
+}
+
 fn sab_priority_matches(priority: Priority, requested: &str) -> bool {
-    let numeric = match priority {
-        Priority::Low => "-1",
-        Priority::Normal => "0",
-        Priority::High => "1",
-        Priority::Force => "2",
-    };
-    requested == numeric || requested.eq_ignore_ascii_case(sab_priority_name(priority))
+    requested == sab_priority_code(priority).to_string()
+        || requested.eq_ignore_ascii_case(sab_priority_name(priority))
 }
 
 fn queue_status(paused: bool, speed_bps: u64) -> &'static str {
@@ -975,10 +981,7 @@ fn handle_queue_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json
     let mut removed_ids: Vec<String> = Vec::new();
     for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
         let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
-        if let Some(job) = jobs
-            .iter()
-            .find(|job| job.id == search_id || job.id.starts_with(search_id))
-        {
+        if let Some(job) = jobs.iter().find(|job| job_id_matches(&job.id, search_id)) {
             let _ = qm.remove_job(&job.id);
             tracing::info!(id = %job.id, "Job removed from queue via arr API (mode=queue)");
             removed_ids.push(queue_nzo_id(job));
@@ -996,7 +999,7 @@ fn handle_queue_item_pause(state: &AppState, req: &SabApiRequest) -> Json<serde_
         .queue_manager
         .get_jobs()
         .into_iter()
-        .find(|job| job.id == search_id || job.id.starts_with(search_id))
+        .find(|job| job_id_matches(&job.id, search_id))
     else {
         return Json(serde_json::json!({ "status": false, "error": "Job not found" }));
     };
@@ -1020,7 +1023,7 @@ fn handle_queue_item_resume(state: &AppState, req: &SabApiRequest) -> Json<serde
         .queue_manager
         .get_jobs()
         .into_iter()
-        .find(|job| job.id == search_id || job.id.starts_with(search_id))
+        .find(|job| job_id_matches(&job.id, search_id))
     else {
         return Json(serde_json::json!({ "status": false, "error": "Job not found" }));
     };
@@ -1052,9 +1055,7 @@ fn handle_queue_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_js
     let mut applied = false;
     for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
         let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
-        if let Some(job) = jobs
-            .iter()
-            .find(|job| job.id == search_id || job.id.starts_with(search_id))
+        if let Some(job) = jobs.iter().find(|job| job_id_matches(&job.id, search_id))
             && qm.set_job_priority(&job.id, priority_value).is_ok()
         {
             applied = true;
@@ -1222,7 +1223,7 @@ fn history_slot_matches(slot: &SabHistorySlot, req: &SabApiRequest) -> bool {
                         .is_some_and(|raw| raw == id)
                     || id
                         .strip_prefix("SABnzbd_nzo_")
-                        .is_some_and(|raw| slot.nzo_id.ends_with(raw))
+                        .is_some_and(|raw| !raw.is_empty() && slot.nzo_id.ends_with(raw))
             })
     })
 }
@@ -1279,7 +1280,7 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
         let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
         if let Some(entry) = entries
             .iter()
-            .find(|entry| entry.id == search_id || entry.id.starts_with(search_id))
+            .find(|entry| job_id_matches(&entry.id, search_id))
         {
             if del_files {
                 let _ = std::fs::remove_dir_all(&entry.output_dir);
@@ -1334,7 +1335,7 @@ fn handle_pause(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         // Try to find and pause the job
         let jobs = qm.get_jobs();
         for job in &jobs {
-            if job.id == search_id || job.id.starts_with(search_id) {
+            if job_id_matches(&job.id, search_id) {
                 let _ = qm.pause_job(&job.id);
                 tracing::info!(id = %job.id, "Job paused via arr API");
                 break;
@@ -1369,7 +1370,7 @@ fn handle_resume(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
 
         let jobs = qm.get_jobs();
         for job in &jobs {
-            if job.id == search_id || job.id.starts_with(search_id) {
+            if job_id_matches(&job.id, search_id) {
                 let _ = qm.resume_job(&job.id);
                 tracing::info!(id = %job.id, "Job resumed via arr API");
                 break;
@@ -1404,7 +1405,7 @@ fn handle_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
     let jobs = qm.get_jobs();
     let mut found = false;
     for job in &jobs {
-        if job.id == search_id || job.id.starts_with(search_id) {
+        if job_id_matches(&job.id, search_id) {
             let _ = qm.remove_job(&job.id);
             tracing::info!(id = %job.id, "Job removed from queue via arr API");
             found = true;
@@ -1416,7 +1417,7 @@ fn handle_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
     if !found {
         let entries = qm.history_list(1000).unwrap_or_default();
         for entry in &entries {
-            if entry.id == search_id || entry.id.starts_with(search_id) {
+            if job_id_matches(&entry.id, search_id) {
                 let _ = qm.history_remove(&entry.id);
                 tracing::info!(id = %entry.id, "Entry removed from history via arr API");
                 found = true;
@@ -1443,7 +1444,7 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         .history_list(1000)
         .unwrap_or_default()
         .into_iter()
-        .find(|entry| entry.id == search_id || entry.id.starts_with(search_id))
+        .find(|entry| job_id_matches(&entry.id, search_id))
     else {
         return Json(serde_json::json!({ "status": false, "error": "History job not found" }));
     };
@@ -1507,9 +1508,35 @@ fn handle_switch(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
         return Json(serde_json::json!({ "status": false, "error": "No job ID" }));
     }
 
-    let id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
-    match state.queue_manager.move_job(id, position) {
-        Ok(()) => Json(serde_json::json!({ "status": true })),
+    // Queue slots report a truncated `SABnzbd_nzo_<12 chars>` id, so resolve
+    // it to the full job id by prefix -- as every other per-job handler does
+    // -- before handing it to `move_job`, which matches ids exactly.
+    let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
+    let qm = &state.queue_manager;
+    let Some(job) = qm
+        .get_jobs()
+        .into_iter()
+        .find(|job| job_id_matches(&job.id, search_id))
+    else {
+        return Json(serde_json::json!({ "status": false, "error": "Job not found" }));
+    };
+    match qm.move_job(&job.id, position) {
+        Ok(()) => {
+            let new_position = qm
+                .get_jobs()
+                .iter()
+                .position(|queued| queued.id == job.id)
+                .unwrap_or(position);
+            // SABnzbd answers `switch` with `{"result": {position, priority}}`;
+            // keep `status` for existing callers of this compat layer.
+            Json(serde_json::json!({
+                "status": true,
+                "result": {
+                    "position": new_position,
+                    "priority": sab_priority_code(job.priority),
+                }
+            }))
+        }
         Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
     }
 }
@@ -1529,7 +1556,7 @@ fn handle_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Va
     let Some(job) = qm
         .get_jobs()
         .into_iter()
-        .find(|job| job.id == search_id || job.id.starts_with(search_id))
+        .find(|job| job_id_matches(&job.id, search_id))
     else {
         return Json(serde_json::json!({ "status": false, "error": "Job not found" }));
     };
@@ -2678,6 +2705,91 @@ mod tests {
         // queue manager at all?), not the value mapping itself -- that's
         // covered separately by sab_priority_to_priority's own tests.
         assert_eq!(job.priority, sab_priority_to_priority("1"));
+    }
+
+    /// Queue slots expose a truncated `SABnzbd_nzo_<12 chars>` id; `switch`
+    /// must resolve it by prefix like every other per-job command.
+    #[tokio::test]
+    async fn switch_accepts_truncated_sab_nzo_id() {
+        let test_state = test_state();
+        add_live_job(&test_state, "aaaaaaaa-1111-0000-0000-000000000001");
+        add_live_job(&test_state, "bbbbbbbb-2222-0000-0000-000000000002");
+
+        let queue = handle_queue(&test_state.state, &SabApiRequest::default()).0;
+        let second_nzo_id = queue["queue"]["slots"][1]["nzo_id"]
+            .as_str()
+            .expect("second slot nzo_id")
+            .to_string();
+        assert_eq!(second_nzo_id, "SABnzbd_nzo_bbbbbbbb-222");
+
+        let req = SabApiRequest {
+            mode: Some("switch".into()),
+            value: Some(second_nzo_id),
+            value2: Some("0".into()),
+            ..SabApiRequest::default()
+        };
+        let response = dispatch_mode(&test_state.state, "switch", &req).0;
+        assert_eq!(response["status"], serde_json::json!(true), "{response:?}");
+        assert_eq!(response["result"]["position"], serde_json::json!(0));
+        assert_eq!(response["result"]["priority"], serde_json::json!(0));
+
+        let order: Vec<String> = test_state
+            .state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .map(|job| job.id)
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "bbbbbbbb-2222-0000-0000-000000000002".to_string(),
+                "aaaaaaaa-1111-0000-0000-000000000001".to_string(),
+            ]
+        );
+    }
+
+    /// An empty or bare `SABnzbd_nzo_` id must not resolve to any job:
+    /// `starts_with("")` is always true, which previously let a missing
+    /// `value` pause or delete whichever job was first in the queue.
+    #[tokio::test]
+    async fn empty_or_bare_nzo_id_never_matches_a_job() {
+        let test_state = test_state();
+        add_live_job(&test_state, "cccccccc-3333-0000-0000-000000000003");
+
+        for value in [None, Some(""), Some("SABnzbd_nzo_"), Some("cccc")] {
+            for name in ["pause", "delete", "priority", "rename"] {
+                let req = SabApiRequest {
+                    mode: Some("queue".into()),
+                    name: Some(name.into()),
+                    value: value.map(Into::into),
+                    value2: Some("1".into()),
+                    ..SabApiRequest::default()
+                };
+                let response = dispatch_mode(&test_state.state, "queue", &req).0;
+                assert_eq!(
+                    response["status"],
+                    serde_json::json!(false),
+                    "name={name} value={value:?} resp={response:?}"
+                );
+            }
+        }
+
+        let jobs = test_state.state.queue_manager.get_jobs();
+        assert_eq!(jobs.len(), 1, "job must not be deleted");
+        assert_ne!(jobs[0].status, JobStatus::Paused, "job must not be paused");
+        assert_eq!(jobs[0].priority, Priority::Normal);
+        assert_eq!(jobs[0].name, "Compat Layer Fixture");
+    }
+
+    #[test]
+    fn job_id_matches_requires_exact_id_or_sab_length_prefix() {
+        let id = "dddddddd-4444-0000-0000-000000000004";
+        assert!(job_id_matches(id, id));
+        assert!(job_id_matches(id, "dddddddd-444"));
+        assert!(!job_id_matches(id, ""));
+        assert!(!job_id_matches(id, "dddd"));
+        assert!(!job_id_matches(id, "eeeeeeee-444"));
     }
 
     /// SABnzbd's real rename endpoint is `mode=queue&name=rename`.

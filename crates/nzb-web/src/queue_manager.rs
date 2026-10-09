@@ -138,6 +138,21 @@ pub struct GlobalStatisticsData {
     pub daily: Vec<DailyStatisticsData>,
 }
 
+/// Shortest id prefix accepted as a job reference. SABnzbd-style `nzo_id`s
+/// carry the first 12 characters of the job id, so anything shorter is too
+/// ambiguous to act on.
+pub const MIN_JOB_ID_PREFIX_LEN: usize = 12;
+
+/// Whether `requested` refers to the job `id`: an exact match, or a prefix at
+/// least [`MIN_JOB_ID_PREFIX_LEN`] long. An empty reference never matches --
+/// `str::starts_with("")` is always true, which let an empty or bare
+/// `SABnzbd_nzo_` id act on whichever job happened to be first.
+pub fn job_id_matches(id: &str, requested: &str) -> bool {
+    !requested.is_empty()
+        && (id == requested
+            || (requested.len() >= MIN_JOB_ID_PREFIX_LEN && id.starts_with(requested)))
+}
+
 /// Get free disk space for a path (returns 0 on error).
 fn get_disk_free(path: &std::path::Path) -> u64 {
     let mut candidate = path.to_path_buf();
@@ -3197,9 +3212,7 @@ impl QueueManager {
     /// Rename a job in the queue.
     pub fn rename_job(&self, id: &str, new_name: &str) -> crate::nzb_core::Result<()> {
         let mut jobs = self.jobs.lock();
-        let state = jobs
-            .iter_mut()
-            .find(|(_, s)| s.job.id == id || s.job.id.starts_with(id));
+        let state = jobs.iter_mut().find(|(_, s)| job_id_matches(&s.job.id, id));
         match state {
             Some((_, s)) => {
                 crate::nzb_core::path::safe_component(new_name).ok_or_else(|| {
@@ -3228,14 +3241,12 @@ impl QueueManager {
             .jobs
             .lock()
             .iter()
-            .find(|(_, state)| state.job.id == id || state.job.id.starts_with(id))
+            .find(|(_, state)| job_id_matches(&state.job.id, id))
             .map(|(_, state)| state.job.name.clone())
             .ok_or_else(|| crate::nzb_core::NzbError::JobNotFound(id.to_string()))?;
         let output_dir = self.output_dir_for(category, &job_name)?;
         let mut jobs = self.jobs.lock();
-        let state = jobs
-            .iter_mut()
-            .find(|(_, s)| s.job.id == id || s.job.id.starts_with(id));
+        let state = jobs.iter_mut().find(|(_, s)| job_id_matches(&s.job.id, id));
         match state {
             Some((_, s)) => {
                 s.job.category = category.to_string();
