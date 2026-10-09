@@ -425,6 +425,30 @@ impl Database {
             )?;
         }
 
+        if version < 15 {
+            info!("Applying database migration v15: per-job archive deletion");
+            // Partial schemas (as built by migration tests) may lack either
+            // table; only add the column where the table exists.
+            for table in ["queue", "history"] {
+                let exists: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )?;
+                if exists > 0 {
+                    self.conn.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN delete_archives INTEGER;"
+                    ))?;
+                }
+            }
+            self.conn.execute_batch(
+                "
+                DELETE FROM schema_version;
+                INSERT INTO schema_version (version) VALUES (15);
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -490,9 +514,9 @@ impl Database {
             "INSERT INTO queue (id, name, category, status, priority, total_bytes,
              downloaded_bytes, file_count, files_completed, article_count,
              articles_downloaded, articles_failed, added_at, work_dir, output_dir, password,
-             nzb_raw, pp_override)
+             nzb_raw, pp_override, delete_archives)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-             ?16, ?17, ?18)",
+             ?16, ?17, ?18, ?19)",
             params![
                 job.id,
                 job.name,
@@ -512,6 +536,7 @@ impl Database {
                 job.password,
                 nzb_data,
                 job.pp_override,
+                job.delete_archives,
             ],
         )?;
 
@@ -620,9 +645,9 @@ impl Database {
             "INSERT INTO queue (id, name, category, status, priority, total_bytes,
              downloaded_bytes, file_count, files_completed, article_count,
              articles_downloaded, articles_failed, added_at, work_dir, output_dir, password,
-             pp_override)
+             pp_override, delete_archives)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-             ?17)",
+             ?17, ?18)",
             params![
                 job.id,
                 job.name,
@@ -641,6 +666,7 @@ impl Database {
                 job.output_dir.to_string_lossy().to_string(),
                 job.password,
                 job.pp_override,
+                job.delete_archives,
             ],
         )?;
         Ok(())
@@ -705,7 +731,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, priority, total_bytes, downloaded_bytes,
              file_count, files_completed, article_count, articles_downloaded, articles_failed,
-             added_at, completed_at, work_dir, output_dir, password, error_message, pp_override
+             added_at, completed_at, work_dir, output_dir, password, error_message, pp_override,
+             delete_archives
              FROM queue ORDER BY priority DESC, added_at ASC",
         )?;
 
@@ -734,6 +761,7 @@ impl Database {
                     error_message: row.get(17)?,
                     speed_bps: 0,
                     pp_override: row.get(18)?,
+                    delete_archives: row.get(19)?,
                     server_stats: Vec::new(),
                     files: Vec::new(), // Loaded separately
                 })
@@ -760,9 +788,9 @@ impl Database {
         self.conn.execute(
             "INSERT INTO history (id, name, category, status, total_bytes, downloaded_bytes,
              added_at, completed_at, download_time_secs, output_dir, stages, error_message,
-             nzb_data, server_stats, retry_data, failure_code, post_processing)
+             nzb_data, server_stats, retry_data, failure_code, post_processing, delete_archives)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-             ?17)",
+             ?17, ?18)",
             params![
                 entry.id,
                 entry.name,
@@ -781,6 +809,7 @@ impl Database {
                 entry.retry_data,
                 entry.failure_code.map(|code| code.to_string()),
                 entry.post_processing,
+                entry.delete_archives,
             ],
         )?;
 
@@ -846,7 +875,7 @@ impl Database {
             "SELECT id, name, category, status, total_bytes, downloaded_bytes,
              added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
              CASE WHEN nzb_data IS NOT NULL THEN 1 ELSE 0 END as has_nzb, failure_code,
-             post_processing
+             post_processing, delete_archives
              FROM history ORDER BY completed_at DESC LIMIT ?1",
         )?;
 
@@ -875,6 +904,7 @@ impl Database {
                     error_message: row.get(11)?,
                     failure_code: parse_failure_code(row.get(14)?)?,
                     post_processing: row.get(15)?,
+                    delete_archives: row.get(16)?,
                     server_stats,
                     // Don't load actual blob in list - just note if it exists
                     nzb_data: if has_nzb != 0 { Some(Vec::new()) } else { None },
@@ -938,7 +968,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, total_bytes, downloaded_bytes,
              added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
-             failure_code, post_processing
+             failure_code, post_processing, delete_archives
              FROM history WHERE id = ?1",
         )?;
 
@@ -964,6 +994,7 @@ impl Database {
                 error_message: row.get(11)?,
                 failure_code: parse_failure_code(row.get(13)?)?,
                 post_processing: row.get(14)?,
+                delete_archives: row.get(15)?,
                 server_stats,
                 nzb_data: None,
                 retry_data: None,
@@ -1392,6 +1423,7 @@ mod tests {
             error_message: None,
             speed_bps: 0,
             pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }
@@ -1410,6 +1442,38 @@ mod tests {
         let pp = |id: &str| jobs.iter().find(|job| job.id == id).unwrap().pp_override;
         assert_eq!(pp("pp-job"), Some(1));
         assert_eq!(pp("plain-job"), None);
+    }
+
+    #[test]
+    fn queue_and_history_round_trip_delete_archives() {
+        let db = Database::open_memory().unwrap();
+        let mut keep = make_job("keep-job", "Keep Job");
+        keep.delete_archives = Some(false);
+        db.queue_insert(&keep).unwrap();
+        db.queue_insert(&make_job("plain-job", "Plain Job"))
+            .unwrap();
+        let jobs = db.queue_list().unwrap();
+        let flag = |id: &str| {
+            jobs.iter()
+                .find(|job| job.id == id)
+                .unwrap()
+                .delete_archives
+        };
+        assert_eq!(flag("keep-job"), Some(false));
+        assert_eq!(flag("plain-job"), None);
+
+        let mut stored = make_history("keep-history", "Keep History");
+        stored.delete_archives = Some(false);
+        db.history_insert(&stored).unwrap();
+        assert_eq!(
+            db.history_get("keep-history")
+                .unwrap()
+                .unwrap()
+                .delete_archives,
+            Some(false)
+        );
+        let listed = db.history_list(10).unwrap();
+        assert_eq!(listed[0].delete_archives, Some(false));
     }
 
     fn make_history(id: &str, name: &str) -> HistoryEntry {
@@ -1433,6 +1497,7 @@ mod tests {
             error_message: None,
             failure_code: None,
             post_processing: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,

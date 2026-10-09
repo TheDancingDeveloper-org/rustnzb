@@ -157,6 +157,7 @@ async fn normal_subjects_pipeline_finds_files() {
     // With zero failures, par2 should be skipped (files known-good)
     let config_zero = PostProcConfig {
         cleanup_after_extract: false,
+        delete_archives: true,
         output_dir: None,
         articles_failed: 0,
         content_articles_failed: 0,
@@ -184,6 +185,7 @@ async fn normal_subjects_pipeline_finds_files() {
     // but the stage should NOT be skipped — confirming detection works)
     let config_fail = PostProcConfig {
         cleanup_after_extract: false,
+        delete_archives: true,
         output_dir: None,
         articles_failed: 1,
         content_articles_failed: 1,
@@ -319,6 +321,7 @@ async fn obfuscated_pipeline_skips_everything() {
     let dir = make_work_dir(&obfuscated_files);
     let config = PostProcConfig {
         cleanup_after_extract: false,
+        delete_archives: true,
         output_dir: None,
         articles_failed: 0,
         content_articles_failed: 0,
@@ -512,6 +515,7 @@ async fn deobfuscation_enables_full_pipeline() {
     // Before deobfuscation: pipeline skips everything
     let config = PostProcConfig {
         cleanup_after_extract: false,
+        delete_archives: true,
         output_dir: None,
         articles_failed: 0,
         content_articles_failed: 0,
@@ -535,6 +539,7 @@ async fn deobfuscation_enables_full_pipeline() {
     // run with articles_failed > 0 so repair is attempted.
     let config_fail = PostProcConfig {
         cleanup_after_extract: false,
+        delete_archives: true,
         output_dir: None,
         articles_failed: 1,
         content_articles_failed: 1,
@@ -701,6 +706,7 @@ async fn pipeline_with_only_archives_no_par2() {
     let output_dir = tempfile::tempdir().unwrap();
     let config = PostProcConfig {
         cleanup_after_extract: false,
+        delete_archives: true,
         output_dir: Some(output_dir.path().to_path_buf()),
         articles_failed: 0,
         content_articles_failed: 0,

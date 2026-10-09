@@ -298,6 +298,7 @@ async fn handle_addurl(
 
             apply_job_password(&mut job, password, inline_password);
             job.pp_override = sab_pp_override(pp.as_deref());
+            job.delete_archives = sab_pp_delete_archives(pp.as_deref());
 
             let qm = &state.queue_manager;
             job.work_dir = qm.incomplete_dir().join(&job.id);
@@ -775,6 +776,7 @@ async fn dispatch_post(
 
                     apply_job_password(&mut job, password, inline_password);
                     job.pp_override = sab_pp_override(query_req.pp.as_deref());
+                    job.delete_archives = sab_pp_delete_archives(query_req.pp.as_deref());
 
                     let qm = &state.queue_manager;
                     job.work_dir = qm.incomplete_dir().join(&job.id);
@@ -2509,6 +2511,27 @@ fn sab_pp_override(pp: Option<&str>) -> Option<u8> {
     }
 }
 
+/// The archive-deletion flag for SABnzbd's `pp`: 2 (+repair/unpack) keeps
+/// the archives, 3 (+delete) removes them. Other values leave the default.
+fn sab_pp_delete_archives(pp: Option<&str>) -> Option<bool> {
+    match pp?.trim().parse::<i32>().ok()? {
+        2 => Some(false),
+        3 => Some(true),
+        _ => None,
+    }
+}
+
+/// The SABnzbd-scale level reported for a RustNZB level: an unpacking job
+/// that keeps its archives is SABnzbd's 2 (+repair/unpack without +delete),
+/// so `pp=2` reads back as `unpackopts` "2" and history `pp` "U".
+fn sab_reported_level(level: u8, delete_archives: Option<bool>) -> u8 {
+    if level >= 2 && delete_archives == Some(false) {
+        2
+    } else {
+        level
+    }
+}
+
 /// Convert arr-protocol priority string to our Priority enum.
 fn sab_priority_to_priority(s: &str) -> Priority {
     match s.trim() {
@@ -2572,7 +2595,7 @@ impl SabQueueSlot {
         Self {
             index,
             nzo_id: queue_nzo_id(job),
-            unpackopts: sab_unpackopts(pp_level).into(),
+            unpackopts: sab_unpackopts(sab_reported_level(pp_level, job.delete_archives)).into(),
             script: "None".into(),
             filename: job.name.clone(),
             labels: Vec::new(),
@@ -2733,7 +2756,12 @@ impl SabHistorySlot {
             nzb_name: format!("{}.nzb", entry.name),
             category: sab_category_label(&entry.category),
             // Rows written before the level was recorded keep reporting "D".
-            pp: entry.post_processing.map_or("D", sab_pp_label).into(),
+            pp: entry
+                .post_processing
+                .map_or("D", |level| {
+                    sab_pp_label(sab_reported_level(level, entry.delete_archives))
+                })
+                .into(),
             script: String::new(),
             report: String::new(),
             url: String::new(),
@@ -2790,7 +2818,7 @@ impl SabHistorySlot {
             name: job.name.clone(),
             nzb_name: format!("{}.nzb", job.name),
             category: sab_category_label(&job.category),
-            pp: sab_pp_label(pp_level).into(),
+            pp: sab_pp_label(sab_reported_level(pp_level, job.delete_archives)).into(),
             script: String::new(),
             report: String::new(),
             url: String::new(),
@@ -2996,6 +3024,7 @@ mod tests {
             error_message: None,
             speed_bps: 0,
             pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }
@@ -3029,6 +3058,7 @@ mod tests {
             error_message: (status == JobStatus::Failed).then(|| "broken archive".into()),
             failure_code: (status == JobStatus::Failed).then_some(JobFailureCode::ArchiveInvalid),
             post_processing: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             nzb_data: (status == JobStatus::Failed).then(Vec::new),
             retry_data: None,
@@ -3058,6 +3088,7 @@ mod tests {
             error_message: None,
             speed_bps: 0,
             pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }
@@ -3283,6 +3314,7 @@ mod tests {
             error_message: None,
             failure_code: None,
             post_processing: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
@@ -3371,6 +3403,38 @@ mod tests {
                 "level {level}"
             );
         }
+    }
+
+    /// A job added with SABnzbd `pp=2` (repair+unpack, keep the archives)
+    /// reports `unpackopts` "2" in the queue and `pp` "U" in history, so a
+    /// client re-adding it with what it reads back gets the same behaviour.
+    #[tokio::test]
+    async fn addfile_pp2_reports_unpack_without_delete() {
+        let job = addfile_multipart(SabApiRequest::default(), &[("pp", "2")]).await;
+        assert_eq!(job.delete_archives, Some(false));
+        let level = job.pp_override.expect("pp override");
+
+        let queue = build_queue_response(
+            std::slice::from_ref(&job),
+            false,
+            0,
+            0,
+            &SabApiRequest::default(),
+            |_| level,
+        );
+        assert_eq!(queue["queue"]["slots"][0]["unpackopts"], "2");
+
+        let running =
+            build_history_response(&[], &[(job.clone(), level)], &SabApiRequest::default(), 1);
+        assert_eq!(running["history"]["slots"][0]["pp"], "U");
+
+        let mut entry = history_entry("keep", "Keep", "movies", JobStatus::Completed, 1);
+        entry.post_processing = Some(level);
+        entry.delete_archives = job.delete_archives;
+        assert_eq!(SabHistorySlot::from_entry(&entry).pp, "U");
+        // The default (delete) still reports "D".
+        entry.delete_archives = Some(true);
+        assert_eq!(SabHistorySlot::from_entry(&entry).pp, "D");
     }
 
     /// The live queue resolves the level from the job's `pp` override, else
@@ -3573,6 +3637,7 @@ mod tests {
             error_message: None,
             speed_bps: 0,
             pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         };
@@ -3617,6 +3682,7 @@ mod tests {
             error_message: None,
             failure_code: None,
             post_processing: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
@@ -3703,6 +3769,7 @@ mod tests {
             error_message: None,
             speed_bps: 0,
             pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         };
@@ -3735,6 +3802,7 @@ mod tests {
             error_message: None,
             speed_bps: 0,
             pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         };
@@ -4714,9 +4782,18 @@ mod tests {
         // SABnzbd's cumulative 2 (+repair/unpack) is RustNZB's 3.
         let repair_unpack = addfile_multipart(SabApiRequest::default(), &[("pp", "2")]).await;
         assert_eq!(repair_unpack.pp_override, Some(3));
+        // ... but without SABnzbd's "+Delete": the archives are kept.
+        assert_eq!(repair_unpack.delete_archives, Some(false));
+
+        let repair_unpack_delete =
+            addfile_multipart(SabApiRequest::default(), &[("pp", "3")]).await;
+        assert_eq!(repair_unpack_delete.pp_override, Some(3));
+        assert_eq!(repair_unpack_delete.delete_archives, Some(true));
+        assert_eq!(from_query.delete_archives, None);
 
         let invalid = addfile_multipart(SabApiRequest::default(), &[("pp", "7")]).await;
         assert_eq!(invalid.pp_override, None);
+        assert_eq!(invalid.delete_archives, None);
 
         let absent = addfile_multipart(SabApiRequest::default(), &[]).await;
         assert_eq!(absent.pp_override, None);
@@ -4823,6 +4900,7 @@ mod tests {
             error_message: None,
             failure_code: None,
             post_processing: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
