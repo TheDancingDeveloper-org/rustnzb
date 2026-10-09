@@ -894,13 +894,14 @@ pub async fn h_sab_api_key_get(
 pub async fn h_sab_api_key_rotate(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SabApiKeyResponse>, ApiError> {
-    let mut config = (*state.config()).clone();
     // UUID v4 is backed by the operating system's cryptographically secure
     // random source. A simple-form UUID supplies a 32-character token without
     // separators, matching the common SABnzbd API-key format.
     let api_key = uuid::Uuid::new_v4().simple().to_string();
-    config.general.api_key = Some(api_key.clone());
-    state.update_config(config).map_err(ApiError::from)?;
+    state.update_config_with(|config| {
+        config.general.api_key = Some(api_key.clone());
+        Ok::<_, ApiError>(())
+    })?;
     tracing::info!("SABnzbd API key rotated");
 
     Ok(Json(SabApiKeyResponse {
@@ -943,12 +944,14 @@ pub async fn h_server_add(
         server.password = None;
     }
 
-    let mut config = (*state.config()).clone();
-    config.servers.push(server);
+    state.update_config_with(|config| {
+        config.servers.push(server);
+        Ok::<_, ApiError>(())
+    })?;
+    // Apply the latest committed list, so concurrent writers converge.
     state
-        .update_config(config.clone())
-        .map_err(ApiError::from)?;
-    state.queue_manager.update_servers(config.servers);
+        .queue_manager
+        .update_servers(state.config().servers.clone());
 
     Ok((StatusCode::OK, Json(SimpleResponse { status: true })))
 }
@@ -980,25 +983,26 @@ pub async fn h_server_update(
     Path(id): Path<String>,
     Json(patch): Json<serde_json::Value>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
-    let mut config = (*state.config()).clone();
+    state.update_config_with(|config| {
+        let idx = config
+            .servers
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or_else(|| ApiError::from(anyhow::anyhow!("Server not found: {id}")))?;
 
-    let idx = config
-        .servers
-        .iter()
-        .position(|s| s.id == id)
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("Server not found: {id}")))?;
-
-    let mut server = merge_server_update(&config.servers[idx], patch)?;
-    keep_unchanged_password(&mut server, &config.servers[idx]);
-    if server.id.is_empty() {
-        server.id = id;
-    }
-    sanitize_server_config(&mut server);
-    config.servers[idx] = server;
+        let mut server = merge_server_update(&config.servers[idx], patch)?;
+        keep_unchanged_password(&mut server, &config.servers[idx]);
+        if server.id.is_empty() {
+            server.id = id.clone();
+        }
+        sanitize_server_config(&mut server);
+        config.servers[idx] = server;
+        Ok::<_, ApiError>(())
+    })?;
+    // Apply the latest committed list, so concurrent writers converge.
     state
-        .update_config(config.clone())
-        .map_err(ApiError::from)?;
-    state.queue_manager.update_servers(config.servers);
+        .queue_manager
+        .update_servers(state.config().servers.clone());
 
     Ok(Json(SimpleResponse { status: true }))
 }
@@ -1024,18 +1028,20 @@ pub async fn h_server_delete(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
-    let mut config = (*state.config()).clone();
-    let before = config.servers.len();
-    config.servers.retain(|s| s.id != id);
+    state.update_config_with(|config| {
+        let before = config.servers.len();
+        config.servers.retain(|s| s.id != id);
 
-    if config.servers.len() == before {
-        return Err(ApiError::from(anyhow::anyhow!("Server not found: {id}")));
-    }
+        if config.servers.len() == before {
+            return Err(ApiError::from(anyhow::anyhow!("Server not found: {id}")));
+        }
 
+        Ok::<_, ApiError>(())
+    })?;
+    // Apply the latest committed list, so concurrent writers converge.
     state
-        .update_config(config.clone())
-        .map_err(ApiError::from)?;
-    state.queue_manager.update_servers(config.servers);
+        .queue_manager
+        .update_servers(state.config().servers.clone());
 
     Ok(Json(SimpleResponse { status: true }))
 }
@@ -1193,18 +1199,19 @@ pub async fn h_category_add(
     State(state): State<Arc<AppState>>,
     Json(cat): Json<CategoryConfig>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let mut config = (*state.config()).clone();
-    if config.categories.iter().any(|c| c.name == cat.name) {
-        return Err(ApiError::from(anyhow::anyhow!(
-            "Category '{}' already exists",
-            cat.name
-        )));
-    }
-    config.categories.push(cat);
-    state
-        .queue_manager
-        .set_categories(config.categories.clone());
-    state.update_config(config).map_err(ApiError::from)?;
+    state.update_config_with(|config| {
+        if config.categories.iter().any(|c| c.name == cat.name) {
+            return Err(ApiError::from(anyhow::anyhow!(
+                "Category '{}' already exists",
+                cat.name
+            )));
+        }
+        config.categories.push(cat);
+        state
+            .queue_manager
+            .set_categories(config.categories.clone());
+        Ok::<_, ApiError>(())
+    })?;
     Ok(Json(serde_json::json!({"status": true})))
 }
 
@@ -1214,17 +1221,18 @@ pub async fn h_category_update(
     Path(name): Path<String>,
     Json(cat): Json<CategoryConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut config = (*state.config()).clone();
-    let idx = config
-        .categories
-        .iter()
-        .position(|c| c.name == name)
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("Category not found")))?;
-    config.categories[idx] = cat;
-    state
-        .queue_manager
-        .set_categories(config.categories.clone());
-    state.update_config(config).map_err(ApiError::from)?;
+    state.update_config_with(|config| {
+        let idx = config
+            .categories
+            .iter()
+            .position(|c| c.name == name)
+            .ok_or_else(|| ApiError::from(anyhow::anyhow!("Category not found")))?;
+        config.categories[idx] = cat;
+        state
+            .queue_manager
+            .set_categories(config.categories.clone());
+        Ok::<_, ApiError>(())
+    })?;
     Ok(Json(serde_json::json!({"status": true})))
 }
 
@@ -1233,16 +1241,17 @@ pub async fn h_category_delete(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut config = (*state.config()).clone();
-    let initial_len = config.categories.len();
-    config.categories.retain(|c| c.name != name);
-    if config.categories.len() == initial_len {
-        return Err(ApiError::from(anyhow::anyhow!("Category not found")));
-    }
-    state
-        .queue_manager
-        .set_categories(config.categories.clone());
-    state.update_config(config).map_err(ApiError::from)?;
+    state.update_config_with(|config| {
+        let initial_len = config.categories.len();
+        config.categories.retain(|c| c.name != name);
+        if config.categories.len() == initial_len {
+            return Err(ApiError::from(anyhow::anyhow!("Category not found")));
+        }
+        state
+            .queue_manager
+            .set_categories(config.categories.clone());
+        Ok::<_, ApiError>(())
+    })?;
     Ok(Json(serde_json::json!({"status": true})))
 }
 
@@ -1254,9 +1263,10 @@ pub async fn h_history_retention_set(
     // 0 means "keep all" (GH #136); persist the normalized value so GET
     // reports what is actually enforced.
     let retention = normalize_history_retention(body.retention);
-    let mut config = (*state.config()).clone();
-    config.general.history_retention = retention;
-    state.update_config(config).map_err(ApiError::from)?;
+    state.update_config_with(|config| {
+        config.general.history_retention = retention;
+        Ok::<_, ApiError>(())
+    })?;
     state.queue_manager.set_history_retention(retention);
     Ok(Json(SimpleResponse { status: true }))
 }
@@ -1276,9 +1286,10 @@ pub async fn h_max_active_downloads_set(
     State(state): State<Arc<AppState>>,
     Json(body): Json<MaxActiveDownloadsBody>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
-    let mut config = (*state.config()).clone();
-    config.general.max_active_downloads = body.max_active_downloads;
-    state.update_config(config).map_err(ApiError::from)?;
+    state.update_config_with(|config| {
+        config.general.max_active_downloads = body.max_active_downloads;
+        Ok::<_, ApiError>(())
+    })?;
     state
         .queue_manager
         .set_max_active_downloads(body.max_active_downloads);
@@ -1325,9 +1336,10 @@ pub async fn h_set_speed_limit(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.queue_manager.set_speed_limit(body.speed_limit_bps);
     // Also update config and persist
-    let mut config = (*state.config()).clone();
-    config.general.speed_limit_bps = body.speed_limit_bps;
-    state.update_config(config).map_err(ApiError::from)?;
+    state.update_config_with(|config| {
+        config.general.speed_limit_bps = body.speed_limit_bps;
+        Ok::<_, ApiError>(())
+    })?;
     Ok(Json(serde_json::json!({"status": true})))
 }
 
@@ -1357,13 +1369,14 @@ pub async fn h_disk_guards_set(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DiskGuardsBody>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
-    let mut config = (*state.config()).clone();
-    config.general.min_free_space_bytes = body.min_free_space_bytes;
-    config.general.abort_hopeless = body.abort_hopeless;
-    state
-        .queue_manager
-        .set_min_free_space(body.min_free_space_bytes);
-    state.update_config(config).map_err(ApiError::from)?;
+    state.update_config_with(|config| {
+        config.general.min_free_space_bytes = body.min_free_space_bytes;
+        config.general.abort_hopeless = body.abort_hopeless;
+        state
+            .queue_manager
+            .set_min_free_space(body.min_free_space_bytes);
+        Ok::<_, ApiError>(())
+    })?;
     Ok(Json(SimpleResponse { status: true }))
 }
 
@@ -1385,15 +1398,16 @@ pub async fn h_rss_feed_add(
     Json(feed): Json<RssFeedConfig>,
 ) -> Result<impl IntoResponse, ApiError> {
     validate_feed_url(&state, &feed.url).await?;
-    let mut config = (*state.config()).clone();
-    if config.rss_feeds.iter().any(|f| f.name == feed.name) {
-        return Err(ApiError::from(anyhow::anyhow!(
-            "Feed '{}' already exists",
-            feed.name
-        )));
-    }
-    config.rss_feeds.push(feed);
-    state.update_config(config).map_err(ApiError::from)?;
+    state.update_config_with(|config| {
+        if config.rss_feeds.iter().any(|f| f.name == feed.name) {
+            return Err(ApiError::from(anyhow::anyhow!(
+                "Feed '{}' already exists",
+                feed.name
+            )));
+        }
+        config.rss_feeds.push(feed);
+        Ok::<_, ApiError>(())
+    })?;
     Ok(Json(serde_json::json!({"status": true})))
 }
 
@@ -1404,14 +1418,15 @@ pub async fn h_rss_feed_update(
     Json(feed): Json<RssFeedConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     validate_feed_url(&state, &feed.url).await?;
-    let mut config = (*state.config()).clone();
-    let idx = config
-        .rss_feeds
-        .iter()
-        .position(|f| f.name == name)
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("Feed not found")))?;
-    config.rss_feeds[idx] = feed;
-    state.update_config(config).map_err(ApiError::from)?;
+    state.update_config_with(|config| {
+        let idx = config
+            .rss_feeds
+            .iter()
+            .position(|f| f.name == name)
+            .ok_or_else(|| ApiError::from(anyhow::anyhow!("Feed not found")))?;
+        config.rss_feeds[idx] = feed;
+        Ok::<_, ApiError>(())
+    })?;
     Ok(Json(serde_json::json!({"status": true})))
 }
 
@@ -1420,13 +1435,14 @@ pub async fn h_rss_feed_delete(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut config = (*state.config()).clone();
-    let len = config.rss_feeds.len();
-    config.rss_feeds.retain(|f| f.name != name);
-    if config.rss_feeds.len() == len {
-        return Err(ApiError::from(anyhow::anyhow!("Feed not found")));
-    }
-    state.update_config(config).map_err(ApiError::from)?;
+    state.update_config_with(|config| {
+        let len = config.rss_feeds.len();
+        config.rss_feeds.retain(|f| f.name != name);
+        if config.rss_feeds.len() == len {
+            return Err(ApiError::from(anyhow::anyhow!("Feed not found")));
+        }
+        Ok::<_, ApiError>(())
+    })?;
     Ok(Json(serde_json::json!({"status": true})))
 }
 
@@ -1663,99 +1679,99 @@ pub async fn h_general_update(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateGeneralBody>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
-    let mut config = (*state.config()).clone();
-
-    if let Some(dir) = body.incomplete_dir {
-        config.general.incomplete_dir = dir.into();
-    }
-    if let Some(dir) = body.complete_dir {
-        config.general.complete_dir = dir.into();
-    }
-    if let Some(dir) = body.data_dir {
-        config.general.data_dir = dir.into();
-    }
-    // watch_dir: empty string means unset
-    if let Some(dir) = body.watch_dir {
-        config.general.watch_dir = if dir.is_empty() {
-            None
-        } else {
-            Some(dir.into())
-        };
-    }
-    if let Some(cs) = body.cache_size {
-        config.general.cache_size = cs;
-    }
-    if let Some(mad) = body.max_active_downloads {
-        state.queue_manager.set_max_active_downloads(mad);
-        config.general.max_active_downloads = mad;
-    }
-    // Resource pools cannot safely discard live permits. Persist updated
-    // stage limits now and apply them on the next process start.
-    if let Some(max) = body.max_post_processing_jobs {
-        config.general.max_post_processing_jobs = max.max(1);
-    }
-    if let Some(max) = body.max_repair_workers {
-        config.general.max_repair_workers = max.max(1);
-    }
-    if let Some(max) = body.max_extract_workers {
-        config.general.max_extract_workers = max.max(1);
-    }
-    if let Some(ret) = body.history_retention {
-        let ret = normalize_history_retention(ret);
-        state.queue_manager.set_history_retention(ret);
-        config.general.history_retention = ret;
-    }
-    if let Some(rss_limit) = body.rss_history_limit {
-        config.general.rss_history_limit = rss_limit;
-        // Prune RSS items if a limit is set
-        if let Some(limit) = rss_limit {
-            let _ = state.queue_manager.rss_items_prune(limit);
+    state.update_config_with(|config| {
+        if let Some(dir) = body.incomplete_dir {
+            config.general.incomplete_dir = dir.into();
         }
-    }
-    if let Some(enabled) = body.auto_sort_remaining_pct {
-        state.queue_manager.set_auto_sort_remaining_pct(enabled);
-        config.general.auto_sort_remaining_pct = enabled;
-    }
-    if let Some(days) = body.rss_downloaded_item_expiry_days {
-        config.general.rss_downloaded_item_expiry_days = days;
-    }
-    if let Some(directory) = body.scripts_dir {
-        config.general.scripts_dir = if directory.is_empty() {
-            None
-        } else {
-            Some(directory.into())
-        };
-    }
-    if let Some(script) = body.script_success {
-        config.general.script_success = if script.is_empty() {
-            None
-        } else {
-            Some(script.into())
-        };
-    }
-    if let Some(script) = body.script_failure {
-        config.general.script_failure = if script.is_empty() {
-            None
-        } else {
-            Some(script.into())
-        };
-    }
-    if let Some(timeout) = body.script_timeout_secs {
-        config.general.script_timeout_secs = timeout.max(1);
-    }
-    if let Some(max_output) = body.script_max_output_bytes {
-        config.general.script_max_output_bytes = max_output;
-    }
+        if let Some(dir) = body.complete_dir {
+            config.general.complete_dir = dir.into();
+        }
+        if let Some(dir) = body.data_dir {
+            config.general.data_dir = dir.into();
+        }
+        // watch_dir: empty string means unset
+        if let Some(dir) = body.watch_dir {
+            config.general.watch_dir = if dir.is_empty() {
+                None
+            } else {
+                Some(dir.into())
+            };
+        }
+        if let Some(cs) = body.cache_size {
+            config.general.cache_size = cs;
+        }
+        if let Some(mad) = body.max_active_downloads {
+            state.queue_manager.set_max_active_downloads(mad);
+            config.general.max_active_downloads = mad;
+        }
+        // Resource pools cannot safely discard live permits. Persist updated
+        // stage limits now and apply them on the next process start.
+        if let Some(max) = body.max_post_processing_jobs {
+            config.general.max_post_processing_jobs = max.max(1);
+        }
+        if let Some(max) = body.max_repair_workers {
+            config.general.max_repair_workers = max.max(1);
+        }
+        if let Some(max) = body.max_extract_workers {
+            config.general.max_extract_workers = max.max(1);
+        }
+        if let Some(ret) = body.history_retention {
+            let ret = normalize_history_retention(ret);
+            state.queue_manager.set_history_retention(ret);
+            config.general.history_retention = ret;
+        }
+        if let Some(rss_limit) = body.rss_history_limit {
+            config.general.rss_history_limit = rss_limit;
+            // Prune RSS items if a limit is set
+            if let Some(limit) = rss_limit {
+                let _ = state.queue_manager.rss_items_prune(limit);
+            }
+        }
+        if let Some(enabled) = body.auto_sort_remaining_pct {
+            state.queue_manager.set_auto_sort_remaining_pct(enabled);
+            config.general.auto_sort_remaining_pct = enabled;
+        }
+        if let Some(days) = body.rss_downloaded_item_expiry_days {
+            config.general.rss_downloaded_item_expiry_days = days;
+        }
+        if let Some(directory) = body.scripts_dir {
+            config.general.scripts_dir = if directory.is_empty() {
+                None
+            } else {
+                Some(directory.into())
+            };
+        }
+        if let Some(script) = body.script_success {
+            config.general.script_success = if script.is_empty() {
+                None
+            } else {
+                Some(script.into())
+            };
+        }
+        if let Some(script) = body.script_failure {
+            config.general.script_failure = if script.is_empty() {
+                None
+            } else {
+                Some(script.into())
+            };
+        }
+        if let Some(timeout) = body.script_timeout_secs {
+            config.general.script_timeout_secs = timeout.max(1);
+        }
+        if let Some(max_output) = body.script_max_output_bytes {
+            config.general.script_max_output_bytes = max_output;
+        }
 
-    state.queue_manager.set_postproc_scripts(
-        config.general.scripts_dir.clone(),
-        config.general.script_success.clone(),
-        config.general.script_failure.clone(),
-        config.general.script_timeout_secs,
-        config.general.script_max_output_bytes,
-    );
+        state.queue_manager.set_postproc_scripts(
+            config.general.scripts_dir.clone(),
+            config.general.script_success.clone(),
+            config.general.script_failure.clone(),
+            config.general.script_timeout_secs,
+            config.general.script_max_output_bytes,
+        );
 
-    state.update_config(config).map_err(ApiError::from)?;
+        Ok::<_, ApiError>(())
+    })?;
     Ok(Json(SimpleResponse { status: true }))
 }
 
@@ -2179,42 +2195,42 @@ pub async fn h_setup_apply(
         ));
     }
 
-    let mut config = (*state.config()).clone();
+    let config = state
+        .update_config_with(|config| {
+            // Convert imported servers → ServerConfig with fresh UUIDs
+            config.servers = preview
+                .servers
+                .iter()
+                .map(|s| s.to_server_config())
+                .collect();
 
-    // Convert imported servers → ServerConfig with fresh UUIDs
-    config.servers = preview
-        .servers
-        .iter()
-        .map(|s| s.to_server_config())
-        .collect();
+            // Replace categories
+            if !preview.categories.is_empty() {
+                config.categories = preview.categories;
+            }
 
-    // Replace categories
-    if !preview.categories.is_empty() {
-        config.categories = preview.categories;
-    }
+            // Apply general settings
+            if let Some(ref key) = preview.general.api_key {
+                config.general.api_key = Some(key.clone());
+            }
+            if let Some(ref dir) = preview.general.complete_dir {
+                config.general.complete_dir = std::path::PathBuf::from(dir);
+            }
+            if let Some(ref dir) = preview.general.incomplete_dir {
+                config.general.incomplete_dir = std::path::PathBuf::from(dir);
+            }
+            if preview.general.speed_limit_bps > 0 {
+                config.general.speed_limit_bps = preview.general.speed_limit_bps;
+            }
 
-    // Apply general settings
-    if let Some(ref key) = preview.general.api_key {
-        config.general.api_key = Some(key.clone());
-    }
-    if let Some(ref dir) = preview.general.complete_dir {
-        config.general.complete_dir = std::path::PathBuf::from(dir);
-    }
-    if let Some(ref dir) = preview.general.incomplete_dir {
-        config.general.incomplete_dir = std::path::PathBuf::from(dir);
-    }
-    if preview.general.speed_limit_bps > 0 {
-        config.general.speed_limit_bps = preview.general.speed_limit_bps;
-    }
+            // Apply RSS feeds
+            if !preview.rss_feeds.is_empty() {
+                config.rss_feeds = preview.rss_feeds;
+            }
 
-    // Apply RSS feeds
-    if !preview.rss_feeds.is_empty() {
-        config.rss_feeds = preview.rss_feeds;
-    }
-
-    // Persist to disk + update in-memory config
-    state
-        .update_config(config.clone())
+            // Persist to disk + update in-memory config
+            Ok::<_, ApiError>(config.clone())
+        })
         .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to save config: {e}")))?;
 
     // Update runtime state
@@ -2378,9 +2394,10 @@ pub async fn h_dav_config_set(
     if body.auto_send_all {
         body.category_rules.clear();
     }
-    let mut config = (*state.config()).clone();
-    config.dav = body;
-    state.update_config(config).map_err(ApiError::from)?;
+    state.update_config_with(|config| {
+        config.dav = body;
+        Ok::<_, ApiError>(())
+    })?;
     Ok(Json(serde_json::json!({ "status": true })))
 }
 

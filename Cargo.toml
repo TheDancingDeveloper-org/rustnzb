@@ -86,7 +86,7 @@ feed-rs = "2"
 unicode-normalization = "0.1"
 
 # Shared NZB crates
-nzb-web = { version = "0.4.22", path = "crates/nzb-web", features = ["groups-db"] }
+nzb-web = { version = "0.4.23", path = "crates/nzb-web", features = ["groups-db"] }
 nzb-nntp = { version = "0.2.24", path = "crates/nzb-nntp" }
 nzb-core = { version = "0.2.18", path = "crates/nzb-core", features = ["groups-db"] }
 nzb-decode = { version = "0.1.5", path = "crates/nzb-decode" }

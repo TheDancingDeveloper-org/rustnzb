@@ -669,3 +669,72 @@ async fn server_add_and_update_accept_partial_bodies() {
         .unwrap();
     assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_config_writes_do_not_lose_updates() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let tokens = client
+        .post(format!("{}/api/auth/login", app.base_url))
+        .json(&serde_json::json!({"username":"admin","password":"password"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let access = tokens["access_token"].as_str().unwrap().to_string();
+
+    const WRITERS: usize = 24;
+    let mut tasks = Vec::new();
+    for i in 0..WRITERS {
+        let client = client.clone();
+        let access = access.clone();
+        let base_url = app.base_url.clone();
+        tasks.push(tokio::spawn(async move {
+            let (path, body) = if i % 2 == 0 {
+                (
+                    "categories",
+                    serde_json::json!({"name": format!("cat-{i}"), "post_processing": 3}),
+                )
+            } else {
+                (
+                    "rss-feeds",
+                    serde_json::json!({"name": format!("feed-{i}"), "url": "https://feed.invalid/rss"}),
+                )
+            };
+            client
+                .post(format!("{base_url}/api/config/{path}"))
+                .bearer_auth(&access)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.unwrap(), reqwest::StatusCode::OK);
+    }
+
+    for config in [
+        (*app.state.config()).clone(),
+        AppConfig::load(&app.config_path).unwrap(),
+    ] {
+        for i in 0..WRITERS {
+            if i % 2 == 0 {
+                let name = format!("cat-{i}");
+                assert!(
+                    config.categories.iter().any(|c| c.name == name),
+                    "lost category {name}"
+                );
+            } else {
+                let name = format!("feed-{i}");
+                assert!(
+                    config.rss_feeds.iter().any(|f| f.name == name),
+                    "lost feed {name}"
+                );
+            }
+        }
+    }
+}

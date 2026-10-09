@@ -1,6 +1,6 @@
 [package]
 name = "nzb-web"
-version = "0.4.22"
+version = "0.4.23"
 edition = "2024"
 description = "Usenet download engine: queue management, download orchestration, and background services"
 license = "MIT"
