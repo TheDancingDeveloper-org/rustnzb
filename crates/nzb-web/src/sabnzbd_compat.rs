@@ -16,7 +16,7 @@ use crate::nzb_core::models::*;
 use crate::nzb_core::nzb_parser;
 
 use crate::error::ApiError;
-use crate::queue_manager::job_id_matches;
+use crate::queue_manager::{HistoryRetryOutcome, job_id_matches};
 use crate::state::AppState;
 
 /// SABnzbd release whose public response contract this compatibility layer
@@ -2051,9 +2051,17 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         return Json(serde_json::json!({ "status": false, "error": "History job not found" }));
     };
 
-    let data = match state.queue_manager.history_get_nzb_data(&entry.id) {
-        Ok(Some(data)) => data,
-        Ok(None) => {
+    // At most one retry of an entry is in flight: a repeat while it is still
+    // queued or running returns the existing job's nzo_id (status true)
+    // rather than enqueueing a duplicate.
+    let job_id = match state.queue_manager.retry_history_entry(&entry) {
+        Ok(HistoryRetryOutcome::Started(job_id)) => job_id,
+        Ok(HistoryRetryOutcome::InProgress(job_id)) => {
+            let nzo_id = format!("SABnzbd_nzo_{}", sab_id_prefix(&job_id));
+            tracing::info!(history_id = %entry.id, retried_id = %nzo_id, "History job retry already in progress");
+            return Json(serde_json::json!({ "status": true, "nzo_ids": [nzo_id] }));
+        }
+        Ok(HistoryRetryOutcome::NoNzbData) => {
             return Json(serde_json::json!({
                 "status": false,
                 "error": "The original NZB data is unavailable for this history job"
@@ -2063,30 +2071,7 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
             return Json(serde_json::json!({ "status": false, "error": error.to_string() }));
         }
     };
-
-    let retry_data = match state.queue_manager.history_get_retry_data(&entry.id) {
-        Ok(data) => data,
-        Err(error) => {
-            return Json(serde_json::json!({ "status": false, "error": error.to_string() }));
-        }
-    };
-    let job = match state
-        .queue_manager
-        .prepare_retry_job(&entry, &data, retry_data.as_deref())
-    {
-        Ok(job) => job,
-        Err(error) => {
-            return Json(serde_json::json!({
-                "status": false,
-                "error": format!("Failed to parse stored NZB: {error}")
-            }));
-        }
-    };
-
-    let nzo_id = format!("SABnzbd_nzo_{}", sab_id_prefix(&job.id));
-    if let Err(error) = state.queue_manager.add_job(job, Some(data)) {
-        return Json(serde_json::json!({ "status": false, "error": error.to_string() }));
-    }
+    let nzo_id = format!("SABnzbd_nzo_{}", sab_id_prefix(&job_id));
 
     tracing::info!(history_id = %entry.id, retried_id = %nzo_id, "History job retried via arr API");
     Json(serde_json::json!({ "status": true, "nzo_ids": [nzo_id] }))
@@ -4741,6 +4726,82 @@ mod tests {
         .0;
         assert_eq!(delete["status"], serde_json::json!(true));
         assert!(!history_ids(&test_state).contains(&"oldest-failed".to_string()));
+    }
+
+    const RETRY_NZB: &[u8] = br#"<?xml version="1.0" encoding="utf-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p" date="0" subject="&quot;retry.bin&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="5" number="1">retry-1@test</segment></segments>
+  </file>
+</nzb>"#;
+
+    fn insert_retryable_history(test_state: &TestState, id: &str) {
+        let mut entry = history_entry(id, id, "tv", JobStatus::Failed, 1);
+        entry.output_dir = test_state.state.config().general.complete_dir.join(id);
+        entry.nzb_data = Some(RETRY_NZB.to_vec());
+        test_state
+            .state
+            .queue_manager
+            .with_db(|database| database.history_insert(&entry).expect("insert history"));
+    }
+
+    /// BUG-64: concurrent `mode=retry` calls for one history entry must
+    /// enqueue exactly one job; every caller gets that job's nzo_id.
+    #[tokio::test]
+    async fn concurrent_retries_of_one_history_entry_enqueue_one_job() {
+        let test_state = test_state();
+        insert_retryable_history(&test_state, "failed-once");
+        let barrier = std::sync::Barrier::new(5);
+        let runtime = tokio::runtime::Handle::current();
+        let responses: Vec<serde_json::Value> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..5)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let _runtime = runtime.enter();
+                        barrier.wait();
+                        handle_retry(
+                            &test_state.state,
+                            &SabApiRequest {
+                                value: Some("failed-once".into()),
+                                ..SabApiRequest::default()
+                            },
+                        )
+                        .0
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        assert_eq!(test_state.state.queue_manager.get_jobs().len(), 1);
+        let first = &responses[0]["nzo_ids"][0];
+        for response in &responses {
+            assert_eq!(response["status"], serde_json::json!(true), "{response}");
+            assert_eq!(&response["nzo_ids"][0], first, "{response}");
+        }
+    }
+
+    /// Once the retried job has left the queue, the history entry can be
+    /// retried again.
+    #[tokio::test]
+    async fn retry_is_allowed_again_after_the_retried_job_leaves_the_queue() {
+        let test_state = test_state();
+        insert_retryable_history(&test_state, "failed-twice");
+        let req = SabApiRequest {
+            value: Some("failed-twice".into()),
+            ..SabApiRequest::default()
+        };
+        let qm = &test_state.state.queue_manager;
+        let first = handle_retry(&test_state.state, &req).0;
+        assert_eq!(first["status"], serde_json::json!(true), "{first}");
+        let job_id = qm.get_jobs()[0].id.clone();
+        qm.remove_job(&job_id).expect("remove retried job");
+
+        let second = handle_retry(&test_state.state, &req).0;
+        assert_eq!(second["status"], serde_json::json!(true), "{second}");
+        assert_ne!(second["nzo_ids"][0], first["nzo_ids"][0]);
+        assert_eq!(qm.get_jobs().len(), 1);
     }
 
     /// Without `del_files`, history delete only removes the DB record, as

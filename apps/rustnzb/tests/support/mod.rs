@@ -26,6 +26,8 @@ fn workspace_path(path: &str) -> PathBuf {
 pub struct TestApp {
     pub base_url: String,
     pub complete_dir: PathBuf,
+    /// Shared app state behind the router, for seeding fixtures directly.
+    pub state: Arc<AppState>,
     _tmp_dir: TempDir,
     handle: JoinHandle<()>,
 }
@@ -123,7 +125,7 @@ async fn start_test_server_inner(
         credential_store,
     ));
 
-    let router = build_router(state);
+    let router = build_router(state.clone());
     #[cfg(feature = "webdav")]
     let router = router.layer(axum::Extension(None::<Arc<rustnzb::dav::DavHandle>>));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -141,6 +143,7 @@ async fn start_test_server_inner(
     TestApp {
         base_url,
         complete_dir,
+        state,
         _tmp_dir: tmp_dir,
         handle,
     }

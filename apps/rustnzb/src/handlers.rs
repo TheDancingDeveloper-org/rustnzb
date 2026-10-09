@@ -28,6 +28,7 @@ use nzb_web::nzb_core::models::*;
 use nzb_web::nzb_core::nzb_parser;
 use nzb_web::nzb_core::sabnzbd_import;
 
+use nzb_web::HistoryRetryOutcome;
 use nzb_web::error::ApiError;
 use nzb_web::fetch_guard::{
     FetchPolicy, MAX_FETCH_BODY_BYTES, build_fetch_client, check_fetch_url_allowed,
@@ -678,54 +679,48 @@ pub async fn h_history_clear(
 }
 
 /// POST /api/history/{id}/retry -- Re-add a failed/completed NZB from history.
+///
+/// Idempotent per history entry: while a retry of `{id}` is still queued or
+/// running, a repeat request enqueues nothing and returns `200` with the
+/// existing job's id in `nzo_ids` (the same replay semantics as an
+/// `Idempotency-Key` queue add). Once that job has left the queue the entry
+/// can be retried again.
 pub async fn h_history_retry(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Get the history entry to get the name/category
     let entry = state
         .queue_manager
         .history_get(&id)
         .map_err(ApiError::from)?
         .ok_or(ApiError::not_found("History entry not found"))?;
 
-    // Get the raw NZB data
-    let nzb_data = state
+    let job_id = match state
         .queue_manager
-        .history_get_nzb_data(&id)
+        .retry_history_entry(&entry)
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("No NZB data stored for this entry")))?;
-
-    let qm = &state.queue_manager;
-    let retry_data = qm.history_get_retry_data(&id).map_err(ApiError::from)?;
-    let job = qm
-        .prepare_retry_job(&entry, &nzb_data, retry_data.as_deref())
-        .map_err(ApiError::from)?;
-
-    std::fs::create_dir_all(&job.work_dir).map_err(|e| {
-        ApiError::from(anyhow::anyhow!(
-            "Failed to create work dir '{}': {}",
-            job.work_dir.display(),
-            e
-        ))
-    })?;
-
-    let new_id = job.id.clone();
-
-    tracing::info!(
-        name = %job.name,
-        id = %new_id,
-        original_id = %id,
-        "Retrying NZB from history"
-    );
-
-    qm.add_job(job, Some(nzb_data)).map_err(ApiError::from)?;
+    {
+        HistoryRetryOutcome::Started(job_id) => job_id,
+        HistoryRetryOutcome::InProgress(job_id) => {
+            tracing::info!(
+                id = %job_id,
+                original_id = %id,
+                "History retry already in progress"
+            );
+            job_id
+        }
+        HistoryRetryOutcome::NoNzbData => {
+            return Err(ApiError::from(anyhow::anyhow!(
+                "No NZB data stored for this entry"
+            )));
+        }
+    };
 
     Ok((
         StatusCode::OK,
         Json(AddNzbResponse {
             status: true,
-            nzo_ids: vec![new_id],
+            nzo_ids: vec![job_id],
         }),
     ))
 }
