@@ -182,6 +182,63 @@ fn restore_claimed_output_dir(job: &mut NzbJob, checkpoint: &JobCheckpoint) -> b
     }
 }
 
+/// Resolve `candidate` to a real directory that is a direct child of the
+/// canonical incomplete root. Symlinks, files, the root itself, and anything
+/// that resolves outside the root are refused.
+fn incomplete_child_dir(
+    root: &std::path::Path,
+    candidate: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let metadata = std::fs::symlink_metadata(candidate).ok()?;
+    if !metadata.file_type().is_dir() {
+        return None;
+    }
+    let resolved = std::fs::canonicalize(candidate).ok()?;
+    (resolved.parent() == Some(root)).then_some(resolved)
+}
+
+/// Whether `name` has the shape of a job id (a hyphenated UUID). Every job
+/// work directory is `incomplete/<job id>`, so the startup sweep only
+/// considers such names and never touches anything else a user keeps there.
+fn is_job_id_dir_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.len() == 36
+        && name.char_indices().all(|(index, ch)| match index {
+            8 | 13 | 18 | 23 => ch == '-',
+            _ => ch.is_ascii_hexdigit(),
+        })
+}
+
+/// Total size of the regular files under `path`, without following symlinks.
+fn tree_size(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match std::fs::symlink_metadata(entry.path()) {
+            Ok(metadata) if metadata.is_dir() => tree_size(&entry.path()),
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// The work directory recorded in a history row's retry checkpoint, read
+/// without materialising the per-article outcomes.
+fn retry_checkpoint_work_dir(retry_data: &[u8]) -> Option<std::path::PathBuf> {
+    #[derive(Deserialize)]
+    struct WorkDirOnly {
+        #[serde(default)]
+        work_dir: Option<std::path::PathBuf>,
+    }
+    serde_json::from_slice::<WorkDirOnly>(retry_data)
+        .ok()?
+        .work_dir
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStatsData {
     pub server_id: String,
@@ -3429,8 +3486,10 @@ impl QueueManager {
             // Remove from order
             self.job_order.lock().retain(|jid| jid != id);
 
-            // Try to clean up work directory
-            if state.job.work_dir.exists() {
+            // Try to clean up work directory. A terminal job whose history
+            // row already exists may have retained its partial download for
+            // retry; deleting that history entry removes it instead.
+            if !history_already_persisted && state.job.work_dir.exists() {
                 let _ = std::fs::remove_dir_all(&state.job.work_dir);
             }
 
@@ -4096,24 +4155,184 @@ impl QueueManager {
 
     /// Remove a history entry.
     pub fn history_remove(&self, id: &str) -> crate::nzb_core::Result<()> {
-        let db = self.db.lock();
-        let existed = db.history_get(id)?.is_some();
-        db.history_remove(id)?;
-        if existed {
-            self.history_changed();
+        let retained = {
+            let db = self.db.lock();
+            let entry = db.history_get(id)?;
+            let retained = entry
+                .as_ref()
+                .map(|entry| self.history_work_dirs(&db, entry))
+                .unwrap_or_default();
+            db.history_remove(id)?;
+            if entry.is_some() {
+                self.history_changed();
+            }
+            retained
+        };
+        for work_dir in retained {
+            self.remove_unreferenced_work_dir(&work_dir, "history entry deleted");
         }
         Ok(())
     }
 
     /// Clear all history.
     pub fn history_clear(&self) -> crate::nzb_core::Result<()> {
-        let db = self.db.lock();
-        let had_entries = db.history_count()? != 0;
-        db.history_clear()?;
-        if had_entries {
-            self.history_changed();
+        let retained = {
+            let db = self.db.lock();
+            let had_entries = db.history_count()? != 0;
+            let retained: Vec<_> = db
+                .history_list(i64::MAX as usize)?
+                .iter()
+                .flat_map(|entry| self.history_work_dirs(&db, entry))
+                .collect();
+            db.history_clear()?;
+            if had_entries {
+                self.history_changed();
+            }
+            retained
+        };
+        for work_dir in retained {
+            self.remove_unreferenced_work_dir(&work_dir, "history cleared");
         }
         Ok(())
+    }
+
+    /// Incomplete work directories a history row may have retained: its own
+    /// `incomplete/<id>` and, for a failed row, the directory its retry
+    /// checkpoint names (a retry reuses an earlier attempt's directory).
+    fn history_work_dirs(&self, db: &Database, entry: &HistoryEntry) -> Vec<std::path::PathBuf> {
+        let mut dirs = vec![self.incomplete_dir().join(&entry.id)];
+        if entry.status == JobStatus::Failed
+            && let Ok(Some(data)) = db.history_get_retry_data(&entry.id)
+            && let Some(work_dir) = retry_checkpoint_work_dir(&data)
+            && !dirs.contains(&work_dir)
+        {
+            dirs.push(work_dir);
+        }
+        dirs
+    }
+
+    /// Canonical incomplete directories still referenced by a queue job or a
+    /// history row. With `only_named`, retry checkpoints are parsed only when
+    /// they mention that directory name, which keeps a single delete cheap.
+    fn referenced_work_dirs(
+        &self,
+        only_named: Option<&std::ffi::OsStr>,
+    ) -> HashSet<std::path::PathBuf> {
+        let incomplete = self.incomplete_dir();
+        // Terminal jobs linger in the queue view briefly after their history
+        // row is written; their directory belongs to that row, not the queue.
+        let mut paths: Vec<std::path::PathBuf> = self
+            .jobs
+            .lock()
+            .values()
+            .filter(|state| !matches!(state.job.status, JobStatus::Completed | JobStatus::Failed))
+            .map(|state| state.job.work_dir.clone())
+            .collect();
+        let needle = only_named.map(|name| name.to_string_lossy().into_owned().into_bytes());
+        {
+            let db = self.db.lock();
+            match db.queue_list() {
+                Ok(jobs) => paths.extend(jobs.into_iter().map(|job| job.work_dir)),
+                Err(e) => warn!("Unable to list queue while checking work directories: {e}"),
+            }
+            match db.history_list(i64::MAX as usize) {
+                Ok(entries) => {
+                    for entry in entries {
+                        paths.push(incomplete.join(&entry.id));
+                        if entry.status != JobStatus::Failed {
+                            continue;
+                        }
+                        let Ok(Some(data)) = db.history_get_retry_data(&entry.id) else {
+                            continue;
+                        };
+                        let mentioned = needle.as_ref().is_none_or(|needle| {
+                            !needle.is_empty()
+                                && data.windows(needle.len()).any(|window| window == needle)
+                        });
+                        if mentioned && let Some(work_dir) = retry_checkpoint_work_dir(&data) {
+                            paths.push(work_dir);
+                        }
+                    }
+                }
+                Err(e) => warn!("Unable to list history while checking work directories: {e}"),
+            }
+        }
+        paths
+            .into_iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .collect()
+    }
+
+    /// Remove one retained incomplete work directory once nothing references
+    /// it. Removal is confined to direct child directories of the incomplete
+    /// root and never follows a symlink out of it.
+    fn remove_unreferenced_work_dir(&self, candidate: &std::path::Path, reason: &str) {
+        let Ok(root) = std::fs::canonicalize(self.incomplete_dir()) else {
+            return;
+        };
+        let Some(work_dir) = incomplete_child_dir(&root, candidate) else {
+            return;
+        };
+        if self
+            .referenced_work_dirs(work_dir.file_name())
+            .contains(&work_dir)
+        {
+            debug!(work_dir = %work_dir.display(), "Keeping work directory still in use");
+            return;
+        }
+        let size_bytes = tree_size(&work_dir);
+        match std::fs::remove_dir_all(&work_dir) {
+            Ok(()) => info!(
+                work_dir = %work_dir.display(),
+                size_bytes,
+                reason,
+                "Removed retained work directory"
+            ),
+            Err(e) => warn!(
+                work_dir = %work_dir.display(),
+                "Failed to remove retained work directory: {e}"
+            ),
+        }
+    }
+
+    /// Remove incomplete work directories that no queue job or history row
+    /// references, such as partial downloads whose history was deleted while
+    /// the process was down. Only direct child directories of the incomplete
+    /// root whose names are job ids are considered; files, symlinks, other
+    /// directories, and the root itself are kept. Runs at startup, before any
+    /// job can create a new work directory.
+    fn sweep_orphaned_work_dirs(&self) {
+        let incomplete = self.incomplete_dir();
+        let Ok(root) = std::fs::canonicalize(&incomplete) else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return;
+        };
+        let referenced = self.referenced_work_dirs(None);
+        for entry in entries.flatten() {
+            if !is_job_id_dir_name(&entry.file_name()) {
+                continue;
+            }
+            let Some(work_dir) = incomplete_child_dir(&root, &entry.path()) else {
+                continue;
+            };
+            if referenced.contains(&work_dir) {
+                continue;
+            }
+            let size_bytes = tree_size(&work_dir);
+            match std::fs::remove_dir_all(&work_dir) {
+                Ok(()) => info!(
+                    work_dir = %work_dir.display(),
+                    size_bytes,
+                    "Removed orphaned incomplete work directory at startup"
+                ),
+                Err(e) => warn!(
+                    work_dir = %work_dir.display(),
+                    "Failed to remove orphaned incomplete work directory: {e}"
+                ),
+            }
+        }
     }
 
     /// Get live logs for an active job from the in-memory log buffer.
@@ -4245,6 +4464,10 @@ impl QueueManager {
             self.globally_paused.store(true, Ordering::SeqCst);
             info!("Restored global pause state from database");
         }
+
+        // Reclaim partial downloads nothing can reach any more before any
+        // job starts writing into the incomplete directory.
+        self.sweep_orphaned_work_dirs();
 
         let jobs = {
             let db = self.db.lock();
@@ -5078,6 +5301,30 @@ mod global_pause_tests {
                 .filter(|entry| entry.id == "terminal")
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_terminal_queue_view_keeps_work_dir_owned_by_history() {
+        let (manager, tempdir) = manager();
+        let mut terminal = job("terminal-retained", JobStatus::Failed, tempdir.path());
+        terminal.error_message = Some("articles missing".into());
+        let work_dir = terminal.work_dir.clone();
+        insert_job(&manager, terminal);
+        {
+            let mut jobs = manager.jobs.lock();
+            let state = jobs.get_mut("terminal-retained").unwrap();
+            manager.move_to_history(state, Vec::new());
+        }
+        // Stand-in for a partial download retained for history retry.
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::write(work_dir.join("partial.bin"), b"partial").unwrap();
+
+        manager.remove_job("terminal-retained").unwrap();
+
+        assert!(
+            work_dir.join("partial.bin").exists(),
+            "the history row owns a retained work dir once it is persisted"
         );
     }
 
