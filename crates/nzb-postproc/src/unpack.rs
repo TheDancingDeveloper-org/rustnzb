@@ -728,15 +728,22 @@ pub fn find_unrar() -> Option<String> {
     None
 }
 
-/// Find the 7z binary on the system. Checks `7z`, `7zz` (7-Zip standalone),
-/// and `7za` (7-Zip standalone, older naming).
+/// Find the 7z binary on the system. See [`pick_7z`] for the preference order.
 pub fn find_7z() -> Option<String> {
-    for name in &["7z", "7zz", "7za"] {
-        if which_exists(name) {
-            return Some(name.to_string());
-        }
-    }
-    None
+    pick_7z(which_exists)
+}
+
+/// Pick the first available 7-Zip binary, given a predicate for "is on PATH".
+///
+/// `7zz` (modern 7-Zip) comes first: on Debian/Ubuntu with both `7zip` and
+/// `p7zip-full` installed, `7z` is p7zip 16.02, which reads passwords from
+/// the terminal only, so the password would have to go in argv; `7zz` takes
+/// it on stdin. Then `7z` (7-Zip or p7zip), then `7za` (older standalone).
+fn pick_7z(exists: impl Fn(&str) -> bool) -> Option<String> {
+    ["7zz", "7z", "7za"]
+        .into_iter()
+        .find(|name| exists(name))
+        .map(str::to_string)
 }
 
 fn which_exists(name: &str) -> bool {
@@ -754,6 +761,20 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    /// On Debian with p7zip-full and 7zip both installed, `7z` is p7zip
+    /// (password from the terminal, so it has to go in argv) and `7zz` is
+    /// modern 7-Zip (password on stdin): prefer `7zz`.
+    #[test]
+    fn pick_7z_prefers_7zz_over_7z() {
+        let all = |_: &str| true;
+        assert_eq!(pick_7z(all).as_deref(), Some("7zz"));
+        let no_7zz = |name: &str| name != "7zz";
+        assert_eq!(pick_7z(no_7zz).as_deref(), Some("7z"));
+        let only_7za = |name: &str| name == "7za";
+        assert_eq!(pick_7z(only_7za).as_deref(), Some("7za"));
+        assert_eq!(pick_7z(|_: &str| false), None);
+    }
 
     #[tokio::test]
     async fn test_extract_zip_valid() {
