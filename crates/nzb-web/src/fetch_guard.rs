@@ -223,7 +223,7 @@ enum GuardError {
 }
 
 async fn validate_inner(raw_url: &str, policy: &FetchPolicy) -> Result<FetchUrlPlan, GuardError> {
-    let reject = |e: anyhow::Error| GuardError::Rejected(ApiError::from(e));
+    let reject = |e: anyhow::Error| GuardError::Rejected(ApiError::url_rejected(e.to_string()));
     let url =
         reqwest::Url::parse(raw_url).map_err(|e| reject(anyhow::anyhow!("Invalid URL: {e}")))?;
 
@@ -269,14 +269,14 @@ async fn validate_inner(raw_url: &str, policy: &FetchPolicy) -> Result<FetchUrlP
     let addrs: Vec<_> = tokio::net::lookup_host(format!("{host}:{port}"))
         .await
         .map_err(|e| {
-            GuardError::Unresolved(ApiError::from(anyhow::anyhow!(
+            GuardError::Unresolved(ApiError::bad_gateway(format!(
                 "DNS resolution failed for '{host}': {e}"
             )))
         })?
         .collect();
 
     if addrs.is_empty() {
-        return Err(GuardError::Unresolved(ApiError::from(anyhow::anyhow!(
+        return Err(GuardError::Unresolved(ApiError::bad_gateway(format!(
             "DNS resolution returned no addresses for '{host}'"
         ))));
     }
@@ -401,6 +401,29 @@ fn is_globally_routable(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn guard_rejections_are_400_url_rejected() {
+        for url in [
+            "http://127.0.0.1/file.nzb",
+            "http://localhost/file.nzb",
+            "http://10.0.0.1/file.nzb",
+            "http://169.254.169.254/latest/meta-data/",
+            "file:///etc/passwd",
+            "not a url",
+            "http://",
+        ] {
+            let err = validate_fetch_url(url).await.unwrap_err();
+            assert_eq!(err.status(), http::StatusCode::BAD_REQUEST, "{url}");
+            let json = serde_json::to_value(&err).unwrap();
+            assert_eq!(json["error_kind"], "url_rejected", "{url}");
+
+            let err = check_fetch_url_allowed(url, &FetchPolicy::strict())
+                .await
+                .unwrap_err();
+            assert_eq!(err.status(), http::StatusCode::BAD_REQUEST, "{url}");
+        }
+    }
 
     #[tokio::test]
     async fn validate_fetch_url_rejects_private_ip_literals() {

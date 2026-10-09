@@ -83,6 +83,25 @@ impl ApiError {
         }
     }
 
+    /// A caller-supplied URL that the server-side fetch guard refuses
+    /// (bad scheme, malformed, or a private/reserved/metadata destination).
+    /// This is client input, so it is a 400 with `error_kind: url_rejected`.
+    pub fn url_rejected(msg: impl Into<String>) -> Self {
+        Self {
+            status: Some(StatusCode::BAD_REQUEST),
+            kind: ApiErrorKind::UrlRejected(msg.into()),
+        }
+    }
+
+    /// A server-side fetch reached the remote host but it failed (error
+    /// status, unreachable host): 502 with `error_kind: bad_gateway`.
+    pub fn bad_gateway(msg: impl Into<String>) -> Self {
+        Self {
+            status: Some(StatusCode::BAD_GATEWAY),
+            kind: ApiErrorKind::Message(msg.into()),
+        }
+    }
+
     pub fn status(&self) -> StatusCode {
         self.status.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
     }
@@ -102,6 +121,8 @@ pub enum ApiErrorKind {
     Text(&'static str),
     #[error("{0}")]
     Message(String),
+    #[error("{0}")]
+    UrlRejected(String),
     #[error(transparent)]
     Anyhow(#[from] anyhow::Error),
     #[error(transparent)]
@@ -145,12 +166,14 @@ impl Serialize for ApiError {
                 | ApiErrorKind::Core(crate::nzb_core::NzbError::AdmissionConflict) => {
                     "admission_conflict"
                 }
+                ApiErrorKind::UrlRejected(_) => "url_rejected",
                 // Otherwise classify by status so clients can tell a bad
                 // request or missing resource from a server fault.
                 _ => match self.status() {
                     StatusCode::BAD_REQUEST => "bad_request",
                     StatusCode::NOT_FOUND => "not_found",
                     StatusCode::CONFLICT => "conflict",
+                    StatusCode::BAD_GATEWAY => "bad_gateway",
                     _ => "internal_error",
                 },
             },
@@ -275,5 +298,21 @@ mod tests {
         let json = serde_json::to_value(ApiError::conflict("taken")).unwrap();
         assert_eq!(json["error_kind"], "conflict");
         assert_eq!(json["status"], 409);
+    }
+
+    #[test]
+    fn fetch_errors_map_to_400_and_502() {
+        let rejected = ApiError::url_rejected("URL scheme 'file' not allowed");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let json = serde_json::to_value(&rejected).unwrap();
+        assert_eq!(json["error_kind"], "url_rejected");
+        assert_eq!(json["status"], 400);
+        assert_eq!(json["human_readable"], "URL scheme 'file' not allowed");
+
+        let upstream = ApiError::bad_gateway("URL returned HTTP 500");
+        assert_eq!(upstream.status(), StatusCode::BAD_GATEWAY);
+        let json = serde_json::to_value(&upstream).unwrap();
+        assert_eq!(json["error_kind"], "bad_gateway");
+        assert_eq!(json["status"], 502);
     }
 }
