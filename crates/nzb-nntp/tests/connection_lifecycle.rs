@@ -145,6 +145,41 @@ async fn test_stat_article_exists() {
 }
 
 #[tokio::test]
+async fn test_stat_article_fatal_codes_mark_connection_error() {
+    use nzb_nntp::connection::ConnectionState;
+
+    for (code, check) in [
+        (
+            502u16,
+            (|e: &NntpError| matches!(e, NntpError::ServiceUnavailable(_)))
+                as fn(&NntpError) -> bool,
+        ),
+        (403, |e| matches!(e, NntpError::PermissionDenied(_))),
+        (400, |e| {
+            matches!(e, NntpError::Protocol(_) | NntpError::Connection(_))
+        }),
+    ] {
+        let mut overrides = HashMap::new();
+        overrides.insert("doomed".to_string(), code);
+        let server = MockNntpServer::start(MockConfig {
+            article_response_overrides: overrides,
+            ..Default::default()
+        })
+        .await;
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&test_config(server.port())).await.unwrap();
+
+        let err = conn.stat_article("doomed").await.unwrap_err();
+        assert!(check(&err), "{code}: unexpected error {err:?}");
+        assert_eq!(
+            conn.state,
+            ConnectionState::Error,
+            "{code} must not leave the connection reusable"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_stat_article_missing() {
     let server = MockNntpServer::start(MockConfig::default()).await;
 
