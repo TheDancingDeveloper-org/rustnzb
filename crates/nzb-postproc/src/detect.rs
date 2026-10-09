@@ -99,11 +99,12 @@ pub fn parse_rar_volume(filename: &str) -> Option<RarVolumeInfo> {
         });
     }
 
-    // Old-style continuation: .r00, .r01, ..., .s00, etc.
+    // Old-style continuation: .r00, .r01, ..., .s00, etc. The letter runs
+    // r..=z only; .n64, .a52, .c01 and friends are unrelated formats.
     if name_lower.len() > 4 {
         let last4 = &name_lower[name_lower.len() - 4..];
         if last4.starts_with('.')
-            && last4.as_bytes()[1].is_ascii_lowercase()
+            && (b'r'..=b'z').contains(&last4.as_bytes()[1])
             && last4.as_bytes()[2].is_ascii_digit()
             && last4.as_bytes()[3].is_ascii_digit()
         {
@@ -763,6 +764,30 @@ mod tests {
         assert!(parse_rar_volume("movie.7z").is_none());
         assert!(parse_rar_volume("movie.zip").is_none());
         assert!(parse_rar_volume("readme.txt").is_none());
+    }
+
+    #[test]
+    fn test_parse_rar_volume_rejects_letters_before_r() {
+        // Old-style continuation volumes run .r00-.r99, .s00-.s99, ... .z99.
+        // Anything a-q is an unrelated extension (N64 ROM, AC-3 audio, ...)
+        // and must neither be parsed as a volume nor panic on underflow.
+        for name in ["Game.n64", "clip.a52", "x.c01", "disk.d64", "tape.q99"] {
+            assert!(
+                parse_rar_volume(name).is_none(),
+                "{name} is not a RAR volume"
+            );
+        }
+
+        let v = parse_rar_volume("archive.t00").unwrap();
+        assert_eq!(v.volume_number, 201);
+        let v = parse_rar_volume("archive.z99").unwrap();
+        assert_eq!(v.volume_number, 900);
+    }
+
+    #[test]
+    fn test_find_archives_ignores_non_rar_letter_extensions() {
+        let dir = make_test_dir(&["Game.n64", "clip.a52", "x.c01", "movie.mkv"]);
+        assert!(find_archives(dir.path()).is_empty());
     }
 
     #[test]
