@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::Json;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
@@ -1283,6 +1284,7 @@ pub async fn h_max_active_downloads_set(
     State(state): State<Arc<AppState>>,
     Json(body): Json<MaxActiveDownloadsBody>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
+    validate_max_active_downloads(body.max_active_downloads)?;
     state.update_config_with(|config| {
         config.general.max_active_downloads = body.max_active_downloads;
         Ok::<_, ApiError>(())
@@ -1696,7 +1698,18 @@ pub async fn h_rss_rule_delete(
 // General settings handler
 // ---------------------------------------------------------------------------
 
+/// Body for `PUT /api/config/general`. Every field is optional; omitted
+/// fields keep their current value.
+///
+/// Unknown fields are rejected with 400 rather than silently ignored, so a
+/// client cannot believe it changed a setting this endpoint does not own.
+/// Settings with their own endpoints stay there and are not accepted here:
+/// `speed_limit_bps` (`/config/speed-limit`), `min_free_space_bytes` and
+/// `abort_hopeless` (`/config/disk-guards`). `log_level` is not editable:
+/// the tracing filter is built once at startup from `--log-level` /
+/// `RUSTNZB_LOG_LEVEL` / `RUST_LOG`, so a saved value would have no effect.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateGeneralBody {
     pub incomplete_dir: Option<String>,
     pub complete_dir: Option<String>,
@@ -1716,13 +1729,112 @@ pub struct UpdateGeneralBody {
     pub script_failure: Option<String>,
     pub script_timeout_secs: Option<u64>,
     pub script_max_output_bytes: Option<usize>,
+    // The settings below are read when the engine starts; changes are
+    // persisted immediately and take effect on the next process start.
+    pub required_completion_pct: Option<f64>,
+    pub article_timeout_secs: Option<u64>,
+    pub max_nested_archive_depth: Option<u8>,
+    pub direct_unpack: Option<bool>,
+    pub early_failure_check: Option<bool>,
+}
+
+/// Article cache size bounds accepted by the API (bytes).
+const CACHE_SIZE_MIN: u64 = 16 * 1024 * 1024;
+const CACHE_SIZE_MAX: u64 = 64 * 1024 * 1024 * 1024;
+/// Upper bound for `max_active_downloads`; `0` still means unlimited.
+const MAX_ACTIVE_DOWNLOADS_LIMIT: usize = 100;
+/// Upper bound for the post-processing job and worker pool sizes.
+const MAX_POSTPROC_WORKERS: usize = 64;
+/// `required_completion_pct` range, matching the clamp the engine applies.
+const REQUIRED_COMPLETION_PCT_RANGE: std::ops::RangeInclusive<f64> = 100.0..=200.0;
+/// Upper bound for `article_timeout_secs`; `0` still disables the timeout.
+const ARTICLE_TIMEOUT_SECS_MAX: u64 = 3600;
+/// Upper bound for `max_nested_archive_depth`.
+const MAX_NESTED_ARCHIVE_DEPTH_LIMIT: u8 = 10;
+
+fn general_field_error(field: &str, requirement: &str) -> ApiError {
+    ApiError::from((
+        StatusCode::BAD_REQUEST,
+        format!("invalid `{field}`: {requirement}"),
+    ))
+}
+
+fn validate_max_active_downloads(value: usize) -> Result<(), ApiError> {
+    if value > MAX_ACTIVE_DOWNLOADS_LIMIT {
+        return Err(general_field_error(
+            "max_active_downloads",
+            &format!("must be at most {MAX_ACTIVE_DOWNLOADS_LIMIT} (0 = unlimited)"),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject out-of-range values before anything is applied, so a bad request
+/// never half-updates the config or the live queue manager.
+fn validate_general_update(body: &UpdateGeneralBody) -> Result<(), ApiError> {
+    if let Some(size) = body.cache_size
+        && !(CACHE_SIZE_MIN..=CACHE_SIZE_MAX).contains(&size)
+    {
+        return Err(general_field_error(
+            "cache_size",
+            &format!("must be between {CACHE_SIZE_MIN} and {CACHE_SIZE_MAX} bytes"),
+        ));
+    }
+    if let Some(max) = body.max_active_downloads {
+        validate_max_active_downloads(max)?;
+    }
+    for (field, value) in [
+        ("max_post_processing_jobs", body.max_post_processing_jobs),
+        ("max_repair_workers", body.max_repair_workers),
+        ("max_extract_workers", body.max_extract_workers),
+    ] {
+        // 0 is still accepted and raised to 1, as before.
+        if let Some(value) = value
+            && value > MAX_POSTPROC_WORKERS
+        {
+            return Err(general_field_error(
+                field,
+                &format!("must be at most {MAX_POSTPROC_WORKERS}"),
+            ));
+        }
+    }
+    if let Some(pct) = body.required_completion_pct
+        && !REQUIRED_COMPLETION_PCT_RANGE.contains(&pct)
+    {
+        return Err(general_field_error(
+            "required_completion_pct",
+            "must be between 100.0 and 200.0",
+        ));
+    }
+    if let Some(secs) = body.article_timeout_secs
+        && secs > ARTICLE_TIMEOUT_SECS_MAX
+    {
+        return Err(general_field_error(
+            "article_timeout_secs",
+            &format!("must be at most {ARTICLE_TIMEOUT_SECS_MAX} (0 = no timeout)"),
+        ));
+    }
+    if let Some(depth) = body.max_nested_archive_depth
+        && depth > MAX_NESTED_ARCHIVE_DEPTH_LIMIT
+    {
+        return Err(general_field_error(
+            "max_nested_archive_depth",
+            &format!("must be at most {MAX_NESTED_ARCHIVE_DEPTH_LIMIT}"),
+        ));
+    }
+    Ok(())
 }
 
 /// PUT /api/config/general -- Update general settings.
 pub async fn h_general_update(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<UpdateGeneralBody>,
+    body: Result<Json<UpdateGeneralBody>, JsonRejection>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
+    // Map extractor failures (unknown field, wrong type) to a 400 that names
+    // the offending field, instead of axum's plain-text 422.
+    let Json(body) =
+        body.map_err(|rejection| ApiError::from((StatusCode::BAD_REQUEST, rejection.body_text())))?;
+    validate_general_update(&body)?;
     state.update_config_with(|config| {
         if let Some(dir) = body.incomplete_dir {
             config.general.incomplete_dir = dir.into();
@@ -1804,6 +1916,21 @@ pub async fn h_general_update(
         }
         if let Some(max_output) = body.script_max_output_bytes {
             config.general.script_max_output_bytes = max_output;
+        }
+        if let Some(pct) = body.required_completion_pct {
+            config.general.required_completion_pct = pct;
+        }
+        if let Some(secs) = body.article_timeout_secs {
+            config.general.article_timeout_secs = secs;
+        }
+        if let Some(depth) = body.max_nested_archive_depth {
+            config.general.max_nested_archive_depth = depth;
+        }
+        if let Some(enabled) = body.direct_unpack {
+            config.general.direct_unpack = enabled;
+        }
+        if let Some(enabled) = body.early_failure_check {
+            config.general.early_failure_check = enabled;
         }
 
         state.queue_manager.set_postproc_scripts(

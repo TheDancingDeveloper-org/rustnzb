@@ -6,8 +6,12 @@ incomplete_dir = "/downloads/incomplete"
 complete_dir = "/downloads/complete"
 data_dir = "/data"
 speed_limit_bps = 0  # 0 = unlimited
-cache_size = 524288000  # 500 MB
+cache_size = 524288000  # 500 MB; the API accepts 16 MiB to 64 GiB
+# The log filter is set at startup by RUST_LOG, --log-level or
+# RUSTNZB_LOG_LEVEL (default "info"); this key does not change it and is not
+# editable through the API.
 log_level = "info"
+# max_active_downloads = 1  # 0 = unlimited; the API accepts at most 100
 # log_file = "data/rustnzb.log"
 # history_retention = 100  # Number of NZBs to keep in history (omit or 0 = keep all)
 max_active_downloads = 1  # NZBs downloading simultaneously (0 = unlimited)
@@ -15,12 +19,18 @@ max_active_downloads = 1  # NZBs downloading simultaneously (0 = unlimited)
 # rss_downloaded_item_expiry_days = 30  # Remove downloaded RSS records after this many days
 # Independent post-processing jobs overlap downloads. Separate repair and
 # extraction gates allow those stages to overlap safely across different jobs.
-# These limits are applied at process start.
+# These limits are applied at process start. The API accepts 0..=64 per
+# limit (0 is raised to 1).
 max_post_processing_jobs = 2
 max_repair_workers = 1
 max_extract_workers = 1
 direct_unpack = true  # Extract RAR volumes while downloading when unrar is available
-max_nested_archive_depth = 5  # 0=outer archive only; protects against unbounded nesting
+max_nested_archive_depth = 5  # 0=outer archive only; protects against unbounded nesting (API: 0-10)
+# The download-health settings below are applied at process start.
+# abort_hopeless = true          # edited via /api/config/disk-guards
+# early_failure_check = true     # abort dead NZBs after the first articles
+# required_completion_pct = 100.2  # 100.0-200.0; >100 reserves a PAR2 repair margin
+# article_timeout_secs = 30      # 0 = no timeout; the API accepts at most 3600
 # Post-processing hooks run without a shell, with a bounded timeout and output capture.
 # scripts_dir = "/data/scripts"
 # script_success = "on-success.sh"
