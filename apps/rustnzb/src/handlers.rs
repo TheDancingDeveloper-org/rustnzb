@@ -348,11 +348,7 @@ impl UploadForm {
 /// the files. Other text fields are ignored.
 async fn read_upload(multipart: &mut Multipart) -> Result<UploadForm, ApiError> {
     let mut form = UploadForm::default();
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| ApiError::from(anyhow::anyhow!("Multipart error: {error}")))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(ApiError::from)? {
         let key = field.name().unwrap_or_default().to_string();
         // A part with a file name is an upload. So is a bare `file` part
         // (curl's `-F "file=<x.nzb"` sends the contents without a name).
@@ -362,17 +358,11 @@ async fn read_upload(multipart: &mut Multipart) -> Result<UploadForm, ApiError> 
             None => None,
         };
         if let Some(file_name) = file_name {
-            let data = field
-                .bytes()
-                .await
-                .map_err(|error| ApiError::from(anyhow::anyhow!("Read error: {error}")))?;
+            let data = field.bytes().await.map_err(ApiError::from)?;
             form.files.push((file_name, data.to_vec()));
             continue;
         }
-        let text = field
-            .text()
-            .await
-            .map_err(|error| ApiError::from(anyhow::anyhow!("Read error: {error}")))?;
+        let text = field.text().await.map_err(ApiError::from)?;
         match key.as_str() {
             "password" => form.password = Some(text),
             "category" | "cat" => form.category = Some(text),
