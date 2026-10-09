@@ -98,6 +98,103 @@ pub struct StartupResult {
     pub state: Arc<AppState>,
     pub queue_manager: Arc<QueueManager>,
     pub log_buffer: LogBuffer,
+    /// Held for the lifetime of the process so a second instance on the
+    /// same data_dir refuses to start.
+    _instance_lock: InstanceLock,
+}
+
+/// Exclusive lock on `<data_dir>/rustnzb.lock` ensuring only one rustnzb
+/// instance uses a given data directory at a time. Released on drop.
+pub struct InstanceLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+    #[cfg(windows)]
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl InstanceLock {
+    fn acquire(data_dir: &Path) -> anyhow::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        let file = open_lock_options()
+            .open(lock_path(data_dir))
+            .with_context(|| format!("failed to open {}", lock_path(data_dir).display()))?;
+        let fd = file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!(
+                    "another rustnzb instance is using {}; stop it or choose a different data_dir",
+                    data_dir.display()
+                );
+            }
+            return Err(err).context(format!("failed to lock {}", lock_path(data_dir).display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(windows)]
+impl InstanceLock {
+    fn acquire(data_dir: &Path) -> anyhow::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // share_mode(0) denies all sharing: a second open fails outright.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .open(lock_path(data_dir))
+            .map_err(|err| {
+                if err.raw_os_error() == Some(32) {
+                    anyhow::anyhow!(
+                        "another rustnzb instance is using {}; stop it or choose a different data_dir",
+                        data_dir.display()
+                    )
+                } else {
+                    anyhow::Error::new(err).context(format!(
+                        "failed to lock {}",
+                        lock_path(data_dir).display()
+                    ))
+                }
+            })?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn lock_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("rustnzb.lock")
+}
+
+fn open_lock_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    // Deliberately no truncate: the lock file's contents are irrelevant and
+    // truncating would churn the file on every start.
+    options
+}
+
+#[cfg(unix)]
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(windows)]
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // Closing the file handle releases the exclusive share.
+    }
+}
+
+/// Acquire the single-instance lock for `data_dir`.
+pub fn acquire_instance_lock(data_dir: &Path) -> anyhow::Result<InstanceLock> {
+    InstanceLock::acquire(data_dir)
 }
 
 /// Initialize the rustnzb engine: load config, open database,
@@ -153,8 +250,12 @@ pub async fn initialize(
 
     warn_unsafe_categories(&config);
 
-    // Ensure directories exist
+    // Ensure directories exist. The instance lock is taken before any
+    // side-effect directories are created, so a second instance on the same
+    // data_dir fails without leaving anything behind.
     create_data_dir(&config.general.data_dir)?;
+    let instance_lock = acquire_instance_lock(&config.general.data_dir)
+        .context("failed to acquire single-instance lock")?;
     create_data_dir(&config.general.incomplete_dir)?;
     create_data_dir(&config.general.complete_dir)?;
 
@@ -260,12 +361,13 @@ pub async fn initialize(
         state,
         queue_manager,
         log_buffer,
+        _instance_lock: instance_lock,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{create_data_dir, sanitize_loaded_config};
+    use super::{acquire_instance_lock, create_data_dir, sanitize_loaded_config};
     use crate::nzb_core::config::AppConfig;
     use crate::nzb_core::config::ServerConfig;
 
@@ -311,6 +413,31 @@ mod tests {
             debug_text.contains("Caused by"),
             "error should retain the underlying io::Error in the chain, got: {debug_text}"
         );
+    }
+
+    #[test]
+    fn second_instance_on_same_data_dir_fails_before_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        // initialize always creates the data_dir before acquiring the lock;
+        // mirror that here so the lock file has a parent to live in.
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let first = acquire_instance_lock(&data_dir).unwrap();
+
+        let second = match acquire_instance_lock(&data_dir) {
+            Err(e) => e,
+            Ok(_) => panic!("second acquire should fail while first lock is held"),
+        };
+        let debug_text = format!("{second:?}");
+        assert!(
+            debug_text.contains("another rustnzb instance"),
+            "error should mention the other instance, got: {debug_text}"
+        );
+
+        // Releasing the first lock lets a later instance acquire it again.
+        drop(first);
+        acquire_instance_lock(&data_dir).unwrap();
     }
 
     #[test]
