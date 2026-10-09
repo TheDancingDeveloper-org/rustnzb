@@ -389,7 +389,8 @@ impl AppConfig {
         if path.exists() {
             let contents = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-            let config: AppConfig = toml::from_str(&contents)?;
+            let mut config: AppConfig = toml::from_str(&contents)?;
+            config.assign_missing_server_ids();
             Ok(config)
         } else {
             let config = AppConfig::default();
@@ -402,6 +403,24 @@ impl AppConfig {
                 )
             })?;
             Ok(config)
+        }
+    }
+
+    /// Give every server without an `id` a stable one derived from its host
+    /// and port, so a hand-written `[[servers]]` block may omit it.
+    pub fn assign_missing_server_ids(&mut self) {
+        for i in 0..self.servers.len() {
+            if !self.servers[i].id.trim().is_empty() {
+                continue;
+            }
+            let base = format!("{}-{}", self.servers[i].host.trim(), self.servers[i].port);
+            let mut candidate = base.clone();
+            let mut n = 2;
+            while self.servers.iter().any(|s| s.id == candidate) {
+                candidate = format!("{base}-{n}");
+                n += 1;
+            }
+            self.servers[i].id = candidate;
         }
     }
 
@@ -458,6 +477,41 @@ mod tests {
         assert_eq!(cfg.retention, 0);
         assert_eq!(cfg.pipelining, 4);
         assert!(!cfg.optional);
+    }
+
+    #[test]
+    fn config_with_minimal_server_block_loads() {
+        // `retention`, `ssl_verify`, `id` etc. omitted: used to fail startup
+        // with "missing field `retention`".
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[servers]]
+name = "Primary"
+host = "news.example.com"
+
+[[servers]]
+host = "news.example.com"
+
+[[servers]]
+id = "backup"
+host = "backup.example.com"
+port = 119
+ssl = false
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::load(&path).unwrap();
+        assert_eq!(config.servers.len(), 3);
+        assert_eq!(config.servers[0].id, "news.example.com-563");
+        assert_eq!(config.servers[1].id, "news.example.com-563-2");
+        assert_eq!(config.servers[2].id, "backup");
+        assert!(config.servers[0].ssl_verify);
+        assert!(config.servers[0].enabled);
+        assert_eq!(config.servers[0].retention, 0);
+        assert_eq!(config.servers[2].port, 119);
     }
 
     #[test]

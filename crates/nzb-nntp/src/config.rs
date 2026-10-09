@@ -6,34 +6,46 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ServerConfig {
-    /// Unique server identifier
+    /// Unique server identifier. Empty when omitted; the API assigns one.
+    #[serde(default)]
     pub id: String,
     /// Display name
+    #[serde(default)]
     pub name: String,
     /// Server hostname
     pub host: String,
-    /// Server port
+    /// Server port (default 563)
+    #[serde(default = "default_port")]
     pub port: u16,
-    /// Use SSL/TLS
+    /// Use SSL/TLS (default true)
+    #[serde(default = "default_true")]
     pub ssl: bool,
-    /// Verify SSL certificates
+    /// Verify SSL certificates (default true)
+    #[serde(default = "default_true")]
     pub ssl_verify: bool,
     /// Username for authentication
+    #[serde(default)]
     pub username: Option<String>,
     /// Password for authentication
+    #[serde(default)]
     pub password: Option<String>,
-    /// Max simultaneous connections
+    /// Max simultaneous connections (default 8)
+    #[serde(default = "default_connections")]
     pub connections: u16,
-    /// Server priority (0 = highest)
+    /// Server priority (0 = highest, the default)
+    #[serde(default)]
     pub priority: u8,
-    /// Enable this server
+    /// Enable this server (default true)
+    #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Article retention in days (0 = unlimited)
+    /// Article retention in days (0 = unlimited, the default)
+    #[serde(default)]
     pub retention: u32,
     /// Number of pipelined requests per connection
     #[serde(default = "default_pipelining")]
     pub pipelining: u8,
-    /// Server is optional (failure is non-fatal)
+    /// Server is optional (failure is non-fatal). Default false.
+    #[serde(default)]
     pub optional: bool,
     /// Enable XFEATURE COMPRESS GZIP negotiation
     #[serde(default)]
@@ -58,6 +70,20 @@ pub struct ServerConfig {
     /// to this server before giving up and treating it as unreachable.
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u32,
+}
+
+/// Default NNTPS port.
+fn default_port() -> u16 {
+    563
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Default maximum simultaneous connections.
+fn default_connections() -> u16 {
+    8
 }
 
 /// Default TCP receive buffer: 2 MiB.
@@ -97,12 +123,12 @@ impl Default for ServerConfig {
             id: uuid::Uuid::new_v4().to_string(),
             name: String::new(),
             host: String::new(),
-            port: 563,
+            port: default_port(),
             ssl: true,
             ssl_verify: true,
             username: None,
             password: None,
-            connections: 8,
+            connections: default_connections(),
             priority: 0,
             enabled: true,
             retention: 0,
@@ -186,6 +212,45 @@ mod tests {
         assert_eq!(deserialized.crc32, Some(0xDEADBEEF));
         assert_eq!(deserialized.tried_servers, vec!["server1"]);
         assert_eq!(deserialized.tries, 2);
+    }
+
+    #[test]
+    fn server_config_minimal_toml_uses_defaults() {
+        // A config.toml server block without retention/ssl_verify/etc.
+        // must load (missing `retention` used to block startup).
+        let server: ServerConfig = toml::from_str(
+            r#"
+            host = "news.example.com"
+            username = "user"
+            password = "pass"
+            "#,
+        )
+        .unwrap();
+        let defaults = ServerConfig::default();
+        assert_eq!(server.host, "news.example.com");
+        assert_eq!(server.id, "");
+        assert_eq!(server.name, "");
+        assert_eq!(server.port, 563);
+        assert!(server.ssl);
+        assert!(server.ssl_verify);
+        assert!(server.enabled);
+        assert!(!server.optional);
+        assert_eq!(server.priority, 0);
+        assert_eq!(server.retention, 0);
+        assert_eq!(server.connections, defaults.connections);
+        assert_eq!(server.pipelining, defaults.pipelining);
+        assert_eq!(server.connect_timeout_secs, defaults.connect_timeout_secs);
+    }
+
+    #[test]
+    fn server_config_partial_json_uses_defaults() {
+        let server: ServerConfig =
+            serde_json::from_str(r#"{"host":"news.example.com","port":119,"ssl":false}"#).unwrap();
+        assert_eq!(server.port, 119);
+        assert!(!server.ssl);
+        assert!(server.ssl_verify);
+        assert!(server.enabled);
+        assert_eq!(server.retention, 0);
     }
 
     #[test]
