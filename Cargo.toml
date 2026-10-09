@@ -90,7 +90,7 @@ unicode-normalization = "0.1"
 # Shared NZB crates
 nzb-web = { version = "0.4.24", path = "crates/nzb-web", features = ["groups-db"] }
 nzb-nntp = { version = "0.2.24", path = "crates/nzb-nntp" }
-nzb-core = { version = "0.2.18", path = "crates/nzb-core", features = ["groups-db"] }
+nzb-core = { version = "0.2.19", path = "crates/nzb-core", features = ["groups-db"] }
 nzb-decode = { version = "0.1.5", path = "crates/nzb-decode" }
 nzb-news = { version = "0.1.14", path = "crates/nzb-news" }
 nzb-dispatch = { version = "0.2.8", path = "crates/nzb-dispatch" }

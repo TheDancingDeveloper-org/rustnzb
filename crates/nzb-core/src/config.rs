@@ -322,6 +322,30 @@ impl Default for CategoryConfig {
     }
 }
 
+impl CategoryConfig {
+    /// Check the name and `output_dir` against the rules
+    /// `QueueManager::output_dir_for` applies when a job is enqueued, so an
+    /// entry that would make every job in the category fail can be refused
+    /// when it is saved. Returns a message suitable for an API client.
+    pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        if crate::path::safe_component(&self.name).is_none() {
+            return Err("category name must be a single non-empty path component \
+                 without '/', '\\', '..' or control characters");
+        }
+        if let Some(output_dir) = &self.output_dir {
+            // Only the shape of the override matters here, not where the
+            // complete directory lives.
+            if crate::path::category_output_root(std::path::Path::new("/"), output_dir).is_none() {
+                return Err(
+                    "category output_dir must be an absolute path, or a relative \
+                     path below the complete directory, without '..' or control characters",
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// RSS feed configuration for automatic NZB downloading.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RssFeedConfig {
@@ -695,6 +719,31 @@ ssl = false
         assert!(cfg.server("primary").is_some());
         assert_eq!(cfg.server("primary").unwrap().host, "news.primary.com");
         assert!(cfg.server("nonexistent").is_none());
+    }
+
+    #[test]
+    fn category_validate_matches_enqueue_rules() {
+        let category = |name: &str, output_dir: Option<&str>| CategoryConfig {
+            name: name.into(),
+            output_dir: output_dir.map(PathBuf::from),
+            ..CategoryConfig::default()
+        };
+        assert!(CategoryConfig::default().validate().is_ok());
+        assert!(category("*", None).validate().is_ok());
+        assert!(category("tv", Some("shows/tv")).validate().is_ok());
+        assert!(category("tv", Some("/srv/media/tv")).validate().is_ok());
+        for bad in [
+            category("", None),
+            category("..", None),
+            category("a/b", None),
+            category("a\\b", None),
+            category("a\tb", None),
+            category("tv", Some("")),
+            category("tv", Some("../../../etc")),
+            category("tv", Some("/srv/../etc")),
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
     }
 
     #[test]

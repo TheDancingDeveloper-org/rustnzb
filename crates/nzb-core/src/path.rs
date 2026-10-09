@@ -40,6 +40,23 @@ pub fn safe_component(value: &str) -> Option<&str> {
     Some(value)
 }
 
+/// Resolve a category `output_dir` override to the root its jobs land in.
+///
+/// A relative override is joined beneath `complete_dir` with [`safe_join`].
+/// An absolute override is used as is, provided it has no `..` component
+/// and no control characters. Returns `None` for anything else, including
+/// an empty override.
+pub fn category_output_root(complete_dir: &Path, output_dir: &Path) -> Option<PathBuf> {
+    if output_dir.is_absolute() {
+        let clean = !output_dir
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+            && !output_dir.to_string_lossy().chars().any(char::is_control);
+        return clean.then(|| output_dir.to_path_buf());
+    }
+    safe_join(complete_dir, &output_dir.to_string_lossy())
+}
+
 /// Maximum length, in bytes, of a sanitized job name. Leaves headroom under
 /// the common 255-byte `NAME_MAX` for suffixes such as `.1` or `_UNPACK_`.
 pub const MAX_JOB_NAME_BYTES: usize = 240;
@@ -138,6 +155,31 @@ mod tests {
         assert!(safe_component("movies").is_some());
         assert!(safe_component("../outside").is_none());
         assert!(safe_component(r"movies\tv").is_none());
+    }
+
+    #[test]
+    fn category_output_root_accepts_subdirs_and_clean_absolute_roots() {
+        let complete = Path::new("/data/complete");
+        assert_eq!(
+            category_output_root(complete, Path::new("shows/tv")),
+            Some(PathBuf::from("/data/complete/shows/tv"))
+        );
+        assert_eq!(
+            category_output_root(complete, Path::new("/srv/media")),
+            Some(PathBuf::from("/srv/media"))
+        );
+        for unsafe_dir in [
+            "",
+            "../../../etc",
+            "shows/../../etc",
+            "/srv/../etc",
+            "/srv/a\nb",
+        ] {
+            assert!(
+                category_output_root(complete, Path::new(unsafe_dir)).is_none(),
+                "{unsafe_dir:?}"
+            );
+        }
     }
 
     #[test]

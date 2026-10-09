@@ -4005,14 +4005,10 @@ impl QueueManager {
             .iter()
             .find(|configured| configured.name == category);
         if let Some(base) = category_config.and_then(|configured| configured.output_dir.as_ref()) {
-            let root = if base.is_absolute() {
-                base.clone()
-            } else {
-                crate::nzb_core::path::safe_join(&self.complete_dir(), &base.to_string_lossy())
-                    .ok_or_else(|| {
-                        crate::nzb_core::NzbError::Other("category output path is unsafe".into())
-                    })?
-            };
+            let root = crate::nzb_core::path::category_output_root(&self.complete_dir(), base)
+                .ok_or_else(|| {
+                    crate::nzb_core::NzbError::Other("category output path is unsafe".into())
+                })?;
             return crate::nzb_core::path::safe_join(&root, name).ok_or_else(|| {
                 crate::nzb_core::NzbError::Other("category output path is unsafe".into())
             });

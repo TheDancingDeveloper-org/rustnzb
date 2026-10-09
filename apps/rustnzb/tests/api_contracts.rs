@@ -283,7 +283,9 @@ async fn config_routes_validate_duplicates_and_persist_successful_updates() {
             .await
             .unwrap()
             .status(),
-        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        // A duplicate name is a client-side conflict. This asserted 500
+        // before BUG-73 routed it through the central 409 mapping.
+        reqwest::StatusCode::CONFLICT
     );
 
     let feed = serde_json::json!({"name":"daily", "url":"https://example.test/feed", "poll_interval_secs":60, "category":"tv", "filter_regex":null, "enabled":true, "auto_download":false});
@@ -946,4 +948,207 @@ async fn missing_article_returns_404() {
     )
     .await;
     assert_eq!(status, 404, "{body}");
+}
+
+/// BUG-73: config endpoints answer an unknown name or id with 404 and a
+/// duplicate add with 409, instead of a 500 that reads as a server fault.
+#[tokio::test]
+async fn unknown_config_entries_return_404_and_duplicates_return_409() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let (access, _) = login(&app, &client).await;
+    let base = &app.base_url;
+
+    // Categories.
+    let category = serde_json::json!({"name": "tv", "output_dir": null, "post_processing": 3});
+    let (status, body) = call(
+        client
+            .put(format!("{base}/api/config/categories/no-such-cat"))
+            .bearer_auth(&access)
+            .json(&category),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error_kind"], "not_found");
+    let (status, body) = call(
+        client
+            .delete(format!("{base}/api/config/categories/no-such-cat"))
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error_kind"], "not_found");
+    for expected in [200, 409] {
+        let (status, body) = call(
+            client
+                .post(format!("{base}/api/config/categories"))
+                .bearer_auth(&access)
+                .json(&category),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+    }
+
+    // Servers.
+    let (status, body) = call(
+        client
+            .put(format!("{base}/api/config/servers/no-such-server"))
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"port": 563})),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error_kind"], "server_not_found");
+    let (status, body) = call(
+        client
+            .delete(format!("{base}/api/config/servers/no-such-server"))
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error_kind"], "server_not_found");
+    let (status, body) = call(
+        client
+            .post(format!("{base}/api/config/servers/no-such-server/test"))
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    let server = serde_json::json!({
+        "id": "primary", "name": "Primary", "host": "news.example.test",
+        "port": 563, "ssl": true, "connections": 4,
+    });
+    for expected in [200, 409] {
+        let (status, body) = call(
+            client
+                .post(format!("{base}/api/config/servers"))
+                .bearer_auth(&access)
+                .json(&server),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+    }
+    assert_eq!(app.state.config().servers.len(), 1);
+
+    // RSS feeds and items.
+    let feed = serde_json::json!({"name":"daily", "url":"https://example.test/feed", "poll_interval_secs":60, "category":null, "filter_regex":null, "enabled":true, "auto_download":false});
+    let (status, body) = call(
+        client
+            .put(format!("{base}/api/config/rss-feeds/no-such-feed"))
+            .bearer_auth(&access)
+            .json(&feed),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = call(
+        client
+            .delete(format!("{base}/api/config/rss-feeds/no-such-feed"))
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    for expected in [200, 409] {
+        let (status, body) = call(
+            client
+                .post(format!("{base}/api/config/rss-feeds"))
+                .bearer_auth(&access)
+                .json(&feed),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+    }
+    let (status, body) = call(
+        client
+            .post(format!("{base}/api/rss/items/no-such-item/download"))
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+
+    // Groups.
+    for path in ["", "/status"] {
+        let (status, body) = call(
+            client
+                .get(format!("{base}/api/groups/987654{path}"))
+                .bearer_auth(&access),
+        )
+        .await;
+        assert_eq!(status, 404, "{path}: {body}");
+        assert_eq!(body["error_kind"], "not_found");
+    }
+    let (status, body) = call(
+        client
+            .post(format!("{base}/api/groups/987654/headers/fetch"))
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+}
+
+/// BUG-74: a category whose name or output_dir would make every later
+/// enqueue fail ("category output path is unsafe") is refused at save time.
+#[tokio::test]
+async fn category_save_rejects_unsafe_name_and_output_dir() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let (access, _) = login(&app, &client).await;
+    let base = &app.base_url;
+    let category = |name: &str, output_dir: serde_json::Value| serde_json::json!({"name": name, "output_dir": output_dir, "post_processing": 3});
+
+    let unsafe_bodies = [
+        category("../escape", serde_json::Value::Null),
+        category("a/b", serde_json::Value::Null),
+        category("..", serde_json::Value::Null),
+        category("", serde_json::Value::Null),
+        category("tab\tname", serde_json::Value::Null),
+        category("tv", serde_json::json!("../../../etc")),
+        category("tv", serde_json::json!("shows/../../etc")),
+        category("tv", serde_json::json!("")),
+        category("tv", serde_json::json!("/srv/media/../../etc")),
+    ];
+    for body in &unsafe_bodies {
+        let (status, response) = call(
+            client
+                .post(format!("{base}/api/config/categories"))
+                .bearer_auth(&access)
+                .json(body),
+        )
+        .await;
+        assert_eq!(status, 400, "POST {body}: {response}");
+        assert_eq!(response["error_kind"], "bad_request");
+        let (status, response) = call(
+            client
+                .put(format!("{base}/api/config/categories/Default"))
+                .bearer_auth(&access)
+                .json(body),
+        )
+        .await;
+        assert_eq!(status, 400, "PUT {body}: {response}");
+    }
+    let saved = AppConfig::load(&app.config_path).unwrap();
+    assert_eq!(saved.categories.len(), 1);
+    assert_eq!(saved.categories[0].name, "Default");
+    assert!(saved.categories[0].output_dir.is_none());
+
+    // What enqueue accepts is still accepted: relative subdirectories and
+    // absolute roots.
+    for body in [
+        category("tv", serde_json::json!("shows/tv")),
+        category("movies", serde_json::json!("/srv/media/movies")),
+    ] {
+        let (status, response) = call(
+            client
+                .post(format!("{base}/api/config/categories"))
+                .bearer_auth(&access)
+                .json(&body),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}: {response}");
+    }
+    let output = app
+        .state
+        .queue_manager
+        .output_dir_for("tv", "Some.Job")
+        .unwrap();
+    assert!(output.ends_with("complete/shows/tv/Some.Job"), "{output:?}");
 }
