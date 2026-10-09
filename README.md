@@ -205,9 +205,11 @@ curl -X POST http://localhost:9090/api/queue/add-url \
   -H "Content-Type: application/json" \
   -d '{"url": "https://example.com/file.nzb", "category": "movies"}'
 
-# Upload NZB file
+# Upload NZB file (optional fields: category/cat, priority 0-3,
+# name/nzbname; each may also be passed as a query parameter, and a form
+# field wins over the query)
 curl -X POST http://localhost:9090/api/queue/add \
-  -F "file=@/path/to/file.nzb" -F "category=tv"
+  -F "file=@/path/to/file.nzb" -F "category=tv" -F "priority=2"
 
 # Upload an NZB with an archive password (multipart `password` field;
 # `add-url` takes a JSON `password`)
