@@ -3,11 +3,32 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::http::request::Parts;
 use serde::Deserialize;
 
 use nzb_web::error::ApiError;
 use nzb_web::state::AppState;
+
+/// `Path` extractor whose rejection is a JSON `ApiError` 400 instead of
+/// axum's plain-text parser message (which leaks Rust type names such as
+/// "Cannot parse `abc` to a `i64`").
+pub struct IdPath<T>(pub T);
+
+impl<S, T> FromRequestParts<S> for IdPath<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned + Send,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Path(value)| IdPath(value))
+            .map_err(|_| ApiError::bad_request("Invalid id in request path"))
+    }
+}
 
 #[derive(Deserialize, Default)]
 pub struct GroupListQuery {
@@ -98,7 +119,7 @@ pub async fn h_group_refresh(
 /// GET /api/groups/{id}
 pub async fn h_group_get(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
+    IdPath(id): IdPath<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let group = state
         .queue_manager
@@ -113,7 +134,7 @@ pub async fn h_group_get(
 /// GET /api/groups/{id}/status
 pub async fn h_group_status(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
+    IdPath(id): IdPath<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let qm = &state.queue_manager;
     let group = qm
@@ -140,7 +161,7 @@ pub async fn h_group_status(
 /// POST /api/groups/{id}/subscribe
 pub async fn h_group_subscribe(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
+    IdPath(id): IdPath<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .queue_manager
@@ -152,7 +173,7 @@ pub async fn h_group_subscribe(
 /// POST /api/groups/{id}/unsubscribe
 pub async fn h_group_unsubscribe(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
+    IdPath(id): IdPath<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .queue_manager
@@ -164,7 +185,7 @@ pub async fn h_group_unsubscribe(
 /// GET /api/groups/{id}/headers
 pub async fn h_header_list(
     State(state): State<Arc<AppState>>,
-    Path(group_id): Path<i64>,
+    IdPath(group_id): IdPath<i64>,
     Query(q): Query<HeaderListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = q.limit.unwrap_or(50);
@@ -186,7 +207,7 @@ pub async fn h_header_list(
 /// POST /api/groups/{id}/headers/fetch — Background XOVER fetch.
 pub async fn h_header_fetch(
     State(state): State<Arc<AppState>>,
-    Path(group_id): Path<i64>,
+    IdPath(group_id): IdPath<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use nzb_web::nzb_core::nzb_nntp::connection::NntpConnection;
 
@@ -292,7 +313,7 @@ pub async fn h_header_fetch(
 /// GET /api/groups/{id}/threads
 pub async fn h_thread_list(
     State(state): State<Arc<AppState>>,
-    Path(group_id): Path<i64>,
+    IdPath(group_id): IdPath<i64>,
     Query(q): Query<HeaderListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = q.limit.unwrap_or(50);
@@ -311,7 +332,7 @@ pub async fn h_thread_list(
 /// GET /api/groups/{gid}/threads/{root_msg_id}
 pub async fn h_thread_get(
     State(state): State<Arc<AppState>>,
-    Path((group_id, root_msg_id)): Path<(i64, String)>,
+    IdPath((group_id, root_msg_id)): IdPath<(i64, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let articles = state
         .queue_manager
@@ -326,7 +347,7 @@ pub async fn h_thread_get(
 /// POST /api/groups/{id}/headers/mark-read
 pub async fn h_header_mark_read(
     State(state): State<Arc<AppState>>,
-    Path(_group_id): Path<i64>,
+    IdPath(_group_id): IdPath<i64>,
     Json(input): Json<nzb_web::nzb_core::models::MarkReadInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let count = state
@@ -339,7 +360,7 @@ pub async fn h_header_mark_read(
 /// POST /api/groups/{id}/headers/mark-all-read
 pub async fn h_header_mark_all_read(
     State(state): State<Arc<AppState>>,
-    Path(group_id): Path<i64>,
+    IdPath(group_id): IdPath<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let count = state
         .queue_manager
@@ -372,10 +393,12 @@ pub async fn h_article_get(
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!("Connect failed: {e}")))?;
 
-    let response = conn
-        .fetch_article(&message_id)
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!("ARTICLE failed: {e}")))?;
+    let response = conn.fetch_article(&message_id).await.map_err(|e| match e {
+        nzb_web::nzb_core::nzb_nntp::error::NntpError::ArticleNotFound(_) => {
+            ApiError::not_found("Article not found")
+        }
+        e => ApiError::from(anyhow::anyhow!("ARTICLE failed: {e}")),
+    })?;
     let _ = conn.quit().await;
 
     let body = response
@@ -392,7 +415,7 @@ pub async fn h_article_get(
 /// POST /api/groups/{id}/headers/download — Download selected as NZB.
 pub async fn h_header_download(
     State(state): State<Arc<AppState>>,
-    Path(group_id): Path<i64>,
+    IdPath(group_id): IdPath<i64>,
     Json(input): Json<nzb_web::nzb_core::models::DownloadSelectedInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let group = state

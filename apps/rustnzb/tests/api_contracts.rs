@@ -530,6 +530,128 @@ async fn logout_revokes_the_access_token() {
     );
 }
 
+/// Send a request and return (status, parsed JSON body or Null).
+async fn call(request: reqwest::RequestBuilder) -> (u16, serde_json::Value) {
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn unknown_ids_return_404_and_invalid_input_returns_400() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let (access, _) = login(&app, &client).await;
+    let base = &app.base_url;
+
+    // BUG-51: retry of an unknown history entry.
+    let (status, body) = call(
+        client
+            .post(format!("{base}/api/history/no-such-id/retry"))
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error_kind"], "not_found");
+
+    // BUG-52: out-of-range priority is a 400, unknown job a 404.
+    let (status, body) = call(
+        client
+            .put(format!("{base}/api/queue/no-such-id/priority"))
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"priority": 999})),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error_kind"], "bad_request");
+    let (status, body) = call(
+        client
+            .put(format!("{base}/api/queue/no-such-id/priority"))
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"priority": 2})),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error_kind"], "job_not_found");
+
+    // BUG-55: move of an unknown job, logs of an unknown history entry.
+    let (status, body) = call(
+        client
+            .post(format!("{base}/api/queue/no-such-id/move"))
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"position": 0})),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = call(
+        client
+            .get(format!("{base}/api/history/no-such-id/logs"))
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+
+    // BUG-55: non-numeric group id is a JSON 400 without parser internals.
+    let response = client
+        .get(format!("{base}/api/groups/not-a-number"))
+        .bearer_auth(&access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400);
+    let text = response.text().await.unwrap();
+    assert!(!text.contains("i64"), "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("JSON error body");
+    assert_eq!(body["error_kind"], "bad_request");
+
+    // BUG-56: invalid regex is a 400; updating an unknown rule is a 404;
+    // deleting an unknown rule stays idempotent.
+    let rule = |regex: &str| serde_json::json!({"name": "r", "feed_names": ["nope"], "match_regex": regex});
+    let (status, body) = call(
+        client
+            .post(format!("{base}/api/rss/rules"))
+            .bearer_auth(&access)
+            .json(&rule("(unclosed")),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = call(
+        client
+            .put(format!("{base}/api/rss/rules/no-such-rule"))
+            .bearer_auth(&access)
+            .json(&rule(".*")),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert!(app.state.queue_manager.rss_rule_list().unwrap().is_empty());
+    let (status, _) = call(
+        client
+            .delete(format!("{base}/api/rss/rules/no-such-rule"))
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // A rule whose feed does not exist is accepted with a warning.
+    let (status, body) = call(
+        client
+            .post(format!("{base}/api/rss/rules"))
+            .bearer_auth(&access)
+            .json(&rule(".*")),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], true);
+    assert!(
+        body["warnings"][0].as_str().unwrap().contains("nope"),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn server_update_keeps_password_unless_a_new_one_is_sent() {
     let app = start_app(false).await;
@@ -737,4 +859,28 @@ async fn concurrent_config_writes_do_not_lose_updates() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn missing_article_returns_404() {
+    use nzb_nntp::testutil::{MockConfig, MockNntpServer, test_config};
+
+    let server = MockNntpServer::start(MockConfig::default()).await;
+    let app = start_app(true).await;
+    app.state
+        .queue_manager
+        .update_servers(vec![test_config(server.port())]);
+    let client = reqwest::Client::new();
+    let (access, _) = login(&app, &client).await;
+
+    let (status, body) = call(
+        client
+            .get(format!(
+                "{}/api/articles/missing@example.test",
+                app.base_url
+            ))
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
 }
