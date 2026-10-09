@@ -96,7 +96,14 @@ pub struct MoveJobBody {
 
 #[derive(Deserialize)]
 pub struct SortQueueBody {
-    /// Sort in ascending remaining percentage order when true.
+    /// Field to sort by: `remaining` (default), `name`, `size`, `age` or
+    /// `priority`.
+    #[serde(default)]
+    pub sort_by: Option<String>,
+    /// `asc` or `desc`. Takes precedence over `ascending` when present.
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// Legacy direction flag, used when `direction` is absent.
     #[serde(default = "default_sort_ascending")]
     pub ascending: bool,
 }
@@ -426,14 +433,25 @@ pub async fn h_queue_set_priority(
     Ok(Json(SimpleResponse { status: true }))
 }
 
-/// POST /api/queue/sort -- Stable sort by remaining work percentage.
+/// POST /api/queue/sort -- Stable sort by `sort_by` (default: remaining
+/// work percentage) in `direction` (or the legacy `ascending` flag).
 pub async fn h_queue_sort(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SortQueueBody>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
-    state
-        .queue_manager
-        .sort_by_remaining_percentage(body.ascending);
+    let field = match body.sort_by.as_deref() {
+        None => nzb_web::QueueSortField::Remaining,
+        Some(value) => value.parse().map_err(|()| {
+            ApiError::bad_request("sort_by must be one of: remaining, name, size, age, priority")
+        })?,
+    };
+    let ascending = match body.direction.as_deref() {
+        None => body.ascending,
+        Some(value) if value.eq_ignore_ascii_case("asc") => true,
+        Some(value) if value.eq_ignore_ascii_case("desc") => false,
+        Some(_) => return Err(ApiError::bad_request("direction must be asc or desc")),
+    };
+    state.queue_manager.sort_queue(field, ascending);
     Ok(Json(SimpleResponse { status: true }))
 }
 
