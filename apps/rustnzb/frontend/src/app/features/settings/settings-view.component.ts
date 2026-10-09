@@ -1489,12 +1489,12 @@ export class SettingsViewComponent implements OnInit {
   }
 
   editServer(s: ServerConfig): void {
-    this.editingServer = { ...s };
+    this.editingServer = { ...s, password: '' };
     this.editingServerId = s.id;
   }
 
   cloneServer(s: ServerConfig): void {
-    this.editingServer = { ...s, id: '', name: `${s.name} (copy)` };
+    this.editingServer = { ...s, id: '', name: `${s.name} (copy)`, password: '' };
     this.editingServerId = null;
   }
 
@@ -1511,7 +1511,11 @@ export class SettingsViewComponent implements OnInit {
       return;
     }
     if (!server.username) server.username = null;
-    if (!server.password) server.password = null;
+    if (this.editingServerId) {
+      server.password = server.password ? server.password : '********';
+    } else if (!server.password) {
+      server.password = null;
+    }
 
     if (this.editingServerId) {
       this.api.put(`/config/servers/${this.editingServerId}`, server).subscribe({
@@ -1548,7 +1552,8 @@ export class SettingsViewComponent implements OnInit {
     if (!this.editingServer) return;
     const body = { ...this.editingServer };
     if (!body.username) body.username = null;
-    if (!body.password) body.password = null;
+    if (this.editingServerId && !body.password) body.password = '********';
+    else if (!body.password) body.password = null;
     this.snack.open('Testing…', '', { duration: 1500 });
     this.api
       .post<{ success: boolean; message: string }>(`/config/servers/test-config`, body)
@@ -1561,7 +1566,7 @@ export class SettingsViewComponent implements OnInit {
   toggleServerEnabled(s: ServerConfig): void {
     const updated = { ...s, enabled: !s.enabled };
     if (!updated.username) updated.username = null;
-    if (!updated.password) updated.password = null;
+    if (!updated.password) updated.password = '********';
     this.api.put(`/config/servers/${s.id}`, updated).subscribe({
       next: () => {
         this.loadServers();

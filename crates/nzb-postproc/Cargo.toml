@@ -25,8 +25,6 @@ tar.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 # Integration tests synthesise real PAR2 index files (see
 # `tests/support/par2_fixture.rs`), which requires writing spec-correct
 # packet MD5s. Version tracks what `rust-par2` itself parses with.

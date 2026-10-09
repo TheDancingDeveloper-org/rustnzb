@@ -532,7 +532,7 @@ async fn logout_revokes_the_access_token() {
 
 #[tokio::test]
 async fn server_update_keeps_password_unless_a_new_one_is_sent() {
-    let app = start_app(true).await;
+    let app = start_app(false).await;
     let client = reqwest::Client::new();
     let access = setup_access(&app, &client).await;
     let server = |password: serde_json::Value| {
@@ -590,11 +590,28 @@ async fn server_update_keeps_password_unless_a_new_one_is_sent() {
     let response = put(server("rotated".into())).await.unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(stored_password().as_deref(), Some("rotated"));
+
+    for path in ["/api/config", "/api/config/servers"] {
+        let body = client
+            .get(format!("{}{path}", app.base_url))
+            .bearer_auth(&access)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            !body.contains("rotated"),
+            "{path} must not echo the password"
+        );
+        assert!(body.contains("********"), "{path} must mask the password");
+    }
 }
 
 #[tokio::test]
 async fn server_add_and_update_accept_partial_bodies() {
-    let app = start_app(true).await;
+    let app = start_app(false).await;
     let client = reqwest::Client::new();
     let access = setup_access(&app, &client).await;
 

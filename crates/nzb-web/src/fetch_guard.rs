@@ -68,12 +68,23 @@ impl FetchPolicy {
     }
 
     fn ip_is_allowed(&self, ip: IpAddr) -> bool {
+        if is_cloud_metadata(ip) {
+            return self.ip_is_explicitly_allowed(ip);
+        }
         is_globally_routable(ip)
             || self
                 .allowed_networks
                 .iter()
                 .any(|(net, prefix)| network_contains(*net, *prefix, ip))
             || (self.allow_private && is_private_lan(ip))
+    }
+
+    /// An explicit IP or CIDR entry, which is the only way to admit a
+    /// cloud-metadata address. A hostname entry does not count.
+    fn ip_is_explicitly_allowed(&self, ip: IpAddr) -> bool {
+        self.allowed_networks
+            .iter()
+            .any(|(net, prefix)| network_contains(*net, *prefix, ip))
     }
 }
 
@@ -114,6 +125,26 @@ fn network_contains(net: IpAddr, prefix: u8, ip: IpAddr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Cloud instance metadata endpoints. These sit inside ranges that
+/// `fetch_allow_private` otherwise admits (CGNAT, unique-local, link-local),
+/// so they are refused even when that flag is on and even when a hostname
+/// that resolves to them is listed. Only an explicit IP or CIDR entry in
+/// `fetch_allowed_hosts` admits them.
+fn is_cloud_metadata(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_cloud_metadata_v4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_cloud_metadata_v4(v4),
+            None => v6 == "fd00:ec2::254".parse::<std::net::Ipv6Addr>().unwrap(),
+        },
+    }
+}
+
+fn is_cloud_metadata_v4(v4: std::net::Ipv4Addr) -> bool {
+    v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
+        || v4 == std::net::Ipv4Addr::new(100, 100, 100, 200)
 }
 
 /// Private LAN ranges a self-hosted indexer may live on: RFC 1918,
@@ -213,6 +244,12 @@ async fn validate_inner(raw_url: &str, policy: &FetchPolicy) -> Result<FetchUrlP
     // IP literal: validate directly without a DNS round-trip.
     let literal = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = literal.parse::<IpAddr>() {
+        if is_cloud_metadata(ip) && !policy.ip_is_explicitly_allowed(ip) {
+            return Err(reject(anyhow::anyhow!(
+                "URL targets a cloud metadata address (allow it only with an \
+                 explicit IP or CIDR in general.fetch_allowed_hosts)"
+            )));
+        }
         if !policy.ip_is_allowed(ip) {
             return Err(reject(anyhow::anyhow!(
                 "URL targets a private/reserved address (allow it with \
@@ -250,6 +287,17 @@ async fn validate_inner(raw_url: &str, policy: &FetchPolicy) -> Result<FetchUrlP
                 return Err(reject(anyhow::anyhow!(
                     "URL resolves to a private/reserved address (allow it with \
                      general.fetch_allow_private or general.fetch_allowed_hosts)"
+                )));
+            }
+        }
+    } else {
+        // A listed hostname still cannot resolve to a cloud-metadata address
+        // unless that address itself is an explicit allowlist entry.
+        for addr in &addrs {
+            if is_cloud_metadata(addr.ip()) && !policy.ip_is_explicitly_allowed(addr.ip()) {
+                return Err(reject(anyhow::anyhow!(
+                    "URL resolves to a cloud metadata address (allow it only with \
+                     an explicit IP or CIDR in general.fetch_allowed_hosts)"
                 )));
             }
         }
@@ -376,7 +424,7 @@ mod tests {
         let err = validate_fetch_url("http://169.254.169.254/latest/meta-data/")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("private/reserved"));
+        assert!(err.to_string().contains("cloud metadata"));
     }
 
     #[tokio::test]
@@ -437,6 +485,10 @@ mod tests {
         }
         for url in [
             "http://169.254.169.254/latest/meta-data/",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://[fd00:ec2::254]/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://[::ffff:100.100.100.200]/",
             "http://[fe80::1]/",
             "http://127.0.0.1:5076/api",
             "http://[::1]/api",
@@ -447,7 +499,11 @@ mod tests {
             let error = validate_fetch_url_with(url, &policy)
                 .await
                 .expect_err("non-LAN special address must stay blocked");
-            assert!(error.to_string().contains("private/reserved"), "{url}");
+            let message = error.to_string();
+            assert!(
+                message.contains("private/reserved") || message.contains("cloud metadata"),
+                "{url}: {message}"
+            );
         }
     }
 
@@ -481,6 +537,26 @@ mod tests {
         validate_fetch_url_with("http://169.254.169.254/", &policy)
             .await
             .expect("explicitly listed metadata address is allowed");
+    }
+
+    #[tokio::test]
+    async fn listed_hostname_still_cannot_resolve_to_metadata() {
+        let policy = FetchPolicy::new(true, &hosts(&["metadata.example.test"]));
+        assert!(policy.host_is_listed("metadata.example.test"));
+        for ip in [
+            "100.100.100.200".parse::<IpAddr>().unwrap(),
+            "fd00:ec2::254".parse().unwrap(),
+            "::ffff:100.100.100.200".parse().unwrap(),
+        ] {
+            assert!(
+                is_cloud_metadata(ip) && !policy.ip_is_explicitly_allowed(ip),
+                "{ip} must stay denied when only a hostname is listed"
+            );
+        }
+        let explicit = FetchPolicy::new(false, &hosts(&["100.100.100.200"]));
+        validate_fetch_url_with("http://100.100.100.200/latest", &explicit)
+            .await
+            .expect("an explicit IP entry admits the metadata address");
     }
 
     #[tokio::test]

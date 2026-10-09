@@ -867,10 +867,13 @@ pub async fn h_logs(
 // ---------------------------------------------------------------------------
 
 /// GET /api/config -- Get current configuration.
+///
+/// Server passwords are replaced with `********`. The stored value is never
+/// returned; an update that sends the mask back keeps it.
 pub async fn h_config_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<nzb_web::nzb_core::config::AppConfig>, ApiError> {
-    Ok(Json((*state.config()).clone()))
+    Ok(Json(masked_config(&state.config())))
 }
 
 /// GET /api/config/sabnzbd-api-key -- Return the current SABnzbd API key.
@@ -906,10 +909,24 @@ pub async fn h_sab_api_key_rotate(
 }
 
 /// GET /api/config/servers -- List configured servers.
+///
+/// Passwords are replaced with `********`.
 pub async fn h_servers_list(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ServerConfig>>, ApiError> {
-    Ok(Json(state.config().servers.clone()))
+    Ok(Json(masked_config(&state.config()).servers))
+}
+
+fn masked_config(
+    config: &nzb_web::nzb_core::config::AppConfig,
+) -> nzb_web::nzb_core::config::AppConfig {
+    let mut config = config.clone();
+    for server in &mut config.servers {
+        if server.password.is_some() {
+            server.password = Some(PASSWORD_MASK.to_string());
+        }
+    }
+    config
 }
 
 /// POST /api/config/servers -- Add a new server.
