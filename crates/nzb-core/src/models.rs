@@ -249,6 +249,11 @@ pub struct HistoryEntry {
     pub stages: Vec<StageResult>,
     pub error_message: Option<String>,
     pub failure_code: Option<JobFailureCode>,
+    /// Effective post-processing level the job ran with (0=none, 1=repair,
+    /// 2=unpack, 3=repair+unpack). `None` for rows recorded before it was
+    /// stored.
+    #[serde(default)]
+    pub post_processing: Option<u8>,
     /// Per-server download statistics
     #[serde(default)]
     pub server_stats: Vec<ServerArticleStats>,

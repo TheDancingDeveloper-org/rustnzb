@@ -23,7 +23,7 @@ use crate::nzb_core::models::*;
 use crate::nzb_core::nzb_parser;
 use nzb_postproc::{
     PostProcConfig, PostProcLimits, PostProcResourcePool, PostProcResourceSnapshot,
-    has_usable_output, parse_rar_volume, run_pipeline_with_cleanup,
+    has_usable_output, parse_rar_volume, run_pipeline_with_cleanup, run_repair_pipeline,
 };
 
 use crate::direct_unpack::DirectUnpacker;
@@ -1283,11 +1283,17 @@ impl QueueManager {
     /// Post-processing level for a job: its own override (e.g. SABnzbd's
     /// `pp`), else its category's setting, else repair+unpack (3).
     pub fn post_processing_level(&self, job: &NzbJob) -> u8 {
-        job.pp_override.unwrap_or_else(|| {
+        self.post_processing_level_for(job.pp_override, &job.category)
+    }
+
+    /// [`Self::post_processing_level`] from the job's fields, for callers
+    /// that hold a borrow of another part of the job.
+    fn post_processing_level_for(&self, pp_override: Option<u8>, category: &str) -> u8 {
+        pp_override.unwrap_or_else(|| {
             self.categories
                 .lock()
                 .iter()
-                .find(|c| c.name == job.category)
+                .find(|c| c.name == category)
                 .map(|c| c.post_processing)
                 .unwrap_or(3) // default: repair+unpack
         })
@@ -2155,6 +2161,12 @@ impl QueueManager {
                                         // unpacker so extraction overlaps with download.
                                         if self.direct_unpack_enabled.load(Ordering::Relaxed)
                                             && state.job.articles_failed == 0
+                                            // Download-only and repair-only jobs
+                                            // deliver their archives unpacked.
+                                            && self.post_processing_level_for(
+                                                state.job.pp_override,
+                                                &state.job.category,
+                                            ) >= 2
                                             && let Some(vol_info) = parse_rar_volume(&file.filename)
                                         {
                                             if state.direct_unpacker.is_none() {
@@ -2644,14 +2656,19 @@ impl QueueManager {
                 max_nested_archive_depth: self.max_nested_archive_depth,
             };
 
-            let result = run_pipeline_with_cleanup(
-                &work_dir,
-                &config,
-                Some(&self.postproc_resources),
-                &cleanup_patterns,
-                &unwanted_extensions,
-            )
-            .await;
+            let result = if pp_level >= 2 {
+                run_pipeline_with_cleanup(
+                    &work_dir,
+                    &config,
+                    Some(&self.postproc_resources),
+                    &cleanup_patterns,
+                    &unwanted_extensions,
+                )
+                .await
+            } else {
+                // Repair only (SABnzbd `pp=1`): the archives are the output.
+                run_repair_pipeline(&work_dir, &config, Some(&self.postproc_resources)).await
+            };
 
             info!(
                 job_id = %job_id,
@@ -2676,18 +2693,22 @@ impl QueueManager {
 
             result.stages
         } else {
-            info!(job_id = %job_id, pp_level, "Post-processing disabled for category, skipping pipeline");
-            // No pipeline to repair — if articles failed, mark as failed now
-            if !success {
-                let mut jobs = self.jobs.lock();
-                if let Some(state) = jobs.get_mut(job_id) {
-                    state.job.status = JobStatus::Failed;
-                    state.job.error_message =
-                        Some(format!("{articles_failed} article(s) failed to download"));
-                    state.failure_code = Some(JobFailureCode::ArticlesUnavailable);
-                }
+            info!(job_id = %job_id, pp_level, "Post-processing disabled for job, skipping pipeline");
+            // Download only (SABnzbd `pp=0`): nothing is verified or
+            // repaired, so the raw files are delivered as downloaded, as
+            // SABnzbd does. Hopeless jobs never reach this point.
+            if success {
+                Vec::new()
+            } else {
+                vec![StageResult {
+                    name: "Verify".to_string(),
+                    status: StageStatus::Skipped,
+                    message: Some(format!(
+                        "Post-processing disabled; {articles_failed} article(s) failed to download"
+                    )),
+                    duration_secs: 0.0,
+                }]
             }
-            Vec::new()
         };
 
         // Run the configured hook after the final status is known. Its output
@@ -2877,7 +2898,10 @@ impl QueueManager {
         // A post-processing job that contains only raw archive/PAR2 artifacts
         // is not a usable completion. Check before moving residual work files
         // so a bad job cannot pollute the completed directory.
-        if final_status == JobStatus::Completed && !stages.is_empty() {
+        // Only unpacking jobs promise extracted output: download-only (0) and
+        // repair-only (1) jobs deliver the archives themselves.
+        let pp_level = self.post_processing_level(&state.job);
+        if final_status == JobStatus::Completed && pp_level >= 2 && !stages.is_empty() {
             let output_has_payload = has_usable_output(&state.job.output_dir).unwrap_or(false);
             let work_has_payload = has_usable_output(&state.job.work_dir).unwrap_or(false);
             if !output_has_payload && !work_has_payload {
@@ -2984,6 +3008,7 @@ impl QueueManager {
             error_message: state.job.error_message.clone(),
             failure_code: (final_status == JobStatus::Failed)
                 .then(|| state.failure_code.unwrap_or(JobFailureCode::DownloadFailed)),
+            post_processing: Some(pp_level),
             server_stats: state.job.server_stats.clone(),
             nzb_data: state.nzb_data.clone(),
             retry_data,
@@ -3461,6 +3486,7 @@ impl QueueManager {
                     failure_code: Some(
                         state.failure_code.unwrap_or(JobFailureCode::DownloadFailed),
                     ),
+                    post_processing: Some(self.post_processing_level(&state.job)),
                     server_stats: state.job.server_stats.clone(),
                     nzb_data: state.nzb_data.clone(),
                     retry_data: None,
@@ -5104,6 +5130,7 @@ mod global_pause_tests {
             stages: Vec::new(),
             error_message: None,
             failure_code: None,
+            post_processing: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
@@ -5540,6 +5567,187 @@ mod global_pause_tests {
             !work_dir.exists(),
             "failed raw artifacts are cleaned after history persists"
         );
+    }
+
+    fn set_default_pp(manager: &QueueManager, level: u8) {
+        manager.set_categories(vec![CategoryConfig {
+            post_processing: level,
+            ..CategoryConfig::default()
+        }]);
+    }
+
+    fn write_raw_artifacts(work_dir: &std::path::Path) {
+        std::fs::create_dir_all(work_dir).unwrap();
+        std::fs::write(work_dir.join("release.part001.rar"), b"raw").unwrap();
+        std::fs::write(work_dir.join("release.part002.rar"), b"raw").unwrap();
+        std::fs::write(work_dir.join("release.par2"), b"par2").unwrap();
+    }
+
+    /// SABnzbd `pp=0` is download only: the raw archives are the output, so
+    /// the "no usable output" rule must not fail the job (even when a
+    /// post-processing script contributed a stage).
+    #[tokio::test]
+    async fn download_only_job_with_raw_archives_is_completed() {
+        let (manager, tempdir) = manager();
+        set_default_pp(&manager, 0);
+        let raw = job("download-only", JobStatus::PostProcessing, tempdir.path());
+        write_raw_artifacts(&raw.work_dir);
+        let output = raw.output_dir.clone();
+        insert_job(&manager, raw);
+
+        let stages = vec![StageResult {
+            name: "Script".to_string(),
+            status: StageStatus::Success,
+            message: Some("ok".to_string()),
+            duration_secs: 0.0,
+        }];
+        let mut jobs = manager.jobs.lock();
+        manager.move_to_history(jobs.get_mut("download-only").unwrap(), stages);
+        drop(jobs);
+
+        let entry = manager
+            .db
+            .lock()
+            .history_get("download-only")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.status,
+            JobStatus::Completed,
+            "{:?}",
+            entry.error_message
+        );
+        assert_eq!(entry.post_processing, Some(0));
+        assert!(output.join("release.part001.rar").exists());
+        assert!(output.join("release.par2").exists());
+    }
+
+    /// SABnzbd `pp=1` is repair only: archives are the expected output.
+    #[tokio::test]
+    async fn repair_only_job_with_raw_archives_is_completed() {
+        let (manager, tempdir) = manager();
+        set_default_pp(&manager, 1);
+        let raw = job("repair-only", JobStatus::PostProcessing, tempdir.path());
+        write_raw_artifacts(&raw.work_dir);
+        let output = raw.output_dir.clone();
+        insert_job(&manager, raw);
+
+        let stages = vec![StageResult {
+            name: "Verify".to_string(),
+            status: StageStatus::Skipped,
+            message: Some("Skipped".to_string()),
+            duration_secs: 0.0,
+        }];
+        let mut jobs = manager.jobs.lock();
+        manager.move_to_history(jobs.get_mut("repair-only").unwrap(), stages);
+        drop(jobs);
+
+        let entry = manager
+            .db
+            .lock()
+            .history_get("repair-only")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.status,
+            JobStatus::Completed,
+            "{:?}",
+            entry.error_message
+        );
+        assert_eq!(entry.post_processing, Some(1));
+        assert!(output.join("release.part002.rar").exists());
+    }
+
+    /// The per-job override decides the level recorded in history.
+    #[tokio::test]
+    async fn history_records_the_job_override_level() {
+        let (manager, tempdir) = manager();
+        set_default_pp(&manager, 3);
+        let mut raw = job("override-level", JobStatus::PostProcessing, tempdir.path());
+        raw.pp_override = Some(1);
+        write_raw_artifacts(&raw.work_dir);
+        insert_job(&manager, raw);
+
+        let mut jobs = manager.jobs.lock();
+        manager.move_to_history(jobs.get_mut("override-level").unwrap(), Vec::new());
+        drop(jobs);
+
+        let entry = manager
+            .db
+            .lock()
+            .history_get("override-level")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.post_processing, Some(1));
+        assert_eq!(entry.status, JobStatus::Completed);
+    }
+
+    /// `pp=1` must not unpack: a (bogus) archive is delivered as-is instead
+    /// of failing extraction.
+    #[tokio::test]
+    async fn repair_only_pipeline_does_not_extract() {
+        let (manager, tempdir) = manager();
+        set_default_pp(&manager, 1);
+        let raw = job(
+            "repair-no-unpack",
+            JobStatus::PostProcessing,
+            tempdir.path(),
+        );
+        std::fs::create_dir_all(&raw.work_dir).unwrap();
+        std::fs::write(raw.work_dir.join("release.zip"), b"not really a zip").unwrap();
+        let output = raw.output_dir.clone();
+        insert_job(&manager, raw);
+
+        manager.on_job_finished("repair-no-unpack", true, 0).await;
+
+        let entry = manager
+            .db
+            .lock()
+            .history_get("repair-no-unpack")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.status,
+            JobStatus::Completed,
+            "{:?}",
+            entry.error_message
+        );
+        assert!(entry.stages.iter().all(|stage| stage.name != "Extract"));
+        assert!(output.join("release.zip").exists());
+    }
+
+    /// `pp=0` does not verify or repair, so missing articles do not fail
+    /// the job; the raw files are delivered like SABnzbd does.
+    #[tokio::test]
+    async fn download_only_job_with_failed_articles_is_completed() {
+        let (manager, tempdir) = manager();
+        set_default_pp(&manager, 0);
+        let raw = job(
+            "download-only-damaged",
+            JobStatus::PostProcessing,
+            tempdir.path(),
+        );
+        write_raw_artifacts(&raw.work_dir);
+        let output = raw.output_dir.clone();
+        insert_job(&manager, raw);
+
+        manager
+            .on_job_finished("download-only-damaged", false, 2)
+            .await;
+
+        let entry = manager
+            .db
+            .lock()
+            .history_get("download-only-damaged")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.status,
+            JobStatus::Completed,
+            "{:?}",
+            entry.error_message
+        );
+        assert!(output.join("release.part001.rar").exists());
     }
 
     #[tokio::test]

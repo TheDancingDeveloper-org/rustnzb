@@ -23,7 +23,7 @@ pub use detect::{
 pub use par2::recovery_can_cover;
 pub use pipeline::{
     PostProcConfig, PostProcResult, run_pipeline, run_pipeline_with_cleanup,
-    run_pipeline_with_resources,
+    run_pipeline_with_resources, run_repair_pipeline,
 };
 pub use resources::{PostProcLimits, PostProcResourcePool, PostProcResourceSnapshot};
 pub use unpack::{extract_tar, find_unrar, normalize_extracted_permissions};
