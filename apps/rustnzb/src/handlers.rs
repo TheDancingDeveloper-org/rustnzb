@@ -2013,6 +2013,16 @@ pub struct BulkActionResponse {
     pub status: bool,
     pub succeeded: usize,
     pub failed: usize,
+    /// One entry per id that failed, in request order.
+    pub failures: Vec<BulkActionFailure>,
+}
+
+#[derive(Serialize)]
+pub struct BulkActionFailure {
+    pub id: String,
+    /// Same shape as an API error body (`error_kind`, `human_readable`,
+    /// `status`).
+    pub error: ApiError,
 }
 
 /// POST /api/queue/bulk -- Perform an action on multiple jobs.
@@ -2022,12 +2032,17 @@ pub async fn h_queue_bulk_action(
 ) -> Result<Json<BulkActionResponse>, ApiError> {
     let qm = &state.queue_manager;
     let mut succeeded = 0usize;
-    let mut failed = 0usize;
+    let mut failures = Vec::new();
 
     for id in &body.ids {
         let result = match body.action.as_str() {
             "pause" => qm.pause_job(id),
             "resume" => qm.resume_job(id),
+            // `remove_job` is idempotent and returns Ok for an unknown id;
+            // a bulk request must report that id as failed.
+            "delete" if !qm.contains_job(id) => {
+                Err(nzb_web::nzb_core::NzbError::JobNotFound(id.clone()))
+            }
             "delete" => qm.remove_job(id),
             "priority" => {
                 let p = body.value.as_ref().and_then(|v| v.as_i64()).unwrap_or(1) as i32;
@@ -2044,14 +2059,18 @@ pub async fn h_queue_bulk_action(
         };
         match result {
             Ok(_) => succeeded += 1,
-            Err(_) => failed += 1,
+            Err(error) => failures.push(BulkActionFailure {
+                id: id.clone(),
+                error: ApiError::from(error),
+            }),
         }
     }
 
     Ok(Json(BulkActionResponse {
-        status: failed == 0,
+        status: failures.is_empty(),
         succeeded,
-        failed,
+        failed: failures.len(),
+        failures,
     }))
 }
 
