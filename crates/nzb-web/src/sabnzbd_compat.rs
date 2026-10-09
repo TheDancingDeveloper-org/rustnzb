@@ -263,13 +263,19 @@ async fn handle_addurl(
     // Content-Disposition, then the URL path), but when neither override nor
     // disposition names the job the decompressed member is used, so a fetched
     // .nzb.gz is named after the inner NZB rather than the archive.
-    let job_name = if nzbname.as_deref().and_then(clean_nzb_name).is_none()
+    // Split SABnzbd's inline password off `nzbname` before it is cleaned.
+    let (nzbname, nzbname_pw) = take_inline_password_opt(nzbname.as_deref());
+    let (job_name, name_pw) = if nzbname.as_deref().and_then(clean_nzb_name).is_none()
         && content_disposition
             .as_deref()
             .and_then(content_disposition_filename)
             .is_none()
     {
-        clean_nzb_name(&nzb_file_name).unwrap_or_else(|| "unknown".to_string())
+        let (member, member_pw) = take_inline_password(&nzb_entry_file_name(&nzb_file_name));
+        (
+            clean_nzb_name(&member).unwrap_or_else(|| "unknown".to_string()),
+            member_pw,
+        )
     } else {
         addurl_job_name(
             nzbname.as_deref(),
@@ -277,6 +283,7 @@ async fn handle_addurl(
             &fetch_plan.url,
         )
     };
+    let inline_password = nzbname_pw.or(name_pw);
 
     match nzb_parser::parse_nzb(&job_name, &data) {
         Ok(mut job) => {
@@ -289,10 +296,7 @@ async fn handle_addurl(
                 apply_sab_add_priority(&mut job, p);
             }
 
-            // API-provided password overrides NZB metadata password
-            if let Some(ref pw) = password {
-                job.password = Some(pw.clone());
-            }
+            apply_job_password(&mut job, password, inline_password);
             job.pp_override = sab_pp_override(pp.as_deref());
 
             let qm = &state.queue_manager;
@@ -357,23 +361,55 @@ fn addurl_job_name(
     nzbname: Option<&str>,
     content_disposition: Option<&str>,
     url: &reqwest::Url,
-) -> String {
-    nzbname
-        .and_then(clean_nzb_name)
-        .or_else(|| {
-            content_disposition
-                .and_then(content_disposition_filename)
-                .as_deref()
-                .and_then(clean_nzb_name)
-        })
+) -> (String, Option<String>) {
+    // The fetched file's name: Content-Disposition, else the URL path. Like
+    // SABnzbd, its inline password applies even when `nzbname` names the job.
+    let file_name = content_disposition
+        .and_then(content_disposition_filename)
+        .filter(|name| clean_nzb_name(name).is_some())
         .or_else(|| {
             url.path_segments()
                 .and_then(|mut segments| segments.next_back())
                 .map(percent_decode_lossy)
-                .as_deref()
-                .and_then(clean_nzb_name)
         })
-        .unwrap_or_else(|| "unknown".to_string())
+        .map(|name| take_inline_password(&nzb_entry_file_name(&name)));
+    let file_pw = file_name.as_ref().and_then(|(_, pw)| pw.clone());
+    let name = nzbname
+        .and_then(clean_nzb_name)
+        .or_else(|| {
+            file_name
+                .as_ref()
+                .and_then(|(name, _)| clean_nzb_name(name))
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    (name, file_pw)
+}
+
+/// Split SABnzbd's inline job password (`name{{pw}}`, `name/pw`) off a
+/// client-supplied name. Returns the name to use and the password, if any;
+/// an empty inline password (`name{{}}`) is treated as none.
+fn take_inline_password(raw: &str) -> (String, Option<String>) {
+    match crate::nzb_core::path::split_job_password(raw) {
+        Some((name, pw)) => (name, Some(pw).filter(|pw| !pw.is_empty())),
+        None => (raw.to_string(), None),
+    }
+}
+
+fn take_inline_password_opt(raw: Option<&str>) -> (Option<String>, Option<String>) {
+    match raw.map(take_inline_password) {
+        Some((name, pw)) => (Some(name), pw),
+        None => (None, None),
+    }
+}
+
+/// Set the job's archive password: an explicit `password` parameter wins
+/// over an inline one from the job name, which wins over the NZB's
+/// `<meta type="password">` (already on the job). Empty values count as
+/// unset, as in SABnzbd.
+fn apply_job_password(job: &mut NzbJob, explicit: Option<String>, inline: Option<String>) {
+    if let Some(pw) = explicit.filter(|pw| !pw.is_empty()).or(inline) {
+        job.password = Some(pw);
+    }
 }
 
 /// Reduce a client- or server-supplied NZB name to a bare job name: last
@@ -706,11 +742,19 @@ async fn dispatch_post(
             let (entry_name, data) = nzbs.pop().expect("extract_nzbs returns at least one NZB");
             let file_name = nzb_entry_file_name(&entry_name);
 
-            let job_name = query_req
-                .nzbname
+            // SABnzbd's `name{{password}}` / `name/password` convention:
+            // split it off every name source before naming (and therefore
+            // sanitizing) the job. `nzbname` must be split before
+            // `clean_nzb_name`, which would keep only the part after `/`.
+            let (nzbname, nzbname_pw) = take_inline_password_opt(query_req.nzbname.as_deref());
+            let (name, name_pw) = take_inline_password_opt(name.as_deref());
+            let (file_name, file_pw) = take_inline_password(&file_name);
+            let inline_password = nzbname_pw.or(name_pw).or(file_pw);
+
+            let job_name = nzbname
                 .as_deref()
                 .and_then(clean_nzb_name)
-                .or_else(|| name.clone())
+                .or(name)
                 .unwrap_or_else(|| {
                     file_name
                         .strip_suffix(".nzb")
@@ -729,10 +773,7 @@ async fn dispatch_post(
                         apply_sab_add_priority(&mut job, p);
                     }
 
-                    // API-provided password overrides NZB metadata password
-                    if let Some(ref pw) = password {
-                        job.password = Some(pw.clone());
-                    }
+                    apply_job_password(&mut job, password, inline_password);
                     job.pp_override = sab_pp_override(query_req.pp.as_deref());
 
                     let qm = &state.queue_manager;
@@ -5120,21 +5161,33 @@ mod tests {
     #[test]
     fn addurl_job_name_sources_in_sabnzbd_order() {
         let url = reqwest::Url::parse("https://indexer.example/get/My%20File.nzb?id=1").unwrap();
-        assert_eq!(addurl_job_name(None, None, &url), "My File");
+        assert_eq!(addurl_job_name(None, None, &url).0, "My File");
         assert_eq!(
             addurl_job_name(
                 None,
                 Some("attachment; filename*=UTF-8''Caf%C3%A9.nzb"),
                 &url
-            ),
+            )
+            .0,
             "Café"
         );
         assert_eq!(
-            addurl_job_name(Some("Chosen.nzb"), Some("attachment; filename=x.nzb"), &url),
+            addurl_job_name(Some("Chosen.nzb"), Some("attachment; filename=x.nzb"), &url).0,
             "Chosen"
         );
+        let braced =
+            reqwest::Url::parse("https://indexer.example/get/Path%7B%7Bpathpw%7D%7D.nzb").unwrap();
+        assert_eq!(
+            addurl_job_name(Some("Chosen{{x}}"), None, &braced),
+            ("Chosen{{x}}".to_string(), Some("pathpw".to_string())),
+            "nzbname is split by the caller; the URL file name still supplies a password"
+        );
+        assert_eq!(
+            addurl_job_name(None, None, &braced),
+            ("Path".to_string(), Some("pathpw".to_string()))
+        );
         let bare = reqwest::Url::parse("https://indexer.example/").unwrap();
-        assert!(!addurl_job_name(None, None, &bare).contains('/'));
+        assert!(!addurl_job_name(None, None, &bare).0.contains('/'));
     }
 
     /// `nzbname` also overrides the job name for uploads, from the query
@@ -5284,5 +5337,188 @@ mod tests {
             Err(err) => err.into_response(),
         };
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -- SABnzbd inline job passwords (`name{{pw}}`, `name/pw`) -----------
+
+    const PASSWORD_META_NZB: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head><meta type="password">meta-pw</meta></head>
+  <file poster="test@example.com" date="1234567890" subject="test.rar (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment number="1" bytes="768000">article1@example.com</segment>
+    </segments>
+  </file>
+</nzb>"#;
+
+    /// Multipart `mode=addfile` uploading `nzb` as `file_name`.
+    async fn addfile_named(
+        query: SabApiRequest,
+        fields: &[(&str, &str)],
+        file_name: &str,
+        nzb: &str,
+    ) -> NzbJob {
+        let TestState { state, _tempdir } = test_state();
+        let state = Arc::new(state);
+        let boundary = "sabboundary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"mode\"\r\n\r\naddfile\r\n"
+        );
+        for (name, value) in fields {
+            body.push_str(&format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        body.push_str(&format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{file_name}\"\r\nContent-Type: application/x-nzb\r\n\r\n{nzb}\r\n--{boundary}--\r\n"
+        ));
+        let query = SabApiRequest {
+            apikey: Some("contract-api-key".into()),
+            ..query
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/sabnzbd/api")
+            .header(
+                CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .expect("build request");
+        let response = h_sabnzbd_api_post(State(state.clone()), Query(query), request)
+            .await
+            .expect("addfile over multipart")
+            .into_response();
+        let value = json_body(response).await;
+        assert_eq!(value["status"], serde_json::json!(true), "resp={value}");
+        let mut jobs = state.queue_manager.get_jobs();
+        assert_eq!(jobs.len(), 1);
+        jobs.remove(0)
+    }
+
+    /// SABnzbd moves `{{pw}}` and a trailing `/pw` out of `nzbname` into the
+    /// job password; the braces never reach the job or folder name.
+    #[tokio::test]
+    async fn addfile_takes_inline_password_from_nzbname() {
+        for nzbname in ["MyShow{{INLINEPW}}", "MyShow/INLINEPW", "MyShow / INLINEPW"] {
+            let job = addfile_named(
+                SabApiRequest {
+                    nzbname: Some(nzbname.into()),
+                    ..SabApiRequest::default()
+                },
+                &[],
+                "upload.nzb",
+                SAMPLE_NZB,
+            )
+            .await;
+            assert_eq!(job.name, "MyShow", "{nzbname}");
+            assert_eq!(job.password.as_deref(), Some("INLINEPW"), "{nzbname}");
+            let folder = job.output_dir.file_name().unwrap().to_string_lossy();
+            assert!(!folder.contains('{'), "{nzbname}: {folder}");
+        }
+    }
+
+    /// The uploaded file name carries the password the same way.
+    #[tokio::test]
+    async fn addfile_takes_inline_password_from_file_name() {
+        let job = addfile_named(
+            SabApiRequest::default(),
+            &[],
+            "My.Release{{filepw}}.nzb",
+            SAMPLE_NZB,
+        )
+        .await;
+        assert_eq!(job.name, "My.Release");
+        assert_eq!(job.password.as_deref(), Some("filepw"));
+
+        // nzbname names the job; the file name still supplies the password.
+        let job = addfile_named(
+            SabApiRequest {
+                nzbname: Some("Chosen".into()),
+                ..SabApiRequest::default()
+            },
+            &[],
+            "My.Release{{filepw}}.nzb",
+            SAMPLE_NZB,
+        )
+        .await;
+        assert_eq!(job.name, "Chosen");
+        assert_eq!(job.password.as_deref(), Some("filepw"));
+    }
+
+    /// Explicit `password` > inline password > NZB `<meta type="password">`.
+    #[tokio::test]
+    async fn addfile_password_precedence() {
+        let inline = addfile_named(
+            SabApiRequest {
+                nzbname: Some("Show{{inline-pw}}".into()),
+                ..SabApiRequest::default()
+            },
+            &[],
+            "upload.nzb",
+            PASSWORD_META_NZB,
+        )
+        .await;
+        assert_eq!(inline.password.as_deref(), Some("inline-pw"));
+
+        let explicit = addfile_named(
+            SabApiRequest {
+                nzbname: Some("Show{{inline-pw}}".into()),
+                ..SabApiRequest::default()
+            },
+            &[("password", "explicit-pw")],
+            "upload.nzb",
+            PASSWORD_META_NZB,
+        )
+        .await;
+        assert_eq!(explicit.name, "Show");
+        assert_eq!(explicit.password.as_deref(), Some("explicit-pw"));
+
+        let meta =
+            addfile_named(SabApiRequest::default(), &[], "Show.nzb", PASSWORD_META_NZB).await;
+        assert_eq!(meta.password.as_deref(), Some("meta-pw"));
+    }
+
+    /// `addurl` applies the convention to `nzbname` and to the name taken
+    /// from `Content-Disposition`.
+    #[tokio::test]
+    async fn addurl_takes_inline_password() {
+        async fn add(url: String, nzbname: Option<&str>) -> NzbJob {
+            let TestState { state, _tempdir } = test_state();
+            {
+                let mut config = (*state.config()).clone();
+                config.general.fetch_allowed_hosts = vec!["127.0.0.1".into()];
+                state.config.store(std::sync::Arc::new(config));
+            }
+            let state = Arc::new(state);
+            let req = SabApiRequest {
+                mode: Some("addurl".into()),
+                name: Some(url),
+                nzbname: nzbname.map(str::to_string),
+                apikey: Some("contract-api-key".into()),
+                ..SabApiRequest::default()
+            };
+            let response = h_sabnzbd_api_get(State(state.clone()), Query(req))
+                .await
+                .expect("addurl over GET")
+                .into_response();
+            let value = json_body(response).await;
+            assert_eq!(value["status"], serde_json::json!(true), "resp={value}");
+            state.queue_manager.get_jobs().remove(0)
+        }
+
+        let job = add(spawn_nzb_server(SAMPLE_NZB).await, Some("Url.Show/urlpw")).await;
+        assert_eq!(job.name, "Url.Show");
+        assert_eq!(job.password.as_deref(), Some("urlpw"));
+
+        let url = spawn_nzb_server_with_headers(
+            SAMPLE_NZB,
+            "Content-Disposition: attachment; filename=\"Disp.Show{{disppw}}.nzb\"\r\n",
+        )
+        .await;
+        let job = add(url, None).await;
+        assert_eq!(job.name, "Disp.Show");
+        assert_eq!(job.password.as_deref(), Some("disppw"));
     }
 }

@@ -255,3 +255,27 @@ async fn slowly_written_nzb_is_parsed_only_once_complete() {
     assert!(!watch_dir.join("failed/slow.nzb").exists());
     assert!(watch_dir.join("processed/slow.nzb").exists());
 }
+
+/// SABnzbd's `name{{password}}` file-name convention applies to the watch
+/// folder: the password is split off before the job is named.
+#[tokio::test]
+async fn watched_nzb_file_name_carries_inline_password() {
+    let temp = tempfile::tempdir().unwrap();
+    let watch_dir = temp.path().join("watch");
+    std::fs::create_dir_all(&watch_dir).unwrap();
+    std::fs::write(
+        watch_dir.join("Watched.Show{{watchpw}}.nzb"),
+        fixture_nzb("pw.bin"),
+    )
+    .unwrap();
+
+    let queue = watch_queue(temp.path());
+    let watcher_task = tokio::spawn(DirWatcher::new(watch_dir.clone(), queue.clone()).run());
+    let imported = wait_until(Duration::from_secs(2), || queue.queue_size() == 1).await;
+    watcher_task.abort();
+
+    assert!(imported, "watch folder did not enqueue the NZB");
+    let job = queue.get_jobs().remove(0);
+    assert_eq!(job.name, "Watched.Show");
+    assert_eq!(job.password.as_deref(), Some("watchpw"));
+}
