@@ -23,6 +23,10 @@ pub struct AppState {
     /// Serialises config writers so a read-modify-write cycle (including
     /// persisting the TOML) cannot interleave with another one.
     config_write: Mutex<()>,
+    /// Signalled after every committed config change so the RSS monitor
+    /// re-reads its feeds at once instead of finishing its current sleep.
+    /// Single consumer: `notify_one` stores a permit if the monitor is busy.
+    pub rss_monitor_wake: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -43,6 +47,7 @@ impl AppState {
             credential_store,
             started_at: std::time::Instant::now(),
             config_write: Mutex::new(()),
+            rss_monitor_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -84,6 +89,7 @@ impl AppState {
     fn commit_config(&self, config: AppConfig) -> anyhow::Result<()> {
         config.save(&self.config_path)?;
         self.config.store(Arc::new(config));
+        self.rss_monitor_wake.notify_one();
         Ok(())
     }
 }

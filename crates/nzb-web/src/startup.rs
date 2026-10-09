@@ -216,24 +216,27 @@ pub async fn initialize(
     // without a restart.
     let shared_config = Arc::new(ArcSwap::new(Arc::new(config)));
 
-    // Always start the RSS monitor so feeds added later via the API are polled.
-    let data_dir_for_rss = shared_config.load().general.data_dir.clone();
-    let monitor = crate::rss_monitor::RssMonitor::new(
-        Arc::clone(&shared_config),
-        Arc::clone(&queue_manager),
-        data_dir_for_rss,
-    );
-    tokio::spawn(async move { monitor.run().await });
-
     // Build shared application state
     let state = Arc::new(AppState::new(
-        shared_config,
+        Arc::clone(&shared_config),
         config_path,
         Arc::clone(&queue_manager),
         log_buffer.clone(),
         token_store,
         credential_store,
     ));
+
+    // Always start the RSS monitor so feeds added later via the API are polled.
+    // Every committed config change wakes it, so a new or re-enabled feed is
+    // checked promptly instead of after the monitor's current sleep.
+    let data_dir_for_rss = shared_config.load().general.data_dir.clone();
+    let monitor = crate::rss_monitor::RssMonitor::new(
+        shared_config,
+        Arc::clone(&queue_manager),
+        data_dir_for_rss,
+    )
+    .with_wake(Arc::clone(&state.rss_monitor_wake));
+    tokio::spawn(async move { monitor.run().await });
 
     Ok(StartupResult {
         state,
