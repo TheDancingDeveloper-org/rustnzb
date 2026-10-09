@@ -1785,8 +1785,14 @@ async fn run_worker_serial(
 
         let result = {
             let _activity = conn_slot.activity();
-            let fetch_fut =
-                fetch_article_with_retry(conn, &item, &ctx.assembler, primary_server, worker_id);
+            let fetch_fut = fetch_article_with_retry(
+                conn,
+                &item,
+                &ctx.assembler,
+                &ctx.cancelled,
+                primary_server,
+                worker_id,
+            );
             if let Some(timeout) = pool.stall_timeout {
                 match tokio::time::timeout(timeout, fetch_fut).await {
                     Ok(r) => r,
@@ -1939,6 +1945,11 @@ async fn run_worker_serial(
                 ) {
                     last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
                 }
+            }
+            Err(ArticleError::Cancelled) => {
+                // Mirror the pipelined path: an aborted job's in-flight
+                // article resolves without being written or reported.
+                ctx.resolve_one();
             }
             Err(ArticleError::AssemblyError(msg)) => {
                 error!(job_id = %item.job_id, file_id = %item.file_id, segment_number = item.segment_number, message_id = %item.message_id, server_id = %primary_server.id, worker_id = %worker_id, original_failure_kind = "decode_error", terminal_failure_kind = "decode_error", "Assembly error: {msg}");
@@ -2823,6 +2834,7 @@ async fn fetch_article_with_retry(
     conn: &mut NntpConnection,
     item: &WorkItem,
     assembler: &FileAssembler,
+    cancelled: &AtomicBool,
     _server: &ServerConfig,
     worker_id: &str,
 ) -> Result<ProcessResult, ArticleError> {
@@ -2841,6 +2853,13 @@ async fn fetch_article_with_retry(
                 fetch_us,
                 "NNTP fetch complete"
             );
+            // The job may have been aborted while this fetch was in
+            // flight. Like the pipelined path, drop the response rather
+            // than writing it into an aborted job's files.
+            if cancelled.load(Ordering::Relaxed) {
+                conn.release_body_buffer(raw_data);
+                return Err(ArticleError::Cancelled);
+            }
             let result = decode_and_assemble(item, &raw_data, assembler);
             // Return the buffer to the connection's pool so the next
             // article's fetch reuses it instead of allocating fresh.
@@ -2975,6 +2994,10 @@ enum ArticleError {
     DecodeError(String),
     #[error("Assembly error: {0}")]
     AssemblyError(String),
+    /// The job was cancelled while the fetch was in flight; the article was
+    /// not written.
+    #[error("Job cancelled")]
+    Cancelled,
 }
 
 /// Choose the file offset a decoded article is written at, rejecting headers
@@ -3376,6 +3399,52 @@ mod tests {
                 .file_complete
         );
         assert_eq!(std::fs::read(&single).unwrap(), b"ONE");
+    }
+
+    #[tokio::test]
+    async fn serial_fetch_does_not_write_article_after_job_cancelled() {
+        use nzb_nntp::testutil::{MockConfig, MockNntpServer, test_config};
+
+        let (encoded, _) = yenc_simd::encode_article(b"payload", "out.bin", 1, 1, 0, 7);
+        let mut articles = HashMap::new();
+        articles.insert("msg@test".to_string(), encoded);
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new(config.id.clone());
+        conn.connect(&config).await.unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file("j1", "f1", path.clone(), 1)
+            .unwrap();
+        let item = make_item("j1", "msg@test", "out.bin");
+
+        // abort_job() flips the flag while the fetch is in flight.
+        let cancelled = AtomicBool::new(true);
+        let result =
+            fetch_article_with_retry(&mut conn, &item, &assembler, &cancelled, &config, "w0").await;
+
+        assert!(
+            matches!(result, Err(ArticleError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 1));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        // Sanity: the same fetch succeeds and writes when not cancelled.
+        let not_cancelled = AtomicBool::new(false);
+        let result =
+            fetch_article_with_retry(&mut conn, &item, &assembler, &not_cancelled, &config, "w0")
+                .await
+                .unwrap();
+        assert!(result.file_complete);
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
     }
 
     #[cfg(target_os = "linux")]
