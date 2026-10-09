@@ -320,19 +320,39 @@ pub async fn h_queue_list(
     }))
 }
 
-/// Enqueue a single NZB from raw bytes, applying category/priority from query params.
-async fn next_uploaded_file(
-    multipart: &mut Multipart,
-) -> Result<Option<(String, Vec<u8>)>, ApiError> {
-    let Some(field) = multipart.next_field().await.map_err(ApiError::from)? else {
+/// One part of a `POST /api/queue/add` multipart body.
+enum UploadPart {
+    File(String, Vec<u8>),
+    /// The optional archive `password` text field.
+    Password(String),
+}
+
+/// Read the next multipart part. A text field named `password` (no file
+/// name) is the job's archive password; every other part is an NZB upload.
+async fn next_upload_part(multipart: &mut Multipart) -> Result<Option<UploadPart>, ApiError> {
+    let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!("Multipart error: {error}")))?
+    else {
         return Ok(None);
     };
+    if field.name() == Some("password") && field.file_name().is_none() {
+        let password = field
+            .text()
+            .await
+            .map_err(|error| ApiError::from(anyhow::anyhow!("Read error: {error}")))?;
+        return Ok(Some(UploadPart::Password(password)));
+    }
     let file_name = field
         .file_name()
         .map(str::to_string)
         .unwrap_or_else(|| "unknown.nzb".to_string());
-    let data = field.bytes().await.map_err(ApiError::from)?;
-    Ok(Some((file_name, data.to_vec())))
+    let data = field
+        .bytes()
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!("Read error: {error}")))?;
+    Ok(Some(UploadPart::File(file_name, data.to_vec())))
 }
 
 /// An archive that cannot be unpacked into NZBs (corrupt, empty, over the
@@ -341,21 +361,69 @@ fn bad_upload(error: anyhow::Error) -> ApiError {
     ApiError::from((StatusCode::BAD_REQUEST, error))
 }
 
+/// Read a whole `POST /api/queue/add` body: the uploaded files and the
+/// optional `password` field (which may come before or after the files).
+async fn read_upload(
+    multipart: &mut Multipart,
+) -> Result<(Vec<(String, Vec<u8>)>, Option<String>), ApiError> {
+    let mut files = Vec::new();
+    let mut password = None;
+    while let Some(part) = next_upload_part(multipart).await? {
+        match part {
+            UploadPart::File(file_name, data) => files.push((file_name, data)),
+            UploadPart::Password(text) => password = Some(text),
+        }
+    }
+    Ok((files, password))
+}
+
+/// Split SABnzbd's inline job password (`name{{pw}}`, `name/pw`) off a
+/// name; an empty inline password counts as none.
+fn take_inline_password(raw: &str) -> (String, Option<String>) {
+    match nzb_web::nzb_core::path::split_job_password(raw) {
+        Some((name, password)) => (name, Some(password).filter(|pw| !pw.is_empty())),
+        None => (raw.to_string(), None),
+    }
+}
+
+/// Enqueue a single NZB from raw bytes, applying category/priority from
+/// query params. The archive password is the explicit `password` if given,
+/// else an inline one from the `name` override or the file name (SABnzbd's
+/// `name{{password}}` / `name/password` convention), else the NZB's own
+/// `<meta type="password">`.
 fn enqueue_nzb(
     state: &AppState,
     q: &AddNzbQuery,
     file_name: &str,
     data: Vec<u8>,
+    password: Option<&str>,
     idempotency_key: Option<&IdempotencyKey>,
 ) -> Result<String, ApiError> {
-    let name = q.name.clone().unwrap_or_else(|| {
+    // Split inline passwords off before parse_nzb sanitizes the name.
+    let (name_override, name_password) = match q.name.as_deref() {
+        Some(name) => {
+            let (name, password) = take_inline_password(name);
+            (Some(name), password)
+        }
+        None => (None, None),
+    };
+    let (file_name, file_password) = take_inline_password(file_name);
+    let name = name_override.unwrap_or_else(|| {
         file_name
             .strip_suffix(".nzb")
-            .unwrap_or(file_name)
+            .unwrap_or(&file_name)
             .to_string()
     });
 
     let mut job = nzb_parser::parse_nzb(&name, &data).map_err(ApiError::from)?;
+    if let Some(password) = password
+        .filter(|pw| !pw.is_empty())
+        .map(str::to_string)
+        .or(name_password)
+        .or(file_password)
+    {
+        job.password = Some(password);
+    }
 
     if let Some(ref cat) = q.category {
         job.category = cat.clone();
@@ -403,8 +471,9 @@ pub async fn h_queue_add(
     if let Some(idempotency_key) = idempotency_key.as_ref() {
         // A keyed admission binds exactly one payload, so the request must carry
         // exactly one NZB — a multi-NZB upload has no single job to replay.
+        let (files, password) = read_upload(&mut multipart).await?;
         let mut uploaded_nzbs = Vec::new();
-        while let Some((file_name, data)) = next_uploaded_file(&mut multipart).await? {
+        for (file_name, data) in files {
             uploaded_nzbs.extend(extract_nzbs(&file_name, &data).map_err(bad_upload)?);
         }
         if uploaded_nzbs.len() != 1 {
@@ -418,13 +487,22 @@ pub async fn h_queue_add(
             &q,
             &nzb_name,
             nzb_data,
+            password.as_deref(),
             Some(idempotency_key),
         )?);
     } else {
-        while let Some((file_name, data)) = next_uploaded_file(&mut multipart).await? {
+        let (files, password) = read_upload(&mut multipart).await?;
+        for (file_name, data) in files {
             // Extract NZBs (handles zip/gz/bz2 archives or plain .nzb)
             for (nzb_name, nzb_data) in extract_nzbs(&file_name, &data).map_err(bad_upload)? {
-                nzo_ids.push(enqueue_nzb(&state, &q, &nzb_name, nzb_data, None)?);
+                nzo_ids.push(enqueue_nzb(
+                    &state,
+                    &q,
+                    &nzb_name,
+                    nzb_data,
+                    password.as_deref(),
+                    None,
+                )?);
             }
         }
     }
@@ -521,6 +599,9 @@ pub struct AddUrlBody {
     pub name: Option<String>,
     pub category: Option<String>,
     pub priority: Option<i32>,
+    /// Archive password; overrides inline and NZB-embedded passwords.
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 /// POST /api/queue/add-url -- Add an NZB from a URL.
@@ -574,7 +655,14 @@ pub async fn h_queue_add_url(
     let nzbs = extract_nzbs(&file_name, &data).map_err(bad_upload)?;
     let mut nzo_ids = Vec::new();
     for (nzb_name, nzb_data) in nzbs {
-        let id = enqueue_nzb(&state, &q, &nzb_name, nzb_data, None)?;
+        let id = enqueue_nzb(
+            &state,
+            &q,
+            &nzb_name,
+            nzb_data,
+            body.password.as_deref(),
+            None,
+        )?;
         nzo_ids.push(id);
     }
 

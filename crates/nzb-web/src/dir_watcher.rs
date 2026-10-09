@@ -220,10 +220,19 @@ impl DirWatcher {
             // Archive entries may carry directories; the job is named after
             // the NZB itself, without its extension.
             let base = nzb_name.rsplit(['/', '\\']).next().unwrap_or(&nzb_name);
-            let name = base.strip_suffix(".nzb").unwrap_or(base);
+            // SABnzbd's `name{{password}}` convention: split the password
+            // off before parse_nzb sanitizes the name.
+            let (base, password) = match crate::nzb_core::path::split_job_password(base) {
+                Some((name, password)) => (name, Some(password).filter(|pw| !pw.is_empty())),
+                None => (base.to_string(), None),
+            };
+            let name = base.strip_suffix(".nzb").unwrap_or(&base);
             let name = if name.is_empty() { "unknown" } else { name };
             let mut job = crate::nzb_core::nzb_parser::parse_nzb(name, &data)
                 .map_err(|e| format!("parse failed for {nzb_name}: {e}"))?;
+            if password.is_some() {
+                job.password = password;
+            }
             job.work_dir = self.queue_manager.incomplete_dir().join(&job.id);
             job.output_dir = self.queue_manager.complete_dir().join(&job.name);
             std::fs::create_dir_all(&job.work_dir)

@@ -209,9 +209,19 @@ curl -X POST http://localhost:9090/api/queue/add-url \
 curl -X POST http://localhost:9090/api/queue/add \
   -F "file=@/path/to/file.nzb" -F "category=tv"
 
+# Upload an NZB with an archive password (multipart `password` field;
+# `add-url` takes a JSON `password`)
+curl -X POST http://localhost:9090/api/queue/add \
+  -F "file=@/path/to/file.nzb" -F "password=secret"
+
 # Check status
 curl http://localhost:9090/api/status
 ```
+
+Job names follow SABnzbd's inline-password convention on both APIs: a name
+or NZB file name of the form `Name{{password}}` or `Name/password` sets the
+job password and is queued as `Name`. An explicit `password` wins over the
+inline one, which wins over a password embedded in the NZB.
 
 The *arr-compatible API is served at `/sabnzbd/api`.
 

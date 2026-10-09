@@ -125,6 +125,109 @@ pub fn sanitize_job_name(name: &str) -> String {
     out
 }
 
+/// Split SABnzbd's inline job-password conventions off a job name.
+///
+/// A port of SABnzbd 5.0.4 `misc.scan_password`. Recognised forms, in
+/// SABnzbd's order of precedence:
+///
+/// - `name/password` and `name / password`, when the `/` precedes any `{{`
+/// - `name password=password`
+/// - `name{{password}}` (the last `}}` closes it, so the password is greedy)
+///
+/// A trailing `.nzb`, `.par` or `.par2` extension is ignored. Returns
+/// `Some((name, password))` when a password was found, `None` otherwise
+/// (including for `http://` and `https://` URLs). The password may be empty,
+/// as in `name{{}}`; the name never is.
+///
+/// Callers apply this to the raw client-supplied name *before*
+/// [`sanitize_job_name`], which would otherwise turn `/` into `_` and keep
+/// the braces in the folder name.
+pub fn split_job_password(name: &str) -> Option<(String, String)> {
+    if name.contains("http://") || name.contains("https://") {
+        return None;
+    }
+    let name = strip_nzb_extensions(name);
+    let strip = |s: &str| s.trim_matches(['.', ' ']).to_string();
+
+    // `{{` counts only after the first character, as in SABnzbd.
+    let first_len = name.chars().next().map_or(0, char::len_utf8);
+    let braces = name[first_len..]
+        .find("{{")
+        .map_or(name.len(), |index| index + first_len);
+    let slash = name.find('/');
+
+    if let Some(slash) = slash
+        && 0 < slash
+        && slash < braces
+        && !name.contains("password=")
+    {
+        // `name / password`: drop the spaces around the slash.
+        if name.find(" / ").map(|index| index + 1) == Some(slash) {
+            let head = strip(&name[..slash - 1]);
+            if !head.is_empty() {
+                return Some((head, name[slash + 2..].to_string()));
+            }
+        }
+        let head = strip(&name[..slash]);
+        if !head.is_empty() {
+            return Some((head, name[slash + 1..].to_string()));
+        }
+    }
+
+    if let Some(pw) = name.find("password=")
+        && pw > 0
+    {
+        let head = strip(&name[..pw]);
+        if !head.is_empty() {
+            return Some((head, name[pw + "password=".len()..].to_string()));
+        }
+    }
+
+    if braces < name.len()
+        && let Some(closing) = name.rfind("}}")
+        && closing > braces
+    {
+        let head = strip(&name[..braces]);
+        if !head.is_empty() {
+            return Some((head, name[braces + 2..closing].to_string()));
+        }
+    }
+
+    if let Some(slash) = slash
+        && slash > 0
+    {
+        let head = strip(&name[..slash]);
+        if !head.is_empty() {
+            return Some((head, name[slash + 1..].to_string()));
+        }
+    }
+
+    None
+}
+
+/// Strip trailing `.nzb`/`.par`/`.par2` extensions (case-insensitive), as
+/// SABnzbd's `strip_extensions` does via `os.path.splitext`.
+fn strip_nzb_extensions(mut name: &str) -> &str {
+    loop {
+        let base_start = name.rfind('/').map_or(0, |index| index + 1);
+        let base = &name[base_start..];
+        // splitext ignores leading dots of the final component.
+        let leading = base.len() - base.trim_start_matches('.').len();
+        let Some(dot) = base[leading..].rfind('.').map(|index| index + leading) else {
+            return name;
+        };
+        let ext = &base[dot..];
+        if [".nzb", ".par", ".par2"]
+            .iter()
+            .any(|known| ext.eq_ignore_ascii_case(known))
+        {
+            name = &name[..base_start + dot];
+        } else {
+            return name;
+        }
+    }
+}
+
 /// Whether `name` is a Windows reserved device name. Windows ignores the
 /// extension and trailing spaces, so `con.txt` and `NUL .x` count too.
 fn is_windows_reserved_name(name: &str) -> bool {
@@ -275,5 +378,81 @@ mod tests {
         }
         // NFD input is normalized to NFC.
         assert_eq!(sanitize_job_name("cafe\u{0301}"), "caf\u{00E9}");
+    }
+
+    /// SABnzbd 5.0.4 `tests/test_misc.py::test_scan_password`.
+    #[test]
+    fn split_job_password_matches_sabnzbd_scan_password() {
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            (
+                "my_awesome_nzb_file{{password}}",
+                "my_awesome_nzb_file",
+                Some("password"),
+            ),
+            (
+                "file_with_text_after_pw{{passw0rd}}_[180519]",
+                "file_with_text_after_pw",
+                Some("passw0rd"),
+            ),
+            ("file_without_pw", "file_without_pw", None),
+            (
+                "multiple_pw{{first-pw}}_{{second-pw}}",
+                "multiple_pw",
+                Some("first-pw}}_{{second-pw"),
+            ),
+            ("デビアン", "デビアン", None),
+            (
+                "Gentoo_Hobby_Edition {{secret}}",
+                "Gentoo_Hobby_Edition",
+                Some("secret"),
+            ),
+            ("Test {{secret}}.nzb", "Test", Some("secret")),
+            ("Mandrake{{top{{secret}}", "Mandrake", Some("top{{secret")),
+            ("Красная}}{{Шляпа}}", "Красная}}", Some("Шляпа")),
+            ("{{Jobname{{PassWord}}", "{{Jobname", Some("PassWord")),
+            ("Hello/kITTY", "Hello", Some("kITTY")),
+            ("Hello/kITTY.nzb", "Hello", Some("kITTY")),
+            ("/Jobname", "/Jobname", None),
+            ("Jobname/Top{{Secret}}", "Jobname", Some("Top{{Secret}}")),
+            ("Jobname / Top{{Secret}}", "Jobname", Some("Top{{Secret}}")),
+            (
+                "Jobname / Top{{Secret}}.nzb",
+                "Jobname",
+                Some("Top{{Secret}}"),
+            ),
+            ("לינוקס/معلومات سرية", "לינוקס", Some("معلومات سرية")),
+            ("לינוקס{{معلومات سرية}}", "לינוקס", Some("معلومات سرية")),
+            (
+                "thư điện tử password=mật_khẩu",
+                "thư điện tử",
+                Some("mật_khẩu"),
+            ),
+            (
+                "password=PartOfTheJobname",
+                "password=PartOfTheJobname",
+                None,
+            ),
+            ("Job password=Test.par2", "Job", Some("Test")),
+            ("Job}}Name{{FTW", "Job}}Name{{FTW", None),
+            ("./Text", "./Text", None),
+        ];
+        for (input, name, password) in cases {
+            match (split_job_password(input), password) {
+                (Some((got_name, got_pw)), Some(pw)) => {
+                    assert_eq!(
+                        (got_name.as_str(), got_pw.as_str()),
+                        (*name, *pw),
+                        "{input}"
+                    );
+                }
+                (None, None) => {}
+                (got, _) => panic!("{input}: got {got:?}, expected {name:?}/{password:?}"),
+            }
+        }
+        assert_eq!(split_job_password("https://host/a{{b}}.nzb"), None);
+        assert_eq!(
+            split_job_password("Show{{}}"),
+            Some(("Show".to_string(), String::new()))
+        );
     }
 }
