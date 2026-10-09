@@ -2141,18 +2141,13 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
 
 fn handle_switch(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
     let target = req.value.as_deref().unwrap_or("");
-    let position = req
-        .value2
-        .as_deref()
-        .or(req.name.as_deref())
-        .and_then(|value| value.parse::<usize>().ok());
-
-    let Some(position) = position else {
+    let destination = req.value2.as_deref().or(req.name.as_deref()).unwrap_or("");
+    if destination.is_empty() {
         return Json(serde_json::json!({
             "status": false,
             "error": "Missing or invalid target queue position"
         }));
-    };
+    }
     if target.is_empty() {
         return Json(serde_json::json!({ "status": false, "error": "No job ID" }));
     }
@@ -2160,15 +2155,51 @@ fn handle_switch(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
     // Queue slots report a truncated `SABnzbd_nzo_<12 chars>` id, so resolve
     // it to the full job id by prefix -- as every other per-job handler does
     // -- before handing it to `move_job`, which matches ids exactly.
-    let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
     let qm = &state.queue_manager;
-    let Some(job) = qm
-        .get_jobs()
-        .into_iter()
-        .find(|job| job_id_matches(&job.id, search_id))
-    else {
+    let find_job = |requested: &str| {
+        let search_id = requested.strip_prefix("SABnzbd_nzo_").unwrap_or(requested);
+        qm.get_jobs()
+            .into_iter()
+            .find(|job| job_id_matches(&job.id, search_id))
+    };
+    let Some(mut job) = find_job(target) else {
         return Json(serde_json::json!({ "status": false, "error": "Job not found" }));
     };
+
+    // `value2` is either a queue index or, as in SABnzbd's
+    // `NzbQueue.switch`, another job's nzo_id: the job then takes that job's
+    // place in the queue and adopts its priority.
+    let position = match destination.parse::<usize>() {
+        Ok(position) => position,
+        Err(_) => {
+            let Some(other) = find_job(destination) else {
+                return Json(serde_json::json!({
+                    "status": false,
+                    "error": "Missing or invalid target queue position"
+                }));
+            };
+            if other.priority != job.priority {
+                if let Err(error) = qm.set_job_priority(&job.id, other.priority) {
+                    return Json(
+                        serde_json::json!({ "status": false, "error": error.to_string() }),
+                    );
+                }
+                job.priority = other.priority;
+            }
+            // Look the target up after any priority reorder.
+            match qm
+                .get_jobs()
+                .iter()
+                .position(|queued| queued.id == other.id)
+            {
+                Some(position) => position,
+                None => {
+                    return Json(serde_json::json!({ "status": false, "error": "Job not found" }));
+                }
+            }
+        }
+    };
+
     match qm.move_job(&job.id, position) {
         Ok(()) => {
             let new_position = qm
@@ -3760,6 +3791,119 @@ mod tests {
                 "aaaaaaaa-1111-0000-0000-000000000001".to_string(),
             ]
         );
+    }
+
+    fn queue_order(test_state: &TestState) -> Vec<String> {
+        test_state
+            .state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .map(|job| job.id)
+            .collect()
+    }
+
+    /// SABnzbd's `switch` also accepts another job's nzo_id as `value2`,
+    /// moving `value` into that job's queue position (`NzbQueue.switch`).
+    #[tokio::test]
+    async fn switch_accepts_target_nzo_id_as_value2() {
+        let test_state = test_state();
+        let a = "aaaaaaaa-1111-0000-0000-000000000001";
+        let b = "bbbbbbbb-2222-0000-0000-000000000002";
+        let c = "cccccccc-3333-0000-0000-000000000003";
+        for id in [a, b, c] {
+            add_live_job(&test_state, id);
+        }
+
+        let req = SabApiRequest {
+            mode: Some("switch".into()),
+            value: Some("SABnzbd_nzo_cccccccc-333".into()),
+            value2: Some("SABnzbd_nzo_aaaaaaaa-111".into()),
+            ..SabApiRequest::default()
+        };
+        let response = dispatch_mode(&test_state.state, "switch", &req).0;
+        assert_eq!(response["status"], serde_json::json!(true), "{response:?}");
+        assert_eq!(response["result"]["position"], serde_json::json!(0));
+        assert_eq!(response["result"]["priority"], serde_json::json!(0));
+        assert_eq!(queue_order(&test_state), vec![c, a, b]);
+
+        // Moving down: the moved job lands in the target's old slot.
+        let req = SabApiRequest {
+            mode: Some("switch".into()),
+            value: Some(format!("SABnzbd_nzo_{}", &c[..12])),
+            value2: Some(b.into()),
+            ..SabApiRequest::default()
+        };
+        let response = dispatch_mode(&test_state.state, "switch", &req).0;
+        assert_eq!(response["status"], serde_json::json!(true), "{response:?}");
+        assert_eq!(response["result"]["position"], serde_json::json!(2));
+        assert_eq!(queue_order(&test_state), vec![a, b, c]);
+    }
+
+    /// Like SABnzbd, a job switched next to a job of another priority adopts
+    /// the target's priority, and the response reports it.
+    #[tokio::test]
+    async fn switch_to_nzo_id_adopts_target_priority() {
+        let test_state = test_state();
+        let a = "aaaaaaaa-1111-0000-0000-000000000001";
+        let b = "bbbbbbbb-2222-0000-0000-000000000002";
+        add_live_job(&test_state, a);
+        add_live_job(&test_state, b);
+        test_state
+            .state
+            .queue_manager
+            .set_job_priority(a, Priority::High)
+            .expect("raise priority");
+
+        let req = SabApiRequest {
+            mode: Some("switch".into()),
+            value: Some(b.into()),
+            value2: Some(a.into()),
+            ..SabApiRequest::default()
+        };
+        let response = dispatch_mode(&test_state.state, "switch", &req).0;
+        assert_eq!(response["status"], serde_json::json!(true), "{response:?}");
+        assert_eq!(response["result"]["position"], serde_json::json!(0));
+        assert_eq!(
+            response["result"]["priority"],
+            serde_json::json!(sab_priority_code(Priority::High))
+        );
+        assert_eq!(queue_order(&test_state), vec![b, a]);
+        let moved = test_state
+            .state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .find(|job| job.id == b)
+            .expect("job b queued");
+        assert_eq!(moved.priority, Priority::High);
+    }
+
+    /// A `value2` that is neither a number nor a known job id fails without
+    /// touching the queue.
+    #[tokio::test]
+    async fn switch_rejects_unknown_target_nzo_id() {
+        let test_state = test_state();
+        let a = "aaaaaaaa-1111-0000-0000-000000000001";
+        let b = "bbbbbbbb-2222-0000-0000-000000000002";
+        add_live_job(&test_state, a);
+        add_live_job(&test_state, b);
+
+        for value2 in ["SABnzbd_nzo_ffffffff-999", "SABnzbd_nzo_", "bbbb", "x"] {
+            let req = SabApiRequest {
+                mode: Some("switch".into()),
+                value: Some(b.into()),
+                value2: Some(value2.into()),
+                ..SabApiRequest::default()
+            };
+            let response = dispatch_mode(&test_state.state, "switch", &req).0;
+            assert_eq!(
+                response["status"],
+                serde_json::json!(false),
+                "value2={value2} resp={response:?}"
+            );
+            assert_eq!(queue_order(&test_state), vec![a, b]);
+        }
     }
 
     /// An empty or bare `SABnzbd_nzo_` id must not resolve to any job:
