@@ -195,13 +195,16 @@ impl RssMonitor {
             ),
         };
 
-        // Load download rules for this feed
+        // Load download rules for this feed (an empty feed list means all feeds)
         let rules = self
             .queue_manager
             .rss_rule_list()
             .unwrap_or_default()
             .into_iter()
-            .filter(|r| r.enabled && r.feed_names.iter().any(|n| n == &feed.name))
+            .filter(|r| {
+                r.enabled
+                    && (r.feed_names.is_empty() || r.feed_names.iter().any(|n| n == &feed.name))
+            })
             .collect::<Vec<_>>();
 
         // Collect all items for batch insert (single DB lock)
@@ -604,6 +607,104 @@ mod tests {
         assert!(RssMonitor::compile_filter(r"release-[0-9]+").is_some());
         assert!(RssMonitor::compile_filter("(").is_none());
         assert!(RssMonitor::compile_filter(&"x".repeat(513)).is_none());
+    }
+
+    /// Serve a one-item feed plus its NZB on loopback, and return a monitor
+    /// whose fetch policy admits that loopback address.
+    async fn monitor_with_local_feed(
+        data_dir: PathBuf,
+    ) -> (RssMonitor, Arc<QueueManager>, RssFeedConfig) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        let feed_xml = format!(
+            r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
+                <id>feed</id><title>Feed</title><updated>2026-07-27T00:00:00Z</updated>
+                <entry><id>new-item</id><title>Show.S01E01.1080p</title>
+                    <updated>2026-07-27T00:00:00Z</updated>
+                    <link href="{base}/release.nzb"/>
+                </entry>
+            </feed>"#
+        );
+        let nzb = r#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p" date="1" subject="&quot;release.bin&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="100" number="1">seg@example.test</segment></segments>
+  </file>
+</nzb>"#;
+        let app = axum::Router::new()
+            .route(
+                "/feed.xml",
+                axum::routing::get(move || async move { feed_xml }),
+            )
+            .route(
+                "/release.nzb",
+                axum::routing::get(move || async move { nzb }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let (mut monitor, queue_manager) = monitor(data_dir);
+        let mut config = AppConfig::default();
+        config.general.fetch_allowed_hosts = vec!["127.0.0.1".into()];
+        monitor.config = Arc::new(ArcSwap::from_pointee(config));
+        let feed = RssFeedConfig {
+            name: "tv-feed".into(),
+            url: format!("{base}/feed.xml"),
+            poll_interval_secs: 900,
+            category: None,
+            filter_regex: None,
+            enabled: true,
+            auto_download: false,
+            max_age_days: None,
+        };
+        (monitor, queue_manager, feed)
+    }
+
+    fn rule(feed_names: Vec<String>) -> crate::nzb_core::models::RssRule {
+        crate::nzb_core::models::RssRule {
+            id: "rule".into(),
+            name: "TV".into(),
+            feed_names,
+            category: None,
+            priority: 1,
+            match_regex: "1080p".into(),
+            enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn rule_with_no_feed_names_applies_to_every_feed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (monitor, queue_manager, feed) = monitor_with_local_feed(temp.path().into()).await;
+        queue_manager
+            .rss_rule_insert(&rule(Vec::new()))
+            .expect("insert rule");
+
+        monitor.check_feed(&feed).await.expect("feed check");
+
+        assert_eq!(queue_manager.get_jobs().len(), 1);
+        assert!(
+            queue_manager
+                .rss_item_get("new-item")
+                .expect("database query")
+                .expect("stored item")
+                .downloaded
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_naming_another_feed_does_not_apply() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (monitor, queue_manager, feed) = monitor_with_local_feed(temp.path().into()).await;
+        queue_manager
+            .rss_rule_insert(&rule(vec!["other-feed".into()]))
+            .expect("insert rule");
+
+        monitor.check_feed(&feed).await.expect("feed check");
+
+        assert!(queue_manager.get_jobs().is_empty());
     }
 
     #[tokio::test]
