@@ -175,6 +175,48 @@ describe('QueueViewComponent', () => {
     expect(component.displayConnectionCount('backup', 2_000)).toEqual({ count: 3, recent: false });
   });
 
+  it('labels a job held by the disk-space guard', () => {
+    const { component } = makeComponent();
+
+    expect(component.statusLabel(makeJob({ status: 'paused', pause_reason: 'disk_space' }))).toBe(
+      'paused · low disk',
+    );
+    expect(component.statusLabel(makeJob({ status: 'paused', pause_reason: 'manual' }))).toBe(
+      'paused',
+    );
+    expect(component.statusLabel(makeJob({ status: 'downloading' }))).toBe('downloading');
+  });
+
+  it('shows the disk-space reason for a global pause applied by the guard', () => {
+    const { component } = makeComponent({
+      get: vi.fn((url: string) =>
+        url === '/queue'
+          ? of({ jobs: [], total: 0, speed_bps: 0, paused: true, pause_reason: 'disk_space' })
+          : of({}),
+      ),
+    });
+
+    component.loadQueue();
+
+    expect(component.pausedLabel()).toBe('Paused · low disk space');
+    // A queued job caught by the global hold before the next refresh.
+    expect(component.statusLabel(makeJob({ status: 'queued' }))).toBe('paused · low disk');
+  });
+
+  it('keeps the plain paused label for a user pause', () => {
+    const { component } = makeComponent({
+      get: vi.fn((url: string) =>
+        url === '/queue'
+          ? of({ jobs: [], total: 0, speed_bps: 0, paused: true, pause_reason: 'global' })
+          : of({}),
+      ),
+    });
+
+    component.loadQueue();
+
+    expect(component.pausedLabel()).toBe('Paused');
+  });
+
   it('ignores a duplicate row action while the first request is pending', () => {
     const action$ = new Subject<unknown>();
     const { component, api } = makeComponent({

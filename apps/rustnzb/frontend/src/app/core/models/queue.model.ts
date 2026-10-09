@@ -6,6 +6,9 @@ export interface ServerArticleStats {
   bytes_downloaded: number;
 }
 
+/** Why a job or the whole queue is paused; `disk_space` lifts automatically. */
+export type PauseReason = 'manual' | 'global' | 'disk_space' | 'server';
+
 export interface NzbJob {
   id: string;
   name: string;
@@ -24,6 +27,7 @@ export interface NzbJob {
   speed_bps: number;
   error_message: string | null;
   server_stats: ServerArticleStats[];
+  pause_reason?: PauseReason | null;
 }
 
 export interface QueueResponse {
@@ -31,6 +35,7 @@ export interface QueueResponse {
   total: number;
   speed_bps: number;
   paused: boolean;
+  pause_reason?: PauseReason | null;
 }
 
 export interface StatusResponse {
@@ -43,6 +48,7 @@ export interface StatusResponse {
   disk_space_total: number;
   min_free_space_bytes: number;
   paused: boolean;
+  pause_reason?: PauseReason | null;
   pause_remaining_secs: number | null;
   webdav_available: boolean;
   webdav_enabled: boolean;

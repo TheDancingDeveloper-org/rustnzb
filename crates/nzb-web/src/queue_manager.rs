@@ -1140,6 +1140,24 @@ impl std::str::FromStr for QueueSortField {
     }
 }
 
+/// Why a job, or the whole queue, is paused.
+///
+/// Exposed on the native API so a pause applied by the disk-space guard can
+/// be told apart from one the user asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseReason {
+    /// The user paused this job.
+    Manual,
+    /// The user paused all downloads (Pause All or a timed pause).
+    Global,
+    /// The disk-space guard (`min_free_space_bytes`) is holding downloads.
+    /// The hold lifts automatically once space frees up.
+    DiskSpace,
+    /// The job was paused after a news-server error.
+    Server,
+}
+
 /// Notification fired immediately when a job is accepted into the queue.
 #[derive(Debug, Clone)]
 pub struct JobAddedEvent {
@@ -1186,6 +1204,10 @@ pub struct QueueManager {
     /// Keeping this separate from ordinary per-job pause state means that
     /// `resume_all` only resumes work stopped by `pause_all`.
     globally_paused_jobs: Mutex<HashSet<String>>,
+    /// Set while the current global pause was applied by the disk-space
+    /// guard rather than the user; holds when the guard tripped. The guard
+    /// lifts only pauses it owns.
+    disk_space_hold: Mutex<Option<DateTime<Utc>>>,
     /// Global speed tracker.
     speed: SpeedTracker,
     /// Database for persistence.
@@ -1242,6 +1264,7 @@ pub struct QueueManager {
 
 impl QueueManager {
     const GLOBAL_PAUSED_JOBS_SETTING: &'static str = "globally_paused_job_ids";
+    const DISK_SPACE_HOLD_SETTING: &'static str = "disk_space_hold_since";
 
     /// Create a new queue manager.
     #[allow(clippy::too_many_arguments)]
@@ -1325,6 +1348,7 @@ impl QueueManager {
             globally_paused: AtomicBool::new(false),
             pause_transition: Mutex::new(()),
             globally_paused_jobs: Mutex::new(HashSet::new()),
+            disk_space_hold: Mutex::new(None),
             speed: SpeedTracker::new(),
             db: Mutex::new(db),
             incomplete_dir: Mutex::new(incomplete_dir),
@@ -3444,6 +3468,12 @@ impl QueueManager {
                 .ok_or_else(|| crate::nzb_core::NzbError::JobNotFound(id.to_string()))?;
 
             state.job.status = JobStatus::Paused;
+            // An explicit pause supersedes a disk-space hold, so the disk
+            // guard must not resume this job when space frees up.
+            if state.failure_code == Some(JobFailureCode::StorageUnavailable) {
+                state.failure_code = None;
+                state.job.error_message = None;
+            }
 
             let db = self.db.lock();
             db.queue_update_progress(
@@ -3718,12 +3748,20 @@ impl QueueManager {
 
     /// Pause all downloads globally.
     pub fn pause_all(&self) {
+        self.pause_all_with_hold(None);
+    }
+
+    /// Pause all downloads. `disk_space_hold` marks a pause applied by the
+    /// disk-space guard; `None` is a user pause, which also takes ownership
+    /// of any existing disk hold so the guard will not lift it.
+    fn pause_all_with_hold(&self, disk_space_hold: Option<DateTime<Utc>>) {
         let _transition = self.pause_transition.lock();
         // Publish the global gate before touching individual jobs. This
         // prevents every scheduling and per-job resume path from starting
         // more work while the active contexts are being paused.
         self.globally_paused.store(true, Ordering::SeqCst);
         self.db.lock().set_setting("globally_paused", "true");
+        self.set_disk_space_hold(disk_space_hold);
         // A plain pause is indefinite: cancel any pending timed resume.
         // `pause_for` sets its deadline after calling this.
         *self.pause_until.lock() = None;
@@ -3807,6 +3845,7 @@ impl QueueManager {
         let _transition = self.pause_transition.lock();
         self.globally_paused.store(false, Ordering::SeqCst);
         self.db.lock().set_setting("globally_paused", "false");
+        self.set_disk_space_hold(None);
         *self.pause_until.lock() = None;
 
         let paused_by_global = std::mem::take(&mut *self.globally_paused_jobs.lock());
@@ -3949,6 +3988,112 @@ impl QueueManager {
     /// Check if downloads are globally paused.
     pub fn is_paused(&self) -> bool {
         self.globally_paused.load(Ordering::SeqCst)
+    }
+
+    /// Why downloads are globally paused, or `None` when they are not.
+    pub fn global_pause_reason(&self) -> Option<PauseReason> {
+        if !self.is_paused() {
+            return None;
+        }
+        Some(if self.disk_space_hold.lock().is_some() {
+            PauseReason::DiskSpace
+        } else {
+            PauseReason::Global
+        })
+    }
+
+    /// When the disk-space guard paused downloads, if it is holding them now.
+    pub fn disk_space_hold_since(&self) -> Option<DateTime<Utc>> {
+        *self.disk_space_hold.lock()
+    }
+
+    fn set_disk_space_hold(&self, since: Option<DateTime<Utc>>) {
+        *self.disk_space_hold.lock() = since;
+        let value = since.map(|at| at.to_rfc3339()).unwrap_or_default();
+        self.db
+            .lock()
+            .set_setting(Self::DISK_SPACE_HOLD_SETTING, &value);
+    }
+
+    /// Why a queued job is paused, or `None` when it is not paused.
+    pub fn pause_reason(&self, job_id: &str) -> Option<PauseReason> {
+        let (storage_hold, server_error) = {
+            let jobs = self.jobs.lock();
+            let state = jobs.get(job_id)?;
+            if state.job.status != JobStatus::Paused {
+                return None;
+            }
+            (
+                state.failure_code == Some(JobFailureCode::StorageUnavailable),
+                state.job.error_message.is_some(),
+            )
+        };
+        if storage_hold {
+            return Some(PauseReason::DiskSpace);
+        }
+        if self.globally_paused_jobs.lock().contains(job_id) {
+            return Some(self.global_pause_reason().unwrap_or(PauseReason::Global));
+        }
+        Some(if server_error {
+            PauseReason::Server
+        } else {
+            PauseReason::Manual
+        })
+    }
+
+    /// Run the disk-space guard once: pause all downloads when a configured
+    /// storage volume is below `min_free_space`, and lift the guard's own
+    /// holds once every volume has room again. User pauses are never lifted.
+    pub fn enforce_disk_guard(self: &Arc<Self>) {
+        let threshold = self.min_free_space();
+        let paths = self.disk_guard_paths();
+        let path_refs: Vec<_> = paths.iter().map(std::path::PathBuf::as_path).collect();
+        if !disk_space_available(threshold, &path_refs) {
+            if !self.is_paused() {
+                warn!(
+                    free_bytes = paths.first().map_or(0, |path| get_disk_free(path)),
+                    min_free_space = threshold,
+                    "Low disk space on a configured storage volume, auto-pausing downloads"
+                );
+                self.pause_all_with_hold(Some(Utc::now()));
+            }
+            return;
+        }
+
+        if self.is_paused() && self.disk_space_hold.lock().is_some() {
+            info!("Disk space recovered, resuming downloads paused by the disk guard");
+            self.resume_all();
+        }
+        self.resume_storage_held_jobs();
+    }
+
+    /// Requeue jobs the start-of-download disk check paused, once space is back.
+    fn resume_storage_held_jobs(self: &Arc<Self>) {
+        let _transition = self.pause_transition.lock();
+        if self.is_paused() {
+            return;
+        }
+        let mut resumed = 0u32;
+        {
+            let mut jobs = self.jobs.lock();
+            for state in jobs.values_mut() {
+                if state.job.status == JobStatus::Paused
+                    && state.failure_code == Some(JobFailureCode::StorageUnavailable)
+                {
+                    state.job.error_message = None;
+                    state.failure_code = None;
+                    state.job.status = JobStatus::Queued;
+                    resumed += 1;
+                }
+            }
+        }
+        if resumed > 0 {
+            info!(
+                count = resumed,
+                "Resumed jobs held for low disk space now that space is available"
+            );
+            self.start_next_queued();
+        }
     }
 
     /// Get the number of jobs in the queue.
@@ -4615,7 +4760,17 @@ impl QueueManager {
         };
         if was_paused {
             self.globally_paused.store(true, Ordering::SeqCst);
-            info!("Restored global pause state from database");
+            let hold = self
+                .db
+                .lock()
+                .get_setting(Self::DISK_SPACE_HOLD_SETTING)
+                .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+                .map(|at| at.with_timezone(&Utc));
+            *self.disk_space_hold.lock() = hold;
+            info!(
+                disk_space_hold = hold.is_some(),
+                "Restored global pause state from database"
+            );
         }
 
         // Reclaim partial downloads nothing can reach any more before any
@@ -5014,20 +5169,8 @@ impl QueueManager {
                         info!(total_nntp_connections = total, "NNTP connection summary");
                     }
                 }
-                if tick_count.is_multiple_of(30) && qm.min_free_space() > 0 {
-                    let paths = qm.disk_guard_paths();
-                    let path_refs: Vec<_> = paths.iter().map(std::path::PathBuf::as_path).collect();
-                    let free = paths.first().map_or(0, |path| get_disk_free(path));
-                    if !disk_space_available(qm.min_free_space(), &path_refs)
-                        && !qm.globally_paused.load(Ordering::Relaxed)
-                    {
-                        warn!(
-                            free_bytes = free,
-                            min_free_space = qm.min_free_space(),
-                            "Low disk space on a configured storage volume, auto-pausing downloads"
-                        );
-                        qm.pause_all();
-                    }
+                if tick_count.is_multiple_of(30) {
+                    qm.enforce_disk_guard();
                 }
             }
         });
@@ -5463,6 +5606,143 @@ mod global_pause_tests {
 
         assert!(!manager.is_paused());
         assert_eq!(manager.get_job("manual").unwrap().status, JobStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn low_disk_guard_reports_disk_space_reason_and_resumes_when_space_frees() {
+        let (manager, tempdir) = manager();
+        insert_job(
+            &manager,
+            job("active", JobStatus::Downloading, tempdir.path()),
+        );
+        insert_job(&manager, job("manual", JobStatus::Paused, tempdir.path()));
+        assert_eq!(manager.pause_reason("active"), None);
+        assert_eq!(manager.pause_reason("manual"), Some(PauseReason::Manual));
+
+        // No volume can ever have u64::MAX bytes free.
+        manager.set_min_free_space(u64::MAX);
+        manager.enforce_disk_guard();
+
+        assert!(manager.is_paused());
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::DiskSpace));
+        assert!(manager.disk_space_hold_since().is_some());
+        assert_eq!(manager.pause_reason("active"), Some(PauseReason::DiskSpace));
+        assert_eq!(manager.pause_reason("manual"), Some(PauseReason::Manual));
+        assert!(
+            manager
+                .db
+                .lock()
+                .get_setting(QueueManager::DISK_SPACE_HOLD_SETTING)
+                .is_some_and(|value| !value.is_empty())
+        );
+
+        // Space frees up: the guard lifts its own hold on the next check.
+        manager.set_min_free_space(1);
+        manager.enforce_disk_guard();
+
+        assert!(!manager.is_paused());
+        assert_eq!(manager.global_pause_reason(), None);
+        assert!(manager.disk_space_hold_since().is_none());
+        assert_ne!(manager.get_job("active").unwrap().status, JobStatus::Paused);
+        assert_eq!(manager.get_job("manual").unwrap().status, JobStatus::Paused);
+        assert_eq!(manager.pause_reason("manual"), Some(PauseReason::Manual));
+    }
+
+    #[tokio::test]
+    async fn disk_guard_never_lifts_a_user_global_pause() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        manager.pause_all();
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Global));
+        assert_eq!(manager.pause_reason("queued"), Some(PauseReason::Global));
+        manager.set_min_free_space(1);
+        manager.enforce_disk_guard();
+        assert!(manager.is_paused());
+
+        // A user Pause All during a disk hold takes ownership of the pause.
+        manager.resume_all();
+        manager.set_min_free_space(u64::MAX);
+        manager.enforce_disk_guard();
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::DiskSpace));
+        manager.pause_all();
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Global));
+        manager.set_min_free_space(1);
+        manager.enforce_disk_guard();
+        assert!(manager.is_paused());
+    }
+
+    #[tokio::test]
+    async fn preflight_storage_hold_reports_disk_space_and_resumes_when_space_frees() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("held", JobStatus::Paused, tempdir.path()));
+        {
+            let mut jobs = manager.jobs.lock();
+            let state = jobs.get_mut("held").unwrap();
+            state.job.error_message = Some("Paused: low disk space".to_string());
+            state.failure_code = Some(JobFailureCode::StorageUnavailable);
+        }
+        assert_eq!(manager.pause_reason("held"), Some(PauseReason::DiskSpace));
+
+        manager.set_min_free_space(1);
+        manager.enforce_disk_guard();
+
+        let held = manager.get_job("held").unwrap();
+        assert_ne!(held.status, JobStatus::Paused);
+        assert_eq!(held.error_message, None);
+        assert_eq!(manager.pause_reason("held"), None);
+    }
+
+    #[tokio::test]
+    async fn manual_pause_takes_over_a_preflight_storage_hold() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("held", JobStatus::Paused, tempdir.path()));
+        {
+            let mut jobs = manager.jobs.lock();
+            let state = jobs.get_mut("held").unwrap();
+            state.job.error_message = Some("Paused: low disk space".to_string());
+            state.failure_code = Some(JobFailureCode::StorageUnavailable);
+        }
+
+        manager.pause_job("held").unwrap();
+        assert_eq!(manager.pause_reason("held"), Some(PauseReason::Manual));
+
+        manager.set_min_free_space(1);
+        manager.enforce_disk_guard();
+        assert_eq!(manager.get_job("held").unwrap().status, JobStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn server_error_pause_reports_server_reason() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("srv", JobStatus::Paused, tempdir.path()));
+        manager
+            .jobs
+            .lock()
+            .get_mut("srv")
+            .unwrap()
+            .job
+            .error_message = Some("server unavailable".to_string());
+        assert_eq!(manager.pause_reason("srv"), Some(PauseReason::Server));
+    }
+
+    #[tokio::test]
+    async fn restored_disk_space_hold_keeps_its_reason() {
+        let (manager, _tempdir) = manager();
+        {
+            let db = manager.db.lock();
+            db.set_setting("globally_paused", "true");
+            db.set_setting(
+                QueueManager::DISK_SPACE_HOLD_SETTING,
+                &Utc::now().to_rfc3339(),
+            );
+        }
+        manager.restore_from_db().unwrap();
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::DiskSpace));
+
+        manager.set_min_free_space(1);
+        manager.enforce_disk_guard();
+        assert!(!manager.is_paused());
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@ use nzb_web::nzb_core::config::{
 use nzb_web::nzb_core::models::*;
 use nzb_web::nzb_core::nzb_parser;
 use nzb_web::nzb_core::sabnzbd_import;
+use nzb_web::queue_manager::PauseReason;
 
 use nzb_web::HistoryRetryOutcome;
 use nzb_web::error::ApiError;
@@ -135,10 +136,21 @@ pub struct SetPriorityBody {
 
 #[derive(Serialize)]
 pub struct QueueResponse {
-    pub jobs: Vec<NzbJob>,
+    pub jobs: Vec<QueueJob>,
     pub total: usize,
     pub speed_bps: u64,
     pub paused: bool,
+    /// Why downloads are globally paused (`global`, `disk_space`), or null.
+    pub pause_reason: Option<PauseReason>,
+}
+
+/// A queued job plus why it is paused (`manual`, `global`, `disk_space`,
+/// `server`), or null when it is not paused.
+#[derive(Serialize)]
+pub struct QueueJob {
+    #[serde(flatten)]
+    pub job: NzbJob,
+    pub pause_reason: Option<PauseReason>,
 }
 
 #[derive(Serialize)]
@@ -215,6 +227,8 @@ pub struct AddNzbResponse {
 pub struct StatusResponse {
     pub version: &'static str,
     pub paused: bool,
+    /// Why downloads are globally paused (`global`, `disk_space`), or null.
+    pub pause_reason: Option<PauseReason>,
     pub speed_bps: u64,
     pub speed_limit_bps: u64,
     pub queue_size: usize,
@@ -281,17 +295,27 @@ pub async fn h_queue_list(
     let total = all_jobs.len();
     let speed_bps = qm.get_speed();
     let paused = qm.is_paused();
+    let pause_reason = qm.global_pause_reason();
 
     // Apply pagination (default: first 100 jobs)
     let offset = q.offset.unwrap_or(0);
     let limit = q.limit.unwrap_or(100);
-    let jobs: Vec<_> = all_jobs.into_iter().skip(offset).take(limit).collect();
+    let jobs: Vec<_> = all_jobs
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|job| QueueJob {
+            pause_reason: qm.pause_reason(&job.id),
+            job,
+        })
+        .collect();
 
     Ok(Json(QueueResponse {
         jobs,
         total,
         speed_bps,
         paused,
+        pause_reason,
     }))
 }
 
@@ -759,6 +783,7 @@ pub async fn h_status(
     Ok(Json(StatusResponse {
         version: env!("RUSTNZB_BUILD_VERSION"),
         paused: qm.is_paused(),
+        pause_reason: qm.global_pause_reason(),
         speed_bps: qm.get_speed(),
         speed_limit_bps: qm.get_speed_limit(),
         queue_size: qm.queue_size(),
