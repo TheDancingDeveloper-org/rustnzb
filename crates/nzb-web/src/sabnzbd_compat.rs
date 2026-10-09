@@ -962,6 +962,15 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
 
         "retry" => handle_retry(state, req),
 
+        // SABnzbd `_api_warnings`. RustNZB does not keep a SABnzbd-style
+        // warnings list (queue/fullstatus report `have_warnings: "0"` and
+        // `warnings: []`), so this is the same empty list; `name=clear`
+        // is accepted.
+        "warnings" => match req.name.as_deref() {
+            Some("clear") => Json(serde_json::json!({ "status": true })),
+            _ => Json(serde_json::json!({ "warnings": Vec::<serde_json::Value>::new() })),
+        },
+
         _ => Json(serde_json::json!({
             "status": false,
             "error": format!("Unknown mode: {mode}")
@@ -4372,6 +4381,26 @@ mod tests {
         assert!(primary["daily"].is_object());
         assert_eq!(primary["articles_tried"], 10);
         assert_eq!(primary["articles_success"], 9);
+    }
+
+    /// `mode=warnings` is a real SABnzbd mode (`api.py::_api_warnings`);
+    /// it must answer with a `warnings` list, consistent with fullstatus,
+    /// and `name=clear` must succeed.
+    #[tokio::test]
+    async fn warnings_mode_matches_fullstatus_warnings() {
+        let test_state = test_state();
+        let warnings = dispatch_mode(&test_state.state, "warnings", &SabApiRequest::default()).0;
+        let fullstatus =
+            dispatch_mode(&test_state.state, "fullstatus", &SabApiRequest::default()).0;
+        assert!(warnings["warnings"].is_array(), "resp={warnings}");
+        assert_eq!(warnings["warnings"], fullstatus["status"]["warnings"]);
+
+        let clear = SabApiRequest {
+            name: Some("clear".into()),
+            ..SabApiRequest::default()
+        };
+        let cleared = dispatch_mode(&test_state.state, "warnings", &clear).0;
+        assert_eq!(cleared, serde_json::json!({ "status": true }));
     }
 
     /// SABnzbd's real `_api_queue_delete` accepts a comma-separated `value`
