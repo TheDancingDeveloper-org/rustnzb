@@ -3289,6 +3289,9 @@ impl QueueManager {
         // more work while the active contexts are being paused.
         self.globally_paused.store(true, Ordering::SeqCst);
         self.db.lock().set_setting("globally_paused", "true");
+        // A plain pause is indefinite: cancel any pending timed resume.
+        // `pause_for` sets its deadline after calling this.
+        *self.pause_until.lock() = None;
 
         // Collect ids to pause in the pool, to avoid holding the jobs lock
         // while calling into the worker pool.

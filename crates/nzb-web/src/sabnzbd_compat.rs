@@ -644,7 +644,9 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
 
         "history" => handle_history(state, req),
 
-        "get_config" | "config" => handle_get_config(state),
+        "get_config" => handle_get_config(state),
+
+        "config" => handle_config(state, req),
 
         "get_cats" => handle_get_cats(state),
 
@@ -1426,19 +1428,23 @@ fn handle_pause(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         let search_id = nzo_id.strip_prefix("SABnzbd_nzo_").unwrap_or(nzo_id);
 
         // Try to find and pause the job
-        let jobs = qm.get_jobs();
-        for job in &jobs {
-            if job_id_matches(&job.id, search_id) {
-                let _ = qm.pause_job(&job.id);
-                tracing::info!(id = %job.id, "Job paused via arr API");
-                break;
-            }
+        if let Some(job) = qm
+            .get_jobs()
+            .into_iter()
+            .find(|job| job_id_matches(&job.id, search_id))
+        {
+            let _ = qm.pause_job(&job.id);
+            tracing::info!(id = %job.id, "Job paused via arr API");
+            return Json(serde_json::json!({ "status": true }));
         }
-
-        return Json(serde_json::json!({ "status": true }));
+        }
+        // SABnzbd's `mode=pause` takes no job id; a value that names no job
+        // (e.g. a duration) must still pause the queue, not be ignored.
     }
 
-    // No specific ID -- pause all
+    // No specific ID -- pause all. Like SABnzbd's `_api_pause`
+    // (`plan_resume(0)`), this is an indefinite pause: pause_all cancels
+    // any pending timed resume.
     qm.pause_all();
     tracing::info!("All jobs paused via arr API");
 
@@ -1798,6 +1804,89 @@ fn apply_sab_add_priority(job: &mut NzbJob, priority: &str) {
     } else {
         job.priority = sab_priority_to_priority(priority);
     }
+}
+
+/// Handle `mode=config`. With a `name`, this is SABnzbd's setter table
+/// (`sabnzbd/api.py::_api_config_table`); without one it keeps returning
+/// the configuration, as `mode=config` always has here.
+fn handle_config(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    let value = req.value.as_deref().unwrap_or("").trim();
+    match req.name.as_deref().unwrap_or("") {
+        "" => handle_get_config(state),
+        "speedlimit" => handle_config_speedlimit(state, value),
+        "set_pause" => {
+            // SABnzbd `plan_resume(minutes)`: a positive value pauses and
+            // schedules a resume, 0 cancels the timed pause and resumes.
+            let qm = &state.queue_manager;
+            match value.parse::<u64>().unwrap_or(0) {
+                0 => qm.resume_all(),
+                minutes => qm.pause_for(minutes.saturating_mul(60)),
+            }
+            Json(serde_json::json!({ "status": true }))
+        }
+        _ => Json(serde_json::json!({ "status": false, "error": "not implemented" })),
+    }
+}
+
+/// `mode=config&name=speedlimit&value=...`, following SABnzbd's
+/// `Downloader.limit_speed`: a value ending in `%`, or a bare number from 1
+/// to 100, is a percentage of the maximum bandwidth; anything else is an
+/// absolute bytes/sec value with an optional K/M/G/T (1024-based) suffix.
+/// An empty value or 0 removes the limit.
+fn handle_config_speedlimit(state: &AppState, value: &str) -> Json<serde_json::Value> {
+    let qm = &state.queue_manager;
+    let (number, explicit_percent) = match value.strip_suffix('%') {
+        Some(number) => (number.trim(), true),
+        None => (value, false),
+    };
+    let amount = if number.is_empty() {
+        Some(0.0)
+    } else {
+        parse_sab_units(number)
+    };
+    let Some(amount) = amount else {
+        return Json(serde_json::json!({
+            "status": false,
+            "error": format!("Invalid speed limit: {value}")
+        }));
+    };
+
+    if explicit_percent || (amount > 0.0 && amount < 101.0) {
+        // A percentage of the maximum bandwidth. RustNZB has no maximum
+        // bandwidth setting, so only "no limit" (0% / 100%) can be applied.
+        if amount == 0.0 || amount >= 100.0 {
+            qm.set_speed_limit(0);
+            return Json(serde_json::json!({ "status": true }));
+        }
+        return Json(serde_json::json!({
+            "status": false,
+            "error": "A percentage speed limit requires a maximum bandwidth, which RustNZB \
+                      does not have; use an absolute value such as 2M"
+        }));
+    }
+
+    // The bandwidth limiter stores the limit as a u32.
+    qm.set_speed_limit(amount.min(u32::MAX as f64) as u64);
+    Json(serde_json::json!({ "status": true }))
+}
+
+/// Parse a SABnzbd `from_units` value: a number with an optional
+/// K/M/G/T suffix (powers of 1024).
+fn parse_sab_units(value: &str) -> Option<f64> {
+    let value = value.trim();
+    let (number, multiplier) = match value.chars().last()?.to_ascii_uppercase() {
+        'K' => (&value[..value.len() - 1], 1024.0),
+        'M' => (&value[..value.len() - 1], 1024.0 * 1024.0),
+        'G' => (&value[..value.len() - 1], 1024.0 * 1024.0 * 1024.0),
+        'T' => (&value[..value.len() - 1], 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        _ => (value, 1.0),
+    };
+    number
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|amount| amount.is_finite() && *amount >= 0.0)
+        .map(|amount| amount * multiplier)
 }
 
 /// Convert arr-protocol priority string to our Priority enum.
@@ -3346,6 +3435,132 @@ mod tests {
         );
         assert_eq!(addfile_with_category(&test_state, "TV").await, "tv");
         assert_eq!(addfile_with_category(&test_state, "*").await, "Default");
+    }
+
+    fn config_request(name: &str, value: &str) -> SabApiRequest {
+        SabApiRequest {
+            mode: Some("config".into()),
+            name: Some(name.into()),
+            value: Some(value.into()),
+            ..SabApiRequest::default()
+        }
+    }
+
+    /// `mode=config&name=speedlimit` sets the live limit, accepting an
+    /// absolute value with an optional K/M/G suffix as SABnzbd does. Values
+    /// of 1-100 (or with `%`) are percentages of the maximum bandwidth.
+    #[tokio::test]
+    async fn config_speedlimit_sets_the_live_limit() {
+        let test_state = test_state();
+        let qm = &test_state.state.queue_manager;
+
+        for (value, expected) in [
+            ("512K", 512 * 1024),
+            ("2M", 2 * 1024 * 1024),
+            ("1.5M", 1024 * 1024 * 3 / 2),
+            ("1048576", 1_048_576),
+            ("0", 0),
+            ("3M", 3 * 1024 * 1024),
+            ("100", 0),
+        ] {
+            let response = dispatch_mode(
+                &test_state.state,
+                "config",
+                &config_request("speedlimit", value),
+            )
+            .0;
+            assert_eq!(
+                response,
+                serde_json::json!({ "status": true }),
+                "value={value}"
+            );
+            assert_eq!(qm.get_speed_limit(), expected, "value={value}");
+        }
+
+        // RustNZB has no maximum-bandwidth setting, so a partial percentage
+        // cannot be applied; report that instead of silently ignoring it.
+        qm.set_speed_limit(4096);
+        let response = dispatch_mode(
+            &test_state.state,
+            "config",
+            &config_request("speedlimit", "50%"),
+        )
+        .0;
+        assert_eq!(response["status"], serde_json::json!(false));
+        assert!(response["error"].is_string());
+        assert_eq!(qm.get_speed_limit(), 4096);
+    }
+
+    /// `mode=config&name=set_pause&value=<minutes>` is SABnzbd's timed
+    /// pause; `value=0` cancels it and resumes.
+    #[tokio::test]
+    async fn config_set_pause_starts_and_cancels_a_timed_pause() {
+        let test_state = test_state();
+        let qm = &test_state.state.queue_manager;
+
+        let response = dispatch_mode(
+            &test_state.state,
+            "config",
+            &config_request("set_pause", "5"),
+        )
+        .0;
+        assert_eq!(response, serde_json::json!({ "status": true }));
+        assert!(qm.is_paused());
+        let remaining = qm.pause_remaining_secs().expect("timed pause");
+        assert!((290..=300).contains(&remaining), "remaining={remaining}");
+
+        let response = dispatch_mode(
+            &test_state.state,
+            "config",
+            &config_request("set_pause", "0"),
+        )
+        .0;
+        assert_eq!(response, serde_json::json!({ "status": true }));
+        assert!(!qm.is_paused());
+        assert_eq!(qm.pause_remaining_secs(), None);
+    }
+
+    /// `mode=config` without a setter keeps returning the configuration;
+    /// unknown setters are reported as not implemented, not ignored.
+    #[tokio::test]
+    async fn config_without_setter_still_returns_configuration() {
+        let test_state = test_state();
+        let config = dispatch_mode(&test_state.state, "config", &SabApiRequest::default()).0;
+        assert!(config["config"]["categories"].is_array());
+
+        let unknown = dispatch_mode(
+            &test_state.state,
+            "config",
+            &config_request("no_such_setter", "1"),
+        )
+        .0;
+        assert_eq!(unknown["status"], serde_json::json!(false));
+    }
+
+    /// SABnzbd's `mode=pause` pauses the whole queue and cancels any
+    /// scheduled resume (`_api_pause` calls `plan_resume(0)`); a `value`
+    /// that is not a job id must not turn it into a no-op.
+    #[tokio::test]
+    async fn pause_with_non_job_value_pauses_all_and_cancels_timed_resume() {
+        let test_state = test_state();
+        let qm = &test_state.state.queue_manager;
+        qm.pause_for(600);
+        qm.resume_all();
+        assert!(!qm.is_paused());
+
+        let req = SabApiRequest {
+            value: Some("30".into()),
+            ..SabApiRequest::default()
+        };
+        let response = dispatch_mode(&test_state.state, "pause", &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert!(qm.is_paused());
+
+        qm.pause_for(600);
+        let response = dispatch_mode(&test_state.state, "pause", &SabApiRequest::default()).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert_eq!(qm.pause_remaining_secs(), None);
+        assert!(qm.is_paused());
     }
 
     /// SABnzbd's real `_api_queue_delete` accepts a comma-separated `value`
