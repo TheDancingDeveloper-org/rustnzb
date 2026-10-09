@@ -8,7 +8,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use crc32fast::Hasher;
 use nzb_web::auth::{CredentialStore, TokenStore};
-use nzb_web::nzb_core::config::{AppConfig, ServerConfig};
+use nzb_web::nzb_core::config::{AppConfig, CategoryConfig, ServerConfig};
 use nzb_web::nzb_core::db::Database;
 use nzb_web::{AppState, QueueManager};
 use rustnzb::server::build_router;
@@ -37,7 +37,13 @@ impl Drop for TestApp {
 }
 
 pub async fn start_test_server(server_configs: Vec<ServerConfig>) -> TestApp {
-    start_test_server_inner(server_configs, false).await
+    start_test_server_inner(server_configs, false, &[]).await
+}
+
+/// Like [`start_test_server`], with extra categories configured next to
+/// the default one.
+pub async fn start_test_server_with_categories(categories: &[&str]) -> TestApp {
+    start_test_server_inner(Vec::new(), false, categories).await
 }
 
 /// Like [`start_test_server`], but points the incomplete directory at a
@@ -47,14 +53,20 @@ pub async fn start_test_server(server_configs: Vec<ServerConfig>) -> TestApp {
 /// permission-based failure would not trigger. Used to exercise the enqueue
 /// failure path (rustnzb#129) without depending on filesystem permissions.
 pub async fn start_test_server_broken_storage() -> TestApp {
-    start_test_server_inner(Vec::new(), true).await
+    start_test_server_inner(Vec::new(), true, &[]).await
 }
 
 async fn start_test_server_inner(
     server_configs: Vec<ServerConfig>,
     broken_incomplete_dir: bool,
+    extra_categories: &[&str],
 ) -> TestApp {
     let base = AppConfig::default();
+    let mut categories = base.categories;
+    categories.extend(extra_categories.iter().map(|name| CategoryConfig {
+        name: (*name).to_string(),
+        ..CategoryConfig::default()
+    }));
     let config = AppConfig {
         general: nzb_web::nzb_core::config::GeneralConfig {
             max_active_downloads: 1,
@@ -62,7 +74,7 @@ async fn start_test_server_inner(
             ..base.general
         },
         servers: server_configs,
-        categories: base.categories,
+        categories,
         otel: base.otel,
         rss_feeds: base.rss_feeds,
         dav: base.dav,
