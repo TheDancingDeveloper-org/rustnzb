@@ -115,7 +115,58 @@ fn is_hashed_asset(path: &str) -> bool {
 }
 
 /// Build the axum Router with all API routes.
+///
+/// With the `webdav` feature this is [`build_router_with_dav`] with no DAV
+/// handle, so the router always carries the `Option<Arc<DavHandle>>` extension
+/// that `/api/status` and `/api/dav/add` extract. Every caller — the binary and
+/// the integration tests — gets the same wiring.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    #[cfg(feature = "webdav")]
+    {
+        build_router_with_dav(state, None)
+    }
+    #[cfg(not(feature = "webdav"))]
+    {
+        build_api_router(state)
+    }
+}
+
+/// Build the router with an optional WebDAV media library.
+///
+/// When `dav` is `Some`, the DAV store is mounted at `/dav` behind
+/// [`crate::dav::auth::dav_auth`]. The `Option<Arc<DavHandle>>` extension is
+/// layered either way, because handlers extract it unconditionally when the
+/// feature is compiled in and would otherwise fail with a 500.
+#[cfg(feature = "webdav")]
+pub fn build_router_with_dav(
+    state: Arc<AppState>,
+    dav: Option<Arc<crate::dav::DavHandle>>,
+) -> Router {
+    let mut router = build_api_router(state.clone());
+    if let Some(ref dav) = dav {
+        let auth_state = state.clone();
+        let dav_auth = axum::middleware::from_fn(
+            move |headers: HeaderMap, req: axum::extract::Request, next: Next| {
+                let st = auth_state.clone();
+                async move { crate::dav::auth::dav_auth(st, headers, req, next).await }
+            },
+        );
+        let dav_router = nzbdav_dav::dav_router(Arc::clone(&dav.store)).layer(dav_auth);
+        router = router.nest("/dav", dav_router);
+        let cfg = state.config();
+        if cfg.dav.username.is_none() && cfg.dav.password.is_none() && cfg.dav.api_key.is_none() {
+            tracing::warn!(
+                "WebDAV media library mounted at /dav (UNAUTHENTICATED — \
+                 set dav.username/password or dav.api_key in config)"
+            );
+        } else {
+            info!("WebDAV media library mounted at /dav (auth enabled)");
+        }
+    }
+    router.layer(axum::Extension(dav))
+}
+
+fn build_api_router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::default()
         .allow_origin(AllowOrigin::any())
         .allow_headers(AllowHeaders::any());

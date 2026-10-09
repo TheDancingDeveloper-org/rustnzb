@@ -51,8 +51,6 @@ async fn start_test_server() -> (
         credential_store,
     ));
     let router = build_router(state.clone());
-    #[cfg(feature = "webdav")]
-    let router = router.layer(axum::Extension(None::<Arc<rustnzb::dav::DavHandle>>));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
