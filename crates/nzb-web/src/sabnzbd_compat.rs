@@ -217,11 +217,62 @@ async fn handle_addurl(
     let data =
         crate::fetch_guard::read_response_bytes_limited(response, MAX_ADDURL_BODY_BYTES).await?;
 
-    let job_name = addurl_job_name(
-        nzbname.as_deref(),
-        content_disposition.as_deref(),
-        &fetch_plan.url,
-    );
+    // Unpack compressed NZBs (.nzb.gz, .nzb.bz2, .zip) the way uploads are.
+    // A multi-NZB zip is handed to addfile, which enqueues each NZB.
+    let url_file_name = url
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.split('?').next())
+        .unwrap_or("unknown")
+        .to_string();
+    let mut nzbs = match crate::nzb_archive::extract_nzbs(&url_file_name, &data) {
+        Ok(nzbs) => nzbs,
+        Err(error) => {
+            return Ok(Json(serde_json::json!({
+                "status": false,
+                "error": error.to_string()
+            })));
+        }
+    };
+    if nzbs.len() > 1 {
+        return Box::pin(dispatch_post(
+            state,
+            "addfile".into(),
+            None,
+            cat,
+            priority,
+            Some((url_file_name, data)),
+            None,
+            password,
+            SabApiRequest {
+                nzbname,
+                pp,
+                ..SabApiRequest::default()
+            },
+        ))
+        .await;
+    }
+    let (nzb_file_name, data) = nzbs.pop().expect("extract_nzbs returns at least one NZB");
+
+    // Adapted: job naming keeps our SABnzbd order (nzbname, then
+    // Content-Disposition, then the URL path), but when neither override nor
+    // disposition names the job the decompressed member is used, so a fetched
+    // .nzb.gz is named after the inner NZB rather than the archive.
+    let job_name = if nzbname.as_deref().and_then(clean_nzb_name).is_none()
+        && content_disposition
+            .as_deref()
+            .and_then(content_disposition_filename)
+            .is_none()
+    {
+        clean_nzb_name(&nzb_file_name).unwrap_or_else(|| "unknown".to_string())
+    } else {
+        addurl_job_name(
+            nzbname.as_deref(),
+            content_disposition.as_deref(),
+            &fetch_plan.url,
+        )
+    };
+
 
     match nzb_parser::parse_nzb(&job_name, &data) {
         Ok(mut job) => {
@@ -631,6 +682,32 @@ async fn dispatch_post(
                 }
             };
 
+            // Unpack compressed uploads (.nzb.gz, .nzb.bz2, .zip) with the
+            // same code and limits as the native add endpoint.
+            let mut nzbs = match crate::nzb_archive::extract_nzbs(&file_name, &data) {
+                Ok(nzbs) => nzbs,
+                Err(error) => {
+                    return Ok(Json(serde_json::json!({
+                        "status": false,
+                        "error": error.to_string()
+                    })));
+                }
+            };
+            if nzbs.len() > 1 {
+                return add_each_nzb(
+                    state,
+                    nzbs,
+                    cat,
+                    priority,
+                    password,
+                    query_req.nzbname.clone(),
+                    query_req.pp.clone(),
+                )
+                .await;
+            }
+            let (entry_name, data) = nzbs.pop().expect("extract_nzbs returns at least one NZB");
+            let file_name = nzb_entry_file_name(&entry_name);
+
             let job_name = query_req
                 .nzbname
                 .as_deref()
@@ -642,6 +719,7 @@ async fn dispatch_post(
                         .unwrap_or(&file_name)
                         .to_string()
                 });
+
 
             match nzb_parser::parse_nzb(&job_name, &data) {
                 Ok(mut job) => {
@@ -768,6 +846,72 @@ async fn dispatch_post(
             ))
         }
     }
+}
+
+/// Zip entries may sit in folders; a job is named after the file alone.
+fn nzb_entry_file_name(entry_name: &str) -> String {
+    entry_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(entry_name)
+        .to_string()
+}
+
+/// Enqueue every NZB of a multi-NZB archive as its own job (SABnzbd adds
+/// each NZB in a zip separately), reporting all resulting nzo_ids.
+async fn add_each_nzb(
+    state: &AppState,
+    nzbs: Vec<(String, Vec<u8>)>,
+    cat: Option<String>,
+    priority: Option<String>,
+    password: Option<String>,
+    nzbname: Option<String>,
+    pp: Option<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut nzo_ids = Vec::new();
+    let mut errors = Vec::new();
+    for (entry_name, data) in nzbs {
+        let file_name = nzb_entry_file_name(&entry_name);
+        let response = Box::pin(dispatch_post(
+            state,
+            "addfile".into(),
+            None,
+            cat.clone(),
+            priority.clone(),
+            Some((file_name, data)),
+            None,
+            password.clone(),
+            SabApiRequest {
+                // Only the first member keeps the explicit nzbname; the rest
+                // are named after their own files.
+                nzbname: if nzo_ids.is_empty() {
+                    nzbname.clone()
+                } else {
+                    None
+                },
+                pp: pp.clone(),
+                ..SabApiRequest::default()
+            },
+        ))
+        .await?
+        .0;
+        match response["nzo_ids"].as_array() {
+            Some(ids) => nzo_ids.extend(ids.iter().cloned()),
+            None => errors.push(format!(
+                "{entry_name}: {}",
+                response["error"].as_str().unwrap_or("failed to add")
+            )),
+        }
+    }
+    if nzo_ids.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "status": false,
+            "error": errors.join("; ")
+        })));
+    }
+    Ok(Json(
+        serde_json::json!({ "status": true, "nzo_ids": nzo_ids }),
+    ))
 }
 
 /// Dispatch an API mode to the appropriate handler.
@@ -3621,6 +3765,7 @@ mod tests {
         assert!(malformed["error"].is_string());
     }
 
+
     /// SABnzbd's PAUSED_PRIORITY (-2) adds the job paused rather than at a
     /// queue priority; the slot keeps reporting a normal priority.
     #[tokio::test]
@@ -3711,6 +3856,152 @@ mod tests {
             .category
     }
 
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn bzip2(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder =
+            bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(data).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    async fn addfile_upload(
+        test_state: &TestState,
+        file_name: &str,
+        data: Vec<u8>,
+    ) -> serde_json::Value {
+        dispatch_post(
+            &test_state.state,
+            "addfile".into(),
+            None,
+            None,
+            None,
+            Some((file_name.into(), data)),
+            None,
+            None,
+            SabApiRequest::default(),
+        )
+        .await
+        .expect("addfile response")
+        .0
+    }
+
+    fn queued_names(test_state: &TestState) -> Vec<String> {
+        let mut names: Vec<String> = test_state
+            .state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .map(|job| job.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `addfile` accepts the same compressed uploads as the native add
+    /// endpoint: `.nzb.gz`, `.nzb.bz2` and `.zip` (one job per NZB inside).
+    #[tokio::test]
+    async fn addfile_accepts_compressed_nzbs() {
+        let test_state = test_state();
+        let gz = addfile_upload(&test_state, "Gz.Show.nzb.gz", gzip(SAMPLE_NZB.as_bytes())).await;
+        assert_eq!(gz["status"], serde_json::json!(true), "gz: {gz}");
+        let bz =
+            addfile_upload(&test_state, "Bz.Show.nzb.bz2", bzip2(SAMPLE_NZB.as_bytes())).await;
+        assert_eq!(bz["status"], serde_json::json!(true), "bz2: {bz}");
+        assert_eq!(queued_names(&test_state), vec!["Bz.Show", "Gz.Show"]);
+
+        let test_state = self::test_state();
+        let archive = zip_of(&[
+            ("First.nzb", SAMPLE_NZB.as_bytes()),
+            ("folder/Second.nzb", SAMPLE_NZB.as_bytes()),
+            ("readme.txt", b"not an nzb"),
+        ]);
+        let zip = addfile_upload(&test_state, "pack.zip", archive).await;
+        assert_eq!(zip["status"], serde_json::json!(true), "zip: {zip}");
+        assert_eq!(zip["nzo_ids"].as_array().unwrap().len(), 2);
+        assert_eq!(queued_names(&test_state), vec!["First", "Second"]);
+
+        let broken =
+            addfile_upload(&self::test_state(), "broken.nzb.gz", b"not gzip".to_vec()).await;
+        assert_eq!(broken["status"], serde_json::json!(false));
+        assert!(broken["error"].is_string());
+    }
+
+    /// Serves `body` once on a loopback port at `path`.
+    async fn spawn_bytes_server(body: Vec<u8>, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral test server");
+        let addr = listener.local_addr().expect("test server local addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept test connection");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            let _ = socket.write_all(&response).await;
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}{path}")
+    }
+
+    /// `addurl` unpacks a fetched `.nzb.gz` the same way.
+    ///
+    /// Adapted: loopback is admitted through the test state's
+    /// `fetch_allowed_hosts` rather than the upstream cfg(test) task-local
+    /// seam, which this tree does not have.
+    #[tokio::test]
+    async fn addurl_accepts_gzipped_nzb() {
+        let test_state = test_state();
+        let mut config = (*test_state.state.config()).clone();
+        config.general.fetch_allowed_hosts = vec!["127.0.0.1".into()];
+        test_state.state.config.store(Arc::new(config));
+
+        let url = spawn_bytes_server(gzip(SAMPLE_NZB.as_bytes()), "/Url.Show.nzb.gz").await;
+        let response = dispatch_post(
+            &test_state.state,
+            "addurl".into(),
+            None,
+            None,
+            None,
+            None,
+            Some(url),
+            None,
+            SabApiRequest::default(),
+        )
+        .await
+        .expect("addurl response")
+        .0;
+        assert_eq!(response["status"], serde_json::json!(true), "resp={response}");
+        assert_eq!(queued_names(&test_state), vec!["Url.Show"]);
+    }
+
+
     /// SABnzbd falls back to the default category when `addfile`/`addurl`
     /// name a category that is not configured, and matches configured
     /// category names case-insensitively.
@@ -3731,6 +4022,7 @@ mod tests {
         assert_eq!(addfile_with_category(&test_state, "TV").await, "tv");
         assert_eq!(addfile_with_category(&test_state, "*").await, "Default");
     }
+
 
     fn config_request(name: &str, value: &str) -> SabApiRequest {
         SabApiRequest {

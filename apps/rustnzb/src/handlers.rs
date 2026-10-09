@@ -19,7 +19,6 @@ static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::
         .expect("Failed to build shared HTTP client")
 });
 
-use nzb_web::nzb_archive::extract_nzbs;
 #[cfg(feature = "webdav")]
 use nzb_web::nzb_core::config::DavConfig;
 use nzb_web::nzb_core::config::{
@@ -35,6 +34,7 @@ use nzb_web::fetch_guard::{
     read_response_bytes_limited, validate_fetch_url_with,
 };
 use nzb_web::log_buffer::LogEntry;
+use nzb_web::nzb_archive::extract_nzbs;
 use nzb_web::state::AppState;
 
 use crate::admissions::{IdempotencyKey, payload_digest};
@@ -357,7 +357,7 @@ fn enqueue_nzb(
 }
 
 /// POST /api/queue/add -- Add NZB file(s) to the queue.
-/// Accepts `.nzb` files directly, or `.zip`/`.gz` archives containing `.nzb` files.
+/// Accepts `.nzb` files directly, or `.zip`/`.gz`/`.bz2` archives containing `.nzb` files.
 /// Multiple files can be uploaded in a single multipart request.
 pub async fn h_queue_add(
     State(state): State<Arc<AppState>>,
@@ -389,7 +389,7 @@ pub async fn h_queue_add(
         )?);
     } else {
         while let Some((file_name, data)) = next_uploaded_file(&mut multipart).await? {
-            // Extract NZBs (handles zip/gz archives or plain .nzb)
+            // Extract NZBs (handles zip/gz/bz2 archives or plain .nzb)
             for (nzb_name, nzb_data) in extract_nzbs(&file_name, &data).map_err(ApiError::from)? {
                 nzo_ids.push(enqueue_nzb(&state, &q, &nzb_name, nzb_data, None)?);
             }
@@ -2385,6 +2385,7 @@ pub async fn h_dav_config_set(
 mod tests {
     use super::{MAX_RSS_REGEX_LEN, compile_rss_regex, sanitize_server_config};
 
+    use nzb_web::nzb_archive::MAX_NZB_DECOMPRESSED_BYTES;
     use nzb_web::nzb_core::config::ServerConfig;
 
     #[test]
