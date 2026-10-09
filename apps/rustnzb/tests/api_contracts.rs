@@ -1152,3 +1152,97 @@ async fn category_save_rejects_unsafe_name_and_output_dir() {
         .unwrap();
     assert!(output.ends_with("complete/shows/tv/Some.Job"), "{output:?}");
 }
+
+#[tokio::test]
+async fn bad_input_on_add_browse_and_rss_download_is_a_client_error() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let (access, _) = login(&app, &client).await;
+    let base = &app.base_url;
+
+    // Empty URL on add-url is the caller's mistake, not a server fault.
+    let (status, body) = call(
+        client
+            .post(format!("{base}/api/queue/add-url"))
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"url": ""})),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error_kind"], "bad_request");
+
+    // Browsing a path that is missing, or is a file, is a 400.
+    let missing = app.config_path.with_file_name("no-such-dir");
+    let (status, body) = call(
+        client
+            .get(format!("{base}/api/browse-directory"))
+            .query(&[("path", missing.to_string_lossy().as_ref())])
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error_kind"], "bad_request");
+    assert!(
+        body["human_readable"]
+            .as_str()
+            .unwrap()
+            .contains("Not a directory")
+    );
+    let (status, body) = call(
+        client
+            .get(format!("{base}/api/browse-directory"))
+            .query(&[("path", app.config_path.to_string_lossy().as_ref())])
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+
+    // A corrupt archive upload is a 400.
+    let part = reqwest::multipart::Part::bytes(b"not a zip".to_vec()).file_name("broken.zip");
+    let (status, body) = call(
+        client
+            .post(format!("{base}/api/queue/add"))
+            .bearer_auth(&access)
+            .multipart(reqwest::multipart::Form::new().part("file", part)),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error_kind"], "bad_request");
+
+    // A malformed multipart body is a 400.
+    let (status, body) = call(
+        client
+            .post(format!("{base}/api/queue/add"))
+            .bearer_auth(&access)
+            .header("content-type", "multipart/form-data; boundary=XYZ")
+            .body("--XYZ\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\ntruncated"),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error_kind"], "bad_request");
+
+    // Downloading an RSS item that has no NZB URL conflicts with its state.
+    app.state
+        .queue_manager
+        .rss_item_upsert(&nzb_web::nzb_core::models::RssItem {
+            id: "no-url".into(),
+            feed_name: "feed".into(),
+            title: "Item".into(),
+            url: None,
+            published_at: None,
+            first_seen_at: chrono::Utc::now(),
+            downloaded: false,
+            downloaded_at: None,
+            category: None,
+            size_bytes: 0,
+        })
+        .unwrap();
+    let (status, body) = call(
+        client
+            .post(format!("{base}/api/rss/items/no-url/download"))
+            .bearer_auth(&access),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error_kind"], "conflict");
+}

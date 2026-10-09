@@ -299,22 +299,21 @@ pub async fn h_queue_list(
 async fn next_uploaded_file(
     multipart: &mut Multipart,
 ) -> Result<Option<(String, Vec<u8>)>, ApiError> {
-    let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| ApiError::from(anyhow::anyhow!("Multipart error: {error}")))?
-    else {
+    let Some(field) = multipart.next_field().await.map_err(ApiError::from)? else {
         return Ok(None);
     };
     let file_name = field
         .file_name()
         .map(str::to_string)
         .unwrap_or_else(|| "unknown.nzb".to_string());
-    let data = field
-        .bytes()
-        .await
-        .map_err(|error| ApiError::from(anyhow::anyhow!("Read error: {error}")))?;
+    let data = field.bytes().await.map_err(ApiError::from)?;
     Ok(Some((file_name, data.to_vec())))
+}
+
+/// An archive that cannot be unpacked into NZBs (corrupt, empty, over the
+/// size or count limits) is bad input, not a server fault.
+fn bad_upload(error: anyhow::Error) -> ApiError {
+    ApiError::from((StatusCode::BAD_REQUEST, error))
 }
 
 fn enqueue_nzb(
@@ -381,7 +380,7 @@ pub async fn h_queue_add(
         // exactly one NZB — a multi-NZB upload has no single job to replay.
         let mut uploaded_nzbs = Vec::new();
         while let Some((file_name, data)) = next_uploaded_file(&mut multipart).await? {
-            uploaded_nzbs.extend(extract_nzbs(&file_name, &data).map_err(ApiError::from)?);
+            uploaded_nzbs.extend(extract_nzbs(&file_name, &data).map_err(bad_upload)?);
         }
         if uploaded_nzbs.len() != 1 {
             return Err(ApiError::bad_request(
@@ -399,7 +398,7 @@ pub async fn h_queue_add(
     } else {
         while let Some((file_name, data)) = next_uploaded_file(&mut multipart).await? {
             // Extract NZBs (handles zip/gz/bz2 archives or plain .nzb)
-            for (nzb_name, nzb_data) in extract_nzbs(&file_name, &data).map_err(ApiError::from)? {
+            for (nzb_name, nzb_data) in extract_nzbs(&file_name, &data).map_err(bad_upload)? {
                 nzo_ids.push(enqueue_nzb(&state, &q, &nzb_name, nzb_data, None)?);
             }
         }
@@ -505,7 +504,7 @@ pub async fn h_queue_add_url(
     Json(body): Json<AddUrlBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     if body.url.is_empty() {
-        return Err(ApiError::from(anyhow::anyhow!("No URL provided")));
+        return Err(ApiError::bad_request("No URL provided"));
     }
 
     let fetch_plan = validate_fetch_url_with(&body.url, &fetch_policy(&state)).await?;
@@ -547,7 +546,7 @@ pub async fn h_queue_add_url(
         priority: body.priority,
     };
 
-    let nzbs = extract_nzbs(&file_name, &data).map_err(ApiError::from)?;
+    let nzbs = extract_nzbs(&file_name, &data).map_err(bad_upload)?;
     let mut nzo_ids = Vec::new();
     for (nzb_name, nzb_data) in nzbs {
         let id = enqueue_nzb(&state, &q, &nzb_name, nzb_data, None)?;
@@ -727,8 +726,9 @@ pub async fn h_history_retry(
             job_id
         }
         HistoryRetryOutcome::NoNzbData => {
-            return Err(ApiError::from(anyhow::anyhow!(
-                "No NZB data stored for this entry"
+            return Err(ApiError::from((
+                StatusCode::CONFLICT,
+                "No NZB data stored for this entry",
             )));
         }
     };
@@ -1457,7 +1457,7 @@ pub async fn h_rss_item_download(
     let url = item
         .url
         .as_ref()
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("No download URL for this item")))?;
+        .ok_or_else(|| ApiError::from((StatusCode::CONFLICT, "No download URL for this item")))?;
 
     // Fetch the NZB
     let fetch_plan = validate_fetch_url_with(url, &fetch_policy(&state)).await?;
@@ -1481,8 +1481,7 @@ pub async fn h_rss_item_download(
 
     let data = read_response_bytes_limited(response, MAX_FETCH_BODY_BYTES).await?;
 
-    let mut job = nzb_parser::parse_nzb(&item.title, &data)
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to parse NZB: {e}")))?;
+    let mut job = nzb_parser::parse_nzb(&item.title, &data).map_err(ApiError::from)?;
 
     // Use the item's category or feed category
     if let Some(ref cat) = item.category {
@@ -1968,7 +1967,10 @@ pub async fn h_browse_directory(
     let dir = std::path::Path::new(&path);
 
     if !dir.is_dir() {
-        return Err(ApiError::from(anyhow::anyhow!("Not a directory: {path}")));
+        return Err(ApiError::from((
+            StatusCode::BAD_REQUEST,
+            format!("Not a directory: {path}"),
+        )));
     }
 
     let parent = dir.parent().map(|p| p.to_string_lossy().to_string());
@@ -2116,13 +2118,10 @@ pub async fn h_import_sabnzbd_ini(mut multipart: Multipart) -> Result<impl IntoR
     let field = multipart
         .next_field()
         .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Multipart error: {e}")))?
+        .map_err(ApiError::from)?
         .ok_or(ApiError::bad_request("no file uploaded"))?;
 
-    let data = field
-        .bytes()
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Read error: {e}")))?;
+    let data = field.bytes().await.map_err(ApiError::from)?;
 
     let content = String::from_utf8(data.to_vec())
         .map_err(|_| ApiError::bad_request("file is not valid UTF-8"))?;
