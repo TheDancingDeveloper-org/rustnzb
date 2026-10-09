@@ -284,6 +284,7 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
         error_message: None,
         speed_bps: 0,
         pp_override: None,
+        delete_archives: None,
         server_stats: Vec::new(),
         files,
     })

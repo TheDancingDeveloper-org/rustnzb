@@ -145,6 +145,7 @@ fn history_entry(id: &str, complete: &Path) -> HistoryEntry {
         error_message: Some("failed".to_string()),
         failure_code: Some(JobFailureCode::DownloadFailed),
         post_processing: None,
+        delete_archives: None,
         server_stats: Vec::new(),
         nzb_data: None,
         retry_data: None,
