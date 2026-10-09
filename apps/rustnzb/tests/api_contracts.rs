@@ -460,3 +460,72 @@ async fn rss_feed_url_is_validated_when_saved() {
         "http://192.168.1.10/api?t=rss"
     );
 }
+
+async fn login(app: &ContractApp, client: &reqwest::Client) -> (String, String) {
+    let tokens = client
+        .post(format!("{}/api/auth/login", app.base_url))
+        .json(&serde_json::json!({"username":"admin","password":"password"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    (
+        tokens["access_token"].as_str().unwrap().to_string(),
+        tokens["refresh_token"].as_str().unwrap().to_string(),
+    )
+}
+
+async fn status_with(app: &ContractApp, client: &reqwest::Client, access: &str) -> u16 {
+    client
+        .get(format!("{}/api/status", app.base_url))
+        .bearer_auth(access)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn logout_revokes_the_access_token() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+
+    // The web UI posts only the refresh token; the paired access token must die too.
+    let (access, refresh) = login(&app, &client).await;
+    let (other_access, _) = login(&app, &client).await;
+    assert_eq!(status_with(&app, &client, &access).await, 200);
+    let logout = client
+        .post(format!("{}/api/auth/logout", app.base_url))
+        .json(&serde_json::json!({ "refresh_token": refresh }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(status_with(&app, &client, &access).await, 401);
+    assert_eq!(status_with(&app, &client, &other_access).await, 200);
+
+    // A client that presents its access token in the header is logged out as well.
+    let (access, refresh) = login(&app, &client).await;
+    let logout = client
+        .post(format!("{}/api/auth/logout", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(status_with(&app, &client, &access).await, 401);
+    assert_eq!(
+        client
+            .post(format!("{}/api/auth/refresh", app.base_url))
+            .json(&serde_json::json!({ "refresh_token": refresh }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+}
