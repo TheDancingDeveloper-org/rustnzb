@@ -3333,9 +3333,17 @@ impl QueueManager {
     }
 
     /// Pause all downloads for a specified duration.
+    ///
+    /// Durations are clamped to a year. `chrono::Duration::seconds` panics on
+    /// values past its range, and a wrapped negative duration would resume
+    /// immediately after `pause_all` had already run.
     pub fn pause_for(self: &Arc<Self>, duration_secs: u64) {
+        const MAX_PAUSE_SECS: u64 = 365 * 24 * 60 * 60;
+        let duration_secs = duration_secs.min(MAX_PAUSE_SECS);
         self.pause_all();
-        let until_value = Utc::now() + chrono::Duration::seconds(duration_secs as i64);
+        let until_value = Utc::now()
+            + chrono::Duration::try_seconds(i64::try_from(duration_secs).unwrap_or(i64::MAX))
+                .expect("clamped pause duration fits in chrono");
         *self.pause_until.lock() = Some(until_value);
 
         let qm = Arc::clone(self);
