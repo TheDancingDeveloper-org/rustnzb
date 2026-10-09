@@ -2763,6 +2763,7 @@ impl QueueManager {
                             job_id = %job_id,
                             set = %r.set_name,
                             error = ?r.error,
+                            password_required = r.password_required,
                             "Direct unpack failed for set — falling back to normal extraction"
                         );
                     }

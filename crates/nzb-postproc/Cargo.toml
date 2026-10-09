@@ -13,7 +13,7 @@ groups-db = ["nzb-core/groups-db"]
 
 [dependencies]
 nzb-core = { version = "0.2.18", path = "../nzb-core" }
-tokio = { version = "1", features = ["rt", "sync", "process"] }
+tokio = { version = "1", features = ["rt", "sync", "process", "io-util"] }
 tracing = "0.1"
 opentelemetry.workspace = true
 anyhow = "1"
@@ -30,7 +30,7 @@ tempfile = "3"
 # packet MD5s. Version tracks what `rust-par2` itself parses with.
 md-5 = "0.11"
 crc32fast = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

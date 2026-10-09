@@ -19,7 +19,9 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use nzb_postproc::{find_unrar, normalize_extracted_permissions};
+use nzb_postproc::{
+    extractor_reads_password_from_stdin, find_unrar, normalize_extracted_permissions,
+};
 
 /// Error strings from unrar output that indicate an unrecoverable failure.
 const UNRAR_ERROR_PATTERNS: &[&str] = &[
@@ -37,6 +39,14 @@ const UNRAR_ERROR_PATTERNS: &[&str] = &[
     "Unexpected end of archive",
 ];
 
+/// The subset of [`UNRAR_ERROR_PATTERNS`] that means a missing or wrong
+/// archive password.
+const UNRAR_PASSWORD_PATTERNS: &[&str] = &[
+    "password is incorrect",
+    "Incorrect password",
+    "in the encrypted file",
+];
+
 /// A healthy extraction can wait for volumes, but a process that neither exits
 /// nor emits output is stuck (for example, waiting on an unrecognised prompt).
 const DIRECT_UNPACK_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -47,6 +57,9 @@ pub struct DirectUnpackResult {
     pub set_name: String,
     pub success: bool,
     pub error: Option<String>,
+    /// The failure was a missing or wrong archive password, the condition
+    /// the batch extractor reports as `archive_password_required`.
+    pub password_required: bool,
 }
 
 /// Tracks which volumes are available for a single RAR set.
@@ -274,12 +287,20 @@ fn unpack_set(
             set_name: set_name.to_string(),
             success: false,
             error: Some(format!("Failed to create output dir: {e}")),
+            password_required: false,
         };
     }
 
-    let pw_flag = match password {
-        Some(pw) => format!("-p{pw}"),
-        None => "-p-".to_string(),
+    // unrar 6+ reads the password from stdin after a bare `-p`, which keeps it
+    // out of `ps` and /proc/<pid>/cmdline. Older builds get `-p<pw>`. A
+    // password with a line break cannot be sent as one line.
+    let password = password.filter(|pw| !pw.is_empty());
+    let stdin_password = password
+        .filter(|pw| !pw.contains(['\n', '\r']) && extractor_reads_password_from_stdin(unrar_bin));
+    let pw_flag = match (password, stdin_password) {
+        (None, _) => "-p-".to_string(),
+        (Some(_), Some(_)) => "-p".to_string(),
+        (Some(pw), None) => format!("-p{pw}"),
     };
 
     // Spawn unrar with -vp (pause between volumes).
@@ -300,11 +321,30 @@ fn unpack_set(
                 set_name: set_name.to_string(),
                 success: false,
                 error: Some(format!("Failed to spawn unrar: {e}")),
+                password_required: false,
             };
         }
     };
 
-    let result = drive_unrar(&mut child, set_name, state, volume_ready, killed, rt);
+    // Answer the password prompt before anything else; unrar asks for it
+    // first. Stdin stays open afterwards for the volume prompts.
+    if let (Some(pw), Some(stdin)) = (stdin_password, child.stdin.as_mut())
+        && let Err(e) = stdin
+            .write_all(format!("{pw}\n").as_bytes())
+            .and_then(|()| stdin.flush())
+    {
+        warn!(set = %set_name, error = %e, "Failed to write the archive password to unrar");
+    }
+
+    let result = drive_unrar(
+        &mut child,
+        set_name,
+        usize::from(stdin_password.is_some()),
+        state,
+        volume_ready,
+        killed,
+        rt,
+    );
 
     // Ensure child is cleaned up.
     let _ = child.kill();
@@ -325,6 +365,7 @@ fn unpack_set(
 fn drive_unrar(
     child: &mut Child,
     set_name: &str,
+    answered_password_prompts: usize,
     state: &Mutex<DirectUnpackState>,
     volume_ready: &Notify,
     killed: &AtomicBool,
@@ -338,6 +379,9 @@ fn drive_unrar(
     spawn_output_reader(stderr, output_tx);
 
     let mut next_volume: u32 = 1; // Volume 0 is already being processed.
+    // The password prompt we answered up front appears in the first output
+    // only; any further prompt means the password was rejected.
+    let mut answered_password_prompts = answered_password_prompts;
     let mut output_buf = String::with_capacity(1024);
     let mut last_output = Instant::now();
 
@@ -359,6 +403,7 @@ fn drive_unrar(
                         set_name: set_name.to_string(),
                         success: true,
                         error: None,
+                        password_required: false,
                     };
                 }
 
@@ -367,7 +412,16 @@ fn drive_unrar(
                     .find(|pattern| output_buf.contains(**pattern))
                 {
                     error!(set = %set_name, error = %output_buf.trim(), "Direct unpack error detected");
-                    return failed_result(set_name, &format!("unrar reported {pattern}"));
+                    let mut result = failed_result(set_name, &format!("unrar reported {pattern}"));
+                    result.password_required = UNRAR_PASSWORD_PATTERNS.contains(pattern);
+                    return result;
+                }
+
+                if output_buf.matches("Enter password").count() > answered_password_prompts {
+                    warn!(set = %set_name, "Unrar asked for the archive password again — aborting");
+                    let mut result = failed_result(set_name, "unrar rejected the archive password");
+                    result.password_required = true;
+                    return result;
                 }
 
                 if is_volume_prompt(&output_buf) {
@@ -381,6 +435,7 @@ fn drive_unrar(
                             let _ = stdin.flush();
                             next_volume += 1;
                             output_buf.clear();
+                            answered_password_prompts = 0;
                         }
                         Err(e) => {
                             let _ = stdin.write_all(b"Q\n");
@@ -452,6 +507,7 @@ fn failed_result(set_name: &str, error: &str) -> DirectUnpackResult {
         set_name: set_name.to_string(),
         success: false,
         error: Some(error.to_string()),
+        password_required: false,
     }
 }
 
@@ -461,9 +517,13 @@ fn result_from_exit_status(set_name: &str, status: std::process::ExitStatus) -> 
             set_name: set_name.to_string(),
             success: true,
             error: None,
+            password_required: false,
         }
     } else {
-        failed_result(set_name, &format!("unrar exited with status {status}"))
+        let mut result = failed_result(set_name, &format!("unrar exited with status {status}"));
+        // unrar exit code 11 is RARX_BADPWD: missing or wrong password.
+        result.password_required = status.code() == Some(11);
+        result
     }
 }
 
@@ -676,6 +736,77 @@ mod tests {
 
         assert!(!result.success);
         assert_eq!(result.error.as_deref(), Some("unrar reported Cannot open"));
+    }
+
+    /// Runs `unpack_set` on a one-volume set with `unrar` and `password`.
+    #[cfg(unix)]
+    fn unpack_one_volume(script: &str, password: Option<&str>) -> DirectUnpackResult {
+        let (script_dir, unrar) = fake_unrar(script);
+        let output_dir = tempfile::tempdir().unwrap();
+        let first_volume = script_dir.path().join("movie.part001.rar");
+        std::fs::write(&first_volume, b"first").unwrap();
+        let state = Mutex::new(DirectUnpackState {
+            sets: BTreeMap::from([(
+                "movie".to_string(),
+                RarSetState {
+                    set_name: "movie".to_string(),
+                    volumes: BTreeMap::from([(0, first_volume.clone())]),
+                },
+            )]),
+            download_finished: true,
+        });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        unpack_set(
+            unrar.to_str().unwrap(),
+            "movie",
+            &first_volume,
+            output_dir.path(),
+            password,
+            &state,
+            &Notify::new(),
+            &AtomicBool::new(false),
+            runtime.handle(),
+        )
+    }
+
+    /// A stand-in for unrar >= 6: prints its banner when probed with no
+    /// arguments, refuses a password on the command line and reads it from
+    /// stdin after `-p`.
+    #[cfg(unix)]
+    const STDIN_PASSWORD_UNRAR: &str = "#!/bin/sh\n\
+        if [ $# -eq 0 ]; then echo 'UNRAR 7.20 freeware'; exit 0; fi\n\
+        for a; do case \"$a\" in *s3cr3t*) echo 'password leaked into argv' >&2; exit 7;; esac; done\n\
+        printf 'Enter password (will not be echoed): ' >&2\n\
+        IFS= read -r pw\n\
+        if [ \"$pw\" = 's3cr3t' ]; then printf 'All OK\\n'; exit 0; fi\n\
+        printf 'Incorrect password for movie.mkv\\n' >&2\n\
+        IFS= read -r again\nexit 11\n";
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_unpack_feeds_the_password_on_stdin() {
+        let result = unpack_one_volume(STDIN_PASSWORD_UNRAR, Some("s3cr3t"));
+        assert!(result.success, "{result:?}");
+        assert!(!result.password_required);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_unpack_wrong_password_is_typed() {
+        let result = unpack_one_volume(STDIN_PASSWORD_UNRAR, Some("wrong"));
+        assert!(!result.success);
+        assert!(result.password_required, "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_unpack_other_errors_are_not_password_errors() {
+        let result = unpack_one_volume(
+            "#!/bin/sh\nprintf 'Cannot open archive\\n' >&2\nexit 2\n",
+            None,
+        );
+        assert!(!result.success);
+        assert!(!result.password_required);
     }
 
     #[test]
