@@ -55,6 +55,11 @@ pub struct SabApiRequest {
     /// SABnzbd's `script` parameter is accepted and ignored (unknown query
     /// fields are not rejected); RustNZB has no per-job scripts.
     pub pp: Option<String>,
+    /// Sort field for `mode=queue&name=sort` (`avg_age`, `name`, `size`,
+    /// `remaining`).
+    pub sort: Option<String>,
+    /// Sort direction for `mode=queue&name=sort` (`asc` or `desc`).
+    pub dir: Option<String>,
 }
 
 /// Validate API key. Returns Err with JSON response on failure.
@@ -840,6 +845,8 @@ async fn dispatch_post(
                 del_files: query_req.del_files,
                 nzbname: query_req.nzbname,
                 pp: query_req.pp,
+                sort: query_req.sort,
+                dir: query_req.dir,
             };
             Ok(dispatch_mode(
                 state,
@@ -1138,13 +1145,42 @@ fn handle_server_stats(state: &AppState) -> Json<serde_json::Value> {
 // Mode handlers
 // ---------------------------------------------------------------------------
 
+/// `mode=queue&name=sort&sort=<field>&dir=<asc|desc>`, as SABnzbd's
+/// `_api_queue_sort`. Only `dir=desc` reverses, like SABnzbd. Without
+/// `sort`, the earlier RustNZB form (remaining percentage, direction in
+/// `value`) still works.
+fn handle_queue_sort(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    let is_desc = |value: &str| {
+        value.eq_ignore_ascii_case("desc") || value.eq_ignore_ascii_case("descending")
+    };
+    let field = match req.sort.as_deref().filter(|sort| !sort.is_empty()) {
+        None => crate::QueueSortField::Remaining,
+        Some(sort) => match sort.parse() {
+            Ok(field) => field,
+            Err(()) => {
+                return Json(serde_json::json!({
+                    "status": false,
+                    "error": format!("Unknown sort field: {sort}")
+                }));
+            }
+        },
+    };
+    let descending = req
+        .dir
+        .as_deref()
+        .or(req.value.as_deref())
+        .is_some_and(is_desc);
+    state.queue_manager.sort_queue(field, !descending);
+    Json(serde_json::json!({ "status": true }))
+}
+
 fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
     let qm = &state.queue_manager;
 
     // Sub-commands dispatched via mode=queue&name=<cmd>, matching SABnzbd's
     // real `_api_queue_table` (delete, pause, resume, priority, rename,
-    // purge, change_complete_action). `sort` and `delete_nzf` have no
-    // equivalent capability in RustNZB's queue manager yet.
+    // purge, change_complete_action, sort). `delete_nzf` has no equivalent
+    // capability in RustNZB's queue manager yet.
     match req.name.as_deref() {
         Some("delete") => return handle_queue_delete(state, req),
         Some("pause") => return handle_queue_item_pause(state, req),
@@ -1152,16 +1188,7 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         Some("priority") => return handle_queue_priority(state, req),
         Some("rename") => return handle_queue_rename(state, req),
         Some("purge") => return handle_queue_purge(state),
-        Some("sort") => {
-            let ascending = !matches!(
-                req.value.as_deref(),
-                Some(value)
-                    if value.eq_ignore_ascii_case("descending")
-                        || value.eq_ignore_ascii_case("desc")
-            );
-            qm.sort_by_remaining_percentage(ascending);
-            return Json(serde_json::json!({ "status": true }));
-        }
+        Some("sort") => return handle_queue_sort(state, req),
         Some("change_complete_action") => return Json(serde_json::json!({ "status": true })),
         _ => {}
     }

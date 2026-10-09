@@ -1081,6 +1081,65 @@ struct JobState {
     output_dir_claimed: bool,
 }
 
+/// Field a manual queue sort orders by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueSortField {
+    /// Fraction of the job's bytes still to download.
+    Remaining,
+    /// Job name, case-insensitively.
+    Name,
+    /// Total job size in bytes.
+    Size,
+    /// Time since the job was added; ascending is youngest first, matching
+    /// SABnzbd's `avg_age`.
+    Age,
+    /// Job priority, `Low` first when ascending.
+    Priority,
+}
+
+impl QueueSortField {
+    fn compare(self, left: &NzbJob, right: &NzbJob) -> std::cmp::Ordering {
+        match self {
+            Self::Remaining => {
+                let remaining = |job: &NzbJob| {
+                    let total = job.total_bytes.max(1);
+                    (total.saturating_sub(job.downloaded_bytes), total)
+                };
+                let (left_remaining, left_total) = remaining(left);
+                let (right_remaining, right_total) = remaining(right);
+                (left_remaining as u128 * right_total as u128)
+                    .cmp(&(right_remaining as u128 * left_total as u128))
+            }
+            Self::Name => left
+                .name
+                .chars()
+                .flat_map(char::to_lowercase)
+                .cmp(right.name.chars().flat_map(char::to_lowercase)),
+            Self::Size => left.total_bytes.cmp(&right.total_bytes),
+            // Younger means added later.
+            Self::Age => right.added_at.cmp(&left.added_at),
+            Self::Priority => (left.priority as u8).cmp(&(right.priority as u8)),
+        }
+    }
+}
+
+impl std::str::FromStr for QueueSortField {
+    type Err = ();
+
+    /// Parse a sort field name, case-insensitively. Accepts SABnzbd's
+    /// `avg_age` and `bytes` spellings alongside the native names.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "remaining" => Ok(Self::Remaining),
+            "name" => Ok(Self::Name),
+            "size" | "bytes" => Ok(Self::Size),
+            "age" | "avg_age" => Ok(Self::Age),
+            "priority" => Ok(Self::Priority),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Notification fired immediately when a job is accepted into the queue.
 #[derive(Debug, Clone)]
 pub struct JobAddedEvent {
@@ -1470,19 +1529,24 @@ impl QueueManager {
     /// queue order is retained for equal percentages, which keeps repeated
     /// manual sorts deterministic and avoids active-job churn.
     pub fn sort_by_remaining_percentage(&self, ascending: bool) {
+        self.sort_queue(QueueSortField::Remaining, ascending);
+    }
+
+    /// Stable sort of the queue by `field`. Only the queue order changes:
+    /// job status is untouched, so active downloads keep running, and the
+    /// original order is retained for equal keys, which keeps repeated
+    /// manual sorts deterministic and avoids active-job churn.
+    pub fn sort_queue(&self, field: QueueSortField, ascending: bool) {
         let jobs = self.jobs.lock();
         let mut order = self.job_order.lock();
         order.sort_by(|left, right| {
-            let remaining = |id: &String| {
-                jobs.get(id).map_or((0u64, 1u64), |state| {
-                    let total = state.job.total_bytes.max(1);
-                    (total.saturating_sub(state.job.downloaded_bytes), total)
-                })
+            let left = jobs.get(left).map(|state| &state.job);
+            let right = jobs.get(right).map(|state| &state.job);
+            let ordering = match (left, right) {
+                (Some(left), Some(right)) => field.compare(left, right),
+                // Ids without a job state keep their relative position.
+                _ => std::cmp::Ordering::Equal,
             };
-            let (left_remaining, left_total) = remaining(left);
-            let (right_remaining, right_total) = remaining(right);
-            let ordering = (left_remaining as u128 * right_total as u128)
-                .cmp(&(right_remaining as u128 * left_total as u128));
             if ascending {
                 ordering
             } else {
@@ -5069,6 +5133,98 @@ mod global_pause_tests {
                 .collect::<Vec<_>>(),
             vec!["third", "first", "second"]
         );
+    }
+
+    fn order_of(manager: &QueueManager) -> Vec<String> {
+        manager.job_order.lock().clone()
+    }
+
+    fn sort_fixture(manager: &QueueManager, root: &std::path::Path) {
+        let base = Utc::now();
+        // (id, name, total, downloaded, priority, age in minutes, status)
+        for (id, name, total, downloaded, priority, age_min, status) in [
+            (
+                "a",
+                "charlie",
+                300,
+                0,
+                Priority::Normal,
+                10,
+                JobStatus::Downloading,
+            ),
+            ("b", "Alpha", 100, 0, Priority::High, 30, JobStatus::Queued),
+            ("c", "bravo", 200, 0, Priority::Low, 20, JobStatus::Queued),
+        ] {
+            let mut j = job(id, status, root);
+            j.name = name.to_string();
+            j.total_bytes = total;
+            j.downloaded_bytes = downloaded;
+            j.priority = priority;
+            j.added_at = base - chrono::Duration::minutes(age_min);
+            insert_job(manager, j);
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_sort_by_name_is_case_insensitive() {
+        let (manager, tempdir) = manager();
+        sort_fixture(&manager, tempdir.path());
+        manager.sort_queue(QueueSortField::Name, true);
+        assert_eq!(order_of(&manager), vec!["b", "c", "a"]);
+        manager.sort_queue(QueueSortField::Name, false);
+        assert_eq!(order_of(&manager), vec!["a", "c", "b"]);
+        // Sorting reorders only: the active job keeps downloading.
+        assert_eq!(manager.get_job("a").unwrap().status, JobStatus::Downloading);
+    }
+
+    #[tokio::test]
+    async fn queue_sort_by_size_age_and_priority() {
+        let (manager, tempdir) = manager();
+        sort_fixture(&manager, tempdir.path());
+        manager.sort_queue(QueueSortField::Size, true);
+        assert_eq!(order_of(&manager), vec!["b", "c", "a"]);
+        manager.sort_queue(QueueSortField::Size, false);
+        assert_eq!(order_of(&manager), vec!["a", "c", "b"]);
+        // Age ascending is youngest first, like SABnzbd's avg_age.
+        manager.sort_queue(QueueSortField::Age, true);
+        assert_eq!(order_of(&manager), vec!["a", "c", "b"]);
+        manager.sort_queue(QueueSortField::Age, false);
+        assert_eq!(order_of(&manager), vec!["b", "c", "a"]);
+        manager.sort_queue(QueueSortField::Priority, true);
+        assert_eq!(order_of(&manager), vec!["c", "a", "b"]);
+        manager.sort_queue(QueueSortField::Priority, false);
+        assert_eq!(order_of(&manager), vec!["b", "a", "c"]);
+    }
+
+    #[tokio::test]
+    async fn queue_sort_is_stable_for_equal_keys() {
+        let (manager, tempdir) = manager();
+        for id in ["x", "y", "z"] {
+            let mut j = job(id, JobStatus::Queued, tempdir.path());
+            j.name = "Same".into();
+            insert_job(&manager, j);
+        }
+        manager.sort_queue(QueueSortField::Name, true);
+        assert_eq!(order_of(&manager), vec!["x", "y", "z"]);
+        manager.sort_queue(QueueSortField::Name, false);
+        assert_eq!(order_of(&manager), vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn queue_sort_field_parses_known_names_only() {
+        for (input, expected) in [
+            ("remaining", QueueSortField::Remaining),
+            ("NAME", QueueSortField::Name),
+            ("size", QueueSortField::Size),
+            ("bytes", QueueSortField::Size),
+            ("age", QueueSortField::Age),
+            ("avg_age", QueueSortField::Age),
+            ("priority", QueueSortField::Priority),
+        ] {
+            assert_eq!(input.parse::<QueueSortField>(), Ok(expected), "{input}");
+        }
+        assert!("bogus".parse::<QueueSortField>().is_err());
+        assert!("".parse::<QueueSortField>().is_err());
     }
 
     #[tokio::test]

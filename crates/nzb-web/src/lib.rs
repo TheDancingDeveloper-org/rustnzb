@@ -21,7 +21,8 @@ pub mod util;
 pub use log_buffer::{LogBuffer, LogBufferLayer};
 pub use nzb_dispatch::{ArticleFailure, ArticleFailureKind};
 pub use queue_manager::{
-    DailyStatisticsData, GlobalStatisticsData, QueueManager, ServerStatsData, StatisticsPeriodData,
+    DailyStatisticsData, GlobalStatisticsData, QueueManager, QueueSortField, ServerStatsData,
+    StatisticsPeriodData,
 };
 pub use startup::{StartupConfig, StartupResult};
 pub use state::AppState;
