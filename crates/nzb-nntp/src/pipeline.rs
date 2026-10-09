@@ -154,7 +154,7 @@ impl Pipeline {
             }
             430 => Err(NntpError::ArticleNotFound(request.message_id.clone())),
             411 => Err(NntpError::NoSuchGroup(status.message)),
-            412 | 420 => Err(NntpError::NoArticleSelected(status.message)),
+            412 | 420 | 423 => Err(NntpError::NoArticleSelected(status.message)),
             403 => {
                 conn.state = ConnectionState::Error;
                 Err(NntpError::PermissionDenied(status.message))
