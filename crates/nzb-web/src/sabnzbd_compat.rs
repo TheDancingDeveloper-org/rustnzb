@@ -1229,7 +1229,10 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     let speed_bps = qm.get_speed();
     let speed_limit_bps = qm.get_speed_limit();
 
-    let mut response = build_queue_response(&jobs, paused, speed_bps, speed_limit_bps, req);
+    let mut response =
+        build_queue_response(&jobs, paused, speed_bps, speed_limit_bps, req, |job| {
+            qm.post_processing_level(job)
+        });
     let queue = &mut response["queue"];
     // Seconds left of a timed pause (POST /api/queue/pause-for), else "0".
     queue["pause_int"] =
@@ -1333,6 +1336,7 @@ fn build_queue_response(
     speed_bps: u64,
     speed_limit_bps: u64,
     req: &SabApiRequest,
+    pp_level: impl Fn(&NzbJob) -> u8,
 ) -> serde_json::Value {
     let start = req.start.unwrap_or(0);
     let limit = req.limit.unwrap_or(0);
@@ -1393,7 +1397,14 @@ fn build_queue_response(
             if queue_totals_include(job) {
                 running_bytes = running_bytes.saturating_add(remaining_bytes(job));
             }
-            SabQueueSlot::from_job(job, start + offset, paused, running_bytes, speed_bps)
+            SabQueueSlot::from_job(
+                job,
+                start + offset,
+                paused,
+                running_bytes,
+                speed_bps,
+                pp_level(job),
+            )
         })
         .collect();
 
@@ -2492,6 +2503,7 @@ impl SabQueueSlot {
         globally_paused: bool,
         running_bytes: u64,
         speed_bps: u64,
+        pp_level: u8,
     ) -> Self {
         let mb = job.total_bytes as f64 / 1_048_576.0;
         let mbleft = remaining_bytes(job) as f64 / 1_048_576.0;
@@ -2505,7 +2517,7 @@ impl SabQueueSlot {
         Self {
             index,
             nzo_id: queue_nzo_id(job),
-            unpackopts: "3".into(),
+            unpackopts: sab_unpackopts(pp_level).into(),
             script: "None".into(),
             filename: job.name.clone(),
             labels: Vec::new(),
@@ -2574,6 +2586,20 @@ fn sab_queue_status(status: JobStatus) -> &'static str {
         JobStatus::PostProcessing => "Running",
         JobStatus::Completed => "Completed",
         JobStatus::Failed => "Failed",
+    }
+}
+
+/// SABnzbd's queue `unpackopts` for an effective post-processing level: the
+/// level as a string, on the scale `pp` is accepted on (see
+/// [`sab_pp_override`]) and history reports (see [`sab_pp_label`]), so a job
+/// re-added with its reported `unpackopts` keeps its level. Out-of-range
+/// levels fall back to the default, 3.
+fn sab_unpackopts(level: u8) -> &'static str {
+    match level {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        _ => "3",
     }
 }
 
@@ -3015,6 +3041,7 @@ mod tests {
             1_048_576,
             2_097_152,
             &SabApiRequest::default(),
+            |_| 3,
         );
         let queue = &response["queue"];
         let slot = &queue["slots"][0];
@@ -3029,7 +3056,7 @@ mod tests {
 
         assert_eq!(slot["index"], 0);
         assert_eq!(slot["nzo_id"], "SABnzbd_nzo_1234567890ab");
-        assert_eq!(slot["unpackopts"], "3");
+        assert!(slot["unpackopts"].is_string());
         assert_eq!(slot["script"], "None");
         assert_eq!(slot["labels"], serde_json::json!([]));
         assert_eq!(slot["password"], "secret");
@@ -3046,6 +3073,7 @@ mod tests {
             0,
             0,
             &SabApiRequest::default(),
+            |_| 3,
         );
         assert_eq!(response["queue"]["status"], "Idle");
         assert_eq!(response["queue"]["timeleft"], "0:00:00");
@@ -3066,6 +3094,7 @@ mod tests {
             0,
             0,
             &SabApiRequest::default(),
+            |_| 3,
         );
         assert_eq!(response["queue"]["status"], "Downloading");
 
@@ -3080,13 +3109,14 @@ mod tests {
             0,
             0,
             &SabApiRequest::default(),
+            |_| 3,
         );
         assert_eq!(paused["queue"]["status"], "Paused");
     }
 
     #[test]
     fn empty_and_paused_queues_have_sab_statuses() {
-        let empty = build_queue_response(&[], false, 0, 0, &SabApiRequest::default());
+        let empty = build_queue_response(&[], false, 0, 0, &SabApiRequest::default(), |_| 3);
         assert_eq!(empty["queue"]["status"], "Idle");
         assert_eq!(empty["queue"]["slots"], serde_json::json!([]));
         assert_eq!(empty["queue"]["noofslots_total"], 0);
@@ -3097,6 +3127,7 @@ mod tests {
             1_048_576,
             0,
             &SabApiRequest::default(),
+            |_| 3,
         );
         assert_eq!(paused["queue"]["status"], "Paused");
         assert_eq!(paused["queue"]["slots"][0]["timeleft"], "0:00:00");
@@ -3149,7 +3180,7 @@ mod tests {
             limit: Some(1),
             ..SabApiRequest::default()
         };
-        let response = build_queue_response(&jobs, false, 0, 0, &req);
+        let response = build_queue_response(&jobs, false, 0, 0, &req, |_| 3);
         let queue = &response["queue"];
 
         assert_eq!(queue["noofslots_total"], 4);
@@ -3173,7 +3204,7 @@ mod tests {
             nzo_ids: Some("SABnzbd_nzo_high-priorit".into()),
             ..SabApiRequest::default()
         };
-        let response = build_queue_response(&[high, normal], false, 0, 0, &req);
+        let response = build_queue_response(&[high, normal], false, 0, 0, &req, |_| 3);
 
         assert_eq!(response["queue"]["noofslots"], 1);
         assert_eq!(response["queue"]["slots"][0]["filename"], "First");
@@ -3269,6 +3300,64 @@ mod tests {
         assert!(slots[0]["bytes"].is_u64());
         assert!(slots[0]["loaded"].is_boolean());
         assert!(slots[0]["completeness"].is_null());
+    }
+
+    /// SABnzbd's queue `unpackopts` is the job's post-processing level as a
+    /// string, on the same scale `pp` is accepted on and history reports.
+    #[test]
+    fn queue_slot_unpackopts_reflects_the_effective_level() {
+        for level in 0..=3_u8 {
+            let jobs = vec![queue_job("upk", "Upk", "tv", JobStatus::Queued)];
+            let response =
+                build_queue_response(&jobs, false, 0, 0, &SabApiRequest::default(), |_| level);
+            assert_eq!(
+                response["queue"]["slots"][0]["unpackopts"],
+                level.to_string(),
+                "level {level}"
+            );
+        }
+    }
+
+    /// The live queue resolves the level from the job's `pp` override, else
+    /// its category.
+    #[tokio::test]
+    async fn queue_unpackopts_uses_job_override_then_category() {
+        let test_state = test_state();
+        test_state
+            .state
+            .queue_manager
+            .set_categories(vec![CategoryConfig {
+                name: "unpackonly".into(),
+                post_processing: 2,
+                ..CategoryConfig::default()
+            }]);
+        add_live_job_with_category(&test_state, "upk-category", "unpackonly");
+        let mut job = queue_job("upk-override", "Override", "unpackonly", JobStatus::Queued);
+        job.pp_override = Some(0);
+        let general = &test_state.state.config().general;
+        job.work_dir = general.incomplete_dir.join("upk-override");
+        job.output_dir = general.complete_dir.join("upk-override");
+        test_state
+            .state
+            .queue_manager
+            .add_job(job, None)
+            .expect("add override job");
+
+        let queue = dispatch_mode(&test_state.state, "queue", &SabApiRequest::default()).0;
+        let slots = queue["queue"]["slots"].as_array().expect("slots");
+        let unpackopts = |nzo_id: &str| {
+            slots
+                .iter()
+                .find(|slot| {
+                    slot["nzo_id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with(nzo_id))
+                })
+                .map(|slot| slot["unpackopts"].clone())
+                .expect("slot present")
+        };
+        assert_eq!(unpackopts("SABnzbd_nzo_upk-category"), "2");
+        assert_eq!(unpackopts("SABnzbd_nzo_upk-override"), "0");
     }
 
     /// SABnzbd reports the job's post-processing level as
@@ -3761,7 +3850,7 @@ mod tests {
             queue_job("default-job", "Default Job", "Default", JobStatus::Queued),
             queue_job("tv-job", "TV Job", "tv", JobStatus::Queued),
         ];
-        let all = build_queue_response(&jobs, false, 0, 0, &SabApiRequest::default());
+        let all = build_queue_response(&jobs, false, 0, 0, &SabApiRequest::default(), |_| 3);
         assert_eq!(all["queue"]["slots"][0]["cat"], "*");
         assert_eq!(all["queue"]["slots"][1]["cat"], "tv");
 
@@ -3769,7 +3858,7 @@ mod tests {
             cat: Some("*".into()),
             ..SabApiRequest::default()
         };
-        let filtered = build_queue_response(&jobs, false, 0, 0, &star);
+        let filtered = build_queue_response(&jobs, false, 0, 0, &star, |_| 3);
         assert_eq!(filtered["queue"]["noofslots"], 1);
         assert_eq!(filtered["queue"]["slots"][0]["filename"], "Default Job");
 
