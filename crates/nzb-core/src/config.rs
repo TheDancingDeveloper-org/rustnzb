@@ -57,7 +57,8 @@ pub struct GeneralConfig {
     /// History retention: how many NZBs to keep in history.
     /// `None` or `Some(0)` both mean keep all; see [`normalize_history_retention`].
     pub history_retention: Option<usize>,
-    /// Max number of NZBs downloading simultaneously (default 1)
+    /// Max number of NZBs downloading simultaneously (default 1).
+    /// `0` means unlimited: every queued job may download at once.
     pub max_active_downloads: usize,
     /// Max number of independent jobs in post-processing at once.
     #[serde(default = "default_max_post_processing_jobs")]
