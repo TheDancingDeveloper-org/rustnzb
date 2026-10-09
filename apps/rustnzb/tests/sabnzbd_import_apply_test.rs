@@ -125,3 +125,73 @@ async fn apply_accepts_absolute_dirs() {
         std::path::PathBuf::from("/downloads/incomplete")
     );
 }
+
+fn preview_with_categories(categories: serde_json::Value) -> SabnzbdImportPreview {
+    serde_json::from_value(serde_json::json!({
+        "servers": [],
+        "categories": categories,
+        "general": {
+            "api_key": null,
+            "complete_dir": null,
+            "incomplete_dir": null,
+            "speed_limit_bps": 0
+        },
+        "rss_feeds": [],
+        "warnings": [],
+        "skipped_fields": []
+    }))
+    .expect("preview JSON should deserialize")
+}
+
+/// Negative: imported categories get the same validation as a category
+/// save; an unsafe name or output_dir rejects the whole apply with 400,
+/// names every offending entry, and changes nothing.
+#[tokio::test]
+async fn apply_rejects_unsafe_imported_categories() {
+    let (state, _tempdir) = test_state();
+    let before = state.config().categories.clone();
+    let preview = preview_with_categories(serde_json::json!([
+        {"name": "tv", "output_dir": "shows/tv", "post_processing": 3},
+        {"name": "../escape", "output_dir": null, "post_processing": 3},
+        {"name": "movies", "output_dir": "../../etc", "post_processing": 3},
+    ]));
+
+    let error = match h_setup_apply(State(state.clone()), Json(preview)).await {
+        Ok(_) => panic!("expected unsafe categories to be rejected"),
+        Err(e) => e,
+    };
+
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    let message = error.to_string();
+    assert!(message.contains("../escape"), "{message}");
+    assert!(message.contains("movies"), "{message}");
+    assert!(!message.contains("'tv'"), "{message}");
+    let after = state.config().categories.clone();
+    assert_eq!(
+        after.iter().map(|c| &c.name).collect::<Vec<_>>(),
+        before.iter().map(|c| &c.name).collect::<Vec<_>>(),
+        "rejected apply must not have replaced the categories"
+    );
+}
+
+/// Positive: safe imported categories replace the configured ones.
+#[tokio::test]
+async fn apply_accepts_safe_imported_categories() {
+    let (state, _tempdir) = test_state();
+    let preview = preview_with_categories(serde_json::json!([
+        {"name": "tv", "output_dir": "shows/tv", "post_processing": 3},
+        {"name": "movies", "output_dir": "/srv/media/movies", "post_processing": 3},
+    ]));
+
+    h_setup_apply(State(state.clone()), Json(preview))
+        .await
+        .expect("safe categories should be accepted");
+
+    let names: Vec<_> = state
+        .config()
+        .categories
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    assert_eq!(names, ["tv", "movies"]);
+}
