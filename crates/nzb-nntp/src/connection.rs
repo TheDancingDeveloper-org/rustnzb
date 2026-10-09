@@ -1230,11 +1230,27 @@ impl NntpConnection {
             .read_response_line()
             .await
             .inspect_err(|_| self.state = ConnectionState::Error)?;
-        self.state = ConnectionState::Ready;
 
+        // Only 223/430 leave the session healthy; every other code means the
+        // provider refused or is going away, so the connection must not be
+        // returned to the pool as Ready.
         match resp.code {
-            223 => Ok(resp),
-            430 => Err(NntpError::ArticleNotFound(mid)),
+            223 => {
+                self.state = ConnectionState::Ready;
+                Ok(resp)
+            }
+            430 => {
+                self.state = ConnectionState::Ready;
+                Err(NntpError::ArticleNotFound(mid))
+            }
+            403 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::PermissionDenied(resp.message))
+            }
+            502 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::ServiceUnavailable(resp.message))
+            }
             480 => {
                 self.state = ConnectionState::Error;
                 Err(NntpError::AuthRequired(resp.message))
@@ -1246,10 +1262,54 @@ impl NntpConnection {
                     resp.code, resp.message
                 )))
             }
-            _ => Err(NntpError::Protocol(format!(
-                "Unexpected STAT response {}: {}",
-                resp.code, resp.message
-            ))),
+            _ => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Protocol(format!(
+                    "Unexpected STAT response {}: {}",
+                    resp.code, resp.message
+                )))
+            }
+        }
+    }
+
+    /// Cheap liveness probe for the pool's idle health check.
+    ///
+    /// Sends `DATE` (RFC 3977 §7.1) and reads a single status line, so it
+    /// always does real I/O no matter which capabilities the server
+    /// advertised (unlike `stat_article`, which short-circuits without
+    /// touching the socket when STAT is not available). Any single-line
+    /// reply — even `500` from a server without DATE — proves the socket is
+    /// alive and in sync; session-ending codes and I/O errors mark the
+    /// connection as `Error`.
+    pub(crate) async fn ping(&mut self) -> NntpResult<()> {
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot ping in state {:?}",
+                self.state
+            )));
+        }
+        self.state = ConnectionState::Busy;
+
+        self.send_command("DATE")
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+        let resp = self
+            .read_response_line()
+            .await
+            .inspect_err(|_| self.state = ConnectionState::Error)?;
+
+        match resp.code {
+            400 | 403 | 480 | 481 | 482 | 502 => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Connection(format!(
+                    "Health check rejected ({}): {}",
+                    resp.code, resp.message
+                )))
+            }
+            _ => {
+                self.state = ConnectionState::Ready;
+                Ok(())
+            }
         }
     }
 

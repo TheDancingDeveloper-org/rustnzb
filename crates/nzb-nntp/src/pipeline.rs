@@ -105,13 +105,16 @@ impl Pipeline {
             };
 
             conn.send_command_no_flush(&format!("ARTICLE {mid}"))
-                .await?;
+                .await
+                .inspect_err(|_| conn.state = ConnectionState::Error)?;
             trace!(mid = %mid, tag = req.tag, "Pipeline sent ARTICLE");
             self.in_flight.push_back(req);
             sent += 1;
         }
         if sent > 0 {
-            conn.flush().await?;
+            conn.flush()
+                .await
+                .inspect_err(|_| conn.state = ConnectionState::Error)?;
         }
         Ok(())
     }
@@ -126,7 +129,13 @@ impl Pipeline {
             return Ok(None);
         };
 
-        let status = conn.read_response_line().await?;
+        // Any I/O failure from here on leaves the stream misaligned with the
+        // in-flight queue, so the connection must not be reused (same as
+        // `NntpConnection::fetch_article`).
+        let status = conn
+            .read_response_line()
+            .await
+            .inspect_err(|_| conn.state = ConnectionState::Error)?;
 
         let result = match status.code {
             220 => {
@@ -137,7 +146,10 @@ impl Pipeline {
                         message: status.message,
                         data: Some(data),
                     }),
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        conn.state = ConnectionState::Error;
+                        Err(e)
+                    }
                 }
             }
             430 => Err(NntpError::ArticleNotFound(request.message_id.clone())),
@@ -362,6 +374,32 @@ mod tests {
     use super::*;
     use crate::testutil::{MockConfig, MockNntpServer, test_config};
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_receive_one_body_failure_marks_connection_error() {
+        // 220 arrives, then the server drops the socket mid-body. The
+        // connection is now misaligned and must not look reusable.
+        let body: Vec<u8> = "line of article data\r\n".repeat(10_000).into_bytes();
+        let mut articles = HashMap::new();
+        articles.insert("cut@test".to_string(), body);
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            // Well past the greeting/CAPABILITIES exchange, well short of
+            // the ~210 KB article.
+            silent_close_after_bytes: Some(50_000),
+            ..Default::default()
+        })
+        .await;
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&test_config(server.port())).await.unwrap();
+
+        let mut pipe = Pipeline::new(1);
+        pipe.submit("cut@test".into(), 0);
+        pipe.flush_sends(&mut conn).await.unwrap();
+        let res = pipe.receive_one(&mut conn).await.unwrap().unwrap();
+        assert!(res.result.is_err(), "body read should fail");
+        assert_eq!(conn.state, ConnectionState::Error);
+    }
 
     #[test]
     fn test_pipeline_submit_and_counts() {

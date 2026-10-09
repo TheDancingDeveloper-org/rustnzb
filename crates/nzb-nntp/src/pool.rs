@@ -165,9 +165,9 @@ impl ConnectionPool {
                         idle_secs = pooled.last_used.elapsed().as_secs(),
                         "Pool: idle connection stale — health checking"
                     );
-                    // STAT a bogus message-id; 430 = alive, I/O error = dead
-                    match pooled.conn.stat_article("<health-check@pool>").await {
-                        Ok(_) | Err(NntpError::ArticleNotFound(_)) => {
+                    // Real round-trip (DATE); any reply = alive, I/O error = dead
+                    match pooled.conn.ping().await {
+                        Ok(()) => {
                             // Connection is alive
                             debug!(
                                 server = %self.config.name,
@@ -452,6 +452,51 @@ mod tests {
         assert_eq!(pool.idle_count(), 0);
 
         pool.release(c2);
+    }
+
+    #[tokio::test]
+    async fn test_pool_health_check_reuses_live_stale_connection() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let pool = ConnectionPool::new(Arc::new(test_config(server.port())));
+
+        let c1 = pool.acquire().await.unwrap();
+        let first_id = c1.conn.server_id.clone();
+        pool.release(c1);
+        pool.idle.lock()[0].last_used = Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+
+        let c2 = pool.acquire().await.unwrap();
+        assert_eq!(c2.conn.server_id, first_id);
+        assert_eq!(c2.conn.state, ConnectionState::Ready);
+        pool.release(c2);
+    }
+
+    #[tokio::test]
+    async fn test_pool_health_check_detects_dead_idle_connection_without_stat() {
+        // Server closes each session right after the CAPABILITIES exchange,
+        // so a parked connection is dead by the time it is health-checked.
+        let server = MockNntpServer::start(MockConfig {
+            close_after_n_commands: Some(1),
+            ..Default::default()
+        })
+        .await;
+        let pool = ConnectionPool::new(Arc::new(test_config(server.port())));
+
+        let mut c1 = pool.acquire().await.unwrap();
+        let first_id = c1.conn.server_id.clone();
+        // A server that doesn't advertise STAT must still be probed with
+        // real I/O rather than "passing" without touching the socket.
+        let mut caps = crate::capabilities::NntpCapabilities::default_assumed();
+        caps.have_stat = false;
+        c1.conn.set_capabilities_for_test(caps);
+        pool.release(c1);
+        pool.idle.lock()[0].last_used = Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+
+        let c2 = pool.acquire().await.unwrap();
+        assert_ne!(
+            c2.conn.server_id, first_id,
+            "dead idle connection passed the health check and was reused"
+        );
+        pool.discard(c2);
     }
 
     #[tokio::test]
