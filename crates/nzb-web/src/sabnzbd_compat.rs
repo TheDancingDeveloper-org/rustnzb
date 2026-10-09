@@ -4479,6 +4479,33 @@ mod tests {
         assert!(!output_dir.exists());
     }
 
+    /// A failed job keeps its partial download in `incomplete/` for retry.
+    /// Deleting its history entry, with or without `del_files`, must free it.
+    #[tokio::test]
+    async fn history_delete_removes_retained_incomplete_work_dir() {
+        let test_state = test_state();
+        let incomplete = test_state.state.queue_manager.incomplete_dir();
+        for (id, del_files) in [("sab-failed-keep", None), ("sab-failed-del", Some("1"))] {
+            insert_history_status(&test_state, id, JobStatus::Failed, 10);
+            let work_dir = incomplete.join(id);
+            std::fs::create_dir_all(&work_dir).expect("create retained work dir");
+            std::fs::write(work_dir.join("partial.rar"), b"partial").expect("write partial");
+
+            let req = SabApiRequest {
+                value: Some(id.into()),
+                del_files: del_files.map(Into::into),
+                ..SabApiRequest::default()
+            };
+            let response = handle_history_delete(&test_state.state, &req).0;
+            assert_eq!(response["status"], serde_json::json!(true));
+            assert!(
+                !work_dir.exists(),
+                "{id}: retained work dir must be removed"
+            );
+        }
+        assert!(incomplete.is_dir(), "the incomplete root itself is kept");
+    }
+
     fn insert_history_status(test_state: &TestState, id: &str, status: JobStatus, age_secs: i64) {
         let mut entry = history_entry(id, id, "tv", status, age_secs);
         entry.output_dir = test_state.state.config().general.complete_dir.join(id);
