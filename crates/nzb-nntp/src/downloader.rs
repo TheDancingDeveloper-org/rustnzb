@@ -10,13 +10,13 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Article;
 use crate::config::ServerConfig;
 
 use crate::error::{NntpError, NntpResult};
-use crate::pool::PooledConnection;
+use crate::pool::ConnectionPool;
 use crate::server::ServerState;
 
 // ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ struct DownloadRequest {
 struct ServerPick {
     index: usize,
     server_id: String,
-    config: Arc<ServerConfig>,
+    pool: Arc<ConnectionPool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,8 +176,16 @@ impl Downloader {
                 continue;
             };
 
-            // Create a fresh connection outside any lock (fully async-safe)
-            let conn_result = self.connect_to_server(&pick.config).await;
+            // Check a connection out of the server's pool outside any lock
+            // (fully async-safe). The pool reuses idle connections and keeps
+            // the slot count within `ServerConfig::connections`.
+            let conn_result = pick.pool.acquire().await;
+            if conn_result.is_ok() {
+                let mut servers = self.servers.lock();
+                if let Some(server) = servers.get_mut(pick.index) {
+                    server.connections_active += 1;
+                }
+            }
 
             match conn_result {
                 Ok(mut pooled) => {
@@ -296,7 +304,7 @@ impl Downloader {
             return Some(ServerPick {
                 index: idx,
                 server_id: server.config.id.clone(),
-                config: Arc::clone(&server.config),
+                pool: server.shared_pool(),
             });
         }
         warn!(
@@ -305,33 +313,6 @@ impl Downloader {
             "No available server found — all tried or penalized"
         );
         None
-    }
-
-    /// Create a fresh NNTP connection to the given server.
-    /// This does NOT go through the pool (avoids holding locks across await).
-    async fn connect_to_server(&self, config: &ServerConfig) -> NntpResult<PooledConnection> {
-        info!(
-            server = %config.name,
-            host = %config.host,
-            port = config.port,
-            ssl = config.ssl,
-            "Downloader: creating fresh connection (bypassing pool)"
-        );
-        let mut conn = crate::connection::NntpConnection::new(format!("{}#dl", config.id));
-        conn.connect(config).await.inspect_err(|e| {
-            error!(
-                server = %config.name,
-                host = %config.host,
-                error = %e,
-                "Downloader: fresh connection FAILED"
-            );
-        })?;
-        info!(
-            server = %config.name,
-            host = %config.host,
-            "Downloader: fresh connection ready"
-        );
-        Ok(PooledConnection::unmanaged(conn))
     }
 }
 
@@ -380,6 +361,37 @@ mod tests {
         let data = result.result.unwrap();
         let body = String::from_utf8_lossy(&data);
         assert!(body.contains("Downloaded content"));
+    }
+
+    #[tokio::test]
+    async fn test_downloader_reuses_pooled_connections() {
+        let mut articles = HashMap::new();
+        for i in 0..5 {
+            articles.insert(format!("reuse{i}@test"), b"payload".to_vec());
+        }
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let max_conns = config.connections as usize;
+
+        let downloader = Downloader::new(vec![config], 0);
+        let (tx, mut rx) = mpsc::channel(10);
+        let batch = (0..5)
+            .map(|i| make_article(&format!("reuse{i}@test"), i + 1))
+            .collect();
+        downloader.download(batch, tx).await.unwrap();
+        for _ in 0..5 {
+            assert!(rx.recv().await.unwrap().result.is_ok());
+        }
+
+        // Articles are fetched sequentially, so one pooled connection should
+        // serve them all, and the pool's slot accounting must be intact.
+        let servers = downloader.servers.lock();
+        assert_eq!(servers[0].idle_connection_count(), 1);
+        assert_eq!(servers[0].pool().available_permits(), max_conns);
     }
 
     #[tokio::test]

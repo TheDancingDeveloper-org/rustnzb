@@ -92,8 +92,10 @@ pub struct ServerState {
     /// When the server penalty expires (None = no penalty).
     pub penalty_until: Option<Instant>,
     pub last_error: Option<String>,
-    /// Connection pool for this server.
-    pool: ConnectionPool,
+    /// Connection pool for this server. Shared (`Arc`) so callers that keep
+    /// `ServerState` behind a synchronous lock can acquire without holding it
+    /// across an `.await`.
+    pool: Arc<ConnectionPool>,
     /// Download speed tracker.
     speed: SpeedTracker,
 }
@@ -102,7 +104,7 @@ impl ServerState {
     /// Create a new server state, including its connection pool.
     pub fn new(config: ServerConfig) -> Self {
         let config = Arc::new(config);
-        let pool = ConnectionPool::new(Arc::clone(&config));
+        let pool = Arc::new(ConnectionPool::new(Arc::clone(&config)));
         Self {
             active: config.enabled,
             connections_active: 0,
@@ -269,6 +271,11 @@ impl ServerState {
     /// Access the underlying pool directly.
     pub fn pool(&self) -> &ConnectionPool {
         &self.pool
+    }
+
+    /// A shared handle to the pool, for acquiring outside a lock on `self`.
+    pub(crate) fn shared_pool(&self) -> Arc<ConnectionPool> {
+        Arc::clone(&self.pool)
     }
 }
 
