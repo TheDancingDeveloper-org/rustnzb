@@ -155,10 +155,16 @@ pub fn job_id_matches(id: &str, requested: &str) -> bool {
 
 /// Get free disk space for a path (returns 0 on error).
 fn get_disk_free(path: &std::path::Path) -> u64 {
+    disk_space(path).0
+}
+
+/// Free and total bytes of the filesystem holding `path` (or its nearest
+/// existing ancestor). Returns `(0, 0)` on error.
+pub(crate) fn disk_space(path: &std::path::Path) -> (u64, u64) {
     let mut candidate = path.to_path_buf();
     while !candidate.exists() {
         if !candidate.pop() {
-            return 0;
+            return (0, 0);
         }
     }
     #[cfg(unix)]
@@ -167,22 +173,25 @@ fn get_disk_free(path: &std::path::Path) -> u64 {
         use std::mem::MaybeUninit;
         let c_path = match CString::new(candidate.to_string_lossy().as_bytes()) {
             Ok(p) => p,
-            Err(_) => return 0,
+            Err(_) => return (0, 0),
         };
         unsafe {
             let mut stat = MaybeUninit::<libc::statvfs>::uninit();
             if libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) == 0 {
                 let stat = stat.assume_init();
                 #[allow(clippy::unnecessary_cast)] // u32 on macOS, u64 on Linux
-                return stat.f_bavail as u64 * stat.f_frsize as u64;
+                return (
+                    stat.f_bavail as u64 * stat.f_frsize as u64,
+                    stat.f_blocks as u64 * stat.f_frsize as u64,
+                );
             }
         }
-        0
+        (0, 0)
     }
     #[cfg(not(unix))]
     {
         let _ = candidate;
-        0
+        (0, 0)
     }
 }
 

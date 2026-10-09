@@ -16,6 +16,9 @@ pub struct AppState {
     pub log_buffer: LogBuffer,
     pub token_store: Arc<TokenStore>,
     pub credential_store: Arc<CredentialStore>,
+    /// When the application state was created at startup; the basis for the
+    /// SABnzbd-compatible `uptime`.
+    pub started_at: std::time::Instant,
 }
 
 impl AppState {
@@ -34,6 +37,7 @@ impl AppState {
             log_buffer,
             token_store,
             credential_store,
+            started_at: std::time::Instant::now(),
         }
     }
 
