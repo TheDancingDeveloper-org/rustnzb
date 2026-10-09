@@ -71,7 +71,9 @@ async fn version_reports_a_string() {
 /// (rustnzb#71) verified against `sabnzbd/constants.py: HIGH_PRIORITY = 1`.
 #[tokio::test]
 async fn addfile_applies_category_and_priority_and_reports_them_in_queue() {
-    let app = start_test_server(Vec::new()).await;
+    // Like SABnzbd, an unknown `cat` falls back to the default category, so
+    // the category under test must be configured.
+    let app = support::start_test_server_with_categories(&["tv"]).await;
     let client = reqwest::Client::new();
 
     let form = reqwest::multipart::Form::new()
