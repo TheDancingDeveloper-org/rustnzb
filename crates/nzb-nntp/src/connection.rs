@@ -35,6 +35,27 @@ const READ_LINE_TIMEOUT: Duration = Duration::from_secs(60);
 /// each individual line read must complete within this window.
 const READ_BODY_LINE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Timeout for a single write (and its flush) to the server. A peer that
+/// stops reading fills the socket buffers and would otherwise block the
+/// writer forever; matching the read-side budget turns that into an I/O
+/// error so workers can reconnect, exactly as a read timeout does.
+const WRITE_TIMEOUT: Duration = READ_LINE_TIMEOUT;
+
+/// Bound an outgoing write by `limit`, mapping expiry to
+/// `io::ErrorKind::TimedOut` (the same shape as read timeouts).
+async fn with_write_timeout<F>(limit: Duration, fut: F) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    match tokio::time::timeout(limit, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("write timed out after {}s", limit.as_secs()),
+        )),
+    }
+}
+
 use crate::capabilities::NntpCapabilities;
 use crate::config::{ListActiveEntry, ServerConfig};
 
@@ -206,18 +227,21 @@ impl Transport {
         }
     }
 
-    /// Write all bytes and flush.
-    async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
-        match self {
-            Transport::Plain(r) => {
-                r.get_mut().write_all(data).await?;
-                r.get_mut().flush().await
+    /// Write all bytes and flush, bounded by `limit`.
+    async fn write_all(&mut self, data: &[u8], limit: Duration) -> std::io::Result<()> {
+        with_write_timeout(limit, async {
+            match self {
+                Transport::Plain(r) => {
+                    r.get_mut().write_all(data).await?;
+                    r.get_mut().flush().await
+                }
+                Transport::Tls(r) => {
+                    r.get_mut().write_all(data).await?;
+                    r.get_mut().flush().await
+                }
             }
-            Transport::Tls(r) => {
-                r.get_mut().write_all(data).await?;
-                r.get_mut().flush().await
-            }
-        }
+        })
+        .await
     }
 
     /// Shut down the write half.
@@ -287,6 +311,9 @@ pub struct NntpConnection {
     /// the per-article page-fault/allocation cost identified by profiling —
     /// see `docs/PERFORMANCE_STATUS.md`.
     body_pool: Vec<Vec<u8>>,
+    /// Upper bound on each socket write/flush. Always [`WRITE_TIMEOUT`]
+    /// outside of tests.
+    write_timeout: Duration,
 }
 
 /// Article bodies are typically well under 1 MiB (yEnc articles are usually
@@ -311,7 +338,15 @@ impl NntpConnection {
             capabilities: NntpCapabilities::default_assumed(),
             line_scratch: Vec::with_capacity(16 * 1024),
             body_pool: Vec::new(),
+            write_timeout: WRITE_TIMEOUT,
         }
+    }
+
+    /// Test-only: shorten the write timeout so a stalled peer can be
+    /// exercised without waiting the full production budget.
+    #[cfg(test)]
+    pub(crate) fn set_write_timeout_for_test(&mut self, limit: Duration) {
+        self.write_timeout = limit;
     }
 
     /// Check out a reusable article-body buffer, or allocate a fresh one if
@@ -1996,6 +2031,7 @@ impl NntpConnection {
             340 => {
                 // Server says "send article"
                 // Send each line, dot-stuffing lines that start with '.'
+                let write_timeout = self.write_timeout;
                 let transport = self
                     .transport
                     .as_mut()
@@ -2004,7 +2040,7 @@ impl NntpConnection {
                 for line in article.lines() {
                     if line.starts_with('.') {
                         transport
-                            .write_all(format!(".{line}\r\n").as_bytes())
+                            .write_all(format!(".{line}\r\n").as_bytes(), write_timeout)
                             .await
                             .map_err(|e| {
                                 self.state = ConnectionState::Error;
@@ -2012,7 +2048,7 @@ impl NntpConnection {
                             })?;
                     } else {
                         transport
-                            .write_all(format!("{line}\r\n").as_bytes())
+                            .write_all(format!("{line}\r\n").as_bytes(), write_timeout)
                             .await
                             .map_err(|e| {
                                 self.state = ConnectionState::Error;
@@ -2022,10 +2058,13 @@ impl NntpConnection {
                 }
 
                 // Send termination line
-                transport.write_all(b".\r\n").await.map_err(|e| {
-                    self.state = ConnectionState::Error;
-                    NntpError::Io(e)
-                })?;
+                transport
+                    .write_all(b".\r\n", write_timeout)
+                    .await
+                    .map_err(|e| {
+                        self.state = ConnectionState::Error;
+                        NntpError::Io(e)
+                    })?;
 
                 // Read final response
                 let result = self
@@ -2076,6 +2115,7 @@ impl NntpConnection {
 
         match status.code {
             340 => {
+                let write_timeout = self.write_timeout;
                 let transport = self
                     .transport
                     .as_mut()
@@ -2093,19 +2133,28 @@ impl NntpConnection {
                         .unwrap_or(&article[start..line_end]);
 
                     if line.starts_with(b".") {
-                        transport.write_all(b".").await.map_err(|e| {
+                        transport
+                            .write_all(b".", write_timeout)
+                            .await
+                            .map_err(|e| {
+                                self.state = ConnectionState::Error;
+                                NntpError::Io(e)
+                            })?;
+                    }
+                    transport
+                        .write_all(line, write_timeout)
+                        .await
+                        .map_err(|e| {
                             self.state = ConnectionState::Error;
                             NntpError::Io(e)
                         })?;
-                    }
-                    transport.write_all(line).await.map_err(|e| {
-                        self.state = ConnectionState::Error;
-                        NntpError::Io(e)
-                    })?;
-                    transport.write_all(b"\r\n").await.map_err(|e| {
-                        self.state = ConnectionState::Error;
-                        NntpError::Io(e)
-                    })?;
+                    transport
+                        .write_all(b"\r\n", write_timeout)
+                        .await
+                        .map_err(|e| {
+                            self.state = ConnectionState::Error;
+                            NntpError::Io(e)
+                        })?;
 
                     start = match nl_pos {
                         Some(p) => p + 1,
@@ -2113,10 +2162,13 @@ impl NntpConnection {
                     };
                 }
 
-                transport.write_all(b".\r\n").await.map_err(|e| {
-                    self.state = ConnectionState::Error;
-                    NntpError::Io(e)
-                })?;
+                transport
+                    .write_all(b".\r\n", write_timeout)
+                    .await
+                    .map_err(|e| {
+                        self.state = ConnectionState::Error;
+                        NntpError::Io(e)
+                    })?;
 
                 let result = self
                     .read_response_line()
@@ -2163,8 +2215,9 @@ impl NntpConnection {
             }
 
             // Shut down the socket
+            let write_timeout = self.write_timeout;
             if let Some(ref mut transport) = self.transport {
-                let _ = transport.shutdown().await;
+                let _ = with_write_timeout(write_timeout, transport.shutdown()).await;
             }
         }
 
@@ -2195,10 +2248,13 @@ impl NntpConnection {
 
         let mut line = cmd.to_string();
         line.push_str("\r\n");
-        match transport {
-            Transport::Plain(r) => r.get_mut().write_all(line.as_bytes()).await,
-            Transport::Tls(r) => r.get_mut().write_all(line.as_bytes()).await,
-        }
+        with_write_timeout(self.write_timeout, async {
+            match transport {
+                Transport::Plain(r) => r.get_mut().write_all(line.as_bytes()).await,
+                Transport::Tls(r) => r.get_mut().write_all(line.as_bytes()).await,
+            }
+        })
+        .await
         .map_err(NntpError::Io)?;
         Ok(())
     }
@@ -2209,10 +2265,13 @@ impl NntpConnection {
             .transport
             .as_mut()
             .ok_or(NntpError::Connection("Not connected".into()))?;
-        match transport {
-            Transport::Plain(r) => r.get_mut().flush().await,
-            Transport::Tls(r) => r.get_mut().flush().await,
-        }
+        with_write_timeout(self.write_timeout, async {
+            match transport {
+                Transport::Plain(r) => r.get_mut().flush().await,
+                Transport::Tls(r) => r.get_mut().flush().await,
+            }
+        })
+        .await
         .map_err(NntpError::Io)?;
         Ok(())
     }
@@ -2788,6 +2847,84 @@ mod tests {
     use crate::testutil::{MockConfig, MockNntpServer, test_config, test_config_with_auth};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    // -----------------------------------------------------------------------
+    // Write timeouts against a peer that stops reading
+    // -----------------------------------------------------------------------
+
+    /// Start a peer that greets, answers every command with 500 until it sees
+    /// `STALL` or `POST` (answered with 340), and then stops reading while
+    /// keeping the socket open — so the client's send buffer fills up.
+    async fn start_stalling_peer() -> u16 {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut sock = tokio::io::BufReader::new(sock);
+            sock.get_mut().write_all(b"200 ready\r\n").await.unwrap();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if sock.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                if line.starts_with("STALL") {
+                    break;
+                }
+                if line.starts_with("POST") {
+                    sock.get_mut().write_all(b"340 send\r\n").await.unwrap();
+                    break;
+                }
+                sock.get_mut().write_all(b"500 what\r\n").await.unwrap();
+            }
+            // Hold the socket open without ever reading again.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(sock);
+        });
+        port
+    }
+
+    /// Larger than any loopback send + receive buffer, so the write blocks.
+    const STALL_PAYLOAD: usize = 64 * 1024 * 1024;
+
+    fn assert_write_timed_out(err: NntpError) {
+        match err {
+            NntpError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}"),
+            other => panic!("expected Io(TimedOut), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_command_times_out_when_peer_stops_reading() {
+        let port = start_stalling_peer().await;
+        let mut conn = NntpConnection::new("stall".into());
+        conn.connect(&test_config(port)).await.unwrap();
+        conn.set_write_timeout_for_test(Duration::from_millis(300));
+        conn.send_command("STALL").await.unwrap();
+
+        let huge = "X".repeat(STALL_PAYLOAD);
+        let res = tokio::time::timeout(Duration::from_secs(30), conn.send_command(&huge))
+            .await
+            .expect("send_command hung instead of timing out");
+        assert_write_timed_out(res.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn test_post_body_write_times_out_when_peer_stops_reading() {
+        let port = start_stalling_peer().await;
+        let mut conn = NntpConnection::new("stall".into());
+        conn.connect(&test_config(port)).await.unwrap();
+        conn.set_write_timeout_for_test(Duration::from_millis(300));
+
+        let mut article = b"Subject: x\r\n\r\n".to_vec();
+        article.extend(std::iter::repeat_n(b'y', STALL_PAYLOAD));
+        let res = tokio::time::timeout(Duration::from_secs(30), conn.post_article_bytes(&article))
+            .await
+            .expect("post_article_bytes hung instead of timing out");
+        assert_write_timed_out(res.unwrap_err());
+        assert_eq!(conn.state, ConnectionState::Error);
+    }
 
     // -----------------------------------------------------------------------
     // Pure helper function tests (existing)
