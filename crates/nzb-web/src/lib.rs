@@ -10,6 +10,7 @@ pub mod direct_unpack;
 pub mod error;
 pub mod fetch_guard;
 pub mod log_buffer;
+pub mod nzb_archive;
 pub mod queue_manager;
 pub mod rss_monitor;
 pub mod sabnzbd_compat;

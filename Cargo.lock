@@ -1901,6 +1901,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "bzip2",
  "chrono",
  "feed-rs",
  "flate2",
@@ -1933,6 +1934,7 @@ dependencies = [
  "utoipa-swagger-ui",
  "uuid",
  "yenc-simd",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -2815,7 +2817,6 @@ dependencies = [
  "chrono",
  "clap",
  "crc32fast",
- "flate2",
  "hex",
  "http",
  "libc",
@@ -2852,7 +2853,6 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
- "zip 8.6.0",
 ]
 
 [[package]]

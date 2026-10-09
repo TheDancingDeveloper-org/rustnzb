@@ -80,6 +80,8 @@ regex = "1"
 walkdir = "2"
 tar = "0.4"
 flate2 = "1"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+bzip2 = "0.6"
 tokio-socks = "0.5"
 notify = "7"
 feed-rs = "2"

@@ -2,11 +2,11 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use flate2::read::GzDecoder;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use crate::nzb_archive::extract_nzbs;
 use crate::queue_manager::QueueManager;
 
 const MAX_WATCHED_NZB_BYTES: usize = 100 * 1024 * 1024;
@@ -72,12 +72,16 @@ impl DirWatcher {
         }
     }
 
+    /// Watched names: `.nzb`, plus `.nzb.gz`, `.nzb.bz2`, and `.zip` archives
+    /// of NZBs. Matching is case-sensitive, as it always has been here.
     fn is_nzb_file(path: &Path) -> bool {
-        path.extension().is_some_and(|ext| ext == "nzb") || Self::is_gz_nzb(path)
-    }
-
-    fn is_gz_nzb(path: &Path) -> bool {
-        path.to_str().is_some_and(|s| s.ends_with(".nzb.gz"))
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                [".nzb", ".nzb.gz", ".nzb.bz2", ".zip"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+            })
     }
 
     async fn process_existing_files(&self) {
@@ -108,70 +112,60 @@ impl DirWatcher {
             }
         };
 
-        let data = if Self::is_gz_nzb(path) {
-            let decoder = GzDecoder::new(raw_data.as_slice());
-            let mut decompressed = Vec::new();
-            if let Err(error) = decoder
-                .take((MAX_WATCHED_NZB_BYTES as u64).saturating_add(1))
-                .read_to_end(&mut decompressed)
-            {
-                warn!(error = %error, file = %path.display(), "Failed to decompress watched NZB");
-                return;
-            }
-            if decompressed.len() > MAX_WATCHED_NZB_BYTES {
-                warn!(file = %path.display(), limit = MAX_WATCHED_NZB_BYTES, "Decompressed watched NZB exceeds the input limit");
-                return;
-            }
-            decompressed
-        } else {
-            raw_data
-        };
-
-        let name = if Self::is_gz_nzb(path) {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.strip_suffix(".nzb.gz"))
-                .unwrap_or("unknown")
-                .to_string()
-        } else {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string()
-        };
-
-        match crate::nzb_core::nzb_parser::parse_nzb(&name, &data) {
-            Ok(mut job) => {
-                job.work_dir = self.queue_manager.incomplete_dir().join(&job.id);
-                job.output_dir = self.queue_manager.complete_dir().join(&job.name);
-
-                if let Err(e) = std::fs::create_dir_all(&job.work_dir) {
-                    error!(error = %e, "Failed to create work directory");
-                    return;
-                }
-
-                info!(name = %job.name, id = %job.id, "Auto-enqueuing NZB from watch dir");
-
-                if let Err(e) = self.queue_manager.add_job(job, Some(data)) {
-                    error!(error = %e, "Failed to enqueue NZB");
-                    return;
-                }
-
-                // Move processed file to avoid re-processing
-                let processed_dir = self.watch_dir.join("processed");
-                let _ = std::fs::create_dir_all(&processed_dir);
-                let dest = processed_dir.join(path.file_name().unwrap_or_default());
-                if let Err(_e) = std::fs::rename(path, &dest) {
-                    // If rename fails (cross-device), try copy+delete
-                    if let Err(e2) =
-                        std::fs::copy(path, &dest).and_then(|_| std::fs::remove_file(path))
-                    {
-                        warn!(error = %e2, "Failed to move processed NZB file");
-                    }
-                }
-            }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown.nzb");
+        let nzbs = match extract_nzbs(file_name, &raw_data) {
+            Ok(nzbs) => nzbs,
             Err(e) => {
-                warn!(error = %e, file = %path.display(), "Failed to parse NZB from watch dir");
+                warn!(error = %e, file = %path.display(), "Failed to unpack watched NZB");
+                return;
+            }
+        };
+
+        let mut enqueued = 0usize;
+        for (nzb_name, data) in nzbs {
+            // Archive entries may carry directories; the job is named after
+            // the NZB itself, without its extension.
+            let base = nzb_name.rsplit(['/', '\\']).next().unwrap_or(&nzb_name);
+            let name = base.strip_suffix(".nzb").unwrap_or(base);
+            let name = if name.is_empty() { "unknown" } else { name };
+            match crate::nzb_core::nzb_parser::parse_nzb(name, &data) {
+                Ok(mut job) => {
+                    job.work_dir = self.queue_manager.incomplete_dir().join(&job.id);
+                    job.output_dir = self.queue_manager.complete_dir().join(&job.name);
+
+                    if let Err(e) = std::fs::create_dir_all(&job.work_dir) {
+                        error!(error = %e, "Failed to create work directory");
+                        continue;
+                    }
+
+                    info!(name = %job.name, id = %job.id, "Auto-enqueuing NZB from watch dir");
+
+                    if let Err(e) = self.queue_manager.add_job(job, Some(data)) {
+                        error!(error = %e, "Failed to enqueue NZB");
+                        continue;
+                    }
+                    enqueued += 1;
+                }
+                Err(e) => {
+                    warn!(error = %e, file = %path.display(), entry = %nzb_name, "Failed to parse NZB from watch dir");
+                }
+            }
+        }
+        if enqueued == 0 {
+            return;
+        }
+
+        // Move processed file to avoid re-processing
+        let processed_dir = self.watch_dir.join("processed");
+        let _ = std::fs::create_dir_all(&processed_dir);
+        let dest = processed_dir.join(path.file_name().unwrap_or_default());
+        if let Err(_e) = std::fs::rename(path, &dest) {
+            // If rename fails (cross-device), try copy+delete
+            if let Err(e2) = std::fs::copy(path, &dest).and_then(|_| std::fs::remove_file(path)) {
+                warn!(error = %e2, "Failed to move processed NZB file");
             }
         }
     }
@@ -210,9 +204,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognizes_plain_and_gzipped_nzb_paths_case_sensitively() {
+    fn recognizes_plain_and_compressed_nzb_paths_case_sensitively() {
         assert!(DirWatcher::is_nzb_file(Path::new("release.nzb")));
         assert!(DirWatcher::is_nzb_file(Path::new("release.nzb.gz")));
+        assert!(DirWatcher::is_nzb_file(Path::new("release.nzb.bz2")));
+        assert!(DirWatcher::is_nzb_file(Path::new("bundle.zip")));
+        assert!(!DirWatcher::is_nzb_file(Path::new("release.gz")));
         assert!(!DirWatcher::is_nzb_file(Path::new("release.NZB")));
         assert!(!DirWatcher::is_nzb_file(Path::new("release.txt")));
     }
