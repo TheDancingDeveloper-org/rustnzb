@@ -21,6 +21,8 @@ import { WidthModeService } from './core/services/width-mode.service';
 import { PauseStateService } from './core/services/pause-state.service';
 import { ThemeService } from './core/services/theme.service';
 import { IconComponent } from './shared/icon.component';
+import { MatSnackBar } from '@angular/material/snack-bar';
+import { showHttpError } from './core/http/http-error';
 
 export function isDemoPath(pathname: string): boolean {
   return pathname === '/demo' || pathname.startsWith('/demo/');
@@ -451,6 +453,7 @@ export class App implements OnInit, OnDestroy {
     public widthMode: WidthModeService,
     readonly theme: ThemeService,
     pauseState: PauseStateService,
+    private snack: MatSnackBar,
   ) {
     this.paused = pauseState.paused;
     this.authenticated = authService.authenticated;
@@ -509,9 +512,14 @@ export class App implements OnInit, OnDestroy {
     this.paused.set(!wasPaused);
     this.api.post(action).subscribe({
       next: () => this.pollStatus(),
-      error: () => {
+      error: (err) => {
         this.paused.set(wasPaused);
         this.pollStatus();
+        showHttpError(
+          this.snack,
+          err,
+          wasPaused ? 'Failed to resume downloads' : 'Failed to pause downloads',
+        );
       },
     });
     this.pauseMenuOpen = false;
@@ -524,7 +532,10 @@ export class App implements OnInit, OnDestroy {
   }
 
   pauseFor(secs: number): void {
-    this.api.post(`/queue/pause-for?duration_secs=${secs}`).subscribe(() => this.pollStatus());
+    this.api.post(`/queue/pause-for?duration_secs=${secs}`).subscribe({
+      next: () => this.pollStatus(),
+      error: (err) => showHttpError(this.snack, err, 'Failed to pause downloads'),
+    });
     this.pauseMenuOpen = false;
   }
 

@@ -23,6 +23,7 @@ function makeApp(postResult = new Subject<unknown>()) {
     navigate: vi.fn(() => Promise.resolve(true)),
   };
   const pauseState = new PauseStateService();
+  const snack = { open: vi.fn() };
   const app = new App(
     api as never,
     auth as never,
@@ -31,8 +32,9 @@ function makeApp(postResult = new Subject<unknown>()) {
     {} as never,
     {} as never,
     pauseState,
+    snack as never,
   );
-  return { app, api, pauseState, postResult };
+  return { app, api, pauseState, postResult, snack };
 }
 
 describe('App global pause control', () => {
@@ -46,13 +48,16 @@ describe('App global pause control', () => {
   });
 
   it('rolls back the shared state if the global request fails', () => {
-    const { app, pauseState, postResult } = makeApp();
+    const { app, pauseState, postResult, snack } = makeApp();
     vi.spyOn(app, 'pollStatus').mockImplementation(() => {});
 
     app.togglePause();
     postResult.error(new Error('request failed'));
 
     expect(pauseState.paused()).toBe(false);
+    expect(snack.open).toHaveBeenCalledWith('Failed to pause downloads', 'Close', {
+      duration: 5000,
+    });
   });
 });
 

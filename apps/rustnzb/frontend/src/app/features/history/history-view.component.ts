@@ -6,6 +6,7 @@ import { ApiService } from '../../core/services/api.service';
 import { HistoryEntry, StatusResponse } from '../../core/models/queue.model';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
+import { showHttpError } from '../../core/http/http-error';
 
 type StatusFilter = 'all' | 'completed' | 'failed';
 type TimeFilter = '7d' | '30d' | 'all';
@@ -407,21 +408,27 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
   });
 
   retry(id: string): void {
-    this.api.post(`/history/${id}/retry`).subscribe(() => {
-      this.load();
-      this.snack.open('Retrying…', 'Close', { duration: 2000 });
+    this.api.post(`/history/${id}/retry`).subscribe({
+      next: () => {
+        this.load();
+        this.snack.open('Retrying…', 'Close', { duration: 2000 });
+      },
+      error: (err) => showHttpError(this.snack, err, 'Failed to retry job'),
     });
   }
 
   addToMedia(id: string): void {
     this.api.post(`/dav/add?id=${id}`).subscribe({
       next: () => this.snack.open('Queued for Media Library', 'Close', { duration: 3000 }),
-      error: () => this.snack.open('Failed to add to Media Library', 'Close', { duration: 3000 }),
+      error: (err) => showHttpError(this.snack, err, 'Failed to add to Media Library'),
     });
   }
 
   remove(id: string): void {
-    this.api.delete(`/history/${id}`).subscribe(() => this.load());
+    this.api.delete(`/history/${id}`).subscribe({
+      next: () => this.load(),
+      error: (err) => showHttpError(this.snack, err, 'Failed to delete history entry'),
+    });
   }
 
   clearAll(): void {
@@ -434,9 +441,12 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
       })
       .subscribe((ok) => {
         if (!ok) return;
-        this.api.delete('/history').subscribe(() => {
-          this.load();
-          this.snack.open('History cleared', 'Close', { duration: 2000 });
+        this.api.delete('/history').subscribe({
+          next: () => {
+            this.load();
+            this.snack.open('History cleared', 'Close', { duration: 2000 });
+          },
+          error: (err) => showHttpError(this.snack, err, 'Failed to clear history'),
         });
       });
   }

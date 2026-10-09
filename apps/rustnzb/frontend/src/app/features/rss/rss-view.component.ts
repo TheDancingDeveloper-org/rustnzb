@@ -4,6 +4,7 @@ import { FormsModule } from '@angular/forms';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { ApiService } from '../../core/services/api.service';
 import { ConfirmService } from '../../shared/confirm.service';
+import { httpErrorMessage, isAuthHandledError, showHttpError } from '../../core/http/http-error';
 
 interface RssFeed {
   name: string; url: string; poll_interval_secs: number; category: string | null;
@@ -86,6 +87,9 @@ interface RuleFormModel {
               <label class="check"><input type="checkbox" [(ngModel)]="feedForm.auto_download" /> Auto-download matches</label>
             </div>
           </div>
+          @if (feedError()) {
+            <div class="form-error" role="alert">{{ feedError() }}</div>
+          }
           <div class="form-actions">
             <button class="btn primary" (click)="saveFeed()">{{ editingFeedName() ? 'Update' : 'Add feed' }}</button>
             <button class="btn" (click)="cancelFeedForm()">Cancel</button>
@@ -154,6 +158,9 @@ interface RuleFormModel {
             <label>Options</label>
             <label class="check"><input type="checkbox" [(ngModel)]="ruleForm.enabled" /> Enabled</label>
           </div>
+          @if (ruleError()) {
+            <div class="form-error" role="alert">{{ ruleError() }}</div>
+          }
           <div class="form-actions">
             <button class="btn primary" (click)="saveRule()">{{ editingRuleId() ? 'Update' : 'Add rule' }}</button>
             <button class="btn" (click)="cancelRuleForm()">Cancel</button>
@@ -270,6 +277,12 @@ interface RuleFormModel {
       border-bottom: 1px solid var(--line);
     }
     .form-actions { margin-top: 14px; display: flex; gap: 8px; }
+    .form-error {
+      margin-top: 14px;
+      background: color-mix(in srgb, var(--danger) 10%, transparent);
+      border: 1px solid var(--danger);
+      border-radius: 6px; padding: 10px 14px; color: var(--danger); font-size: 13px;
+    }
 
     td.dim { color: var(--mute); }
     .dim { color: var(--mute); }
@@ -285,10 +298,12 @@ export class RssViewComponent implements OnInit {
   feedFormVisible = signal(false);
   editingFeedName = signal<string | null>(null);
   feedForm: FeedFormModel = this.emptyFeedForm();
+  feedError = signal<string | null>(null);
 
   ruleFormVisible = signal(false);
   editingRuleId = signal<string | null>(null);
   ruleForm: RuleFormModel = this.emptyRuleForm();
+  ruleError = signal<string | null>(null);
 
   // ---- Stat-card derivations ----
   enabledFeedCount = computed(() => this.feeds().filter(f => f.enabled).length);
@@ -332,6 +347,7 @@ export class RssViewComponent implements OnInit {
   showAddFeed(): void {
     this.feedForm = this.emptyFeedForm();
     this.editingFeedName.set(null);
+    this.feedError.set(null);
     this.feedFormVisible.set(true);
   }
 
@@ -346,12 +362,14 @@ export class RssViewComponent implements OnInit {
       auto_download: f.auto_download,
     };
     this.editingFeedName.set(f.name);
+    this.feedError.set(null);
     this.feedFormVisible.set(true);
   }
 
   cancelFeedForm(): void {
     this.feedFormVisible.set(false);
     this.editingFeedName.set(null);
+    this.feedError.set(null);
   }
 
   saveFeed(): void {
@@ -378,7 +396,10 @@ export class RssViewComponent implements OnInit {
         this.cancelFeedForm();
         this.loadAll();
       },
-      error: () => this.snack.open('Failed to save feed', 'Close', { duration: 3000 }),
+      error: (err) => {
+        if (!isAuthHandledError(err)) this.feedError.set(httpErrorMessage(err, 'Failed to save feed'));
+        showHttpError(this.snack, err, 'Failed to save feed');
+      },
     });
   }
 
@@ -397,7 +418,7 @@ export class RssViewComponent implements OnInit {
             this.snack.open('Feed deleted', 'Close', { duration: 2000 });
             this.loadAll();
           },
-          error: () => this.snack.open('Failed to delete feed', 'Close', { duration: 3000 }),
+          error: (err) => showHttpError(this.snack, err, 'Failed to delete feed'),
         });
       });
   }
@@ -407,6 +428,7 @@ export class RssViewComponent implements OnInit {
   showAddRule(): void {
     this.ruleForm = this.emptyRuleForm();
     this.editingRuleId.set(null);
+    this.ruleError.set(null);
     this.ruleFormVisible.set(true);
   }
 
@@ -420,12 +442,14 @@ export class RssViewComponent implements OnInit {
       feed_names_csv: r.feed_names.join(', '),
     };
     this.editingRuleId.set(r.id);
+    this.ruleError.set(null);
     this.ruleFormVisible.set(true);
   }
 
   cancelRuleForm(): void {
     this.ruleFormVisible.set(false);
     this.editingRuleId.set(null);
+    this.ruleError.set(null);
   }
 
   saveRule(): void {
@@ -455,7 +479,10 @@ export class RssViewComponent implements OnInit {
         this.cancelRuleForm();
         this.loadAll();
       },
-      error: () => this.snack.open('Failed to save rule', 'Close', { duration: 3000 }),
+      error: (err) => {
+        if (!isAuthHandledError(err)) this.ruleError.set(httpErrorMessage(err, 'Failed to save rule'));
+        showHttpError(this.snack, err, 'Failed to save rule');
+      },
     });
   }
 
@@ -474,7 +501,7 @@ export class RssViewComponent implements OnInit {
             this.snack.open('Rule deleted', 'Close', { duration: 2000 });
             this.loadAll();
           },
-          error: () => this.snack.open('Failed to delete rule', 'Close', { duration: 3000 }),
+          error: (err) => showHttpError(this.snack, err, 'Failed to delete rule'),
         });
       });
   }
@@ -487,7 +514,7 @@ export class RssViewComponent implements OnInit {
         this.snack.open('Added to queue', 'Close', { duration: 2000 });
         this.loadAll();
       },
-      error: () => this.snack.open('Download failed', 'Close', { duration: 3000 }),
+      error: (err) => showHttpError(this.snack, err, 'Download failed'),
     });
   }
 

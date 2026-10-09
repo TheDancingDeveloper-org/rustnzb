@@ -7,6 +7,7 @@ import { GroupService } from '../../core/services/group.service';
 import { GroupRow, HeaderRow } from '../../core/models/group.model';
 import { GroupBrowserDialogComponent } from './group-browser-dialog.component';
 import { IconComponent } from '../../shared/icon.component';
+import { showHttpError } from '../../core/http/http-error';
 
 @Component({
   selector: 'app-groups-view',
@@ -493,7 +494,10 @@ export class GroupsViewComponent implements OnInit {
     this.fetching.set(true);
     this.svc.fetchHeaders(g.id).subscribe({
       next: () => this.snack.open('Fetching headers…', 'Close', { duration: 2000 }),
-      error: () => this.fetching.set(false),
+      error: (err) => {
+        this.fetching.set(false);
+        showHttpError(this.snack, err, 'Failed to fetch headers');
+      },
     });
     const poll = setInterval(() => {
       this.loadHeaders();
@@ -519,10 +523,13 @@ export class GroupsViewComponent implements OnInit {
   markAllRead(): void {
     const g = this.selectedGroup();
     if (!g) return;
-    this.svc.markAllRead(g.id).subscribe(() => {
-      this.loadHeaders();
-      this.loadGroups();
-      this.snack.open('All marked read', 'Close', { duration: 2000 });
+    this.svc.markAllRead(g.id).subscribe({
+      next: () => {
+        this.loadHeaders();
+        this.loadGroups();
+        this.snack.open('All marked read', 'Close', { duration: 2000 });
+      },
+      error: (err) => showHttpError(this.snack, err, 'Failed to mark all read'),
     });
   }
 
@@ -567,7 +574,7 @@ export class GroupsViewComponent implements OnInit {
         this.snack.open(r.message, 'Close', { duration: 3000 });
         this.selectedIds.set([]);
       },
-      error: () => this.snack.open('Download failed', 'Close', { duration: 5000 }),
+      error: (err) => showHttpError(this.snack, err, 'Download failed'),
     });
   }
 

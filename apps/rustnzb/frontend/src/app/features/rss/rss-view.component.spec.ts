@@ -1,6 +1,7 @@
 import '@angular/compiler';
 
 import { describe, expect, it, vi } from 'vitest';
+import { HttpErrorResponse } from '@angular/common/http';
 import { of, throwError } from 'rxjs';
 
 import { ApiService } from '../../core/services/api.service';
@@ -42,7 +43,7 @@ describe('RssViewComponent', () => {
     component.feedForm = { ...component.feedForm, name: 'daily', url: 'https://example.test' };
     component.saveFeed();
     expect(api.post).toHaveBeenCalledWith('/config/rss-feeds', expect.objectContaining({ name: 'daily' }));
-    expect(snack.open).toHaveBeenCalledWith('Failed to save feed', 'Close', { duration: 3000 });
+    expect(snack.open).toHaveBeenCalledWith('Failed to save feed', 'Close', { duration: 5000 });
   });
 
   it('encodes edited feed names and submits parsed rule feed names', () => {
@@ -55,5 +56,39 @@ describe('RssViewComponent', () => {
     component.ruleForm = { ...component.ruleForm, name: 'TV', match_regex: '1080p', feed_names_csv: ' daily, tv , ' };
     component.saveRule();
     expect(api.post).toHaveBeenCalledWith('/rss/rules', expect.objectContaining({ feed_names: ['daily', 'tv'] }));
+  });
+
+  it('shows the server message inline and as a toast when adding a feed is rejected', () => {
+    const rejected = new HttpErrorResponse({
+      status: 400,
+      url: '/api/config/rss-feeds',
+      error: {
+        error_kind: 'bad_request',
+        human_readable: 'Feed URL rejected: URL targets a private/reserved address',
+        status: 400,
+      },
+    });
+    const { component, snack } = createComponent({ post: vi.fn(() => throwError(() => rejected)) });
+    component.showAddFeed();
+    component.feedForm = { ...component.feedForm, name: 'lan', url: 'http://192.168.1.10/rss' };
+    component.saveFeed();
+
+    const expected = 'Failed to save feed: Feed URL rejected: URL targets a private/reserved address';
+    expect(component.feedFormVisible()).toBe(true);
+    expect(component.feedError()).toBe(expected);
+    expect(snack.open).toHaveBeenCalledWith(expected, 'Close', { duration: 5000 });
+
+    component.cancelFeedForm();
+    component.showAddFeed();
+    expect(component.feedError()).toBeNull();
+  });
+
+  it('shows the server message inline when saving a rule is rejected', () => {
+    const rejected = new HttpErrorResponse({ status: 400, error: { human_readable: 'Invalid regex' } });
+    const { component } = createComponent({ post: vi.fn(() => throwError(() => rejected)) });
+    component.showAddRule();
+    component.ruleForm = { ...component.ruleForm, name: 'TV', match_regex: '(' };
+    component.saveRule();
+    expect(component.ruleError()).toBe('Failed to save rule: Invalid regex');
   });
 });
