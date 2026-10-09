@@ -2426,15 +2426,24 @@ pub fn parse_response_line(line: &str) -> NntpResult<NntpResponse> {
         )));
     }
 
-    let code: u16 = trimmed[..3]
-        .parse()
-        .map_err(|_| NntpError::Protocol(format!("Invalid response code in: {trimmed:?}")))?;
+    // Validate the status code on raw bytes: slicing the `&str` at fixed
+    // byte offsets panics when a (valid UTF-8) multibyte char straddles
+    // them, and `u16::from_str` would also accept a leading '+'.
+    let bytes = trimmed.as_bytes();
+    if !bytes[..3].iter().all(u8::is_ascii_digit) {
+        return Err(NntpError::Protocol(format!(
+            "Invalid response code in: {trimmed:?}"
+        )));
+    }
+    let code = bytes[..3]
+        .iter()
+        .fold(0u16, |acc, b| acc * 10 + u16::from(b - b'0'));
 
-    let message = if trimmed.len() > 4 {
-        trimmed[4..].to_string()
-    } else {
-        String::new()
-    };
+    // The first three bytes are ASCII, so byte 3 is a char boundary. Skip
+    // the single separator char (normally a space) that follows the code.
+    let mut rest = trimmed[3..].chars();
+    rest.next();
+    let message = rest.as_str().to_string();
 
     Ok(NntpResponse {
         code,
@@ -2834,6 +2843,29 @@ mod tests {
     fn test_parse_response_line_invalid_code() {
         let err = parse_response_line("ABC some message\r\n");
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_parse_response_line_multibyte_does_not_panic() {
+        // A multibyte char straddling byte 3 (the end of the status code).
+        let err = parse_response_line("2\u{20ac}0 bogus\r\n");
+        assert!(matches!(err, Err(NntpError::Protocol(_))), "{err:?}");
+        // A greeting that starts with a multibyte char.
+        let err = parse_response_line("\u{20ac}\u{20ac} hi\r\n");
+        assert!(matches!(err, Err(NntpError::Protocol(_))), "{err:?}");
+        // A multibyte char straddling byte 4 (the separator position).
+        let resp = parse_response_line("200\u{e9}t\u{e9}\r\n").unwrap();
+        assert_eq!(resp.code, 200);
+        assert_eq!(resp.message, "t\u{e9}");
+        // Multibyte text in the message itself is preserved.
+        let resp = parse_response_line("200 Caf\u{e9} ready\r\n").unwrap();
+        assert_eq!(resp.message, "Caf\u{e9} ready");
+    }
+
+    #[test]
+    fn test_parse_response_line_rejects_signed_code() {
+        // `u16::from_str` accepts a leading '+'; NNTP status codes do not.
+        assert!(parse_response_line("+20 nope\r\n").is_err());
     }
 
     #[test]
