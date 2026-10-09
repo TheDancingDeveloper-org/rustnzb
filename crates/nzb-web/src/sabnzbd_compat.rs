@@ -273,7 +273,6 @@ async fn handle_addurl(
         )
     };
 
-
     match nzb_parser::parse_nzb(&job_name, &data) {
         Ok(mut job) => {
             if let Some(ref c) = cat
@@ -719,7 +718,6 @@ async fn dispatch_post(
                         .unwrap_or(&file_name)
                         .to_string()
                 });
-
 
             match nzb_parser::parse_nzb(&job_name, &data) {
                 Ok(mut job) => {
@@ -3825,7 +3823,6 @@ mod tests {
         assert!(malformed["error"].is_string());
     }
 
-
     /// SABnzbd's PAUSED_PRIORITY (-2) adds the job paused rather than at a
     /// queue priority; the slot keeps reporting a normal priority.
     #[tokio::test]
@@ -3918,16 +3915,14 @@ mod tests {
 
     fn gzip(data: &[u8]) -> Vec<u8> {
         use std::io::Write as _;
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(data).unwrap();
         encoder.finish().unwrap()
     }
 
     fn bzip2(data: &[u8]) -> Vec<u8> {
         use std::io::Write as _;
-        let mut encoder =
-            bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
         encoder.write_all(data).unwrap();
         encoder.finish().unwrap()
     }
@@ -3984,8 +3979,7 @@ mod tests {
         let test_state = test_state();
         let gz = addfile_upload(&test_state, "Gz.Show.nzb.gz", gzip(SAMPLE_NZB.as_bytes())).await;
         assert_eq!(gz["status"], serde_json::json!(true), "gz: {gz}");
-        let bz =
-            addfile_upload(&test_state, "Bz.Show.nzb.bz2", bzip2(SAMPLE_NZB.as_bytes())).await;
+        let bz = addfile_upload(&test_state, "Bz.Show.nzb.bz2", bzip2(SAMPLE_NZB.as_bytes())).await;
         assert_eq!(bz["status"], serde_json::json!(true), "bz2: {bz}");
         assert_eq!(queued_names(&test_state), vec!["Bz.Show", "Gz.Show"]);
 
@@ -4057,10 +4051,13 @@ mod tests {
         .await
         .expect("addurl response")
         .0;
-        assert_eq!(response["status"], serde_json::json!(true), "resp={response}");
+        assert_eq!(
+            response["status"],
+            serde_json::json!(true),
+            "resp={response}"
+        );
         assert_eq!(queued_names(&test_state), vec!["Url.Show"]);
     }
-
 
     /// SABnzbd falls back to the default category when `addfile`/`addurl`
     /// name a category that is not configured, and matches configured
@@ -4082,7 +4079,6 @@ mod tests {
         assert_eq!(addfile_with_category(&test_state, "TV").await, "tv");
         assert_eq!(addfile_with_category(&test_state, "*").await, "Default");
     }
-
 
     fn config_request(name: &str, value: &str) -> SabApiRequest {
         SabApiRequest {

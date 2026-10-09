@@ -4465,5 +4465,4 @@ mod tests {
             assert!(!counts_against_circuit_breaker(&e), "{e}");
         }
     }
-
 }

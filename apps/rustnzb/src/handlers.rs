@@ -2385,7 +2385,6 @@ pub async fn h_dav_config_set(
 mod tests {
     use super::{MAX_RSS_REGEX_LEN, compile_rss_regex, sanitize_server_config};
 
-    use nzb_web::nzb_archive::MAX_NZB_DECOMPRESSED_BYTES;
     use nzb_web::nzb_core::config::ServerConfig;
 
     #[test]
