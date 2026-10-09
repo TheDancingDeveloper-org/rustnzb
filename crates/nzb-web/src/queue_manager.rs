@@ -1154,6 +1154,18 @@ pub struct JobAddedEvent {
 // QueueManager
 // ---------------------------------------------------------------------------
 
+/// Result of [`QueueManager::retry_history_entry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryRetryOutcome {
+    /// A new job was enqueued; carries its id.
+    Started(String),
+    /// A retry of this entry is already queued or running; carries that
+    /// job's id. Nothing new was enqueued.
+    InProgress(String),
+    /// The history entry has no stored NZB to retry from.
+    NoNzbData,
+}
+
 /// Thread-safe queue manager that coordinates all downloads.
 ///
 /// Wrapped in `Arc` for sharing between the background task and HTTP handlers.
@@ -1194,6 +1206,10 @@ pub struct QueueManager {
     add_tx: broadcast::Sender<JobAddedEvent>,
     /// Max concurrent active downloads (0 = unlimited).
     max_active_downloads: AtomicUsize,
+    /// History retries in flight: history entry id -> id of the job the
+    /// retry enqueued. Held from the in-flight check through the enqueue so
+    /// concurrent retries of one entry admit exactly one job.
+    history_retries: Mutex<HashMap<String, String>>,
     /// Automatically keep the queue ordered by remaining percentage.
     auto_sort_remaining_pct: AtomicBool,
     /// Optional bounded post-processing hooks.
@@ -1319,6 +1335,7 @@ impl QueueManager {
             log_buffer: Some(log_buffer),
             add_tx,
             max_active_downloads: AtomicUsize::new(max_active_downloads),
+            history_retries: Mutex::new(HashMap::new()),
             auto_sort_remaining_pct: AtomicBool::new(false),
             postproc_scripts: Mutex::new(PostProcScriptConfig::default()),
             postproc_resources: PostProcResourcePool::new(postproc_limits),
@@ -1849,6 +1866,49 @@ impl QueueManager {
 
         // Try to start this or other queued jobs
         self.start_next_queued();
+    }
+
+    /// Retry one history entry at most once at a time.
+    ///
+    /// The first caller claims the entry, rebuilds the job (reusing a
+    /// retained partial work directory via [`Self::prepare_retry_job`]) and
+    /// enqueues it. While that job is still in the queue -- queued, paused,
+    /// downloading or post-processing -- any further retry of the same entry
+    /// returns [`HistoryRetryOutcome::InProgress`] with the existing job id
+    /// instead of enqueueing a duplicate. Once the job has left the queue the
+    /// entry can be retried again.
+    ///
+    /// This is an in-flight guard, not the durable `Idempotency-Key`
+    /// admission: a history entry stays retryable after its retry finishes,
+    /// whereas an admission key binds exactly one job forever.
+    pub fn retry_history_entry(
+        self: &Arc<Self>,
+        entry: &HistoryEntry,
+    ) -> crate::nzb_core::Result<HistoryRetryOutcome> {
+        let mut retries = self.history_retries.lock();
+        {
+            let jobs = self.jobs.lock();
+            retries.retain(|_, job_id| jobs.contains_key(job_id));
+            if let Some(job_id) = retries.get(&entry.id) {
+                return Ok(HistoryRetryOutcome::InProgress(job_id.clone()));
+            }
+        }
+
+        let Some(nzb_data) = self.history_get_nzb_data(&entry.id)? else {
+            return Ok(HistoryRetryOutcome::NoNzbData);
+        };
+        let retry_data = self.history_get_retry_data(&entry.id)?;
+        let job = self.prepare_retry_job(entry, &nzb_data, retry_data.as_deref())?;
+        let job_id = job.id.clone();
+        info!(
+            name = %job.name,
+            id = %job_id,
+            original_id = %entry.id,
+            "Retrying NZB from history"
+        );
+        self.add_job(job, Some(nzb_data))?;
+        retries.insert(entry.id.clone(), job_id.clone());
+        Ok(HistoryRetryOutcome::Started(job_id))
     }
 
     /// Rebuild a history job for retry. Newer history rows carry a checkpoint
