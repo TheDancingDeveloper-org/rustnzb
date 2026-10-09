@@ -563,6 +563,9 @@ pub(crate) struct JobContext {
     active_elapsed: Mutex<Duration>,
     /// Total bytes across all files (for perf summary throughput).
     pub total_bytes: u64,
+    /// The first `size=` seen per file, pinned so later articles for the same
+    /// file cannot claim a different size.
+    pinned_file_sizes: Mutex<HashMap<String, Option<u64>>>,
     /// Ensures JobFinished/JobAborted is only emitted once.
     finished: AtomicBool,
     /// Avoid repeatedly reporting the same all-provider outage while the
@@ -603,6 +606,7 @@ impl JobContext {
             active_started: Mutex::new(Some(Instant::now())),
             active_elapsed: Mutex::new(Duration::ZERO),
             total_bytes: job.total_bytes,
+            pinned_file_sizes: Mutex::new(HashMap::new()),
             finished: AtomicBool::new(false),
             waiting_for_providers_reported: AtomicBool::new(false),
         }
@@ -963,18 +967,19 @@ impl SharedWorkQueue {
     }
 
     /// Remove and return every queued item matching `predicate`.
+    /// Remove and return the items matching `predicate`, leaving the rest in
+    /// place and in order.
     fn take_where(&self, mut predicate: impl FnMut(&WorkItem) -> bool) -> Vec<WorkItem> {
         let mut q = self.inner.lock();
-        let mut kept = VecDeque::with_capacity(q.items.len());
         let mut taken = Vec::new();
-        while let Some(item) = q.items.pop_front() {
-            if predicate(&item) {
-                taken.push(item);
+        let mut index = 0;
+        while index < q.items.len() {
+            if predicate(&q.items[index]) {
+                taken.push(q.items.remove(index).expect("index < len"));
             } else {
-                kept.push_back(item);
+                index += 1;
             }
         }
-        q.items = kept;
         taken
     }
 
@@ -1456,6 +1461,21 @@ impl WorkerPool {
     /// server, whose workers no longer pull work. Since the optional server is
     /// no longer required, resolve such items here.
     fn resolve_items_not_waiting_on_required_providers(&self) {
+        // Nothing can become resolvable unless an optional server is down:
+        // with every enabled server required, an item resolves only when a
+        // worker records the last server's outcome. Skip the queue walk.
+        {
+            let servers = self.servers.lock();
+            let health = self.server_health.lock();
+            let optional_down = servers.iter().any(|server| {
+                server.enabled
+                    && server.optional
+                    && health.get(&server.id).is_some_and(|h| !h.is_available())
+            });
+            if !optional_down {
+                return;
+            }
+        }
         let taken = {
             let servers = self.servers.lock();
             let health = self.server_health.lock();
@@ -2237,7 +2257,12 @@ async fn run_worker_pipelined(
                         let yield_t = Instant::now();
                         tokio::task::yield_now().await;
                         perf_yield_us += yield_t.elapsed().as_micros() as u64;
-                        let decode_result = decode_and_assemble(&item, &raw_data, &ctx.assembler);
+                        let decode_result = decode_and_assemble(
+                            &item,
+                            &raw_data,
+                            &ctx.assembler,
+                            Some(&ctx.pinned_file_sizes),
+                        );
                         // Return the buffer to the connection's pool so the
                         // next article's fetch reuses it instead of
                         // allocating fresh.
@@ -2421,7 +2446,25 @@ async fn run_worker_pipelined(
                             .or_default()
                             .record_failure(is_auth, &e.to_string());
                         pool.report_provider_outage();
-                        if retry_or_fail_over(
+                        // An outage (502, 480, 403, TLS, timeout) says nothing
+                        // about the article, so it must not spend one of the
+                        // article's tries: after MAX_TRIES_PER_SERVER the
+                        // article would be failed permanently and a resume
+                        // would skip it. Re-queue it untouched and reconnect.
+                        // Only an article-specific error is a definitive
+                        // outcome for this server.
+                        let is_outage = matches!(
+                            failure.kind,
+                            crate::article_failure::ArticleFailureKind::ServerDown
+                                | crate::article_failure::ArticleFailureKind::AuthFailed
+                                | crate::article_failure::ArticleFailureKind::PermissionDenied
+                                | crate::article_failure::ArticleFailureKind::Timeout
+                                | crate::article_failure::ArticleFailureKind::ConnectionClosed
+                                | crate::article_failure::ArticleFailureKind::Other
+                        );
+                        if is_outage {
+                            pool.work_queue.push_front(item);
+                        } else if retry_or_fail_over(
                             item,
                             primary_server,
                             pool,
@@ -2840,6 +2883,7 @@ pub fn has_known_extension(name: &str) -> bool {
 pub(crate) fn build_job_submission(
     job: &NzbJob,
     progress_tx: mpsc::Sender<ProgressUpdate>,
+    enabled_server_ids: &[String],
 ) -> (Arc<JobContext>, Vec<WorkItem>) {
     let assembler = Arc::new(FileAssembler::new());
     for file in &job.files {
@@ -2863,19 +2907,24 @@ pub(crate) fn build_job_submission(
             output_path,
             &segment_numbers,
             &completed_segments,
+            Some(file.bytes),
         ) {
             error!(file = %file.filename, "Failed to register file for assembly: {e}");
         }
     }
 
     // `tried_servers` on a persisted article is only ever written when the
-    // article reached a terminal `ArticleFailed` (and was counted in
-    // `articles_failed`). Re-queuing it would hang: `pop_workable` never hands
-    // an item back to a server in `tried_servers`, and the item has no
-    // `provider_outcomes` for those servers, so it can never resolve. Treat it
-    // as already resolved instead and carry its failure into the context.
-    let is_previously_failed =
-        |article: &nzb_nntp::Article| !article.downloaded && !article.tried_servers.is_empty();
+    // article reached a terminal `ArticleFailed`. That is only still terminal
+    // if every server enabled now was one of them: a server added or
+    // re-enabled since the failure has never been asked, so the article must
+    // be fetched again rather than skipped.
+    let is_previously_failed = |article: &nzb_nntp::Article| {
+        !article.downloaded
+            && !enabled_server_ids.is_empty()
+            && enabled_server_ids
+                .iter()
+                .all(|server| article.tried_servers.iter().any(|tried| tried == server))
+    };
     let previously_failed = job
         .files
         .iter()
@@ -2949,7 +2998,7 @@ async fn fetch_article_with_retry(
                 conn.release_body_buffer(raw_data);
                 return Err(ArticleError::Cancelled);
             }
-            let result = decode_and_assemble(item, &raw_data, assembler);
+            let result = decode_and_assemble(item, &raw_data, assembler, None);
             // Return the buffer to the connection's pool so the next
             // article's fetch reuses it instead of allocating fresh.
             conn.release_body_buffer(raw_data);
@@ -3093,15 +3142,38 @@ enum ArticleError {
 /// that would place it outside the file.
 ///
 /// The offset comes from `=ypart begin=` and is used directly as the `pwrite`
-/// position, so it must be checked: an unchecked huge `begin` creates an
-/// enormous sparse file, and a missing `=ypart` on a later segment would
-/// overwrite the start of the file. Both are treated as a corrupt article.
+/// position. The bound is the size the NZB declared for the file
+/// (`declared_bytes`), not the `size=` the article itself claims: a forged
+/// `size=2e12 begin=1e12` would otherwise create a terabyte sparse file. The
+/// first `size=` seen for a file is pinned (`pinned_size`) and later articles
+/// must agree with it. A multi-segment file with no bound at all — no NZB
+/// size and no `size=` — is rejected, as is a `part_end` that does not
+/// describe exactly the decoded bytes. A missing `=ypart` on a later segment
+/// would overwrite the start of the file and is rejected too.
 fn validated_write_offset(
     segment_number: u32,
-    part_begin: Option<u64>,
-    file_size: Option<u64>,
+    decoded: &nzb_decode::YencDecodeResult,
     data_len: u64,
+    declared_bytes: Option<u64>,
+    pinned_size: Option<u64>,
 ) -> Result<u64, String> {
+    let file_size = decoded.file_size;
+    let part_begin = decoded.part_begin;
+    let part_end = decoded.part_end;
+    if file_size != pinned_size {
+        return Err(format!(
+            "article size {file_size:?} does not match the size {pinned_size:?} established for this file"
+        ));
+    }
+    let bound = match declared_bytes.or(pinned_size) {
+        Some(size) => Some(size),
+        None if segment_number <= 1 => None,
+        None => {
+            return Err(format!(
+                "no declared file size for multi-segment file (segment {segment_number})"
+            ));
+        }
+    };
     let begin = match part_begin {
         Some(begin) => begin,
         // A single-part article (no =ypart) can only be the first segment.
@@ -3112,9 +3184,25 @@ fn validated_write_offset(
             ));
         }
     };
-    if let Some(size) = file_size {
+    if let Some(size) = bound {
+        if size == 0 {
+            return Err("declared file size is 0".to_string());
+        }
+        if begin >= size {
+            return Err(format!(
+                "=ypart begin {begin} is past the declared file size {size}"
+            ));
+        }
         match begin.checked_add(data_len) {
-            Some(end) if end <= size => {}
+            Some(end) if end <= size => {
+                if let Some(part_end) = part_end
+                    && part_end != end
+                {
+                    return Err(format!(
+                        "=ypart end {part_end} does not match the decoded bytes ending at {end}"
+                    ));
+                }
+            }
             _ => {
                 return Err(format!(
                     "part range begin={begin} len={data_len} exceeds declared file size {size}"
@@ -3129,6 +3217,7 @@ fn decode_and_assemble(
     item: &WorkItem,
     raw_data: &[u8],
     assembler: &FileAssembler,
+    pinned_file_sizes: Option<&Mutex<HashMap<String, Option<u64>>>>,
 ) -> Result<ProcessResult, ArticleError> {
     let decode_start = Instant::now();
     let decoded = decode_yenc(raw_data).map_err(|e| {
@@ -3139,12 +3228,27 @@ fn decode_and_assemble(
     })?;
     let decode_us = decode_start.elapsed().as_micros();
 
+    // Pin the first size= seen for this file. Later articles must agree with
+    // it, so one article cannot inflate the bound the others are checked
+    // against. The caller's bound is the size the NZB declared.
+    let pinned_size = match pinned_file_sizes {
+        Some(sizes) => {
+            let mut sizes = sizes.lock();
+            match sizes.entry(item.file_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(existing) => *existing.get(),
+                std::collections::hash_map::Entry::Vacant(slot) => *slot.insert(decoded.file_size),
+            }
+        }
+        None => decoded.file_size,
+    };
+
     let decoded_len = decoded.data.len() as u64;
     let data_begin = validated_write_offset(
         item.segment_number,
-        decoded.part_begin,
-        decoded.file_size,
+        &decoded,
         decoded_len,
+        assembler.declared_bytes(&item.job_id, &item.file_id),
+        pinned_size,
     )
     .map_err(|reason| {
         ArticleError::DecodeError(format!(
@@ -3283,7 +3387,7 @@ mod tests {
         });
         let (tx, _rx) = mpsc::channel(4);
 
-        let (_ctx, items) = build_job_submission(&job, tx);
+        let (_ctx, items) = build_job_submission(&job, tx, &["srv1".into()]);
 
         assert_eq!(
             items
@@ -3312,7 +3416,7 @@ mod tests {
         job.files.push(nzb_core::models::NzbFile {
             id: "file-1".into(),
             filename: "gap.bin".into(),
-            bytes: 12,
+            bytes: 16,
             bytes_downloaded: 0,
             is_par2: false,
             par2_setname: None,
@@ -3324,7 +3428,7 @@ mod tests {
             articles: vec![article("s1", 1), article("s2", 2), article("s4", 4)],
         });
         let (tx, _rx) = mpsc::channel(4);
-        let (ctx, _items) = build_job_submission(&job, tx);
+        let (ctx, _items) = build_job_submission(&job, tx, &["srv1".into()]);
 
         let asm = &ctx.assembler;
         assert!(
@@ -3374,7 +3478,7 @@ mod tests {
         });
         let (tx, _rx) = mpsc::channel(4);
 
-        let (ctx, items) = build_job_submission(&job, tx);
+        let (ctx, items) = build_job_submission(&job, tx, &["srv1".into()]);
 
         assert_eq!(
             items
@@ -3385,6 +3489,13 @@ mod tests {
         );
         assert_eq!(ctx.articles_remaining.load(Ordering::Relaxed), 1);
         assert_eq!(ctx.articles_failed.load(Ordering::Relaxed), 1);
+
+        // A server enabled since the failure has never been asked, so the
+        // article is fetched again instead of being skipped.
+        let (tx, _rx) = mpsc::channel(4);
+        let (ctx, items) = build_job_submission(&job, tx, &["srv1".into(), "srv2".into()]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(ctx.articles_failed.load(Ordering::Relaxed), 0);
     }
 
     fn decode_test_item(job_id: &str, segment_number: u32) -> WorkItem {
@@ -3404,13 +3515,68 @@ mod tests {
 
         // Part 2 of an 8-byte file claims to start at ~1 TB.
         let (raw, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 1_000_000_000_000, 8);
-        let result = decode_and_assemble(&decode_test_item("j1", 2), &raw, &assembler);
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &raw, &assembler, None);
 
         assert!(
             matches!(result, Err(ArticleError::DecodeError(_))),
             "expected corrupt-article error, got {result:?}"
         );
         assert!(std::fs::metadata(&path).unwrap().len() <= 8);
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 2));
+    }
+
+    #[test]
+    fn decode_rejects_forged_size_past_nzb_declared_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        // The NZB says the file is 8 bytes. The article claims 2 TB and asks
+        // to be written at 1 TB, which the article's own size= would allow.
+        assembler
+            .register_file_with_segment_numbers("j1", "f1", path.clone(), &[1, 2], &[], Some(8))
+            .unwrap();
+
+        let (raw, _) = yenc_simd::encode_article(
+            b"BBBB",
+            "out.bin",
+            2,
+            2,
+            1_000_000_000_000,
+            2_000_000_000_000,
+        );
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &raw, &assembler, None);
+
+        assert!(
+            matches!(result, Err(ArticleError::DecodeError(_))),
+            "forged size= must not win over the NZB size, got {result:?}"
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() <= 8);
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 2));
+    }
+
+    #[test]
+    fn decode_rejects_missing_size_on_multi_segment_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        // No NZB size, and the article carries no size= either.
+        assembler
+            .register_file("j1", "f1", path.clone(), 2)
+            .unwrap();
+
+        let (mut raw, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 4, 8);
+        let header_end = raw.windows(2).position(|w| w == b"\r\n").unwrap();
+        raw.splice(
+            0..header_end,
+            b"=ybegin part=2 line=128 name=out.bin".iter().copied(),
+        );
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &raw, &assembler, None);
+
+        assert!(
+            matches!(result, Err(ArticleError::DecodeError(_))),
+            "a multi-segment file with no bound at all must be rejected, got {result:?}"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 2));
     }
 
@@ -3424,7 +3590,7 @@ mod tests {
 
         // Begins inside the file but runs 2 bytes past its declared end.
         let (raw, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 6, 8);
-        let result = decode_and_assemble(&decode_test_item("j1", 2), &raw, &assembler);
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &raw, &assembler, None);
 
         assert!(matches!(result, Err(ArticleError::DecodeError(_))));
         assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 2));
@@ -3440,12 +3606,12 @@ mod tests {
             .unwrap();
 
         let (seg1, _) = yenc_simd::encode_article(b"AAAA", "out.bin", 1, 2, 0, 8);
-        decode_and_assemble(&decode_test_item("j1", 1), &seg1, &assembler).unwrap();
+        decode_and_assemble(&decode_test_item("j1", 1), &seg1, &assembler, None).unwrap();
 
         // Segment 2 arrives as a single-part article (no =ypart). Writing it
         // at offset 0 would overwrite segment 1.
         let (seg2, _) = yenc_simd::encode_article(b"ZZZZ", "out.bin", 1, 1, 0, 4);
-        let result = decode_and_assemble(&decode_test_item("j1", 2), &seg2, &assembler);
+        let result = decode_and_assemble(&decode_test_item("j1", 2), &seg2, &assembler, None);
 
         assert!(matches!(result, Err(ArticleError::DecodeError(_))));
         assert_eq!(std::fs::read(&path).unwrap(), b"AAAA");
@@ -3468,12 +3634,12 @@ mod tests {
         let (seg2, _) = yenc_simd::encode_article(b"BBBB", "multi.bin", 2, 2, 4, 8);
         let (seg1, _) = yenc_simd::encode_article(b"AAAA", "multi.bin", 1, 2, 0, 8);
         assert!(
-            !decode_and_assemble(&decode_test_item("j1", 2), &seg2, &assembler)
+            !decode_and_assemble(&decode_test_item("j1", 2), &seg2, &assembler, None)
                 .unwrap()
                 .file_complete
         );
         assert!(
-            decode_and_assemble(&decode_test_item("j1", 1), &seg1, &assembler)
+            decode_and_assemble(&decode_test_item("j1", 1), &seg1, &assembler, None)
                 .unwrap()
                 .file_complete
         );
@@ -3483,7 +3649,7 @@ mod tests {
         let mut item = decode_test_item("j1", 1);
         item.file_id = "f2".into();
         assert!(
-            decode_and_assemble(&item, &whole, &assembler)
+            decode_and_assemble(&item, &whole, &assembler, None)
                 .unwrap()
                 .file_complete
         );

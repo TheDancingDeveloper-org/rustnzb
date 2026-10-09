@@ -462,3 +462,57 @@ async fn restart_does_not_requeue_article_that_already_failed() {
         assert_eq!(failed, 1, "the old failure must not be counted twice");
     }
 }
+
+#[tokio::test]
+async fn repeated_502_then_recovery_completes_with_no_failures() {
+    let body = b"recovers";
+    let fixture = NzbFixture::new("outage-recovery")
+        .add_file("payload.bin", &[("outage-recovery-1", body)])
+        .build();
+    let triples = fixture
+        .articles
+        .iter()
+        .map(|(id, bytes, name)| (*id, *bytes, name.as_str()))
+        .collect::<Vec<_>>();
+    let mut sequences = HashMap::new();
+    // Three 502s is the per-server try cap. An outage must not spend those
+    // tries, or the article is failed permanently before the server recovers.
+    sequences.insert(
+        "outage-recovery-1".to_string(),
+        std::collections::VecDeque::from([
+            (502, "service unavailable".into()),
+            (502, "service unavailable".into()),
+            (502, "service unavailable".into()),
+        ]),
+    );
+    let server = ServerProfile::start(
+        "outage-recovery",
+        MockConfig {
+            articles: yenc_articles(&triples),
+            article_response_sequences: Some(std::sync::Arc::new(parking_lot::Mutex::new(
+                sequences,
+            ))),
+            ..MockConfig::default()
+        },
+        1,
+    )
+    .await;
+    let engine = HarnessBuilder::new().with_server(server).build();
+    let id = engine
+        .submit_nzb_xml("outage-recovery", fixture.xml)
+        .unwrap();
+    assert!(
+        engine
+            .wait_for_status(&id, Duration::from_secs(30), &[JobStatus::Completed])
+            .await,
+        "job did not complete after the server recovered from 502s"
+    );
+    let history = engine
+        .queue_manager
+        .history_get(&id)
+        .expect("history query")
+        .expect("completed history");
+    assert_eq!(history.downloaded_bytes, history.total_bytes);
+    let job = engine.job(&id);
+    assert_eq!(job.map(|j| j.articles_failed).unwrap_or(0), 0);
+}

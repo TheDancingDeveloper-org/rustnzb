@@ -152,7 +152,15 @@ impl DispatchEngine for DispatchHandle {
     }
 
     fn submit_job(&self, job: &NzbJob, progress_tx: mpsc::Sender<ProgressUpdate>) {
-        let (ctx, items) = build_job_submission(job, progress_tx);
+        let enabled_server_ids = self
+            .0
+            .servers
+            .lock()
+            .iter()
+            .filter(|server| server.enabled)
+            .map(|server| server.id.clone())
+            .collect::<Vec<_>>();
+        let (ctx, items) = build_job_submission(job, progress_tx, &enabled_server_ids);
         self.0.submit_job(ctx, items);
     }
 
