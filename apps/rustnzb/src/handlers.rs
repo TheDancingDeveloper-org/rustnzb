@@ -2233,6 +2233,26 @@ pub async fn h_setup_apply(
         ));
     }
 
+    // Imported categories replace the configured ones wholesale, so they get
+    // the same check as a category save. Otherwise an unsafe name or
+    // output_dir is persisted and every later job in it fails at enqueue.
+    let invalid: Vec<String> = preview
+        .categories
+        .iter()
+        .filter_map(|category| {
+            category
+                .validate()
+                .err()
+                .map(|reason| format!("'{}': {reason}", category.name))
+        })
+        .collect();
+    if !invalid.is_empty() {
+        return Err(ApiError::from((
+            StatusCode::BAD_REQUEST,
+            format!("cannot apply: invalid categories: {}", invalid.join("; ")),
+        )));
+    }
+
     let config = state
         .update_config_with(|config| {
             // Convert imported servers → ServerConfig with fresh UUIDs
