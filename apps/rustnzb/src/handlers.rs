@@ -628,7 +628,7 @@ fn validate_feed_poll_interval(feed: &RssFeedConfig) -> Result<(), ApiError> {
 async fn validate_feed_url(state: &AppState, url: &str) -> Result<(), ApiError> {
     check_fetch_url_allowed(url, &fetch_policy(state))
         .await
-        .map_err(|e| ApiError::from((StatusCode::BAD_REQUEST, format!("Feed URL rejected: {e}"))))
+        .map_err(|e| ApiError::url_rejected(format!("Feed URL rejected: {e}")))
 }
 
 #[derive(Deserialize)]
@@ -663,10 +663,10 @@ pub async fn h_queue_add_url(
         .get(fetch_plan.url.clone())
         .send()
         .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to fetch URL: {e}")))?;
+        .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch URL: {e}")))?;
 
     if !response.status().is_success() {
-        return Err(ApiError::from(anyhow::anyhow!(
+        return Err(ApiError::bad_gateway(format!(
             "URL returned HTTP {}",
             response.status()
         )));
@@ -1623,13 +1623,10 @@ pub async fn h_rss_item_download(
         .get(fetch_plan.url.clone())
         .send()
         .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to fetch NZB: {e}")))?;
+        .map_err(|e| ApiError::bad_gateway(format!("Failed to fetch NZB: {e}")))?;
 
     if !response.status().is_success() {
-        return Err(ApiError::from(anyhow::anyhow!(
-            "HTTP {}",
-            response.status()
-        )));
+        return Err(ApiError::bad_gateway(format!("HTTP {}", response.status())));
     }
 
     let data = read_response_bytes_limited(response, MAX_FETCH_BODY_BYTES).await?;
@@ -2457,7 +2454,7 @@ pub async fn h_import_sabnzbd_api(
         }
 
         if !resp.status().is_success() {
-            return Err(ApiError::from(anyhow::anyhow!(
+            return Err(ApiError::bad_gateway(format!(
                 "SABnzbd returned HTTP {} — check your API key",
                 resp.status()
             )));
@@ -2465,13 +2462,13 @@ pub async fn h_import_sabnzbd_api(
 
         let body = read_response_bytes_limited(resp, MAX_FETCH_BODY_BYTES).await?;
         let json: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid JSON from SABnzbd: {e}")))?;
+            .map_err(|e| ApiError::bad_gateway(format!("Invalid JSON from SABnzbd: {e}")))?;
 
         let preview = sabnzbd_import::parse_sabnzbd_api_response(&json);
         return Ok(Json(preview));
     }
 
-    Err(ApiError::from(anyhow::anyhow!(
+    Err(ApiError::bad_gateway(format!(
         "Could not reach SABnzbd API — {last_err}"
     )))
 }
