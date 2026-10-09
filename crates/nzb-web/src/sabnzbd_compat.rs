@@ -49,6 +49,8 @@ pub struct SabApiRequest {
     pub last_history_update: Option<u64>,
     pub password: Option<String>,
     pub del_files: Option<String>,
+    /// Job name override for `addfile`/`addurl` (SABnzbd `nzbname`).
+    pub nzbname: Option<String>,
 }
 
 /// Validate API key. Returns Err with JSON response on failure.
@@ -124,11 +126,13 @@ pub async fn h_sabnzbd_api_get(
     // GET rather than a multipart POST. Route it to the same URL-fetching
     // logic the POST handler uses so `cat`/`priority` are honored here too.
     if mode == "addurl" {
+        // `name` (or `value`) is the URL; the job name comes from `nzbname`
+        // or is derived from the fetched NZB, never from the URL string.
         let url = req.name.clone().or_else(|| req.value.clone());
         return handle_addurl(
             &state,
             url,
-            req.name.clone(),
+            req.nzbname.clone(),
             req.cat.clone(),
             req.priority.clone(),
             req.password.clone(),
@@ -141,11 +145,12 @@ pub async fn h_sabnzbd_api_get(
 }
 
 /// Fetch an NZB from a URL and enqueue it, applying category/priority/password
-/// overrides. Shared by the GET and POST `addurl` entry points.
+/// overrides. Shared by the GET and POST `addurl` entry points. `nzbname`
+/// is the optional job-name override.
 async fn handle_addurl(
     state: &AppState,
     url: Option<String>,
-    name: Option<String>,
+    nzbname: Option<String>,
     cat: Option<String>,
     priority: Option<String>,
     password: Option<String>,
@@ -196,25 +201,21 @@ async fn handle_addurl(
         })));
     }
 
+    let content_disposition = response
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
     // Cap the fetched body to avoid unbounded memory from a hostile URL.
     let data =
         crate::fetch_guard::read_response_bytes_limited(response, MAX_ADDURL_BODY_BYTES).await?;
 
-    // Derive job name from URL filename if not provided
-    let job_name = name.unwrap_or_else(|| {
-        url.rsplit('/')
-            .next()
-            .and_then(|s| s.split('?').next())
-            .unwrap_or("unknown")
-            .strip_suffix(".nzb")
-            .unwrap_or(
-                url.rsplit('/')
-                    .next()
-                    .and_then(|s| s.split('?').next())
-                    .unwrap_or("unknown"),
-            )
-            .to_string()
-    });
+    let job_name = addurl_job_name(
+        nzbname.as_deref(),
+        content_disposition.as_deref(),
+        &fetch_plan.url,
+    );
 
     match nzb_parser::parse_nzb(&job_name, &data) {
         Ok(mut job) => {
@@ -285,6 +286,90 @@ async fn handle_addurl(
     }
 }
 
+/// Job name for an `addurl` fetch, in SABnzbd's order of preference: the
+/// `nzbname` parameter, else the `Content-Disposition` filename, else the
+/// last path segment of the URL (query string excluded). The `.nzb`
+/// extension is dropped. The URL itself is never used: it is not a valid
+/// single path component, so every such job failed to enqueue.
+fn addurl_job_name(
+    nzbname: Option<&str>,
+    content_disposition: Option<&str>,
+    url: &reqwest::Url,
+) -> String {
+    nzbname
+        .and_then(clean_nzb_name)
+        .or_else(|| {
+            content_disposition
+                .and_then(content_disposition_filename)
+                .as_deref()
+                .and_then(clean_nzb_name)
+        })
+        .or_else(|| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .map(percent_decode_lossy)
+                .as_deref()
+                .and_then(clean_nzb_name)
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Reduce a client- or server-supplied NZB name to a bare job name: last
+/// path component, without a `.nzb` extension. `None` if nothing is left.
+fn clean_nzb_name(raw: &str) -> Option<String> {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw).trim();
+    let name = if base.len() > 4 && base[base.len() - 4..].eq_ignore_ascii_case(".nzb") {
+        &base[..base.len() - 4]
+    } else {
+        base
+    };
+    let name = name.trim();
+    (!name.is_empty() && name != "." && name != "..").then(|| name.to_string())
+}
+
+/// The filename of a `Content-Disposition` header, preferring the RFC 5987
+/// `filename*` form over plain `filename`.
+fn content_disposition_filename(header: &str) -> Option<String> {
+    let mut plain = None;
+    for part in header.split(';') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"');
+        match key.trim().to_ascii_lowercase().as_str() {
+            "filename*" => {
+                // charset'language'percent-encoded-name
+                let encoded = value.splitn(3, '\'').nth(2).unwrap_or(value);
+                return Some(percent_decode_lossy(encoded));
+            }
+            "filename" => plain = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    plain
+}
+
+/// Decode `%XX` escapes, replacing invalid UTF-8 with U+FFFD.
+fn percent_decode_lossy(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(byte) = value
+                .get(index + 1..index + 3)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        {
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// Body encodings a SABnzbd client may use for a POST request.
 enum SabPostBody {
     /// `multipart/form-data` -- the only encoding that can carry an NZB file.
@@ -323,7 +408,7 @@ fn classify_post_body(request: &Request) -> SabPostBody {
 /// request actually says it is one.
 pub async fn h_sabnzbd_api_post(
     State(state): State<Arc<AppState>>,
-    Query(query_req): Query<SabApiRequest>,
+    Query(mut query_req): Query<SabApiRequest>,
     request: Request,
 ) -> Result<impl IntoResponse, ApiError> {
     // Query-string parameters are the baseline; body fields override them.
@@ -365,6 +450,9 @@ pub async fn h_sabnzbd_api_post(
             if let Some(pw) = form.password.filter(|pw| !pw.is_empty()) {
                 password = Some(pw);
             }
+            if form.nzbname.is_some() {
+                query_req.nzbname = form.nzbname;
+            }
         }
         SabPostBody::Multipart => {
             let mut multipart = Multipart::from_request(request, &()).await.map_err(|e| {
@@ -380,6 +468,7 @@ pub async fn h_sabnzbd_api_post(
                 &mut nzb_data,
                 &mut nzb_url,
                 &mut password,
+                &mut query_req.nzbname,
             )
             .await?;
         }
@@ -412,6 +501,7 @@ async fn read_multipart_fields(
     nzb_data: &mut Option<(String, Vec<u8>)>,
     nzb_url: &mut Option<String>,
     password: &mut Option<String>,
+    nzbname: &mut Option<String>,
 ) -> Result<(), ApiError> {
     while let Some(field) = multipart
         .next_field()
@@ -483,6 +573,11 @@ async fn read_multipart_fields(
                     *password = Some(text);
                 }
             }
+            "nzbname" => {
+                if let Ok(text) = field.text().await {
+                    *nzbname = Some(text);
+                }
+            }
             _ => {
                 let _ = field.bytes().await;
             }
@@ -492,7 +587,8 @@ async fn read_multipart_fields(
 }
 
 /// Dispatch a POST request once its parameters have been assembled from the
-/// query string and (optional) body.
+/// query string and (optional) body. `query_req.nzbname` carries the merged
+/// `nzbname` job-name override.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_post(
     state: &AppState,
@@ -517,12 +613,17 @@ async fn dispatch_post(
                 }
             };
 
-            let job_name = name.clone().unwrap_or_else(|| {
-                file_name
-                    .strip_suffix(".nzb")
-                    .unwrap_or(&file_name)
-                    .to_string()
-            });
+            let job_name = query_req
+                .nzbname
+                .as_deref()
+                .and_then(clean_nzb_name)
+                .or_else(|| name.clone())
+                .unwrap_or_else(|| {
+                    file_name
+                        .strip_suffix(".nzb")
+                        .unwrap_or(&file_name)
+                        .to_string()
+                });
 
             match nzb_parser::parse_nzb(&job_name, &data) {
                 Ok(mut job) => {
@@ -599,8 +700,9 @@ async fn dispatch_post(
         }
 
         "addurl" => {
+            // `value`/`url` (or `name`) is the URL to fetch, not a job name.
             let url = nzb_url.or_else(|| name.clone());
-            handle_addurl(state, url, name, cat, priority, password).await
+            handle_addurl(state, url, query_req.nzbname, cat, priority, password).await
         }
 
         _ => {
@@ -628,6 +730,7 @@ async fn dispatch_post(
                 last_history_update: query_req.last_history_update,
                 password,
                 del_files: query_req.del_files,
+                nzbname: query_req.nzbname,
             };
             Ok(dispatch_mode(
                 state,
@@ -4029,6 +4132,15 @@ mod tests {
     /// Serves `body` once over a raw TCP listener bound to an ephemeral
     /// port, returning the URL to fetch it from.
     async fn spawn_nzb_server(body: &'static str) -> String {
+        spawn_nzb_server_with_headers(body, "").await
+    }
+
+    /// Like [`spawn_nzb_server`], adding `extra_headers` (each line ending
+    /// in `\r\n`) to the response.
+    async fn spawn_nzb_server_with_headers(
+        body: &'static str,
+        extra_headers: &'static str,
+    ) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4041,7 +4153,7 @@ mod tests {
             let mut buf = [0u8; 1024];
             let _ = socket.read(&mut buf).await;
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/x-nzb\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/x-nzb\r\n{extra_headers}Connection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -4203,6 +4315,160 @@ mod tests {
             .into_response();
         let value = json_body(response).await;
         assert_eq!(value["version"], serde_json::json!(SABNZBD_COMPAT_VERSION));
+    }
+
+    /// Run a GET `mode=addurl` against a loopback fixture (admitted by the
+    /// test state's explicit `fetch_allowed_hosts` entry) and return the
+    /// response and the names of the queued jobs.
+    async fn addurl_over_get(
+        url: String,
+        nzbname: Option<&str>,
+    ) -> (serde_json::Value, Vec<String>) {
+        let TestState { state, _tempdir } = test_state();
+        // Loopback is not a private LAN address; admit the fixture only here,
+        // through an explicit entry, instead of relaxing the guard globally.
+        {
+            let mut config = (*state.config()).clone();
+            config.general.fetch_allowed_hosts = vec!["127.0.0.1".into()];
+            state.config.store(std::sync::Arc::new(config));
+        }
+        let state = Arc::new(state);
+        let req = SabApiRequest {
+            mode: Some("addurl".into()),
+            name: Some(url),
+            nzbname: nzbname.map(str::to_string),
+            apikey: Some("contract-api-key".into()),
+            ..SabApiRequest::default()
+        };
+        let response = h_sabnzbd_api_get(State(state.clone()), Query(req))
+            .await
+            .expect("addurl over GET")
+            .into_response();
+        let value = json_body(response).await;
+        let names = state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .map(|job| job.name)
+            .collect();
+        (value, names)
+    }
+
+    /// `mode=addurl&name=<URL>` used the whole URL as the job name, which
+    /// `output_dir_for` rejects, so every successful fetch failed to
+    /// enqueue. The name comes from the URL's last path segment instead,
+    /// without `.nzb` or the query string.
+    #[tokio::test]
+    async fn addurl_names_job_from_url_path_not_the_url() {
+        let url = spawn_nzb_server(SAMPLE_NZB).await;
+        let (response, names) = addurl_over_get(format!("{url}?apikey=x&t=get"), None).await;
+        assert_eq!(
+            response["status"],
+            serde_json::json!(true),
+            "resp={response}"
+        );
+        assert_eq!(names, vec!["test".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn addurl_honours_nzbname() {
+        let url = spawn_nzb_server(SAMPLE_NZB).await;
+        let (response, names) = addurl_over_get(url, Some("My.Show.S01E01")).await;
+        assert_eq!(
+            response["status"],
+            serde_json::json!(true),
+            "resp={response}"
+        );
+        assert_eq!(names, vec!["My.Show.S01E01".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn addurl_uses_content_disposition_filename() {
+        let url = spawn_nzb_server_with_headers(
+            SAMPLE_NZB,
+            "Content-Disposition: attachment; filename=\"Some.Release.nzb\"\r\n",
+        )
+        .await;
+        let (response, names) = addurl_over_get(url, None).await;
+        assert_eq!(
+            response["status"],
+            serde_json::json!(true),
+            "resp={response}"
+        );
+        assert_eq!(names, vec!["Some.Release".to_string()]);
+    }
+
+    #[test]
+    fn addurl_job_name_sources_in_sabnzbd_order() {
+        let url = reqwest::Url::parse("https://indexer.example/get/My%20File.nzb?id=1").unwrap();
+        assert_eq!(addurl_job_name(None, None, &url), "My File");
+        assert_eq!(
+            addurl_job_name(
+                None,
+                Some("attachment; filename*=UTF-8''Caf%C3%A9.nzb"),
+                &url
+            ),
+            "Café"
+        );
+        assert_eq!(
+            addurl_job_name(Some("Chosen.nzb"), Some("attachment; filename=x.nzb"), &url),
+            "Chosen"
+        );
+        let bare = reqwest::Url::parse("https://indexer.example/").unwrap();
+        assert!(!addurl_job_name(None, None, &bare).contains('/'));
+    }
+
+    /// `nzbname` also overrides the job name for uploads, from the query
+    /// string, a urlencoded body or a multipart field.
+    #[tokio::test]
+    async fn addfile_honours_nzbname_from_query_and_multipart() {
+        for (query_name, field_name, expected) in [
+            (Some("From.Query"), None, "From.Query"),
+            (None, Some("From.Field"), "From.Field"),
+        ] {
+            let TestState { state, _tempdir } = test_state();
+            let state = Arc::new(state);
+            let boundary = "sabboundary";
+            let mut body = String::new();
+            body.push_str(&format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"mode\"\r\n\r\naddfile\r\n"
+            ));
+            if let Some(field) = field_name {
+                body.push_str(&format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"nzbname\"\r\n\r\n{field}\r\n"
+                ));
+            }
+            body.push_str(&format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"upload.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n{SAMPLE_NZB}\r\n--{boundary}--\r\n"
+            ));
+            let req = SabApiRequest {
+                apikey: Some("contract-api-key".into()),
+                nzbname: query_name.map(str::to_string),
+                ..SabApiRequest::default()
+            };
+            let request = Request::builder()
+                .method("POST")
+                .uri("/sabnzbd/api")
+                .header(
+                    CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(axum::body::Body::from(body))
+                .expect("build request");
+            let response = h_sabnzbd_api_post(State(state.clone()), Query(req), request)
+                .await
+                .expect("addfile over multipart")
+                .into_response();
+            let value = json_body(response).await;
+            assert_eq!(value["status"], serde_json::json!(true), "resp={value}");
+            let names: Vec<String> = state
+                .queue_manager
+                .get_jobs()
+                .into_iter()
+                .map(|job| job.name)
+                .collect();
+            assert_eq!(names, vec![expected.to_string()]);
+        }
     }
 
     /// Non-upload modes must also work over a bare POST.
