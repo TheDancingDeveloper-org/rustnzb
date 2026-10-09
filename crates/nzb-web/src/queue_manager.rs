@@ -1369,8 +1369,42 @@ impl QueueManager {
     fn start_next_queued(self: &Arc<Self>) {
         let max = self.max_active_downloads.load(Ordering::Relaxed);
         while let Some(job_id) = self.claim_next_download_slot(max) {
-            self.launch_download(&job_id);
+            if self.dispatch.has_job(&job_id) {
+                // A job resumed while the active limit was reached keeps its
+                // paused context in the pool; unpause it instead of
+                // submitting its work a second time.
+                self.resume_queued_context(&job_id);
+            } else {
+                self.launch_download(&job_id);
+            }
         }
+    }
+
+    /// Unpause a queued job whose download context is still held (paused)
+    /// by the worker pool. The caller has already marked it `Downloading`.
+    fn resume_queued_context(&self, job_id: &str) {
+        {
+            let mut jobs = self.jobs.lock();
+            if let Some(state) = jobs.get_mut(job_id) {
+                state.job.error_message = None;
+                state.failure_code = None;
+                // The paused interval must not count toward the no-progress
+                // watchdog (GH #123).
+                if let Some(tracker) = state.hopeless_tracker.as_mut() {
+                    tracker.reset_progress_clock();
+                }
+                let db = self.db.lock();
+                let _ = db.queue_update_progress(
+                    job_id,
+                    JobStatus::Downloading,
+                    state.job.downloaded_bytes,
+                    state.job.articles_downloaded,
+                    state.job.articles_failed,
+                    state.job.files_completed,
+                );
+            }
+        }
+        self.dispatch.resume_job(job_id);
     }
 
     /// Add a job to the queue and start downloading if a slot is available.
@@ -3047,7 +3081,28 @@ impl QueueManager {
                 .filter(|s| s.job.status == JobStatus::Downloading)
                 .count();
 
+            let max = self.max_active_downloads.load(Ordering::Relaxed);
+            let at_limit = max > 0 && active >= max;
             let state = jobs.get_mut(id).unwrap();
+
+            if at_limit {
+                // Respect the active download limit whether or not the pool
+                // still holds this job's context. A paused context stays
+                // paused in the pool; `start_next_queued` resumes it once a
+                // slot frees up.
+                state.job.status = JobStatus::Queued;
+                let db = self.db.lock();
+                let _ = db.queue_update_progress(
+                    id,
+                    JobStatus::Queued,
+                    state.job.downloaded_bytes,
+                    state.job.articles_downloaded,
+                    state.job.articles_failed,
+                    state.job.files_completed,
+                );
+                info!(job_id = %id, "Job queued (active download limit reached)");
+                return Ok(());
+            }
 
             if ctx_alive {
                 // Job context still lives in the pool — just unpause it.
@@ -3073,17 +3128,10 @@ impl QueueManager {
                 false
             } else {
                 // Pool has no context — we need to rebuild work items and submit.
-                let max = self.max_active_downloads.load(Ordering::Relaxed);
-                if max > 0 && active >= max {
-                    state.job.status = JobStatus::Queued;
-                    info!(job_id = %id, "Job queued (active download limit reached)");
-                    false
-                } else {
-                    state.job.status = JobStatus::Downloading;
-                    state.job.error_message = None;
-                    state.failure_code = None;
-                    true
-                }
+                state.job.status = JobStatus::Downloading;
+                state.job.error_message = None;
+                state.failure_code = None;
+                true
             }
         };
 
@@ -3343,9 +3391,9 @@ impl QueueManager {
         let paused_by_global = std::mem::take(&mut *self.globally_paused_jobs.lock());
         self.persist_globally_paused_jobs();
 
-        // Decide per job whether to just unpause (ctx still in pool) or
-        // mark it as Queued so start_next_queued re-submits it.
-        let mut to_unpause: Vec<String> = Vec::new();
+        // Mark every globally paused job Queued; start_next_queued then
+        // unpauses a live pool context or re-submits the job, up to the
+        // active download limit.
         {
             let mut jobs = self.jobs.lock();
             for id in paused_by_global {
@@ -3355,17 +3403,9 @@ impl QueueManager {
                 if state.job.status == JobStatus::Paused {
                     state.job.error_message = None;
                     state.failure_code = None;
-                    if self.dispatch.has_job(&id) {
-                        state.job.status = JobStatus::Downloading;
-                        to_unpause.push(id);
-                    } else {
-                        state.job.status = JobStatus::Queued;
-                    }
+                    state.job.status = JobStatus::Queued;
                 }
             }
-        }
-        for id in to_unpause {
-            self.dispatch.resume_job(&id);
         }
 
         // Start queued jobs up to the concurrency limit
@@ -3407,25 +3447,18 @@ impl QueueManager {
         }
 
         let mut resumed = 0u32;
-        let mut to_unpause: Vec<String> = Vec::new();
         {
             let mut jobs = self.jobs.lock();
-            for (id, state) in jobs.iter_mut() {
+            for state in jobs.values_mut() {
                 if state.job.status == JobStatus::Paused && state.job.error_message.is_some() {
                     state.job.error_message = None;
                     state.failure_code = None;
-                    if self.dispatch.has_job(id) {
-                        state.job.status = JobStatus::Downloading;
-                        to_unpause.push(id.clone());
-                    } else {
-                        state.job.status = JobStatus::Queued;
-                    }
+                    // start_next_queued unpauses or re-submits it within the
+                    // active download limit.
+                    state.job.status = JobStatus::Queued;
                     resumed += 1;
                 }
             }
-        }
-        for id in to_unpause {
-            self.dispatch.resume_job(&id);
         }
         if resumed > 0 {
             info!(
