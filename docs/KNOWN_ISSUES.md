@@ -23,7 +23,8 @@ optimization experiments are recorded in the
   receive it as a `-p<password>` argument, where any local user can read it
   while the extraction runs. So does a password that contains a line break.
   Install a current unrar or 7-Zip, or mount `/proc` with `hidepid=2`, on
-  multi-user hosts.
+  multi-user hosts. When both are installed, rustnzb runs 7-Zip's `7zz` in
+  preference to `7z`.
 - **Stored in plaintext.** Extraction needs the original password, so it is
   kept unencrypted in the queue database (`queue.password` in the SQLite
   database under the data directory) and in the stored NZB. Keep the data
