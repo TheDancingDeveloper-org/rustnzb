@@ -9,7 +9,7 @@ readme = "README.md"
 
 [dependencies]
 nzb-nntp = { version = "0.2.24", path = "../nzb-nntp" }
-nzb-decode = { version = "0.1.4", path = "../nzb-decode" }
+nzb-decode = { version = "0.1.5", path = "../nzb-decode" }
 nzb-core = { version = "0.2.18", path = "../nzb-core" }
 
 tokio = { version = "1", features = ["full"] }

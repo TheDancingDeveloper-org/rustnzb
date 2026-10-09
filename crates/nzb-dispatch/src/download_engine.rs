@@ -2680,11 +2680,18 @@ pub(crate) fn build_job_submission(
             .filter(|article| article.downloaded)
             .map(|article| article.segment_number)
             .collect();
-        if let Err(e) = assembler.register_file_with_completed_segments(
+        // Register the declared segment numbers rather than assuming 1..=N:
+        // an NZB may skip or repeat numbers.
+        let segment_numbers: Vec<u32> = file
+            .articles
+            .iter()
+            .map(|article| article.segment_number)
+            .collect();
+        if let Err(e) = assembler.register_file_with_segment_numbers(
             &job.id,
             &file.id,
             output_path,
-            file.articles.len() as u32,
+            &segment_numbers,
             &completed_segments,
         ) {
             error!(file = %file.filename, "Failed to register file for assembly: {e}");
@@ -3032,6 +3039,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("third", 3), ("first", 1)]
         );
+    }
+
+    #[test]
+    fn submission_with_segment_gap_completes_when_all_declared_segments_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = test_job("segment-gap", temp.path());
+        let article = |message_id: &str, segment_number: u32| nzb_nntp::Article {
+            message_id: message_id.to_string(),
+            segment_number,
+            bytes: 4,
+            downloaded: false,
+            data_begin: None,
+            data_size: None,
+            crc32: None,
+            tried_servers: Vec::new(),
+            tries: 0,
+        };
+        job.files.push(nzb_core::models::NzbFile {
+            id: "file-1".into(),
+            filename: "gap.bin".into(),
+            bytes: 12,
+            bytes_downloaded: 0,
+            is_par2: false,
+            par2_setname: None,
+            par2_vol: None,
+            par2_blocks: None,
+            assembled: false,
+            groups: Vec::new(),
+            // Segment 3 is absent from the NZB.
+            articles: vec![article("s1", 1), article("s2", 2), article("s4", 4)],
+        });
+        let (tx, _rx) = mpsc::channel(4);
+        let (ctx, _items) = build_job_submission(&job, tx);
+
+        let asm = &ctx.assembler;
+        assert!(
+            !asm.assemble_article(&job.id, "file-1", 1, 0, b"AAAA")
+                .unwrap()
+        );
+        assert!(
+            !asm.assemble_article(&job.id, "file-1", 2, 4, b"BBBB")
+                .unwrap()
+        );
+        // Segment 4 must be accepted and must complete the file.
+        assert!(
+            asm.assemble_article(&job.id, "file-1", 4, 12, b"DDDD")
+                .unwrap()
+        );
+        assert!(asm.is_file_complete(&job.id, "file-1"));
+        assert_eq!(asm.get_file_progress(&job.id, "file-1"), (3, 3));
     }
 
     #[cfg(target_os = "linux")]

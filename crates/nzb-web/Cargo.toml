@@ -12,7 +12,7 @@ groups-db = ["nzb-postproc/groups-db"]
 
 [dependencies]
 nzb-nntp = { version = "0.2.24", path = "../nzb-nntp" }
-nzb-decode = { version = "0.1.4", path = "../nzb-decode" }
+nzb-decode = { version = "0.1.5", path = "../nzb-decode" }
 nzb-postproc = { version = "0.2.8", path = "../nzb-postproc" }
 nzb-dispatch = { version = "0.2.8", path = "../nzb-dispatch" }
 axum = { version = "0.8", features = ["multipart"] }
