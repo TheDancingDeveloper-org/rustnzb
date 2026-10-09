@@ -40,7 +40,6 @@ fn failed_history_entry(id: &str, complete_dir: &std::path::Path) -> HistoryEntr
         error_message: Some("missing articles".into()),
         failure_code: Some(JobFailureCode::ArticlesUnavailable),
         post_processing: None,
-        delete_archives: None,
         server_stats: Vec::new(),
         nzb_data: Some(sample_nzb_bytes()),
         retry_data: None,
