@@ -702,6 +702,17 @@ async fn unknown_ids_return_404_and_invalid_input_returns_400() {
         body["warnings"][0].as_str().unwrap().contains("nope"),
         "{body}"
     );
+
+    // An empty feed list means "all feeds", so it is saved without a warning.
+    let (status, body) = call(
+        client
+            .post(format!("{base}/api/rss/rules"))
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"name": "all", "feed_names": [], "match_regex": ".*"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("warnings").is_none(), "{body}");
 }
 
 #[tokio::test]

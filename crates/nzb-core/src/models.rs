@@ -379,7 +379,7 @@ pub struct RssRule {
     pub id: String,
     /// Human-readable name for the rule
     pub name: String,
-    /// Which feed(s) this rule applies to (one or more feed names)
+    /// Which feed(s) this rule applies to; empty means every feed
     pub feed_names: Vec<String>,
     /// Category to assign to downloaded NZBs
     pub category: Option<String>,
