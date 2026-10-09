@@ -25,7 +25,7 @@
   },
   "devDependencies": {
     "@angular/build": "^21.2.22",
-    "@angular/cli": "^21.2.22",
+    "@angular/cli": "^21.2.26",
     "@angular/compiler-cli": "^21.2.22",
     "@vitest/coverage-v8": "^4.0.8",
     "jsdom": "^29.1.1",
