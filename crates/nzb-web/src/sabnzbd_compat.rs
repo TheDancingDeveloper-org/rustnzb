@@ -180,7 +180,7 @@ async fn handle_addurl(
                 job.category = sab_resolve_category(c).to_string();
             }
             if let Some(ref p) = priority {
-                job.priority = sab_priority_to_priority(p);
+                apply_sab_add_priority(&mut job, p);
             }
 
             // API-provided password overrides NZB metadata password
@@ -484,7 +484,7 @@ async fn dispatch_post(
                         job.category = sab_resolve_category(c).to_string();
                     }
                     if let Some(ref p) = priority {
-                        job.priority = sab_priority_to_priority(p);
+                        apply_sab_add_priority(&mut job, p);
                     }
 
                     // API-provided password overrides NZB metadata password
@@ -1046,6 +1046,7 @@ fn handle_queue_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_js
         }));
     }
 
+    let pause = sab_priority_is_paused(priority);
     let priority_value = sab_priority_to_priority(priority);
     let qm = &state.queue_manager;
     // set_job_priority requires an exact job-id match, but clients only ever
@@ -1056,7 +1057,11 @@ fn handle_queue_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_js
     for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
         let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
         if let Some(job) = jobs.iter().find(|job| job_id_matches(&job.id, search_id))
-            && qm.set_job_priority(&job.id, priority_value).is_ok()
+            && if pause {
+                qm.pause_job(&job.id).is_ok()
+            } else {
+                qm.set_job_priority(&job.id, priority_value).is_ok()
+            }
         {
             applied = true;
         }
@@ -1560,7 +1565,12 @@ fn handle_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Va
     else {
         return Json(serde_json::json!({ "status": false, "error": "Job not found" }));
     };
-    match qm.set_job_priority(&job.id, sab_priority_to_priority(priority)) {
+    let result = if sab_priority_is_paused(priority) {
+        qm.pause_job(&job.id)
+    } else {
+        qm.set_job_priority(&job.id, sab_priority_to_priority(priority))
+    };
+    match result {
         Ok(()) => Json(serde_json::json!({ "status": true })),
         Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
     }
@@ -1652,6 +1662,22 @@ fn handle_rename(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
             "status": false,
             "error": format!("{e}")
         })),
+    }
+}
+
+/// SABnzbd's PAUSED_PRIORITY (`-2`). It is not a queue priority: adding or
+/// re-prioritising a job with it pauses the job and leaves the job's
+/// priority unchanged (`sabnzbd/nzbstuff.py::NzbObject.set_priority`).
+fn sab_priority_is_paused(s: &str) -> bool {
+    s.trim() == "-2"
+}
+
+/// Apply an `addfile`/`addurl` `priority` parameter to a freshly parsed job.
+fn apply_sab_add_priority(job: &mut NzbJob, priority: &str) {
+    if sab_priority_is_paused(priority) {
+        job.status = JobStatus::Paused;
+    } else {
+        job.priority = sab_priority_to_priority(priority);
     }
 }
 
@@ -2985,6 +3011,64 @@ mod tests {
         .0;
         assert_eq!(malformed["status"], serde_json::json!(false));
         assert!(malformed["error"].is_string());
+    }
+
+    /// SABnzbd's PAUSED_PRIORITY (-2) adds the job paused rather than at a
+    /// queue priority; the slot keeps reporting a normal priority.
+    #[tokio::test]
+    async fn addfile_with_paused_priority_adds_job_paused() {
+        let test_state = test_state();
+        let response = dispatch_post(
+            &test_state.state,
+            "addfile".into(),
+            None,
+            None,
+            Some("-2".into()),
+            Some(("paused.nzb".into(), SAMPLE_NZB.as_bytes().to_vec())),
+            None,
+            None,
+            SabApiRequest::default(),
+        )
+        .await
+        .expect("addfile response")
+        .0;
+        assert_eq!(response["status"], serde_json::json!(true));
+
+        let jobs = test_state.state.queue_manager.get_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, JobStatus::Paused);
+        assert_eq!(jobs[0].priority, Priority::Normal);
+
+        let queue = dispatch_mode(&test_state.state, "queue", &SabApiRequest::default()).0;
+        assert_eq!(queue["queue"]["slots"][0]["status"], "Paused");
+        assert_eq!(queue["queue"]["slots"][0]["priority"], "Normal");
+    }
+
+    /// `mode=queue&name=priority&value2=-2` pauses the job, as in SABnzbd.
+    #[tokio::test]
+    async fn queue_priority_paused_value_pauses_job() {
+        let test_state = test_state();
+        add_live_job(&test_state, "queue-paused-priority");
+
+        let req = SabApiRequest {
+            mode: Some("queue".into()),
+            name: Some("priority".into()),
+            value: Some("SABnzbd_nzo_queue-paused".into()),
+            value2: Some("-2".into()),
+            ..SabApiRequest::default()
+        };
+        let response = dispatch_mode(&test_state.state, "queue", &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+
+        let job = test_state
+            .state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .find(|job| job.id == "queue-paused-priority")
+            .expect("job still queued");
+        assert_eq!(job.status, JobStatus::Paused);
+        assert_eq!(job.priority, Priority::Normal);
     }
 
     /// SABnzbd's real `_api_queue_delete` accepts a comma-separated `value`
