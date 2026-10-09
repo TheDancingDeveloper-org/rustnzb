@@ -529,3 +529,65 @@ async fn logout_revokes_the_access_token() {
         reqwest::StatusCode::UNAUTHORIZED
     );
 }
+
+#[tokio::test]
+async fn server_update_keeps_password_unless_a_new_one_is_sent() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let access = setup_access(&app, &client).await;
+    let server = |password: serde_json::Value| {
+        let mut server = serde_json::json!({
+            "id":"srv", "name":"Primary", "host":"news.example.test", "port":563,
+            "ssl":true, "ssl_verify":true, "username":"user", "connections":8,
+            "priority":0, "enabled":true, "retention":0, "pipelining":1, "optional":false
+        });
+        if !password.is_null() {
+            server["password"] = password;
+        }
+        server
+    };
+    let stored_password = || {
+        AppConfig::load(&app.config_path).unwrap().servers[0]
+            .password
+            .clone()
+    };
+    let put = |body: serde_json::Value| {
+        client
+            .put(format!("{}/api/config/servers/srv", app.base_url))
+            .bearer_auth(&access)
+            .json(&body)
+            .send()
+    };
+
+    let added = client
+        .post(format!("{}/api/config/servers", app.base_url))
+        .bearer_auth(&access)
+        .json(&server("secret".into()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), reqwest::StatusCode::OK);
+    assert_eq!(stored_password().as_deref(), Some("secret"));
+
+    for unchanged in [
+        serde_json::json!(""),
+        serde_json::json!("********"),
+        serde_json::Value::Null,
+    ] {
+        let response = put(server(unchanged.clone())).await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{unchanged}");
+        assert_eq!(
+            stored_password().as_deref(),
+            Some("secret"),
+            "password {unchanged} must keep the stored password"
+        );
+        assert_eq!(
+            app.state.config().servers[0].password.as_deref(),
+            Some("secret")
+        );
+    }
+
+    let response = put(server("rotated".into())).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(stored_password().as_deref(), Some("rotated"));
+}

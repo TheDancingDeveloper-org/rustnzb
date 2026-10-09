@@ -922,6 +922,9 @@ pub async fn h_server_add(
         server.id = uuid::Uuid::new_v4().to_string();
     }
     sanitize_server_config(&mut server);
+    if server.password.as_deref() == Some(PASSWORD_MASK) {
+        server.password = None;
+    }
 
     let mut config = (*state.config()).clone();
     config.servers.push(server);
@@ -933,7 +936,27 @@ pub async fn h_server_add(
     Ok((StatusCode::OK, Json(SimpleResponse { status: true })))
 }
 
+/// Placeholder the API uses in place of a stored server password. A client
+/// that sends it back (or sends an empty/absent password) on update means
+/// "leave the password unchanged".
+pub const PASSWORD_MASK: &str = "********";
+
+/// Whether a submitted password means "keep the stored one".
+fn password_unchanged(password: Option<&str>) -> bool {
+    password.is_none_or(|p| p.is_empty() || p == PASSWORD_MASK)
+}
+
+/// Carry the stored password over when the client did not supply a new one.
+fn keep_unchanged_password(server: &mut ServerConfig, existing: &ServerConfig) {
+    if password_unchanged(server.password.as_deref()) {
+        server.password = existing.password.clone();
+    }
+}
+
 /// PUT /api/config/servers/{id} -- Update an existing server.
+///
+/// An empty or absent `password`, or the mask `********`, keeps the stored
+/// password; any other value replaces it.
 pub async fn h_server_update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -948,6 +971,7 @@ pub async fn h_server_update(
         .position(|s| s.id == id)
         .ok_or_else(|| ApiError::from(anyhow::anyhow!("Server not found: {id}")))?;
 
+    keep_unchanged_password(&mut server, &config.servers[idx]);
     config.servers[idx] = server;
     state
         .update_config(config.clone())
@@ -1021,9 +1045,18 @@ pub struct ServerTestResponse {
 }
 
 /// POST /api/config/servers/test-config -- Test a server config without saving.
+///
+/// When the body names an existing server and carries no new password (empty,
+/// absent or the mask), the stored password is used, matching update.
 pub async fn h_server_test_inline(
-    Json(server): Json<ServerConfig>,
+    State(state): State<Arc<AppState>>,
+    Json(mut server): Json<ServerConfig>,
 ) -> Result<Json<ServerTestResponse>, ApiError> {
+    if let Some(existing) = state.config().servers.iter().find(|s| s.id == server.id) {
+        keep_unchanged_password(&mut server, existing);
+    } else if server.password.as_deref() == Some(PASSWORD_MASK) {
+        server.password = None;
+    }
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         test_server_connection(server),
