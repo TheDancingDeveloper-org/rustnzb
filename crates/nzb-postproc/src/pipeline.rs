@@ -190,6 +190,38 @@ pub async fn run_pipeline_with_cleanup(
     cleanup_patterns: &[String],
     unwanted_extensions: &[String],
 ) -> PostProcResult {
+    run_stages(
+        job_dir,
+        config,
+        resources,
+        cleanup_patterns,
+        unwanted_extensions,
+        true,
+    )
+    .await
+}
+
+/// Run only PAR2 verification and repair, without extraction or cleanup.
+///
+/// This is SABnzbd's "repair only" post-processing level (`pp=1`): the
+/// archives themselves are the job's output, so they are neither unpacked
+/// nor removed.
+pub async fn run_repair_pipeline(
+    job_dir: &Path,
+    config: &PostProcConfig,
+    resources: Option<&Arc<PostProcResourcePool>>,
+) -> PostProcResult {
+    run_stages(job_dir, config, resources, &[], &[], false).await
+}
+
+async fn run_stages(
+    job_dir: &Path,
+    config: &PostProcConfig,
+    resources: Option<&Arc<PostProcResourcePool>>,
+    cleanup_patterns: &[String],
+    unwanted_extensions: &[String],
+    unpack: bool,
+) -> PostProcResult {
     let mut stages: Vec<StageResult> = Vec::new();
     let mut pipeline_ok = true;
     let mut failure_code = None;
@@ -451,7 +483,7 @@ pub async fn run_pipeline_with_cleanup(
     // Extraction is safe only after verification/repair succeeded (or source
     // content was already known-good). Confirmed unrepaired content damage
     // must not be mistaken for a successful archive.
-    let should_extract = pipeline_ok;
+    let should_extract = unpack && pipeline_ok;
     let mut extracted_archives = Vec::new();
     if should_extract {
         let output_dir = config.output_dir.as_deref().unwrap_or(job_dir);
@@ -502,7 +534,7 @@ pub async fn run_pipeline_with_cleanup(
     // ------------------------------------------------------------------
     // Stage 4: Cleanup
     // ------------------------------------------------------------------
-    if pipeline_ok && config.cleanup_after_extract {
+    if unpack && pipeline_ok && config.cleanup_after_extract {
         let cleanup_root = config.output_dir.as_deref().unwrap_or(job_dir);
         let result = run_cleanup_stage_with_rules(
             job_dir,
@@ -1114,6 +1146,32 @@ mod tests {
         assert_eq!(result.status, StageStatus::Failed, "{result:?}");
         assert_eq!(failure_code, Some(JobFailureCode::ArchiveInvalid));
         assert!(output.path().join("inner.zip").exists());
+        assert!(!output.path().join("payload.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn repair_pipeline_neither_extracts_nor_cleans_up() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let archive = source.path().join("release.zip");
+        write_zip(&archive, &[("payload.txt", b"payload")]);
+
+        let config = PostProcConfig {
+            output_dir: Some(output.path().to_path_buf()),
+            ..Default::default()
+        };
+        let result = run_repair_pipeline(source.path(), &config, None).await;
+
+        assert!(result.success, "{result:?}");
+        assert!(
+            result
+                .stages
+                .iter()
+                .all(|stage| stage.name != "Extract" && stage.name != "Cleanup"),
+            "{:?}",
+            result.stages
+        );
+        assert!(archive.exists());
         assert!(!output.path().join("payload.txt").exists());
     }
 

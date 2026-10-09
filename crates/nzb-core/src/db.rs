@@ -405,6 +405,26 @@ impl Database {
             )?;
         }
 
+        if version < 14 {
+            info!("Applying database migration v14: history post-processing level");
+            // Existing rows keep NULL: their level was never recorded.
+            let has_history: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'history'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_history > 0 {
+                self.conn
+                    .execute_batch("ALTER TABLE history ADD COLUMN post_processing INTEGER;")?;
+            }
+            self.conn.execute_batch(
+                "
+                DELETE FROM schema_version;
+                INSERT INTO schema_version (version) VALUES (14);
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -740,8 +760,9 @@ impl Database {
         self.conn.execute(
             "INSERT INTO history (id, name, category, status, total_bytes, downloaded_bytes,
              added_at, completed_at, download_time_secs, output_dir, stages, error_message,
-             nzb_data, server_stats, retry_data, failure_code)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             nzb_data, server_stats, retry_data, failure_code, post_processing)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+             ?17)",
             params![
                 entry.id,
                 entry.name,
@@ -759,6 +780,7 @@ impl Database {
                 server_stats_json,
                 entry.retry_data,
                 entry.failure_code.map(|code| code.to_string()),
+                entry.post_processing,
             ],
         )?;
 
@@ -823,7 +845,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, total_bytes, downloaded_bytes,
              added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
-             CASE WHEN nzb_data IS NOT NULL THEN 1 ELSE 0 END as has_nzb, failure_code
+             CASE WHEN nzb_data IS NOT NULL THEN 1 ELSE 0 END as has_nzb, failure_code,
+             post_processing
              FROM history ORDER BY completed_at DESC LIMIT ?1",
         )?;
 
@@ -851,6 +874,7 @@ impl Database {
                     stages,
                     error_message: row.get(11)?,
                     failure_code: parse_failure_code(row.get(14)?)?,
+                    post_processing: row.get(15)?,
                     server_stats,
                     // Don't load actual blob in list - just note if it exists
                     nzb_data: if has_nzb != 0 { Some(Vec::new()) } else { None },
@@ -914,7 +938,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, category, status, total_bytes, downloaded_bytes,
              added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
-             failure_code
+             failure_code, post_processing
              FROM history WHERE id = ?1",
         )?;
 
@@ -939,6 +963,7 @@ impl Database {
                 stages,
                 error_message: row.get(11)?,
                 failure_code: parse_failure_code(row.get(13)?)?,
+                post_processing: row.get(14)?,
                 server_stats,
                 nzb_data: None,
                 retry_data: None,
@@ -1407,6 +1432,7 @@ mod tests {
             }],
             error_message: None,
             failure_code: None,
+            post_processing: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
@@ -1528,6 +1554,31 @@ mod tests {
         };
         assert_eq!(replay.job_id, "durable-job");
         assert!(db.queue_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_round_trips_post_processing_level() {
+        let db = Database::open_memory().unwrap();
+        let mut stored = make_history("pp-level", "PP Level");
+        stored.post_processing = Some(1);
+        db.history_insert(&stored).unwrap();
+        db.history_insert(&make_history("pp-legacy", "Legacy"))
+            .unwrap();
+
+        assert_eq!(
+            db.history_get("pp-level").unwrap().unwrap().post_processing,
+            Some(1)
+        );
+        assert_eq!(
+            db.history_get("pp-legacy")
+                .unwrap()
+                .unwrap()
+                .post_processing,
+            None
+        );
+        let listed = db.history_list(10).unwrap();
+        let level = listed.iter().find(|entry| entry.id == "pp-level").unwrap();
+        assert_eq!(level.post_processing, Some(1));
     }
 
     #[test]

@@ -1588,6 +1588,10 @@ fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Val
                     | JobStatus::PostProcessing
             )
         })
+        .map(|job| {
+            let level = qm.post_processing_level(&job);
+            (job, level)
+        })
         .collect();
 
     Json(build_history_response(
@@ -1600,13 +1604,13 @@ fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Val
 
 fn build_history_response(
     entries: &[HistoryEntry],
-    postprocessing: &[NzbJob],
+    postprocessing: &[(NzbJob, u8)],
     req: &SabApiRequest,
     history_update: u64,
 ) -> serde_json::Value {
     let mut slots: Vec<SabHistorySlot> = postprocessing
         .iter()
-        .map(SabHistorySlot::from_postprocessing)
+        .map(|(job, level)| SabHistorySlot::from_postprocessing(job, *level))
         .chain(entries.iter().map(SabHistorySlot::from_entry))
         .filter(|slot| history_slot_matches(slot, req))
         .collect();
@@ -2510,6 +2514,18 @@ fn sab_queue_status(status: JobStatus) -> &'static str {
     }
 }
 
+/// SABnzbd's history `pp` label for an effective post-processing level
+/// (`sabnzbd/constants.py::PP_LOOKUP`); unknown levels map to `"X"` as there.
+fn sab_pp_label(level: u8) -> &'static str {
+    match level {
+        0 => "",
+        1 => "R",
+        2 => "U",
+        3 => "D",
+        _ => "X",
+    }
+}
+
 #[derive(Serialize)]
 struct SabHistorySlot {
     completed: i64,
@@ -2572,7 +2588,8 @@ impl SabHistorySlot {
             name: entry.name.clone(),
             nzb_name: format!("{}.nzb", entry.name),
             category: sab_category_label(&entry.category),
-            pp: "D".into(),
+            // Rows written before the level was recorded keep reporting "D".
+            pp: entry.post_processing.map_or("D", sab_pp_label).into(),
             script: String::new(),
             report: String::new(),
             url: String::new(),
@@ -2619,7 +2636,7 @@ impl SabHistorySlot {
         }
     }
 
-    fn from_postprocessing(job: &NzbJob) -> Self {
+    fn from_postprocessing(job: &NzbJob, pp_level: u8) -> Self {
         let path = job.work_dir.to_string_lossy().to_string();
         Self {
             completed: job
@@ -2629,7 +2646,7 @@ impl SabHistorySlot {
             name: job.name.clone(),
             nzb_name: format!("{}.nzb", job.name),
             category: sab_category_label(&job.category),
-            pp: "D".into(),
+            pp: sab_pp_label(pp_level).into(),
             script: String::new(),
             report: String::new(),
             url: String::new(),
@@ -2867,6 +2884,7 @@ mod tests {
             }],
             error_message: (status == JobStatus::Failed).then(|| "broken archive".into()),
             failure_code: (status == JobStatus::Failed).then_some(JobFailureCode::ArchiveInvalid),
+            post_processing: None,
             server_stats: Vec::new(),
             nzb_data: (status == JobStatus::Failed).then(Vec::new),
             retry_data: None,
@@ -3115,6 +3133,7 @@ mod tests {
             stages: Vec::new(),
             error_message: None,
             failure_code: None,
+            post_processing: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
@@ -3189,6 +3208,32 @@ mod tests {
         assert!(slots[0]["completeness"].is_null());
     }
 
+    /// SABnzbd reports the job's post-processing level as
+    /// `PP_LOOKUP = {0: "", 1: "R", 2: "U", 3: "D"}`.
+    #[test]
+    fn history_slot_pp_reflects_the_effective_level() {
+        for (level, label) in [(0, ""), (1, "R"), (2, "U"), (3, "D")] {
+            let mut entry = history_entry("pp", "PP", "movies", JobStatus::Completed, 1);
+            entry.post_processing = Some(level);
+            assert_eq!(
+                SabHistorySlot::from_entry(&entry).pp,
+                label,
+                "level {level}"
+            );
+        }
+        // Rows recorded before the level was stored keep the old answer.
+        let legacy = history_entry("legacy", "Legacy", "movies", JobStatus::Completed, 1);
+        assert_eq!(SabHistorySlot::from_entry(&legacy).pp, "D");
+
+        let response = build_history_response(
+            &[],
+            &[(postprocessing_job(), 1)],
+            &SabApiRequest::default(),
+            1,
+        );
+        assert_eq!(response["history"]["slots"][0]["pp"], "R");
+    }
+
     #[test]
     fn history_includes_postprocessing_before_terminal_slots() {
         let response = build_history_response(
@@ -3199,7 +3244,7 @@ mod tests {
                 JobStatus::Completed,
                 1,
             )],
-            &[postprocessing_job()],
+            &[(postprocessing_job(), 3)],
             &SabApiRequest::default(),
             4,
         );
@@ -3364,6 +3409,7 @@ mod tests {
             stages: Vec::new(),
             error_message: None,
             failure_code: None,
+            post_processing: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
@@ -4456,6 +4502,7 @@ mod tests {
             stages: Vec::new(),
             error_message: None,
             failure_code: None,
+            post_processing: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
