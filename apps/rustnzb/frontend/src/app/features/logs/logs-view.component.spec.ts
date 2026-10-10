@@ -7,10 +7,12 @@ import { ApiService } from '../../core/services/api.service';
 import { LogsViewComponent } from './logs-view.component';
 
 type TestLog = { seq: number; level: string; message: string; timestamp: string; target?: string };
+type LogsBody = { entries: TestLog[]; latest_seq?: number; boot_id?: string };
+const line = (seq: number, message = `line ${seq}`): TestLog => ({ seq, level: 'INFO', message, timestamp: '' });
 
 function setup() {
   const api = {
-    get: vi.fn<(...args: unknown[]) => Observable<{ entries: TestLog[] }>>(() =>
+    get: vi.fn<(...args: unknown[]) => Observable<LogsBody>>(() =>
       of({ entries: [] }),
     ),
   };
@@ -67,5 +69,49 @@ describe('LogsViewComponent', () => {
     expect(component.follow()).toBe(false);
     component.clear();
     expect(component.entries()).toEqual([]);
+  });
+
+  it('treats seq 0 as a real cursor instead of refetching the whole buffer (BUG-119)', () => {
+    const { api, component } = setup();
+    component.entries.set([]);
+    api.get
+      .mockReturnValueOnce(of({ entries: [line(0)], latest_seq: 0, boot_id: 'a' }))
+      .mockReturnValueOnce(of({ entries: [], latest_seq: 0, boot_id: 'a' }));
+    component.loadLogs();
+    component.loadLogs();
+    expect(api.get).toHaveBeenNthCalledWith(2, '/logs', { after_seq: '0' });
+    expect(component.entries().map((e) => e.seq)).toEqual([0]);
+  });
+
+  it('starts over when the server restarts with a new boot id (BUG-119)', () => {
+    const { api, component } = setup();
+    component.entries.set([]);
+    api.get
+      .mockReturnValueOnce(of({ entries: [line(40), line(41)], latest_seq: 41, boot_id: 'a' }))
+      // After a restart the filtered poll (after_seq=41) sees nothing new...
+      .mockReturnValueOnce(of({ entries: [], latest_seq: 3, boot_id: 'b' }))
+      // ...so the view must refetch the new process's buffer from the start.
+      .mockReturnValueOnce(of({ entries: [line(0, 'boot'), line(1), line(2), line(3)], latest_seq: 3, boot_id: 'b' }))
+      .mockReturnValueOnce(of({ entries: [line(4)], latest_seq: 4, boot_id: 'b' }));
+    component.loadLogs();
+    component.loadLogs();
+    expect(api.get).toHaveBeenNthCalledWith(3, '/logs', {});
+    expect(component.entries().map((e) => e.seq)).toEqual([0, 1, 2, 3]);
+    component.loadLogs();
+    expect(api.get).toHaveBeenNthCalledWith(4, '/logs', { after_seq: '3' });
+    expect(component.entries().map((e) => e.seq)).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it('detects a restart from a backwards latest_seq when no boot id is sent (BUG-119)', () => {
+    const { api, component } = setup();
+    component.entries.set([]);
+    api.get
+      .mockReturnValueOnce(of({ entries: [line(40)], latest_seq: 40 }))
+      .mockReturnValueOnce(of({ entries: [], latest_seq: 2 }))
+      .mockReturnValueOnce(of({ entries: [line(0), line(1), line(2)], latest_seq: 2 }));
+    component.loadLogs();
+    component.loadLogs();
+    expect(api.get).toHaveBeenNthCalledWith(3, '/logs', {});
+    expect(component.entries().map((e) => e.seq)).toEqual([0, 1, 2]);
   });
 });

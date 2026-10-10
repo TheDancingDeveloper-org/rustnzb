@@ -339,6 +339,25 @@ async fn config_routes_validate_duplicates_and_persist_successful_updates() {
     assert_eq!(app.state.config().general.speed_limit_bps, 1234);
 }
 
+#[tokio::test]
+async fn logs_response_carries_the_log_buffer_boot_id() {
+    let app = start_app(false).await;
+    let client = reqwest::Client::new();
+    let access = setup_access(&app, &client).await;
+    let body: serde_json::Value = client
+        .get(format!("{}/api/logs", app.base_url))
+        .bearer_auth(&access)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(body["entries"].is_array(), "{body}");
+    assert!(body["latest_seq"].is_u64(), "{body}");
+    assert_eq!(body["boot_id"], app.state.log_buffer.boot_id(), "{body}");
+}
+
 async fn setup_access(app: &ContractApp, client: &reqwest::Client) -> String {
     let setup = client
         .post(format!("{}/api/auth/setup", app.base_url))

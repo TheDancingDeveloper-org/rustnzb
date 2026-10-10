@@ -11,6 +11,13 @@ interface LogEntry {
   target?: string;
 }
 
+interface LogsResponse {
+  entries: LogEntry[];
+  latest_seq?: number;
+  /** Changes whenever the server restarts (seq numbers then restart at 0). */
+  boot_id?: string;
+}
+
 @Component({
   selector: 'app-logs-view',
   standalone: true,
@@ -95,7 +102,10 @@ export class LogsViewComponent implements OnInit, OnDestroy {
   levelFilter = signal('');
   follow = signal(true);
 
-  private lastSeq = 0;
+  /** Highest seq received so far; null until the first entry (seq 0 is valid). */
+  private lastSeq: number | null = null;
+  /** Server log-buffer identity; changes when the server process restarts. */
+  private bootId: string | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
 
   @ViewChild('logContainer') logContainer!: ElementRef<HTMLElement>;
@@ -115,9 +125,19 @@ export class LogsViewComponent implements OnInit, OnDestroy {
 
   loadLogs(): void {
     const params: Record<string, string> = {};
-    if (this.lastSeq > 0) params['after_seq'] = String(this.lastSeq);
-    this.api.get<{ entries: LogEntry[] }>('/logs', params).subscribe({
+    if (this.lastSeq !== null) params['after_seq'] = String(this.lastSeq);
+    this.api.get<LogsResponse>('/logs', params).subscribe({
       next: r => {
+        if (this.serverRestarted(r)) {
+          // Sequence numbers restarted at 0 in a new process, so our cursor
+          // would filter out every new line. Start over from the new buffer.
+          this.bootId = r.boot_id ?? null;
+          this.lastSeq = null;
+          this.entries.set([]);
+          this.loadLogs();
+          return;
+        }
+        if (r.boot_id) this.bootId = r.boot_id;
         if (r.entries?.length) {
           const all = [...this.entries(), ...r.entries].slice(-1000);
           this.entries.set(all);
@@ -127,6 +147,14 @@ export class LogsViewComponent implements OnInit, OnDestroy {
       },
       error: () => {},
     });
+  }
+
+  private serverRestarted(r: LogsResponse): boolean {
+    if (this.lastSeq === null) return false;
+    if (r.boot_id && this.bootId && r.boot_id !== this.bootId) return true;
+    // Older servers send no boot_id: a cursor ahead of the server's newest
+    // seq can only mean the counter was reset.
+    return typeof r.latest_seq === 'number' && r.latest_seq < this.lastSeq;
   }
 
   private scrollToBottom(): void {

@@ -33,6 +33,10 @@ pub struct LogEntry {
 #[derive(Clone)]
 pub struct LogBuffer {
     inner: Arc<RwLock<LogBufferInner>>,
+    /// Random id for this buffer's lifetime (one per process). Sequence
+    /// numbers restart at 0 on every boot, so clients paging with `after_seq`
+    /// compare this to notice their cursor belongs to a previous run.
+    boot_id: Arc<str>,
 }
 
 struct LogBufferInner {
@@ -53,7 +57,13 @@ impl LogBuffer {
                 entries: VecDeque::with_capacity(MAX_LOG_ENTRIES),
                 next_seq: 0,
             })),
+            boot_id: uuid::Uuid::new_v4().simple().to_string().into(),
         }
+    }
+
+    /// Identifier of this buffer's lifetime; see the field docs.
+    pub fn boot_id(&self) -> &str {
+        &self.boot_id
     }
 
     /// Push a log entry into the buffer.
@@ -268,5 +278,16 @@ mod tests {
         assert_eq!(entries.len(), MAX_LOG_ENTRIES);
         assert_eq!(entries.first().unwrap().seq, 1);
         assert_eq!(entries.last().unwrap().seq, MAX_LOG_ENTRIES as u64);
+    }
+
+    #[test]
+    fn boot_id_identifies_one_buffer_lifetime() {
+        // Sequence numbers restart at 0 with every process, so clients need a
+        // per-boot identifier to notice that their `after_seq` is stale.
+        let first = LogBuffer::new();
+        let second = LogBuffer::new();
+        assert!(!first.boot_id().is_empty());
+        assert_ne!(first.boot_id(), second.boot_id());
+        assert_eq!(first.clone().boot_id(), first.boot_id());
     }
 }
