@@ -56,7 +56,8 @@ impl Database {
 
         if version < 1 {
             info!("Applying database migration v1");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 -- Active download queue
                 CREATE TABLE IF NOT EXISTS queue (
@@ -108,15 +109,15 @@ impl Database {
                     id TEXT PRIMARY KEY,
                     config TEXT NOT NULL -- JSON ServerConfig
                 );
-
-                INSERT INTO schema_version (version) VALUES (1);
                 ",
             )?;
+            commit_migration(tx, 1)?;
         }
 
         if version < 2 {
             info!("Applying database migration v2");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 -- Add NZB data storage and server stats to history
                 ALTER TABLE history ADD COLUMN nzb_data BLOB;
@@ -127,27 +128,27 @@ impl Database {
 
                 -- Add NZB data to queue for preservation
                 ALTER TABLE queue ADD COLUMN nzb_raw BLOB;
-
-                UPDATE schema_version SET version = 2;
                 ",
             )?;
+            commit_migration(tx, 2)?;
         }
 
         if version < 3 {
             info!("Applying database migration v3");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 -- Per-job log storage for history
                 ALTER TABLE history ADD COLUMN job_logs TEXT DEFAULT '[]';
-
-                UPDATE schema_version SET version = 3;
                 ",
             )?;
+            commit_migration(tx, 3)?;
         }
 
         if version < 4 {
             info!("Applying database migration v4");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 -- RSS feed items (persistent feed cache)
                 CREATE TABLE IF NOT EXISTS rss_items (
@@ -176,24 +177,23 @@ impl Database {
                     match_regex TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1
                 );
-
-                UPDATE schema_version SET version = 4;
                 ",
             )?;
+            commit_migration(tx, 4)?;
         }
 
         if version < 5 {
             info!("Applying database migration v5: settings table");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
-
-                UPDATE schema_version SET version = 5;
                 ",
             )?;
+            commit_migration(tx, 5)?;
         }
 
         // Ensure settings table exists for databases that jumped to v5
@@ -208,7 +208,8 @@ impl Database {
         #[cfg(feature = "groups-db")]
         if version < 6 {
             info!("Applying database migration v6: newsgroup browsing");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS groups (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -253,15 +254,15 @@ impl Database {
                 CREATE TRIGGER IF NOT EXISTS headers_fts_del AFTER DELETE ON headers BEGIN
                     INSERT INTO headers_fts(headers_fts, rowid, subject, author) VALUES ('delete', old.id, old.subject, old.author);
                 END;
-
-                UPDATE schema_version SET version = 6;
                 ",
             )?;
+            commit_migration(tx, 6)?;
         }
 
         if version < 7 {
             info!("Applying database migration v7: persistent download statistics");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS download_statistics (
                     job_id TEXT PRIMARY KEY,
@@ -291,33 +292,31 @@ impl Database {
                     END,
                     COALESCE(server_stats, '[]')
                 FROM history;
-
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (7);
                 ",
             )?;
+            commit_migration(tx, 7)?;
         }
 
         if version < 8 {
             info!("Applying database migration v8: active download duration");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 ALTER TABLE history ADD COLUMN download_time_secs REAL;
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (8);
                 ",
             )?;
+            commit_migration(tx, 8)?;
         }
 
         if version < 9 {
             info!("Applying database migration v9: per-article retry outcomes");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 ALTER TABLE history ADD COLUMN retry_data BLOB;
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (9);
                 ",
             )?;
+            commit_migration(tx, 9)?;
         }
 
         if version < 10 {
@@ -326,7 +325,8 @@ impl Database {
             // not damage evidence, so there is no backfill: it carries no
             // failure reason, per-server evidence, TTL, or server fingerprint
             // to reconstruct a confirmed-missing record from. See WI-143.
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS damage_ledger (
                     scope_id TEXT NOT NULL,
@@ -343,15 +343,15 @@ impl Database {
                 );
                 CREATE INDEX IF NOT EXISTS idx_damage_ledger_file
                     ON damage_ledger (scope_id, file_index);
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (10);
                 ",
             )?;
+            commit_migration(tx, 10)?;
         }
 
         if version < 11 {
             info!("Applying database migration v11: idempotent queue admissions");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE queue_admissions (
                     idempotency_key TEXT PRIMARY KEY,
@@ -362,26 +362,23 @@ impl Database {
 
                 CREATE INDEX idx_queue_admissions_job
                     ON queue_admissions(job_id);
-
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (11);
                 ",
             )?;
+            commit_migration(tx, 11)?;
         }
 
         if version < 12 {
             info!("Applying database migration v12: typed terminal failure codes");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 ALTER TABLE history ADD COLUMN failure_code TEXT;
                 UPDATE history
                 SET failure_code = 'download_failed'
                 WHERE LOWER(status) = 'failed' AND failure_code IS NULL;
-
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (12);
                 ",
             )?;
+            commit_migration(tx, 12)?;
         }
 
         if version < 13 {
@@ -393,16 +390,11 @@ impl Database {
                 [],
                 |row| row.get(0),
             )?;
+            let tx = self.conn.unchecked_transaction()?;
             if has_queue > 0 {
-                self.conn
-                    .execute_batch("ALTER TABLE queue ADD COLUMN pp_override INTEGER;")?;
+                tx.execute_batch("ALTER TABLE queue ADD COLUMN pp_override INTEGER;")?;
             }
-            self.conn.execute_batch(
-                "
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (13);
-                ",
-            )?;
+            commit_migration(tx, 13)?;
         }
 
         if version < 14 {
@@ -413,40 +405,35 @@ impl Database {
                 [],
                 |row| row.get(0),
             )?;
+            let tx = self.conn.unchecked_transaction()?;
             if has_history > 0 {
-                self.conn
-                    .execute_batch("ALTER TABLE history ADD COLUMN post_processing INTEGER;")?;
+                tx.execute_batch("ALTER TABLE history ADD COLUMN post_processing INTEGER;")?;
             }
-            self.conn.execute_batch(
-                "
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (14);
-                ",
-            )?;
+            commit_migration(tx, 14)?;
         }
 
         if version < 15 {
             info!("Applying database migration v15: per-job archive deletion");
             // Partial schemas (as built by migration tests) may lack either
             // table; only add the column where the table exists.
+            let mut table_exists_map = std::collections::HashMap::new();
             for table in ["queue", "history"] {
                 let exists: i64 = self.conn.query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
                     [table],
                     |row| row.get(0),
                 )?;
-                if exists > 0 {
-                    self.conn.execute_batch(&format!(
+                table_exists_map.insert(table, exists > 0);
+            }
+            let tx = self.conn.unchecked_transaction()?;
+            for table in ["queue", "history"] {
+                if table_exists_map.get(&table).copied().unwrap_or(false) {
+                    tx.execute_batch(&format!(
                         "ALTER TABLE {table} ADD COLUMN delete_archives INTEGER;"
                     ))?;
                 }
             }
-            self.conn.execute_batch(
-                "
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (15);
-                ",
-            )?;
+            commit_migration(tx, 15)?;
         }
 
         if version < 16 {
@@ -460,8 +447,23 @@ impl Database {
                 [],
                 |row| row.get(0),
             )?;
+            let has_groups: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'groups'",
+                [],
+                |row| row.get(0),
+            )?;
+            let has_scan_server: i64 = if has_groups > 0 {
+                self.conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('groups') WHERE name = 'scan_server_id'",
+                    [],
+                    |row| row.get(0),
+                )?
+            } else {
+                0
+            };
+            let tx = self.conn.unchecked_transaction()?;
             if has_headers > 0 {
-                self.conn.execute_batch(
+                tx.execute_batch(
                     "
                     UPDATE headers
                     SET read = 1
@@ -481,28 +483,10 @@ impl Database {
                     ",
                 )?;
             }
-            let has_groups: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'groups'",
-                [],
-                |row| row.get(0),
-            )?;
-            if has_groups > 0 {
-                let has_scan_server: i64 = self.conn.query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('groups') WHERE name = 'scan_server_id'",
-                    [],
-                    |row| row.get(0),
-                )?;
-                if has_scan_server == 0 {
-                    self.conn
-                        .execute_batch("ALTER TABLE groups ADD COLUMN scan_server_id TEXT;")?;
-                }
+            if has_groups > 0 && has_scan_server == 0 {
+                tx.execute_batch("ALTER TABLE groups ADD COLUMN scan_server_id TEXT;")?;
             }
-            self.conn.execute_batch(
-                "
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (16);
-                ",
-            )?;
+            commit_migration(tx, 16)?;
         }
 
         Ok(())
@@ -1464,6 +1448,38 @@ fn parse_datetime(s: &str) -> chrono::DateTime<Utc> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+fn commit_migration(tx: rusqlite::Transaction<'_>, version: u32) -> Result<(), NzbError> {
+    tx.execute_batch(&format!(
+        "DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES ({version});"
+    ))?;
+    tx.commit()?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn add_column_if_missing(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), NzbError> {
+    let exists: bool = tx
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info(?) WHERE name = ?",
+            [table, column],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !exists {
+        tx.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+        ))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
