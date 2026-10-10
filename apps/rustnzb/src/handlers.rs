@@ -364,6 +364,10 @@ pub struct SabApiKeyResponse {
 pub struct LogResponse {
     pub entries: Vec<LogEntry>,
     pub latest_seq: u64,
+    /// Live log buffer identity (changes on server restart, when `seq`
+    /// restarts at 0). Absent for persisted per-job history logs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,6 +1094,7 @@ pub async fn h_logs(
     Ok(Json(LogResponse {
         entries,
         latest_seq,
+        boot_id: Some(state.log_buffer.boot_id().to_string()),
     }))
 }
 
@@ -1429,6 +1434,7 @@ pub async fn h_history_logs(
     Ok(Json(LogResponse {
         entries,
         latest_seq,
+        boot_id: None,
     }))
 }
 
