@@ -245,13 +245,13 @@ function emptyCategory(): CategoryConfig {
                           <span>Total</span><b>{{ fmtBytes(st.total_bytes) }}</b>
                         </div>
                         <div class="srv-stats-row">
-                          <span>Today</span><b>{{ fmtBytes(st.today_bytes) }}</b>
+                          <span>24 hours</span><b>{{ fmtBytes(st.today_bytes) }}</b>
                         </div>
                         <div class="srv-stats-row">
-                          <span>This week</span><b>{{ fmtBytes(st.week_bytes) }}</b>
+                          <span>7 days</span><b>{{ fmtBytes(st.week_bytes) }}</b>
                         </div>
                         <div class="srv-stats-row">
-                          <span>This month</span><b>{{ fmtBytes(st.month_bytes) }}</b>
+                          <span>30 days</span><b>{{ fmtBytes(st.month_bytes) }}</b>
                         </div>
                       </div>
                       <div class="srv-stats-col">
@@ -260,13 +260,13 @@ function emptyCategory(): CategoryConfig {
                           <span>Total</span><b>{{ fmtAvail(st.total_ok, st.total_fail) }}</b>
                         </div>
                         <div class="srv-stats-row">
-                          <span>Today</span><b>{{ fmtAvail(st.today_ok, st.today_fail) }}</b>
+                          <span>24 hours</span><b>{{ fmtAvail(st.today_ok, st.today_fail) }}</b>
                         </div>
                         <div class="srv-stats-row">
-                          <span>This week</span><b>{{ fmtAvail(st.week_ok, st.week_fail) }}</b>
+                          <span>7 days</span><b>{{ fmtAvail(st.week_ok, st.week_fail) }}</b>
                         </div>
                         <div class="srv-stats-row">
-                          <span>This month</span><b>{{ fmtAvail(st.month_ok, st.month_fail) }}</b>
+                          <span>30 days</span><b>{{ fmtAvail(st.month_ok, st.month_fail) }}</b>
                         </div>
                       </div>
                     </div>
