@@ -24,7 +24,7 @@ pub use queue_manager::{
     DailyStatisticsData, GlobalStatisticsData, HistoryRetryOutcome, QueueManager, QueueSortField,
     ServerStatsData, StatisticsPeriodData,
 };
-pub use startup::{StartupConfig, StartupResult};
+pub use startup::{InstanceLock, StartupConfig, StartupResult};
 pub use state::AppState;
 
 pub(crate) fn increment_counter(name: &'static str) {
