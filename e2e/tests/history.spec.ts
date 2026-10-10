@@ -65,7 +65,7 @@ test.describe('5. Download History', () => {
     const error =
       'Aborted: only 99.9% of content available (need 100.2%), 6 of 4408 content articles missing';
 
-    await page.route('**/api/history', async (route) => {
+    await page.route(/\/api\/history(\?|$)/, async (route) => {
       await route.fulfill({
         contentType: 'application/json',
         body: JSON.stringify({
