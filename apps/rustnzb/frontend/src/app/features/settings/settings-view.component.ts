@@ -1036,8 +1036,8 @@ function emptyCategory(): CategoryConfig {
                 <div>MIT</div>
                 <label>Source</label>
                 <div>
-                  <a href="https://repo.indexarr.net/indexarr/rustnzb" target="_blank"
-                    >repo.indexarr.net/indexarr/rustnzb</a
+                  <a href="https://github.com/TheDancingDeveloper-org/rustnzb" target="_blank" rel="noopener"
+                    >github.com/TheDancingDeveloper-org/rustnzb</a
                   >
                 </div>
               </div>
