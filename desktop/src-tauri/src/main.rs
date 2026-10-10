@@ -13,12 +13,28 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use nzb_web::startup::InstanceLock;
 use nzb_web::{LogBuffer, LogBufferLayer, QueueManager, StartupConfig};
+
+/// Keeps the data-dir flock alive independently of the HTTP task.
+///
+/// `start_engine` returns one of these. Dropping `StartupResult` after the
+/// server is spawned used to unlock immediately.
+struct RetainedInstanceLock {
+    lock: InstanceLock,
+}
+
+impl RetainedInstanceLock {
+    fn new(lock: InstanceLock) -> Self {
+        Self { lock }
+    }
+}
 
 /// Shared state accessible from Tauri commands and background tasks.
 struct EngineState {
     queue_manager: Arc<QueueManager>,
     server_port: u16,
+    instance_lock: RetainedInstanceLock,
 }
 
 /// Determine the platform-appropriate config directory.
@@ -154,7 +170,11 @@ fn setup_tray(app: &AppHandle) -> anyhow::Result<()> {
 }
 
 /// Start the rustnzb engine and HTTP server.
-async fn start_engine() -> anyhow::Result<(Arc<QueueManager>, u16)> {
+///
+/// The returned lock must be kept alive for the process lifetime. Dropping
+/// `StartupResult` after moving `state` out used to unlock immediately, so a
+/// second desktop instance could start against the same data directory.
+async fn start_engine() -> anyhow::Result<(Arc<QueueManager>, u16, RetainedInstanceLock)> {
     let config_dir = config_dir()?;
     let data_dir = data_dir()?;
     let config_path = config_dir.join("config.toml");
@@ -190,6 +210,8 @@ async fn start_engine() -> anyhow::Result<(Arc<QueueManager>, u16)> {
 
     let port = result.state.config().general.port;
     let queue_manager = Arc::clone(&result.queue_manager);
+    // Take the lock before `result` is dropped by moving `state` below.
+    let instance_lock = RetainedInstanceLock::new(result.instance_lock);
 
     // Spawn the HTTP server in the background
     let state = result.state;
@@ -205,7 +227,7 @@ async fn start_engine() -> anyhow::Result<(Arc<QueueManager>, u16)> {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if reqwest::get(&health_url).await.is_ok() {
             info!("HTTP server ready on port {port}");
-            return Ok((queue_manager, port));
+            return Ok((queue_manager, port, instance_lock));
         }
     }
 
@@ -221,7 +243,7 @@ async fn start() {
         .expect("Failed to install rustls CryptoProvider");
 
     // Start the engine and HTTP server
-    let (queue_manager, port) = match start_engine().await {
+    let (queue_manager, port, instance_lock) = match start_engine().await {
         Ok(result) => result,
         Err(e) => {
             error!("Failed to start engine: {e}");
@@ -238,6 +260,7 @@ async fn start() {
         .manage(EngineState {
             queue_manager,
             server_port: port,
+            instance_lock,
         })
         .setup(move |app| {
             // Create main window pointing at the HTTP server

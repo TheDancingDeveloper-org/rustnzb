@@ -181,3 +181,14 @@ async fn categories_and_stats_cover_the_whole_window_not_the_page() {
     assert_eq!(week["stats"]["failed"], 15);
     assert_eq!(week["stats"]["success_pct"], 87);
 }
+
+#[tokio::test]
+async fn huge_days_query_is_rejected_instead_of_panicking() {
+    let (state, _dir) = state_with_history();
+    let uri: axum::http::Uri = "/api/history?days=100000000".parse().expect("uri");
+    let q: Query<HistoryQuery> = Query::try_from_uri(&uri).expect("query");
+    match h_history_list(State(state), q).await {
+        Err(err) => assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST),
+        Ok(_) => panic!("an overflowing days window must be rejected, not listed"),
+    }
+}

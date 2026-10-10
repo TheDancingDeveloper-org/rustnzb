@@ -14,6 +14,7 @@ function setup(token = 'access-1') {
     getAccessToken: vi.fn(() => token),
     refresh: vi.fn(() => of({ access_token: 'access-2' })),
     clearTokens: vi.fn(),
+    discardFailedSession: vi.fn(() => true),
   };
   const router = { navigate: vi.fn() };
   TestBed.configureTestingModule({
@@ -75,5 +76,27 @@ describe('authInterceptor', () => {
     await run(new HttpRequest('GET', '/api/dav/status'), next);
 
     expect(auth.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries with the other tab’s access token, not its refresh token', async () => {
+    const { auth, router, run } = setup('access-stale');
+    auth.refresh.mockReturnValue(throwError(() => new HttpErrorResponse({ status: 401 })));
+    auth.discardFailedSession.mockImplementation(() => {
+      auth.getAccessToken.mockReturnValue('access-from-other-tab');
+      return false;
+    });
+    const next = vi
+      .fn()
+      .mockReturnValueOnce(unauthorized('/api/queue'))
+      .mockReturnValueOnce(of(new HttpResponse({ status: 200 })));
+
+    await run(new HttpRequest('GET', '/api/queue'), next);
+
+    expect(auth.discardFailedSession).toHaveBeenCalledTimes(1);
+    expect(next.mock.calls[1][0].headers.get('Authorization')).toBe(
+      'Bearer access-from-other-tab',
+    );
+    expect(auth.clearTokens).not.toHaveBeenCalled();
+    expect(router.navigate).not.toHaveBeenCalled();
   });
 });

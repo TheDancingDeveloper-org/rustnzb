@@ -81,8 +81,13 @@ pub struct HistoryQuery {
     /// Case-insensitive substring of the job name.
     pub search: Option<String>,
     /// Only entries completed within the last N days. Also bounds `stats`.
+    /// Values above [`MAX_HISTORY_DAYS`] are rejected: `chrono::Duration::days`
+    /// panics when the span does not fit in an `i64` of milliseconds.
     pub days: Option<u32>,
 }
+
+/// Largest `days` window `GET /api/history` accepts (about 100 years).
+const MAX_HISTORY_DAYS: u32 = 36_500;
 
 #[derive(Deserialize)]
 pub struct AddNzbQuery {
@@ -894,6 +899,9 @@ pub async fn h_history_list(
     categories.sort();
     categories.dedup();
 
+    if q.days.is_some_and(|d| d > MAX_HISTORY_DAYS) {
+        return Err(ApiError::bad_request("days must be at most 36500"));
+    }
     let cutoff = q
         .days
         .map(|d| chrono::Utc::now() - chrono::Duration::days(i64::from(d)));

@@ -100,7 +100,7 @@ pub struct StartupResult {
     pub log_buffer: LogBuffer,
     /// Held for the lifetime of the process so a second instance on the
     /// same data_dir refuses to start.
-    _instance_lock: InstanceLock,
+    pub instance_lock: InstanceLock,
 }
 
 /// Exclusive lock on `<data_dir>/rustnzb.lock` ensuring only one rustnzb
@@ -361,7 +361,7 @@ pub async fn initialize(
         state,
         queue_manager,
         log_buffer,
-        _instance_lock: instance_lock,
+        instance_lock,
     })
 }
 
@@ -438,6 +438,25 @@ mod tests {
         // Releasing the first lock lets a later instance acquire it again.
         drop(first);
         acquire_instance_lock(&data_dir).unwrap();
+    }
+
+    /// Desktop `start_engine` moves `StartupResult.instance_lock` into process
+    /// state and then drops the rest of the result. The moved lock must still
+    /// exclude a second instance until that owner drops it.
+    #[test]
+    fn moved_instance_lock_still_excludes_a_second_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let lock = acquire_instance_lock(&data_dir).unwrap();
+        let retained = lock;
+        assert!(
+            acquire_instance_lock(&data_dir).is_err(),
+            "moving the lock out of StartupResult must not release it"
+        );
+        drop(retained);
+        acquire_instance_lock(&data_dir).expect("released on drop");
     }
 
     #[test]
