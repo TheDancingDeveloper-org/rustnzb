@@ -219,7 +219,7 @@ pub async fn h_group_get(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let group = db_blocking(&state, move |db| db.group_get(id))
         .await?
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("Group not found")))?;
+        .ok_or_else(|| ApiError::not_found("Group not found"))?;
     Ok(Json(serde_json::to_value(group).map_err(|e| {
         ApiError::from(anyhow::anyhow!("Serialisation error: {e}"))
     })?))
@@ -238,7 +238,7 @@ pub async fn h_group_status(
         ))
     })
     .await?;
-    let group = group.ok_or_else(|| ApiError::from(anyhow::anyhow!("Group not found")))?;
+    let group = group.ok_or_else(|| ApiError::not_found("Group not found"))?;
     let new_available = (group.last_article - group.last_scanned).max(0);
 
     Ok(Json(serde_json::json!({
@@ -376,7 +376,7 @@ pub async fn h_header_fetch(
         .queue_manager
         .with_db(|db| db.group_get(group_id))
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::from(anyhow::anyhow!("Group not found")))?;
+        .ok_or_else(|| ApiError::not_found("Group not found"))?;
     let server = browse_server(&state)?;
     let scan_server = state
         .queue_manager
