@@ -1,4 +1,4 @@
-import { Component, OnInit, signal, computed } from '@angular/core';
+import { Component, OnDestroy, OnInit, signal, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
@@ -44,7 +44,7 @@ import { showHttpError } from '../../core/http/http-error';
       <aside class="side">
         <div class="side-head">Subscribed ({{ groups().length }})</div>
         <div class="side-filter">
-          <input [(ngModel)]="groupNameFilter" placeholder="Filter…" />
+          <input [ngModel]="groupNameFilter()" (ngModelChange)="groupNameFilter.set($event)" placeholder="Filter…" />
         </div>
         <div class="side-list">
           @for (g of filteredGroups(); track g.id) {
@@ -385,11 +385,12 @@ import { showHttpError } from '../../core/http/http-error';
     `,
   ],
 })
-export class GroupsViewComponent implements OnInit {
+export class GroupsViewComponent implements OnInit, OnDestroy {
   groups = signal<GroupRow[]>([]);
   selectedGroup = signal<GroupRow | null>(null);
   groupFilter = '';
-  groupNameFilter = '';
+  // Signal so the filtered list recomputes when the filter changes.
+  groupNameFilter = signal('');
   headers = signal<HeaderRow[]>([]);
   headerTotal = signal(0);
   searchQuery = '';
@@ -401,9 +402,11 @@ export class GroupsViewComponent implements OnInit {
   previewHeader = signal<HeaderRow | null>(null);
   articleBody = signal<string | null>(null);
   articleLoading = signal(false);
+  private fetchPoll: ReturnType<typeof setInterval> | null = null;
+  private fetchGiveUp: ReturnType<typeof setTimeout> | null = null;
 
   filteredGroups = computed(() => {
-    const f = this.groupNameFilter.toLowerCase();
+    const f = this.groupNameFilter().toLowerCase();
     return f ? this.groups().filter((g) => g.name.toLowerCase().includes(f)) : this.groups();
   });
   allSelected = computed(() => {
@@ -428,6 +431,10 @@ export class GroupsViewComponent implements OnInit {
     this.loadGroups();
   }
 
+  ngOnDestroy(): void {
+    this.stopFetchPolling();
+  }
+
   loadGroups(): void {
     this.svc.list({ subscribed: true, limit: 500 }).subscribe((r) => this.groups.set(r.groups));
   }
@@ -443,14 +450,18 @@ export class GroupsViewComponent implements OnInit {
     this.loadStatus();
   }
 
+  /**
+   * Reload every page shown so far (0..offset+pageSize) so refreshes from the
+   * fetch poll or mark-all-read don't collapse the list to the last page.
+   */
   loadHeaders(): void {
     const g = this.selectedGroup();
     if (!g) return;
     this.svc
       .listHeaders(g.id, {
         search: this.searchQuery || undefined,
-        limit: this.pageSize,
-        offset: this.offset,
+        limit: this.offset + this.pageSize,
+        offset: 0,
       })
       .subscribe((r) => {
         this.headers.set(r.headers);
@@ -477,20 +488,13 @@ export class GroupsViewComponent implements OnInit {
 
   loadMore(): void {
     this.offset += this.pageSize;
-    const g = this.selectedGroup();
-    if (!g) return;
-    this.svc
-      .listHeaders(g.id, {
-        search: this.searchQuery || undefined,
-        limit: this.pageSize,
-        offset: this.offset,
-      })
-      .subscribe((r) => this.headers.set([...this.headers(), ...r.headers]));
+    this.loadHeaders();
   }
 
   fetchHeaders(): void {
     const g = this.selectedGroup();
     if (!g) return;
+    this.stopFetchPolling();
     this.fetching.set(true);
     this.svc.fetchHeaders(g.id).subscribe({
       next: () => this.snack.open('Fetching headers…', 'Close', { duration: 2000 }),
@@ -499,18 +503,23 @@ export class GroupsViewComponent implements OnInit {
         showHttpError(this.snack, err, 'Failed to fetch headers');
       },
     });
-    const poll = setInterval(() => {
+    this.fetchPoll = setInterval(() => {
+      // The fetch request failed (its error handler clears `fetching`):
+      // nothing is running server-side, so stop polling without reloading.
+      if (!this.fetching()) {
+        this.stopFetchPolling();
+        return;
+      }
       this.loadHeaders();
       this.loadStatus();
       this.loadGroups();
       if (this.newAvailable() <= 0) {
         this.fetching.set(false);
-        clearInterval(poll);
-        clearTimeout(giveUp);
+        this.stopFetchPolling();
       }
     }, 3000);
-    const giveUp = setTimeout(() => {
-      clearInterval(poll);
+    this.fetchGiveUp = setTimeout(() => {
+      this.stopFetchPolling();
       this.fetching.set(false);
       this.snack.open(
         'Header fetch is taking longer than expected — it may still finish in the background. Refresh to check.',
@@ -518,6 +527,13 @@ export class GroupsViewComponent implements OnInit {
         { duration: 6000 },
       );
     }, 120_000);
+  }
+
+  private stopFetchPolling(): void {
+    if (this.fetchPoll !== null) clearInterval(this.fetchPoll);
+    if (this.fetchGiveUp !== null) clearTimeout(this.fetchGiveUp);
+    this.fetchPoll = null;
+    this.fetchGiveUp = null;
   }
 
   markAllRead(): void {
