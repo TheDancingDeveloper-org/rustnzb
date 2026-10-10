@@ -156,6 +156,23 @@ describe('QueueViewComponent', () => {
     expect(component.failedArticlesLabel(37)).toBe('37 failed articles');
   });
 
+  it('formats queue sizes and speeds beyond TB (BUG-120)', () => {
+    const { component } = makeComponent();
+    expect(component.formatBytes(3 * 1024 ** 5)).toBe('3.0 PB');
+    expect(component.formatSpeed(-1)).toBe('0 B/s');
+  });
+
+  it('shows the real speed limit on the download speed card (BUG-121)', () => {
+    const { component } = makeComponent();
+    const base = { speed_bps: 0, paused: false } as never;
+    component.status.set({ ...(base as object), speed_limit_bps: 0 } as never);
+    expect(component.speedLimitLabel()).toBe('Active · limit off');
+    component.status.set({ ...(base as object), speed_limit_bps: 5 * 1024 * 1024 } as never);
+    expect(component.speedLimitLabel()).toBe('Active · limit 5.0 MB/s');
+    component.paused.set(true);
+    expect(component.speedLimitLabel()).toBe('Paused');
+  });
+
   it('holds a just-finished connection count for five seconds', () => {
     const { component } = makeComponent();
     component.status.set({ nntp_connections: [] } as never);

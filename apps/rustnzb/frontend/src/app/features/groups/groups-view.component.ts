@@ -8,6 +8,7 @@ import { GroupRow, HeaderRow } from '../../core/models/group.model';
 import { GroupBrowserDialogComponent } from './group-browser-dialog.component';
 import { IconComponent } from '../../shared/icon.component';
 import { showHttpError } from '../../core/http/http-error';
+import { formatBytes } from '../../core/format';
 
 @Component({
   selector: 'app-groups-view',
@@ -602,10 +603,6 @@ export class GroupsViewComponent implements OnInit, OnDestroy {
   }
 
   formatBytes(b: number): string {
-    if (b === 0) return '0 B';
-    const k = 1024;
-    const s = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.min(4, Math.floor(Math.log(b) / Math.log(k)));
-    return (b / Math.pow(k, i)).toFixed(1) + ' ' + s[i];
+    return formatBytes(b);
   }
 }

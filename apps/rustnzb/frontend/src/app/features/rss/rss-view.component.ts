@@ -1,6 +1,7 @@
 import { Component, OnInit, signal, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { formatBytes } from '../../core/format';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { ApiService } from '../../core/services/api.service';
 import { ConfirmService } from '../../shared/confirm.service';
@@ -520,12 +521,9 @@ export class RssViewComponent implements OnInit {
 
   // -- Helpers --
 
+  /** Item size; blank (not "0 B") when the feed didn't report one. */
   formatBytes(b: number): string {
-    if (!b) return '';
-    const k = 1024;
-    const s = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(b) / Math.log(k));
-    return (b / Math.pow(k, i)).toFixed(1) + ' ' + s[i];
+    return b > 0 ? formatBytes(b) : '';
   }
 
   /**

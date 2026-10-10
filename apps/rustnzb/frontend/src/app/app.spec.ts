@@ -87,4 +87,10 @@ describe('bare route detection', () => {
     expect(isBareRoute('/settings')).toBe(false);
     expect(isBareRoute('/welcomes')).toBe(false);
   });
+
+  it('formats sizes and speeds beyond TB without "undefined" (BUG-120)', () => {
+    const { app } = makeApp();
+    expect(app.formatBytes(1.1 * 1024 ** 5)).toBe('1.1 PB');
+    expect(app.formatSpeed(2 * 1024 ** 4)).toBe('2.0 TB/s');
+  });
 });
