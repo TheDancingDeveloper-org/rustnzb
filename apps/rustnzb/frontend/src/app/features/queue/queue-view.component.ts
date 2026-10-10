@@ -9,6 +9,7 @@ import { ApiService } from '../../core/services/api.service';
 import { AddNzbService } from '../../core/services/add-nzb.service';
 import { PauseStateService } from '../../core/services/pause-state.service';
 import { NzbJob, PauseReason, QueueResponse, StatusResponse } from '../../core/models/queue.model';
+import { formatBytes, formatBytesParts, formatSpeed } from '../../core/format';
 import { HistoryViewComponent } from '../history/history-view.component';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
@@ -67,7 +68,7 @@ interface PipelineStep {
         <div class="val">
           {{ speedValue() }} <span class="unit">{{ speedUnit() }}</span>
         </div>
-        <div class="sub">{{ paused() ? pausedLabel() : 'Active · limit off' }}</div>
+        <div class="sub">{{ speedLimitLabel() }}</div>
       </div>
       <div class="card">
         <div class="label">NNTP connections</div>
@@ -1245,10 +1246,19 @@ export class QueueViewComponent implements OnInit, OnDestroy {
 
   // ---- Stat-card derivations ----
 
-  speedValue = computed(() => this.formatSpeedValue(this.status()?.speed_bps ?? 0));
-  speedUnit = computed(() => this.formatSpeedUnit(this.status()?.speed_bps ?? 0));
-  diskFreeValue = computed(() => this.formatBytesValue(this.status()?.disk_space_free ?? 0));
-  diskFreeUnit = computed(() => this.formatBytesUnit(this.status()?.disk_space_free ?? 0));
+  speedValue = computed(() => formatBytesParts(this.status()?.speed_bps).value);
+  speedUnit = computed(() => `${formatBytesParts(this.status()?.speed_bps).unit}/s`);
+  pausedLabel = computed(() =>
+    this.pauseReason() === 'disk_space' ? 'Paused · low disk space' : 'Paused',
+  );
+  /** Sub-line of the speed card: pause state, else the configured limit (0 = off). */
+  speedLimitLabel = computed(() => {
+    if (this.paused()) return this.pausedLabel();
+    const limit = this.status()?.speed_limit_bps ?? 0;
+    return limit > 0 ? `Active · limit ${formatSpeed(limit)}` : 'Active · limit off';
+  });
+  diskFreeValue = computed(() => formatBytesParts(this.status()?.disk_space_free).value);
+  diskFreeUnit = computed(() => formatBytesParts(this.status()?.disk_space_free).unit);
   diskTotalKnown = computed(() => (this.status()?.disk_space_total ?? 0) > 0);
   diskUsedPct = computed(() => {
     const total = this.status()?.disk_space_total ?? 0;
@@ -1337,10 +1347,10 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   }
 
   etaTotal(): string {
-    const speed = this.status()?.speed_bps ?? 0;
-    if (speed === 0 || this.remainingBytes() === 0) return '—';
-    const secs = this.remainingBytes() / speed;
-    return 'ETA ' + this.formatDuration(secs);
+    const speed = this.normalizeNonNegative(this.status()?.speed_bps ?? 0);
+    const remaining = this.normalizeNonNegative(this.remainingBytes());
+    if (speed <= 0 || remaining <= 0) return '—';
+    return 'ETA ' + this.formatDuration(remaining / speed);
   }
 
   // ---- Post-processing pipeline ----
@@ -1809,11 +1819,6 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     return 's-q';
   }
 
-  /** Stat-card label while globally paused. */
-  pausedLabel(): string {
-    return this.pauseReason() === 'disk_space' ? 'Paused · low disk space' : 'Paused';
-  }
-
   /** Whether this job is paused by the disk-space guard. */
   isDiskSpaceHold(job: NzbJob): boolean {
     if (this.effectiveStatus(job.status) !== 'paused') return false;
@@ -1839,32 +1844,10 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   }
 
   formatSpeed(bps: number): string {
-    return `${this.formatSpeedValue(bps)} ${this.formatSpeedUnit(bps)}`;
-  }
-  private formatSpeedValue(bps: number): string {
-    if (bps === 0) return '0';
-    const k = 1024;
-    const i = Math.min(3, Math.floor(Math.log(bps) / Math.log(k)));
-    return (bps / Math.pow(k, i)).toFixed(1);
-  }
-  private formatSpeedUnit(bps: number): string {
-    const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
-    if (bps === 0) return 'B/s';
-    return units[Math.min(3, Math.floor(Math.log(bps) / Math.log(1024)))];
+    return formatSpeed(bps);
   }
 
   formatBytes(bytes: number): string {
-    return `${this.formatBytesValue(bytes)} ${this.formatBytesUnit(bytes)}`;
-  }
-  private formatBytesValue(bytes: number): string {
-    if (bytes === 0) return '0';
-    const k = 1024;
-    const i = Math.min(4, Math.floor(Math.log(bytes) / Math.log(k)));
-    return (bytes / Math.pow(k, i)).toFixed(1);
-  }
-  private formatBytesUnit(bytes: number): string {
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    if (bytes === 0) return 'B';
-    return units[Math.min(4, Math.floor(Math.log(bytes) / Math.log(1024)))];
+    return formatBytes(bytes);
   }
 }

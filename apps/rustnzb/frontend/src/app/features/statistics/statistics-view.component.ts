@@ -1,6 +1,7 @@
 import { CommonModule } from '@angular/common';
 import { Component, OnInit, computed, signal } from '@angular/core';
 import { ApiService } from '../../core/services/api.service';
+import { formatBytes } from '../../core/format';
 
 interface StatisticsPeriod {
   downloads: number;
@@ -192,12 +193,9 @@ export class StatisticsViewComponent implements OnInit {
   }
 
   formatBytes(bytes: number): string {
-    if (!bytes) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-    return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+    return formatBytes(bytes);
   }
-  formatSpeed(bytes: number): string { return `${this.formatBytes(bytes)}/s`; }
+  formatSpeed(bytes: number): string { return `${formatBytes(bytes)}/s`; }
   formatCount(value: number): string { return new Intl.NumberFormat().format(value || 0); }
   relativeTime(value: string): string {
     const seconds = Math.max(0, (Date.now() - new Date(value).getTime()) / 1000);

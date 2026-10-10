@@ -16,6 +16,7 @@ import { filter } from 'rxjs';
 import { ApiService } from './core/services/api.service';
 import { AuthService } from './core/services/auth.service';
 import { StatusResponse } from './core/models/queue.model';
+import { formatBytes, formatSpeed } from './core/format';
 import { AddNzbService } from './core/services/add-nzb.service';
 import { WidthModeService } from './core/services/width-mode.service';
 import { PauseStateService } from './core/services/pause-state.service';
@@ -547,18 +548,10 @@ export class App implements OnInit, OnDestroy {
   }
 
   formatSpeed(bps: number): string {
-    if (bps === 0) return '0 B/s';
-    const k = 1024;
-    const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
-    const i = Math.floor(Math.log(bps) / Math.log(k));
-    return parseFloat((bps / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    return formatSpeed(bps);
   }
 
   formatBytes(bytes: number): string {
-    if (!bytes) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    return formatBytes(bytes);
   }
 }
