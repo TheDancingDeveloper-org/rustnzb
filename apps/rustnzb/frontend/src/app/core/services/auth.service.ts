@@ -82,8 +82,12 @@ export class AuthService {
    */
   discardFailedSession(): boolean {
     const stored = localStorage.getItem(REFRESH_KEY);
-    if (stored && stored !== this.lastSpentRefresh && this.getAccessToken()) {
-      this.accessToken.set(stored);
+    const access = this.getAccessToken();
+    if (stored && stored !== this.lastSpentRefresh && access) {
+      // The replacement is the access token another tab stored, never the
+      // refresh token sitting next to it.
+      this.accessToken.set(access);
+      this.verified.set(true);
       return false;
     }
     this.clearTokens();
