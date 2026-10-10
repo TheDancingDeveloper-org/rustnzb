@@ -1503,7 +1503,7 @@ impl NntpConnection {
                     value: parse_lossless_overview_rows(&data, format, start, end),
                 })
             }
-            420 => {
+            420 | 423 => {
                 self.state = ConnectionState::Ready;
                 Ok(BoundedResponse {
                     value: LosslessOverviewRows {
@@ -1582,7 +1582,7 @@ impl NntpConnection {
                 );
                 Ok(entries)
             }
-            420 => {
+            420 | 423 => {
                 self.state = ConnectionState::Ready;
                 Ok(Vec::new()) // No articles in range
             }
@@ -1652,7 +1652,7 @@ impl NntpConnection {
                 self.state = ConnectionState::Ready;
                 Ok(parse_header_data(&data))
             }
-            420 => {
+            420 | 423 => {
                 self.state = ConnectionState::Ready;
                 Ok(Vec::new()) // No articles in range
             }
@@ -1766,7 +1766,7 @@ impl NntpConnection {
                     value: parse_header_data(&data),
                 })
             }
-            420 => {
+            420 | 423 => {
                 self.state = ConnectionState::Ready;
                 Ok(BoundedResponse {
                     value: Vec::new(),

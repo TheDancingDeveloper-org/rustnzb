@@ -449,6 +449,62 @@ impl Database {
             )?;
         }
 
+        if version < 16 {
+            info!("Applying database migration v16: header dedupe + per-group scan server");
+            // Existing databases may have duplicate header rows when the same
+            // article was fetched from more than one server. Deduplicate first
+            // (keeping the oldest row so read state survives), then enforce a
+            // unique index so it cannot happen again.
+            let has_headers: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'headers'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_headers > 0 {
+                self.conn.execute_batch(
+                    "
+                    UPDATE headers
+                    SET read = 1
+                    WHERE read = 0
+                      AND id IN (
+                          SELECT MIN(id)
+                          FROM headers
+                          GROUP BY group_id, message_id
+                          HAVING MAX(read) = 1
+                      );
+                    DELETE FROM headers
+                    WHERE id NOT IN (
+                        SELECT MIN(id) FROM headers GROUP BY group_id, message_id
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_headers_group_msgid
+                        ON headers(group_id, message_id);
+                    ",
+                )?;
+            }
+            let has_groups: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'groups'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_groups > 0 {
+                let has_scan_server: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('groups') WHERE name = 'scan_server_id'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if has_scan_server == 0 {
+                    self.conn
+                        .execute_batch("ALTER TABLE groups ADD COLUMN scan_server_id TEXT;")?;
+                }
+            }
+            self.conn.execute_batch(
+                "
+                DELETE FROM schema_version;
+                INSERT INTO schema_version (version) VALUES (16);
+                ",
+            )?;
+        }
+
         Ok(())
     }
 

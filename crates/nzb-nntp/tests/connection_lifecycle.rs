@@ -271,6 +271,41 @@ async fn test_xover_range() {
     conn.quit().await.unwrap();
 }
 
+/// BUG-106: RFC 3977 answers XOVER of an expired range with `423 No articles
+/// in that range`. That is an empty result, not a protocol error, and the
+/// connection stays usable.
+#[tokio::test]
+async fn test_xover_expired_range_423_is_empty() {
+    let mut groups = HashMap::new();
+    groups.insert("alt.test".to_string(), (3, 500, 502));
+
+    let server = MockNntpServer::start(MockConfig {
+        groups,
+        xover_entries: vec!["500\tSubject\tuser@test\t01 Jan 2024\t<mid500>\t\t100\t5".to_string()],
+        xover_423_outside_group: true,
+        ..Default::default()
+    })
+    .await;
+
+    let config = test_config(server.port());
+    let mut conn = NntpConnection::new("test".into());
+    conn.connect(&config).await.unwrap();
+    conn.group("alt.test").await.unwrap();
+
+    let entries = conn.xover(1, 100).await.expect("423 is an empty range");
+    assert!(entries.is_empty());
+    let format = conn.overview_format().await.unwrap();
+    let rows = conn
+        .xover_lossless(1, 100, &format)
+        .await
+        .expect("423 is an empty range for the lossless variant too");
+    assert!(rows.rows.is_empty());
+
+    // Still usable afterwards.
+    assert_eq!(conn.xover(500, 502).await.unwrap().len(), 1);
+    conn.quit().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Dot-stuffing
 // ---------------------------------------------------------------------------

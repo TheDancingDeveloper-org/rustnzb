@@ -129,12 +129,31 @@ impl Database {
         Ok(())
     }
 
-    pub fn group_update_watermark(&self, id: i64, last_scanned: i64) -> Result<(), NzbError> {
+    pub fn group_update_watermark(
+        &self,
+        id: i64,
+        last_scanned: i64,
+        scan_server_id: Option<&str>,
+    ) -> Result<(), NzbError> {
         self.conn.execute(
-            "UPDATE groups SET last_scanned = ?2, last_updated = datetime('now') WHERE id = ?1",
-            params![id, last_scanned],
+            "UPDATE groups SET last_scanned = ?2, scan_server_id = ?3, last_updated = datetime('now')
+             WHERE id = ?1",
+            params![id, last_scanned, scan_server_id],
         )?;
         Ok(())
+    }
+
+    /// Returns the id of the server that produced the current watermark, if known.
+    pub fn group_scan_server(&self, id: i64) -> Result<Option<String>, NzbError> {
+        match self.conn.query_row(
+            "SELECT scan_server_id FROM groups WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<String>>(0),
+        ) {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(NzbError::Database(e)),
+        }
     }
 
     // ---- Headers ----
@@ -152,7 +171,7 @@ impl Database {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for e in entries {
-                stmt.execute(params![
+                count += stmt.execute(params![
                     group_id,
                     e.article_num as i64,
                     e.subject,
@@ -162,8 +181,7 @@ impl Database {
                     e.references,
                     e.bytes as i64,
                     e.lines as i64,
-                ])?;
-                count += 1;
+                ])? as u64;
             }
         }
         tx.commit()?;
@@ -319,6 +337,35 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// Keeps only the newest `keep` headers in the group; returns rows deleted.
+    pub fn header_prune_group(&self, group_id: i64, keep: usize) -> Result<u64, NzbError> {
+        if keep == 0 {
+            return Ok(0);
+        }
+        let keep = i64::try_from(keep).unwrap_or(i64::MAX);
+        let deleted = self.conn.execute(
+            "DELETE FROM headers WHERE group_id = ?1 AND id NOT IN (
+                 SELECT id FROM headers WHERE group_id = ?1
+                 ORDER BY article_num DESC, id DESC LIMIT ?2
+             )",
+            params![group_id, keep],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    /// Deletes all headers in the group and resets its scan watermark; returns rows deleted.
+    pub fn header_clear_group(&self, group_id: i64) -> Result<u64, NzbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let deleted = tx.execute("DELETE FROM headers WHERE group_id = ?1", params![group_id])?;
+        tx.execute(
+            "UPDATE groups SET last_scanned = 0, scan_server_id = NULL, last_updated = datetime('now')
+             WHERE id = ?1",
+            params![group_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted as u64)
     }
 
     // ---- Threading ----
@@ -481,5 +528,99 @@ mod tests {
         assert_eq!(threads[0].reply_count, 1);
         assert_eq!(threads[0].unread_count, 1);
         assert_eq!(db.group_get(group.id).unwrap().unwrap().unread_count, 1);
+    }
+
+    fn entry(article_num: u64, message_id: &str) -> XoverEntry {
+        XoverEntry {
+            article_num,
+            subject: "Release".into(),
+            from: "poster".into(),
+            date: "2026-01-01".into(),
+            message_id: message_id.into(),
+            references: "".into(),
+            bytes: 42,
+            lines: 1,
+        }
+    }
+
+    #[test]
+    fn header_insert_batch_dedupes_by_message_id() {
+        let db = Database::open_memory().unwrap();
+        db.group_upsert_batch(&[("alt.binaries.test".into(), 30, 10)])
+            .unwrap();
+        let group = db.group_list(false, None, 10, 0).unwrap().pop().unwrap();
+
+        db.header_insert_batch(group.id, &[entry(10, "a@test")])
+            .unwrap();
+        let inserted = db
+            .header_insert_batch(group.id, &[entry(10, "a@test"), entry(11, "b@test")])
+            .unwrap();
+
+        assert_eq!(inserted, 1);
+        assert_eq!(db.header_count(group.id, None).unwrap(), 2);
+    }
+
+    #[test]
+    fn header_prune_group_keeps_newest() {
+        let db = Database::open_memory().unwrap();
+        db.group_upsert_batch(&[("alt.binaries.test".into(), 30, 10)])
+            .unwrap();
+        let group = db.group_list(false, None, 10, 0).unwrap().pop().unwrap();
+        db.header_insert_batch(
+            group.id,
+            &[
+                entry(10, "a@test"),
+                entry(11, "b@test"),
+                entry(12, "c@test"),
+            ],
+        )
+        .unwrap();
+
+        let deleted = db.header_prune_group(group.id, 2).unwrap();
+
+        assert_eq!(deleted, 1);
+        assert_eq!(db.header_count(group.id, None).unwrap(), 2);
+        assert!(db.header_get_by_message_id("b@test").unwrap().is_some());
+        assert!(db.header_get_by_message_id("c@test").unwrap().is_some());
+        assert!(db.header_get_by_message_id("a@test").unwrap().is_none());
+        assert_eq!(db.header_prune_group(group.id, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn header_clear_group_deletes_headers_and_resets_watermark() {
+        let db = Database::open_memory().unwrap();
+        db.group_upsert_batch(&[("alt.binaries.test".into(), 30, 10)])
+            .unwrap();
+        let group = db.group_list(false, None, 10, 0).unwrap().pop().unwrap();
+        db.header_insert_batch(group.id, &[entry(10, "a@test")])
+            .unwrap();
+        db.group_update_watermark(group.id, 42, Some("srv-1"))
+            .unwrap();
+
+        let deleted = db.header_clear_group(group.id).unwrap();
+
+        assert_eq!(deleted, 1);
+        assert_eq!(db.header_count(group.id, None).unwrap(), 0);
+        let updated = db.group_get(group.id).unwrap().unwrap();
+        assert_eq!(updated.last_scanned, 0);
+        assert!(db.group_scan_server(group.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn group_watermark_remembers_scan_server() {
+        let db = Database::open_memory().unwrap();
+        db.group_upsert_batch(&[("alt.binaries.test".into(), 30, 10)])
+            .unwrap();
+        let group = db.group_list(false, None, 10, 0).unwrap().pop().unwrap();
+
+        db.group_update_watermark(group.id, 100, Some("srv-a"))
+            .unwrap();
+        assert_eq!(
+            db.group_scan_server(group.id).unwrap().as_deref(),
+            Some("srv-a")
+        );
+
+        db.group_update_watermark(group.id, 200, None).unwrap();
+        assert_eq!(db.group_scan_server(group.id).unwrap(), None);
     }
 }

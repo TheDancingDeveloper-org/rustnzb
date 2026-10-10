@@ -118,6 +118,10 @@ pub struct MockConfig {
     pub xover_entries_by_range: HashMap<String, Vec<String>>,
     /// Raw XOVER entries used when exact non-UTF-8 bytes are required.
     pub xover_raw_entries: Vec<Vec<u8>>,
+    /// If true, XOVER of a range lying entirely outside the selected
+    /// group's `first..=last` answers `423 No articles in that range`, as an
+    /// RFC 3977 server does once the requested articles have expired.
+    pub xover_423_outside_group: bool,
     /// XHDR entries as pre-formatted `artnum value` lines.
     pub xhdr_entries: Vec<String>,
     /// XPAT entries as pre-formatted `artnum value` lines.
@@ -189,6 +193,7 @@ impl Default for MockConfig {
             xover_entries: Vec::new(),
             xover_entries_by_range: HashMap::new(),
             xover_raw_entries: Vec::new(),
+            xover_423_outside_group: false,
             xhdr_entries: Vec::new(),
             xpat_entries: Vec::new(),
             xpat_entries_by_request: HashMap::new(),
@@ -538,6 +543,15 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                     mwrite!(conn, b"480 Authentication required\r\n");
                 } else if selected_group.is_none() {
                     mwrite!(conn, b"412 No newsgroup selected\r\n");
+                } else if config.xover_423_outside_group
+                    && xover_range_outside_group(
+                        parts.get(1).copied(),
+                        selected_group
+                            .as_deref()
+                            .and_then(|name| config.groups.get(name)),
+                    )
+                {
+                    mwrite!(conn, b"423 No articles in that range\r\n");
                 } else if entries.is_empty() && config.xover_raw_entries.is_empty() {
                     mwrite!(conn, b"420 No articles in range\r\n");
                 } else {
@@ -757,6 +771,21 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
 /// on raw bytes — must NOT lossy-UTF-8-convert because article bodies can be
 /// binary (yEnc-encoded payloads contain non-UTF-8 byte sequences). Accepts
 /// either `\n`- or `\r\n`-delimited input lines and emits canonical `\r\n`.
+/// True when an `XOVER first-last` range lies entirely outside the group's
+/// current `first..=last` article numbers.
+fn xover_range_outside_group(range: Option<&str>, group: Option<&(u64, u64, u64)>) -> bool {
+    let (Some(range), Some(&(_, first, last))) = (range, group) else {
+        return false;
+    };
+    let mut bounds = range.splitn(2, '-');
+    let start = bounds.next().and_then(|v| v.parse::<u64>().ok());
+    let end = bounds.next().and_then(|v| v.parse::<u64>().ok());
+    match (start, end) {
+        (Some(start), Some(end)) => end < first || start > last,
+        _ => false,
+    }
+}
+
 /// Returns `false` if the connection should close (silent_close_after_bytes hit).
 async fn write_multiline_body(conn: &mut ConnState<'_>, data: &[u8]) -> bool {
     let mut start = 0usize;

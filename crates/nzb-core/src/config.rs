@@ -144,6 +144,14 @@ pub struct GeneralConfig {
     /// against the URL host (`prowlarr`, `nzbhydra.lan`). Default: empty.
     #[serde(default)]
     pub fetch_allowed_hosts: Vec<String>,
+    /// Most headers kept per group when fetching a group's headers; the
+    /// oldest are pruned first. 0 keeps all fetched headers. Default: 100000.
+    #[serde(default = "default_group_max_headers")]
+    pub group_max_headers: usize,
+}
+
+fn default_group_max_headers() -> usize {
+    100_000
 }
 
 fn default_rss_history_limit() -> Option<usize> {
@@ -232,6 +240,7 @@ impl Default for GeneralConfig {
             script_max_output_bytes: default_script_output_bytes(),
             fetch_allow_private: false,
             fetch_allowed_hosts: Vec::new(),
+            group_max_headers: default_group_max_headers(),
         }
     }
 }
