@@ -34,6 +34,43 @@ interface StatusResponse {
   webdav_enabled: boolean;
 }
 
+// The mount point of the WebDAV router on the server.
+const DAV_MOUNT = '/dav';
+
+/**
+ * Turn a PROPFIND `<D:href>` into a decoded path relative to the DAV root.
+ *
+ * The server emits hrefs that include the `/dav` mount prefix and are
+ * percent-encoded (`/dav/content/My%20Show/`). Root-relative hrefs without the
+ * prefix (`/content/...`) are accepted too. Absolute URLs are reduced to their
+ * path first.
+ */
+function normalizeDavHref(raw: string): string {
+  let path = raw.trim();
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(path)) {
+    try {
+      path = new URL(path).pathname;
+    } catch {
+      /* keep as-is */
+    }
+  }
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    /* malformed escape: keep the raw text */
+  }
+  if (path === DAV_MOUNT || path.startsWith(DAV_MOUNT + '/')) {
+    path = path.slice(DAV_MOUNT.length) || '/';
+  }
+  return path.startsWith('/') ? path : '/' + path;
+}
+
+/** Compare two DAV-relative paths ignoring a trailing slash. */
+function samePath(a: string, b: string): boolean {
+  const trim = (p: string) => (p.length > 1 ? p.replace(/\/+$/, '') : p);
+  return trim(a) === trim(b);
+}
+
 interface Release {
   href: string;
   name: string;
@@ -490,10 +527,7 @@ export class MediaViewComponent implements OnInit, OnDestroy {
       .then(([items, status]) => {
         if (status) this.pipelineStatus = status;
         const existing = this.releases();
-        const self = ['/content', '/content/'];
-        const dirs = items.filter(
-          (i) => i.isDir && !self.includes(i.href) && !self.includes(i.href + '/'),
-        );
+        const dirs = items.filter((i) => i.isDir && !samePath(i.href, '/content'));
         const updated = dirs.map((d) => {
           const prev = existing.find((r) => r.href === d.href);
           const base = prev ?? {
@@ -540,9 +574,7 @@ export class MediaViewComponent implements OnInit, OnDestroy {
     rel.loading = true;
     this.propfind(rel.href, 1)
       .then((items) => {
-        rel.files = items.filter(
-          (i) => !i.isDir && i.href !== rel.href && i.href !== rel.href + '/',
-        );
+        rel.files = items.filter((i) => !i.isDir && !samePath(i.href, rel.href));
         rel.loading = false;
         this.releases.set([...this.releases()]);
       })
@@ -552,9 +584,9 @@ export class MediaViewComponent implements OnInit, OnDestroy {
       });
   }
 
-  // davRelPath: WebDAV-relative path (no /dav prefix), e.g. '/content' or '/content/Release/'
+  // davRelPath: decoded WebDAV-relative path (no /dav prefix), e.g. '/content' or '/content/Release/'
   private propfind(davRelPath: string, depth: number): Promise<DavFile[]> {
-    const url = `${window.location.origin}/dav${davRelPath}`;
+    const url = this.fileUrl(davRelPath);
     const headers = new HttpHeaders({ Depth: String(depth) });
     return this.http
       .request('PROPFIND', url, {
@@ -570,7 +602,8 @@ export class MediaViewComponent implements OnInit, OnDestroy {
     const ns = 'DAV:';
     const items: DavFile[] = [];
     for (const resp of Array.from(doc.getElementsByTagNameNS(ns, 'response'))) {
-      const href = resp.getElementsByTagNameNS(ns, 'href')[0]?.textContent ?? '';
+      const rawHref = resp.getElementsByTagNameNS(ns, 'href')[0]?.textContent ?? '';
+      const href = normalizeDavHref(rawHref);
       const displayName = resp.getElementsByTagNameNS(ns, 'displayname')[0]?.textContent ?? '';
       const contentType = resp.getElementsByTagNameNS(ns, 'getcontenttype')[0]?.textContent ?? '';
       const sizeStr = resp.getElementsByTagNameNS(ns, 'getcontentlength')[0]?.textContent ?? '0';
@@ -578,7 +611,7 @@ export class MediaViewComponent implements OnInit, OnDestroy {
       const isDir = !!rtype?.getElementsByTagNameNS(ns, 'collection').length;
       const name = displayName || href.split('/').filter(Boolean).pop() || href;
       items.push({
-        href: decodeURIComponent(href),
+        href,
         name,
         isDir,
         size: parseInt(sizeStr) || 0,
@@ -588,8 +621,10 @@ export class MediaViewComponent implements OnInit, OnDestroy {
     return items;
   }
 
+  // href: decoded WebDAV-relative path (as produced by normalizeDavHref).
   fileUrl(href: string): string {
-    return `${window.location.origin}/dav${href}`;
+    const encoded = href.split('/').map(encodeURIComponent).join('/');
+    return `${window.location.origin}/dav${encoded}`;
   }
 
   isVideo(f: DavFile): boolean {
