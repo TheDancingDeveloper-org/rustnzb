@@ -7,10 +7,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use base64::Engine;
-use http::{HeaderMap, StatusCode, header};
+use http::{HeaderMap, HeaderValue, StatusCode, header};
 use rust_embed::Embed;
 use tokio::net::TcpListener;
-use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -127,7 +126,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     }
     #[cfg(not(feature = "webdav"))]
     {
-        build_api_router(state)
+        build_api_router(state).layer(axum::middleware::from_fn(security_headers))
     }
 }
 
@@ -163,13 +162,57 @@ pub fn build_router_with_dav(
             info!("WebDAV media library mounted at /dav (auth enabled)");
         }
     }
-    router.layer(axum::Extension(dav))
+    router
+        .layer(axum::Extension(dav))
+        .layer(axum::middleware::from_fn(security_headers))
+}
+
+/// Browser security headers for the embedded UI.
+///
+/// Applied to every response, including `/api` and `/dav`. These are response
+/// headers only — they do not add authentication or reject cross-origin
+/// requests, so non-browser clients (Sonarr/Radarr, WebDAV) are unaffected.
+///
+/// CSP notes:
+/// - The Angular `index.html` has no inline scripts, so `script-src 'self'`
+///   needs no `'unsafe-inline'`.
+/// - Angular component styles are emitted as inline `<style>` tags, so
+///   `style-src` keeps `'unsafe-inline'`.
+/// - The UI loads Inter, JetBrains Mono, and Material Icons from Google
+///   Fonts, so those two origins are the minimum addition to the requested
+///   policy. Without them the shell renders unstyled.
+const CSP: &str = "default-src 'self'; \
+    img-src 'self' data:; \
+    style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+    font-src 'self' https://fonts.gstatic.com; \
+    script-src 'self'; \
+    connect-src 'self'; \
+    frame-ancestors 'none'";
+
+async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("same-origin"),
+    );
+    response
 }
 
 fn build_api_router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::default()
-        .allow_origin(AllowOrigin::any())
-        .allow_headers(AllowHeaders::any());
+    // No CorsLayer. The previous layer allowed any origin and any header,
+    // which let a foreign page drive the API from a browser. Same-origin is
+    // the default when no CORS layer is present. Non-browser clients never
+    // send an Origin-checked preflight, so `/api` and `/dav` keep working.
 
     // Auth endpoints (no auth middleware on these)
     let auth_routes = Router::new()
@@ -470,7 +513,6 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         .fallback(h_spa_fallback)
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024)) // 200 MB for multi-file NZB uploads
         .layer(TraceLayer::new_for_http())
-        .layer(cors)
         .with_state(state)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
 }
@@ -531,6 +573,17 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{cache_header_for, is_hashed_asset};
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use http::StatusCode;
+    use nzb_web::auth::{CredentialStore, TokenStore};
+    use nzb_web::nzb_core::config::AppConfig;
+    use nzb_web::nzb_core::db::Database;
+    use nzb_web::state::AppState;
+    use nzb_web::{LogBuffer, QueueManager};
+
+    use super::build_router;
 
     #[test]
     fn hashed_asset_detection() {
@@ -555,5 +608,77 @@ mod tests {
         );
         assert_eq!(cache_header_for("favicon.ico"), "max-age=3600");
         assert_eq!(cache_header_for("logo.png"), "max-age=3600");
+    }
+
+    fn test_state() -> Arc<AppState> {
+        let temp = tempfile::tempdir().unwrap();
+        let config = AppConfig::default();
+        let logs = LogBuffer::new();
+        let queue = QueueManager::new(
+            Vec::new(),
+            Database::open_memory().unwrap(),
+            temp.path().join("incomplete"),
+            temp.path().join("complete"),
+            logs.clone(),
+            config.general.max_active_downloads,
+            config.categories.clone(),
+            config.general.min_free_space_bytes,
+            config.general.speed_limit_bps,
+            false,
+            config.general.max_nested_archive_depth,
+            config.general.abort_hopeless,
+            config.general.early_failure_check,
+            config.general.required_completion_pct,
+            config.general.article_timeout_secs,
+        );
+        Arc::new(AppState::new(
+            Arc::new(ArcSwap::from_pointee(config)),
+            temp.path().join("config.toml"),
+            queue,
+            logs,
+            Arc::new(TokenStore::new()),
+            Arc::new(CredentialStore::new(temp.path().to_path_buf())),
+        ))
+    }
+
+    #[tokio::test]
+    async fn root_has_security_headers_and_sab_version_still_works() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router = build_router(test_state());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let root = client.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(root.status(), StatusCode::OK);
+        let headers = root.headers();
+        let csp = headers
+            .get(http::header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap();
+        assert!(csp.contains("default-src 'self'"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("script-src 'self'"), "{csp}");
+        assert!(!csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
+        assert_eq!(headers.get(http::header::X_FRAME_OPTIONS).unwrap(), "DENY");
+        assert_eq!(
+            headers.get(http::header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            headers.get(http::header::REFERRER_POLICY).unwrap(),
+            "same-origin"
+        );
+
+        let version = client
+            .get(format!("{base}/api?mode=version"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(version.status(), StatusCode::OK);
+        let json: serde_json::Value = version.json().await.unwrap();
+        assert!(json.get("version").is_some(), "{json}");
     }
 }

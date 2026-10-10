@@ -78,8 +78,8 @@ assets = [
 reqwest = { workspace = true, features = ["multipart", "json"] }
 serde_json = { workspace = true }
 axum = { workspace = true }
-tempfile = "3"
-arc-swap.workspace = true
+	tempfile = "3"
+	arc-swap.workspace = true
 nzb-nntp = { workspace = true, features = ["test-support"] }
 crc32fast = { workspace = true }
 mock-nntp-server = { workspace = true }
