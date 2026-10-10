@@ -14,8 +14,34 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use nzb_web::QueueManager;
 use nzb_web::error::{ApiError, WithStatusError};
+use nzb_web::nzb_core::NzbError;
 use nzb_web::nzb_core::config::ServerConfig;
+use nzb_web::nzb_core::db::Database;
 use nzb_web::state::AppState;
+
+/// Largest page any group/header/thread listing returns.
+pub const MAX_PAGE_LIMIT: usize = 1_000;
+
+fn page_limit(requested: Option<usize>, default: usize) -> usize {
+    requested.unwrap_or(default).min(MAX_PAGE_LIMIT)
+}
+
+/// Run a database query on the blocking pool.
+///
+/// Newsgroup queries can scan large header tables while holding the global
+/// database mutex; doing that on an async worker thread would stall every
+/// other task scheduled on it.
+async fn db_blocking<F, R>(state: &AppState, query: F) -> Result<R, ApiError>
+where
+    F: FnOnce(&Database) -> Result<R, NzbError> + Send + 'static,
+    R: Send + 'static,
+{
+    let qm = state.queue_manager.clone();
+    tokio::task::spawn_blocking(move || qm.with_db(query))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Database task failed: {e}")))?
+        .map_err(ApiError::from)
+}
 
 /// `Path` extractor whose rejection is a JSON `ApiError` 400 instead of
 /// axum's plain-text parser message (which leaks Rust type names such as
@@ -134,16 +160,17 @@ pub async fn h_group_list(
     Query(q): Query<GroupListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let subscribed = q.subscribed.unwrap_or(false);
-    let limit = q.limit.unwrap_or(100);
+    let limit = page_limit(q.limit, 100);
     let offset = q.offset.unwrap_or(0);
-    let qm = &state.queue_manager;
 
-    let groups = qm
-        .with_db(|db| db.group_list(subscribed, q.search.as_deref(), limit, offset))
-        .map_err(ApiError::from)?;
-    let total = qm
-        .with_db(|db| db.group_count(subscribed, q.search.as_deref()))
-        .map_err(ApiError::from)?;
+    let (groups, total) = db_blocking(&state, move |db| {
+        let search = q.search.as_deref();
+        Ok((
+            db.group_list(subscribed, search, limit, offset)?,
+            db.group_count(subscribed, search)?,
+        ))
+    })
+    .await?;
 
     Ok(Json(serde_json::json!({
         "groups": groups, "total": total, "limit": limit, "offset": offset,
@@ -190,11 +217,9 @@ pub async fn h_group_get(
     State(state): State<Arc<AppState>>,
     IdPath(id): IdPath<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let group = state
-        .queue_manager
-        .with_db(|db| db.group_get(id))
-        .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found("Group not found"))?;
+    let group = db_blocking(&state, move |db| db.group_get(id))
+        .await?
+        .ok_or_else(|| ApiError::from(anyhow::anyhow!("Group not found")))?;
     Ok(Json(serde_json::to_value(group).map_err(|e| {
         ApiError::from(anyhow::anyhow!("Serialisation error: {e}"))
     })?))
@@ -205,18 +230,15 @@ pub async fn h_group_status(
     State(state): State<Arc<AppState>>,
     IdPath(id): IdPath<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let qm = &state.queue_manager;
-    let group = qm
-        .with_db(|db| db.group_get(id))
-        .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found("Group not found"))?;
-
-    let total_headers = qm
-        .with_db(|db| db.header_count(id, None))
-        .map_err(ApiError::from)?;
-    let unread = qm
-        .with_db(|db| db.header_unread_count(id))
-        .map_err(ApiError::from)?;
+    let (group, total_headers, unread) = db_blocking(&state, move |db| {
+        Ok((
+            db.group_get(id)?,
+            db.header_count(id, None)?,
+            db.header_unread_count(id)?,
+        ))
+    })
+    .await?;
+    let group = group.ok_or_else(|| ApiError::from(anyhow::anyhow!("Group not found")))?;
     let new_available = (group.last_article - group.last_scanned).max(0);
 
     Ok(Json(serde_json::json!({
@@ -257,16 +279,17 @@ pub async fn h_header_list(
     IdPath(group_id): IdPath<i64>,
     Query(q): Query<HeaderListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let limit = q.limit.unwrap_or(50);
+    let limit = page_limit(q.limit, 50);
     let offset = q.offset.unwrap_or(0);
-    let qm = &state.queue_manager;
 
-    let headers = qm
-        .with_db(|db| db.header_list(group_id, q.search.as_deref(), limit, offset))
-        .map_err(ApiError::from)?;
-    let total = qm
-        .with_db(|db| db.header_count(group_id, q.search.as_deref()))
-        .map_err(ApiError::from)?;
+    let (headers, total) = db_blocking(&state, move |db| {
+        let search = q.search.as_deref();
+        Ok((
+            db.header_list(group_id, search, limit, offset)?,
+            db.header_count(group_id, search)?,
+        ))
+    })
+    .await?;
 
     Ok(Json(serde_json::json!({
         "headers": headers, "total": total, "limit": limit, "offset": offset,
@@ -504,13 +527,13 @@ pub async fn h_thread_list(
     IdPath(group_id): IdPath<i64>,
     Query(q): Query<HeaderListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let limit = q.limit.unwrap_or(50);
+    let limit = page_limit(q.limit, 50);
     let offset = q.offset.unwrap_or(0);
 
-    let (threads, total) = state
-        .queue_manager
-        .with_db(|db| db.header_list_threads(group_id, limit, offset))
-        .map_err(ApiError::from)?;
+    let (threads, total) = db_blocking(&state, move |db| {
+        db.header_list_threads(group_id, limit, offset)
+    })
+    .await?;
 
     Ok(Json(serde_json::json!({
         "threads": threads, "total": total, "limit": limit, "offset": offset,
@@ -522,10 +545,8 @@ pub async fn h_thread_get(
     State(state): State<Arc<AppState>>,
     IdPath((group_id, root_msg_id)): IdPath<(i64, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let articles = state
-        .queue_manager
-        .with_db(|db| db.header_get_thread(group_id, &root_msg_id))
-        .map_err(ApiError::from)?;
+    let root = root_msg_id.clone();
+    let articles = db_blocking(&state, move |db| db.header_get_thread(group_id, &root)).await?;
 
     Ok(Json(serde_json::json!({
         "root_message_id": root_msg_id, "articles": articles,
@@ -550,10 +571,7 @@ pub async fn h_header_mark_all_read(
     State(state): State<Arc<AppState>>,
     IdPath(group_id): IdPath<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let count = state
-        .queue_manager
-        .with_db(|db| db.header_mark_all_read(group_id))
-        .map_err(ApiError::from)?;
+    let count = db_blocking(&state, move |db| db.header_mark_all_read(group_id)).await?;
     Ok(Json(serde_json::json!({ "marked": count })))
 }
 
