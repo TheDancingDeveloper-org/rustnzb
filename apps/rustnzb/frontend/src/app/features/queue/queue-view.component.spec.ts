@@ -265,6 +265,71 @@ describe('QueueViewComponent', () => {
     expect(snackBar.open).toHaveBeenCalledWith('Job paused', 'Close', { duration: 2500 });
   });
 
+  describe('queue poll sequencing (BUG-126)', () => {
+    /** /queue responses are held until the test flushes them, in any order. */
+    function controlledQueue(overrides: Partial<ApiStub> = {}) {
+      const pending: Subject<unknown>[] = [];
+      const ctx = makeComponent({
+        get: vi.fn((path: string) => {
+          if (path !== '/queue') return of({});
+          const response = new Subject<unknown>();
+          pending.push(response);
+          return response.asObservable();
+        }),
+        ...overrides,
+      });
+      const respond = (index: number, jobs: NzbJob[]) => {
+        pending[index].next({ jobs, total: jobs.length, speed_bps: 0, paused: false });
+        pending[index].complete();
+      };
+      return { ...ctx, pending, respond };
+    }
+    const ids = (component: QueueViewComponent) => component.jobs().map((job) => job.id);
+
+    it('drops a poll that started before a delete finished', () => {
+      const { component, respond } = controlledQueue();
+      const [one, two] = [makeJob({ id: 'job-1' }), makeJob({ id: 'job-2' })];
+      component.jobs.set([one, two]);
+
+      component.loadQueue(); // #0: poll in flight while the delete runs
+      component.deleteJob(one); // delete succeeds → reload #1
+      respond(1, [two]);
+      respond(0, [one, two]); // stale: must not resurrect job-1
+
+      expect(ids(component)).toEqual(['job-2']);
+    });
+
+    it('keeps the optimistic order while a reorder is in flight and after it lands', () => {
+      const move = new Subject<unknown>();
+      const { component, respond } = controlledQueue({ post: vi.fn(() => move.asObservable()) });
+      const jobs = ['job-1', 'job-2', 'job-3'].map((id) => makeJob({ id }));
+      component.jobs.set(jobs);
+      component.draggingJobId.set('job-1');
+      component.dropAfterTarget.set(true);
+
+      component.loadQueue(); // #0 started before the drop
+      component.onRowDrop({ preventDefault: vi.fn() } as unknown as DragEvent, 'job-2');
+      component.loadQueue(); // #1 started while the move is pending
+      respond(0, jobs);
+      respond(1, jobs);
+      expect(ids(component)).toEqual(['job-2', 'job-1', 'job-3']);
+
+      move.next({});
+      move.complete(); // → reload #2
+      respond(2, [jobs[1], jobs[0], jobs[2]]);
+      expect(ids(component)).toEqual(['job-2', 'job-1', 'job-3']);
+    });
+
+    it('ignores a poll response that arrives after a newer one', () => {
+      const { component, respond } = controlledQueue();
+      component.loadQueue();
+      component.loadQueue();
+      respond(1, [makeJob({ id: 'new' })]);
+      respond(0, [makeJob({ id: 'old' })]);
+      expect(ids(component)).toEqual(['new']);
+    });
+  });
+
   it('shows active download states as paused while global pause is active', () => {
     const { component } = makeComponent();
     component.paused.set(true);

@@ -1139,6 +1139,10 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   }
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private queueRequestSeq = 0;
+  // Polls started before this sequence finished must not apply their response:
+  // a snapshot taken mid-reorder/delete would resurrect rows (BUG-126).
+  private queueStaleThrough = 0;
   private connectionHoldTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly connectionHold = new Map<string, { count: number; expiresAt: number }>();
   connectionClock = signal(Date.now());
@@ -1183,7 +1187,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       }
     });
     this.loadAll();
-    this.pollTimer = setInterval(() => this.loadQueue(), 2000);
+    this.pollTimer = setInterval(() => this.fetchQueue(false), 2000);
     this.toggleSub = this.addNzbService.panelToggle$.subscribe(() => {
       this.showAddPanel = !this.showAddPanel;
     });
@@ -1203,8 +1207,23 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   }
 
   loadQueue(): void {
+    this.fetchQueue(true);
+    this.api.get<StatusResponse>('/status').subscribe({
+      next: (s) => {
+        this.status.set(s);
+        this.updateConnectionHold(s.nntp_connections ?? [], Date.now());
+      },
+      error: () => {},
+    });
+  }
+
+  private fetchQueue(supersedeInFlight: boolean): void {
+    const seq = ++this.queueRequestSeq;
+    if (supersedeInFlight) this.queueStaleThrough = seq - 1;
     this.api.get<QueueResponse>('/queue').subscribe({
       next: (r) => {
+        if (seq <= this.queueStaleThrough || this.reorderPending()) return;
+        this.queueStaleThrough = seq;
         this.jobs.set(r.jobs);
         this.paused.set(r.paused);
         this.pauseReason.set(r.pause_reason ?? null);
@@ -1220,13 +1239,6 @@ export class QueueViewComponent implements OnInit, OnDestroy {
         this.loading.set(false);
       },
       error: () => this.loading.set(false),
-    });
-    this.api.get<StatusResponse>('/status').subscribe({
-      next: (s) => {
-        this.status.set(s);
-        this.updateConnectionHold(s.nntp_connections ?? [], Date.now());
-      },
-      error: () => {},
     });
   }
 
