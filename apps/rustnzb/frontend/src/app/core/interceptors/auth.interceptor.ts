@@ -8,6 +8,21 @@ function withToken<T>(req: HttpRequest<T>, token: string): HttpRequest<T> {
   return req.clone({ setHeaders: { Authorization: `Bearer ${token}` } });
 }
 
+/**
+ * The WebDAV mount (`/dav`, not `/api/dav/...`). It accepts the session token
+ * but sits outside the API's refresh flow, so a 401 there must never rotate
+ * the single-use refresh token or bounce the user to the login page.
+ */
+function isWebDavRequest(url: string): boolean {
+  let path: string;
+  try {
+    path = new URL(url, window.location.origin).pathname;
+  } catch {
+    return false;
+  }
+  return path === '/dav' || path.startsWith('/dav/');
+}
+
 export const authInterceptor: HttpInterceptorFn = (req, next) => {
   // Don't intercept auth endpoints
   if (req.url.includes('/api/auth/')) {
@@ -24,7 +39,7 @@ export const authInterceptor: HttpInterceptorFn = (req, next) => {
 
   return next(req).pipe(
     catchError((error: HttpErrorResponse) => {
-      if (error.status !== 401) {
+      if (error.status !== 401 || isWebDavRequest(req.url)) {
         return throwError(() => error);
       }
 

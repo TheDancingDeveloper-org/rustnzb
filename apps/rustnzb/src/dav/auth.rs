@@ -5,6 +5,8 @@
 //!
 //! - `X-Api-Key: <key>` header matching `dav.api_key`, OR
 //! - HTTP Basic auth matching `dav.username` + `dav.password`.
+//! - `Authorization: Bearer <token>` carrying a valid web UI session token
+//!   (lets the Media page browse /dav with the session it already has).
 //!
 //! When **all three** fields are unset, requests pass through unauthenticated
 //! (a warning is logged at startup so the operator notices).
@@ -41,6 +43,23 @@ pub async fn dav_auth(
         && constant_time_eq(provided.as_bytes(), expected.as_bytes())
     {
         return next.run(request).await;
+    }
+
+    // Web UI session token. A presented-but-invalid Bearer token is rejected
+    // without a Basic challenge so the browser never pops a password prompt.
+    if let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+    {
+        if state.token_store.validate_access_token(token) {
+            return next.run(request).await;
+        }
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::WWW_AUTHENTICATE, "Bearer realm=\"rustnzb DAV\"")
+            .body(Body::empty())
+            .unwrap();
     }
 
     // Basic auth
