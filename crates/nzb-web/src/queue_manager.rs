@@ -239,6 +239,9 @@ fn retry_checkpoint_work_dir(retry_data: &[u8]) -> Option<std::path::PathBuf> {
         .work_dir
 }
 
+/// Per-server totals. The `today_*`, `week_*` and `month_*` fields are rolling
+/// windows (the last 24 hours, 7 days and 30 days before the request), not
+/// calendar periods; the UI labels them "24 hours", "7 days" and "30 days".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStatsData {
     pub server_id: String,
@@ -283,10 +286,15 @@ pub struct DailyStatisticsData {
 pub struct GlobalStatisticsData {
     pub generated_at: DateTime<Utc>,
     pub lifetime: StatisticsPeriodData,
+    /// Rolling last 24 hours before `generated_at` -- not the current
+    /// calendar day, so it need not equal today's `daily` bucket.
     pub today: StatisticsPeriodData,
+    /// Rolling last 7 days before `generated_at`.
     pub week: StatisticsPeriodData,
+    /// Rolling last 30 days before `generated_at`.
     pub month: StatisticsPeriodData,
     pub servers: Vec<ServerStatsData>,
+    /// Per-day buckets keyed by UTC calendar date (`YYYY-MM-DD`).
     pub daily: Vec<DailyStatisticsData>,
 }
 
