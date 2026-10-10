@@ -1,7 +1,7 @@
 import '@angular/compiler';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { of } from 'rxjs';
+import { firstValueFrom, of } from 'rxjs';
 
 import { ApiService } from '../../core/services/api.service';
 import { HistoryEntry } from '../../core/models/queue.model';
@@ -64,41 +64,130 @@ describe('HistoryViewComponent', () => {
     component.ngOnDestroy();
   });
 
-  it('combines name, status, category, and time filters', () => {
-    component.entries.set([
-      entry(),
-      entry({ id: '2', name: 'Release.Failed', category: 'tv', status: 'failed' }),
-      entry({ id: '3', name: 'Ancient.Release', completed_at: '2025-01-01T00:00:00Z' }),
-    ]);
-    component.nameFilter = 'failed';
-    component.filterStatus = 'failed';
-    component.filterCategory = 'tv';
-    expect(component.filteredEntries().map((item) => item.id)).toEqual(['2']);
+  function historyCalls() {
+    return api.get.mock.calls.filter(([path]) => path === '/history');
+  }
+
+  it('requests one page with the default 7-day window', () => {
+    component.load();
+    expect(api.get).toHaveBeenCalledWith('/history', { offset: '0', limit: '50', days: '7' });
   });
 
-  it('derives sorted unique category options', () => {
-    component.entries.set([
-      entry({ category: 'tv' }),
-      entry({ id: '2', category: 'movies' }),
-      entry({ id: '3', category: 'tv' }),
-      entry({ id: '4', category: '' }),
-    ]);
+  it('sends name, status, category, and time filters to the server and resets to page one', () => {
+    component.offset.set(100);
+    component.nameFilter = ' failed ';
+    component.filterStatus = 'failed';
+    component.filterCategory = 'tv';
+    component.filterTime = 'all';
+    component.onFiltersChanged();
+    expect(component.offset()).toBe(0);
+    expect(historyCalls().at(-1)?.[1]).toEqual({
+      offset: '0',
+      limit: '50',
+      status: 'failed',
+      category: 'tv',
+      search: 'failed',
+    });
+  });
+
+  it('pages through the full history using the server total', () => {
+    api.get.mockImplementation((path: string) =>
+      of(path === '/history' ? { entries: [entry()], total: 120, offset: 0, limit: 50 } : {}),
+    );
+    component.load();
+    expect(component.total()).toBe(120);
+    expect(component.rangeLabel()).toBe('1–50 of 120');
+    expect(component.hasPrev()).toBe(false);
+    expect(component.hasNext()).toBe(true);
+
+    component.nextPage();
+    expect(component.offset()).toBe(50);
+    expect(historyCalls().at(-1)?.[1]).toMatchObject({ offset: '50', limit: '50' });
+    component.nextPage();
+    expect(component.offset()).toBe(100);
+    expect(component.rangeLabel()).toBe('101–120 of 120');
+    expect(component.hasNext()).toBe(false);
+    component.nextPage();
+    expect(component.offset()).toBe(100);
+
+    component.prevPage();
+    expect(component.offset()).toBe(50);
+  });
+
+  it('steps back to the last page when the current page disappears', () => {
+    api.get.mockImplementation((path: string, params?: Record<string, string>) =>
+      of(path === '/history'
+        ? { entries: params?.['offset'] === '50' ? [entry()] : [], total: 51 }
+        : {}),
+    );
+    component.offset.set(100);
+    component.load();
+    expect(component.offset()).toBe(50);
+    expect(component.entries()).toHaveLength(1);
+  });
+
+  it('takes category options from the server rather than the visible page', () => {
+    api.get.mockImplementation((path: string) =>
+      of(path === '/history'
+        ? { entries: [entry({ category: 'tv' })], total: 1, categories: ['movies', 'tv'] }
+        : {}),
+    );
+    component.load();
     expect(component.categoryOptions()).toEqual(['movies', 'tv']);
   });
 
-  it('computes success statistics and failure summaries', () => {
-    component.entries.set([
-      entry(),
-      entry({ id: '2', total_bytes: 3072 }),
-      entry({ id: '3', status: 'failed', error_message: 'CRC mismatch: bad block' }),
-    ]);
+  it('shows server-computed statistics for the whole window', () => {
+    api.get.mockImplementation((path: string) =>
+      of(path === '/history'
+        ? {
+            entries: [entry()],
+            total: 300,
+            stats: {
+              completed: 200,
+              completed_bytes: 4096,
+              failed: 100,
+              success_pct: 67,
+              avg_duration_secs: 90,
+              fail_reasons: [{ reason: 'CRC mismatch', count: 60 }, { reason: 'Aborted', count: 40 }],
+            },
+          }
+        : {}),
+    );
+    component.load();
     expect(component.statCards()).toMatchObject({
-      completed: 2,
+      completed: 200,
       completedBytes: 4096,
-      failed: 1,
-      failReasons: '1 CRC mismatch',
+      failed: 100,
+      failReasons: '60 CRC mismatch · 40 Aborted',
       successPct: 67,
+      avgDurationLabel: '1m 30s',
     });
+  });
+
+  it('tolerates a server response without totals or stats', () => {
+    api.get.mockImplementation((path: string) =>
+      of(path === '/history' ? { entries: [entry(), entry({ id: '2', category: 'tv' })] } : {}),
+    );
+    component.load();
+    expect(component.total()).toBe(2);
+    expect(component.categoryOptions()).toEqual(['movies', 'tv']);
+    expect(component.statCards()).toMatchObject({ completed: 0, failed: 0, failReasons: 'none' });
+  });
+
+  it('exports every matching entry, not just the visible page', async () => {
+    const all = Array.from({ length: 450 }, (_, i) => entry({ id: `e${i}`, name: `Release.${i}` }));
+    api.get.mockImplementation((path: string, params?: Record<string, string>) => {
+      const offset = Number(params?.['offset'] ?? 0);
+      const limit = Number(params?.['limit'] ?? 50);
+      return of(path === '/history'
+        ? { entries: all.slice(offset, offset + limit), total: all.length }
+        : {});
+    });
+    component.filterStatus = 'completed';
+    const exported = await firstValueFrom(component.fetchAllMatching());
+    expect(exported).toHaveLength(450);
+    expect(historyCalls().every(([, params]) => params.status === 'completed')).toBe(true);
+    expect(historyCalls().length).toBeLessThanOrEqual(3);
   });
 
   it('retries, removes, and queues media through the expected routes', () => {

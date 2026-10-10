@@ -70,7 +70,18 @@ pub struct QueueQuery {
 
 #[derive(Deserialize, Default)]
 pub struct HistoryQuery {
+    /// Page size (default 50).
     pub limit: Option<usize>,
+    /// Number of matching entries to skip (default 0).
+    pub offset: Option<usize>,
+    /// Only `completed` or `failed` entries.
+    pub status: Option<String>,
+    /// Only entries in this category.
+    pub category: Option<String>,
+    /// Case-insensitive substring of the job name.
+    pub search: Option<String>,
+    /// Only entries completed within the last N days. Also bounds `stats`.
+    pub days: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -157,7 +168,80 @@ pub struct QueueJob {
 #[derive(Serialize)]
 pub struct HistoryResponse {
     pub entries: Vec<HistoryResponseEntry>,
+    /// Number of entries matching the filters (across all pages).
     pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+    /// Every category present in history, sorted.
+    pub categories: Vec<String>,
+    /// Aggregates over the `days` window (ignores status/category/search).
+    pub stats: HistoryStats,
+}
+
+#[derive(Serialize, Default)]
+pub struct HistoryStats {
+    pub completed: usize,
+    pub completed_bytes: u64,
+    pub failed: usize,
+    /// Completed share of completed + failed, rounded to a whole percent.
+    pub success_pct: u32,
+    /// Mean wall-clock time from add to completion of completed jobs.
+    pub avg_duration_secs: Option<f64>,
+    /// The two most common failure reasons.
+    pub fail_reasons: Vec<HistoryFailReason>,
+}
+
+#[derive(Serialize)]
+pub struct HistoryFailReason {
+    pub reason: String,
+    pub count: usize,
+}
+
+impl HistoryStats {
+    fn from_entries<'a>(entries: impl Iterator<Item = &'a HistoryEntry>) -> Self {
+        let mut stats = Self::default();
+        let mut duration_total = 0.0;
+        let mut reasons: Vec<HistoryFailReason> = Vec::new();
+        for e in entries {
+            match e.status {
+                JobStatus::Completed => {
+                    stats.completed += 1;
+                    stats.completed_bytes += e.total_bytes;
+                    duration_total +=
+                        (e.completed_at - e.added_at).num_milliseconds() as f64 / 1000.0;
+                }
+                JobStatus::Failed => {
+                    stats.failed += 1;
+                    // First clause of the message, as a short grouping key.
+                    let msg = e.error_message.as_deref().unwrap_or("unknown");
+                    let reason: String = msg
+                        .split(['.', ':'])
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(32)
+                        .collect();
+                    match reasons.iter_mut().find(|r| r.reason == reason) {
+                        Some(r) => r.count += 1,
+                        None => reasons.push(HistoryFailReason { reason, count: 1 }),
+                    }
+                }
+                _ => {}
+            }
+        }
+        let finished = stats.completed + stats.failed;
+        if finished > 0 {
+            stats.success_pct = ((stats.completed as f64 / finished as f64) * 100.0).round() as u32;
+        }
+        if stats.completed > 0 {
+            stats.avg_duration_secs = Some(duration_total / stats.completed as f64);
+        }
+        // Stable sort keeps first-seen order among equal counts.
+        reasons.sort_by_key(|r| std::cmp::Reverse(r.count));
+        reasons.truncate(2);
+        stats.fail_reasons = reasons;
+        stats
+    }
 }
 
 #[derive(Serialize)]
@@ -790,13 +874,62 @@ pub async fn h_history_list(
     Query(q): Query<HistoryQuery>,
 ) -> Result<Json<HistoryResponse>, ApiError> {
     let limit = q.limit.unwrap_or(50);
-    let entries = state
+    let offset = q.offset.unwrap_or(0);
+    // Filtering, totals and stats need the whole history (newest first), as
+    // the SABnzbd history endpoint already does.
+    let all = state
         .queue_manager
-        .history_list(limit)
+        .history_list(i64::MAX as usize)
         .map_err(ApiError::from)?;
-    let total = entries.len();
-    let entries: Vec<HistoryResponseEntry> = entries.into_iter().map(Into::into).collect();
-    Ok(Json(HistoryResponse { entries, total }))
+
+    let mut categories: Vec<String> = all
+        .iter()
+        .filter(|e| !e.category.is_empty())
+        .map(|e| e.category.clone())
+        .collect();
+    categories.sort();
+    categories.dedup();
+
+    let cutoff = q
+        .days
+        .map(|d| chrono::Utc::now() - chrono::Duration::days(i64::from(d)));
+    let in_window = |e: &&HistoryEntry| cutoff.is_none_or(|c| e.completed_at >= c);
+    let stats = HistoryStats::from_entries(all.iter().filter(in_window));
+
+    let status = q.status.as_deref().filter(|s| !s.is_empty() && *s != "all");
+    let category = q.category.as_deref().filter(|c| !c.is_empty());
+    let search = q
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase);
+    let matching: Vec<HistoryEntry> = all
+        .into_iter()
+        .filter(|e| in_window(&e))
+        .filter(|e| status.is_none_or(|s| e.status.to_string().eq_ignore_ascii_case(s)))
+        .filter(|e| category.is_none_or(|c| e.category == c))
+        .filter(|e| {
+            search
+                .as_deref()
+                .is_none_or(|s| e.name.to_lowercase().contains(s))
+        })
+        .collect();
+    let total = matching.len();
+    let entries: Vec<HistoryResponseEntry> = matching
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(Into::into)
+        .collect();
+    Ok(Json(HistoryResponse {
+        entries,
+        total,
+        offset,
+        limit,
+        categories,
+        stats,
+    }))
 }
 
 /// GET /api/history/{id} -- Detailed information for one completed/failed job.

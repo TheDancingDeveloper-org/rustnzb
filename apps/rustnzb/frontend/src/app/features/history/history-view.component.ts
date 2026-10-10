@@ -1,4 +1,5 @@
 import { Component, OnInit, OnDestroy, signal, computed } from '@angular/core';
+import { EMPTY, Observable, expand, map, reduce } from 'rxjs';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
@@ -10,6 +11,27 @@ import { showHttpError } from '../../core/http/http-error';
 
 type StatusFilter = 'all' | 'completed' | 'failed';
 type TimeFilter = '7d' | '30d' | 'all';
+
+/** Aggregates the server computes over the whole time window. */
+interface HistoryStats {
+  completed: number;
+  completed_bytes: number;
+  failed: number;
+  success_pct: number;
+  avg_duration_secs: number | null;
+  fail_reasons: { reason: string; count: number }[];
+}
+
+interface HistoryPage {
+  entries: HistoryEntry[];
+  /** Entries matching the filters across all pages. */
+  total?: number;
+  categories?: string[];
+  stats?: HistoryStats;
+}
+
+const PAGE_SIZE = 50;
+const EXPORT_PAGE_SIZE = 200;
 
 @Component({
   selector: 'app-history-view',
@@ -44,27 +66,29 @@ type TimeFilter = '7d' | '30d' | 'all';
     <!-- History panel -->
     <div class="panel">
       <h3>History
-        <span class="hint">{{ filteredEntries().length }} of {{ entries().length }} shown</span>
+        <span class="hint">{{ rangeLabel() }}</span>
       </h3>
       <div class="body">
         <div class="search-bar">
-          <input placeholder="Filter name…" [(ngModel)]="nameFilter" />
-          <select [(ngModel)]="filterStatus">
+          <input placeholder="Filter name…" [(ngModel)]="nameFilter" (ngModelChange)="onNameFilterChanged()" />
+          <select [(ngModel)]="filterStatus" (ngModelChange)="onFiltersChanged()">
             <option value="all">All statuses</option>
             <option value="completed">Completed</option>
             <option value="failed">Failed</option>
           </select>
-          <select [(ngModel)]="filterCategory">
+          <select [(ngModel)]="filterCategory" (ngModelChange)="onFiltersChanged()">
             <option value="">All categories</option>
             @for (cat of categoryOptions(); track cat) { <option [value]="cat">{{ cat }}</option> }
           </select>
-          <select [(ngModel)]="filterTime">
+          <select [(ngModel)]="filterTime" (ngModelChange)="onFiltersChanged()">
             <option value="7d">Last 7 days</option>
             <option value="30d">Last 30 days</option>
             <option value="all">All time</option>
           </select>
-          <button class="btn ghost" (click)="exportCsv()">Export CSV</button>
-          @if (entries().length > 0) {
+          <button class="btn ghost" (click)="exportCsv()" [disabled]="exporting()" title="Exports every entry matching the filters">
+            {{ exporting() ? 'Exporting…' : 'Export CSV' }}
+          </button>
+          @if (total() > 0) {
             <button class="btn danger" (click)="clearAll()">Clear all</button>
           }
         </div>
@@ -203,10 +227,12 @@ type TimeFilter = '7d' | '30d' | 'all';
             } @else if (filteredEntries().length === 0) {
               <tr>
                 <td colspan="8" class="empty-cell">
-                  @if (entries().length === 0) {
+                  @if (narrowingFilters()) {
+                    No entries match the current filter.
+                  } @else if (filterTime === 'all') {
                     No download history yet. Finished jobs will show up here.
                   } @else {
-                    No entries match the current filter.
+                    No downloads finished in the last {{ statCards().windowLabel }}.
                   }
                 </td>
               </tr>
@@ -214,6 +240,13 @@ type TimeFilter = '7d' | '30d' | 'all';
           </tbody>
         </table>
       </div>
+      @if (hasPrev() || hasNext()) {
+        <div class="pager">
+          <button class="btn ghost" (click)="prevPage()" [disabled]="!hasPrev()">‹ Newer</button>
+          <span class="hint">{{ rangeLabel() }}</span>
+          <button class="btn ghost" (click)="nextPage()" [disabled]="!hasNext()">Older ›</button>
+        </div>
+      }
     </div>
   `,
   styles: [`
@@ -241,6 +274,10 @@ type TimeFilter = '7d' | '30d' | 'all';
       align-items: center;
       justify-content: flex-end;
       gap: 2px;
+    }
+    .pager {
+      display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+      padding: 10px 14px; border-top: 1px solid var(--line);
     }
     .history-row { cursor: pointer; }
     .history-row:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
@@ -271,7 +308,17 @@ type TimeFilter = '7d' | '30d' | 'all';
 })
 export class HistoryViewComponent implements OnInit, OnDestroy {
   loading = signal(true);
+  /** The current page of entries, already filtered by the server. */
   entries = signal<HistoryEntry[]>([]);
+  /** Entries matching the filters across all pages. */
+  total = signal(0);
+  offset = signal(0);
+  readonly pageSize = PAGE_SIZE;
+  exporting = signal(false);
+  private categories = signal<string[] | null>(null);
+  private stats = signal<HistoryStats | null>(null);
+  private loadSeq = 0;
+  private nameDebounce: ReturnType<typeof setTimeout> | null = null;
   selectedId = signal<string | null>(null);
   selectedEntry = signal<HistoryEntry | null>(null);
   detailLoading = signal(false);
@@ -300,13 +347,87 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.nameDebounce) clearTimeout(this.nameDebounce);
+  }
+
+  /** Query parameters for the active filters (shared by paging and export). */
+  private filterParams(): Record<string, string> {
+    const params: Record<string, string> = {};
+    if (this.filterStatus !== 'all') params['status'] = this.filterStatus;
+    if (this.filterCategory) params['category'] = this.filterCategory;
+    const name = this.nameFilter.trim();
+    if (name) params['search'] = name;
+    if (this.filterTime !== 'all') params['days'] = this.filterTime === '7d' ? '7' : '30';
+    return params;
   }
 
   load(): void {
-    this.api.get<{ entries: HistoryEntry[] }>('/history').subscribe({
-      next: r => { this.entries.set(r.entries || []); this.loading.set(false); },
+    const seq = ++this.loadSeq;
+    const params = { offset: String(this.offset()), limit: String(PAGE_SIZE), ...this.filterParams() };
+    this.api.get<HistoryPage>('/history', params).subscribe({
+      next: r => {
+        // A slower response for superseded filters/page must not win.
+        if (seq !== this.loadSeq) return;
+        const entries = r.entries || [];
+        const total = r.total ?? entries.length;
+        // The page we were on vanished (deletes, retention): go to the last one.
+        if (entries.length === 0 && this.offset() > 0 && this.offset() >= total) {
+          this.offset.set(Math.max(0, Math.ceil(total / PAGE_SIZE) - 1) * PAGE_SIZE);
+          this.load();
+          return;
+        }
+        this.entries.set(entries);
+        this.total.set(total);
+        this.categories.set(r.categories ?? null);
+        this.stats.set(r.stats ?? null);
+        this.loading.set(false);
+      },
       error: () => this.loading.set(false),
     });
+  }
+
+  onFiltersChanged(): void {
+    this.offset.set(0);
+    this.closeDetails();
+    this.load();
+  }
+
+  onNameFilterChanged(): void {
+    if (this.nameDebounce) clearTimeout(this.nameDebounce);
+    this.nameDebounce = setTimeout(() => this.onFiltersChanged(), 250);
+  }
+
+  hasPrev(): boolean {
+    return this.offset() > 0;
+  }
+
+  hasNext(): boolean {
+    return this.offset() + PAGE_SIZE < this.total();
+  }
+
+  prevPage(): void {
+    if (!this.hasPrev()) return;
+    this.offset.set(Math.max(0, this.offset() - PAGE_SIZE));
+    this.load();
+  }
+
+  nextPage(): void {
+    if (!this.hasNext()) return;
+    this.offset.set(this.offset() + PAGE_SIZE);
+    this.load();
+  }
+
+  rangeLabel(): string {
+    const total = this.total();
+    if (total === 0) return '0 of 0';
+    const start = Math.min(this.offset() + 1, total);
+    const end = Math.min(this.offset() + PAGE_SIZE, total);
+    return `${start}–${end} of ${total}`;
+  }
+
+  /** Filters other than the time window are narrowing the list. */
+  narrowingFilters(): boolean {
+    return this.filterStatus !== 'all' || !!this.filterCategory || !!this.nameFilter.trim();
   }
 
   selectEntry(entry: HistoryEntry): void {
@@ -332,78 +453,39 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
     this.detailLoading.set(false);
   }
 
-  categoryOptions = computed(() =>
-    Array.from(new Set(this.entries().map(e => e.category).filter(c => !!c))).sort()
+  /** All categories in history (server-provided), not just the visible page. */
+  categoryOptions = computed(
+    () =>
+      this.categories() ??
+      Array.from(new Set(this.entries().map(e => e.category).filter(c => !!c))).sort(),
   );
 
-  /**
-   * Returns entries filtered by *all* active filters. Not memoized as a
-   * signal because it depends on plain fields (ngModel) that don't trigger
-   * signal recomputation — the template re-renders on change detection
-   * anyway.
-   */
+  /** The current page; filtering happens server-side. */
   filteredEntries(): HistoryEntry[] {
-    const cutoff = this.timeCutoffMs();
-    const name = this.nameFilter.trim().toLowerCase();
-    return this.entries().filter(e => {
-      if (this.filterStatus !== 'all' && e.status !== this.filterStatus) return false;
-      if (this.filterCategory && e.category !== this.filterCategory) return false;
-      if (cutoff > 0 && new Date(e.completed_at).getTime() < cutoff) return false;
-      if (name && !e.name.toLowerCase().includes(name)) return false;
-      return true;
-    });
-  }
-
-  private timeCutoffMs(): number {
-    if (this.filterTime === 'all') return 0;
-    const now = Date.now();
-    const days = this.filterTime === '7d' ? 7 : 30;
-    return now - days * 86400_000;
+    return this.entries();
   }
 
   /**
-   * Computed aggregate for the 4 stat cards at the top. Uses the time
-   * window filter (but ignores the status filter) so the success-rate
-   * card remains meaningful when the user filters to just failures.
+   * The 4 stat cards at the top. The server computes them over the whole
+   * time window (ignoring the status/category/name filters) so the
+   * success-rate card stays meaningful when the user filters to failures.
    */
   statCards = computed(() => {
-    const cutoff = this.timeCutoffMs();
-    const inWindow = this.entries().filter(e =>
-      cutoff === 0 || new Date(e.completed_at).getTime() >= cutoff
-    );
-    const completed = inWindow.filter(e => e.status === 'completed');
-    const failed = inWindow.filter(e => e.status === 'failed');
-    const completedBytes = completed.reduce((n, e) => n + e.total_bytes, 0);
-    const total = inWindow.length;
-    const successPct = total === 0 ? 0 : Math.round((completed.length / total) * 100);
-
-    let avgDurationLabel = '—';
-    if (completed.length > 0) {
-      const total = completed.reduce((n, e) => {
-        return n + (new Date(e.completed_at).getTime() - new Date(e.added_at).getTime());
-      }, 0);
-      avgDurationLabel = this.formatShortDuration(total / completed.length / 1000);
-    }
-
-    const reasonCounts = new Map<string, number>();
-    for (const f of failed) {
-      const reason = (f.error_message || 'unknown').split(/[.:]/)[0].slice(0, 32);
-      reasonCounts.set(reason, (reasonCounts.get(reason) || 0) + 1);
-    }
-    const topReasons = [...reasonCounts.entries()]
-      .sort((a, b) => b[1] - a[1])
+    const st = this.stats();
+    const failed = st?.failed ?? 0;
+    const topReasons = (st?.fail_reasons ?? [])
       .slice(0, 2)
-      .map(([r, n]) => `${n} ${r}`)
-      .join(' · ') || 'none';
-
+      .map(r => `${r.count} ${r.reason}`)
+      .join(' · ');
     return {
       windowLabel: this.filterTime === 'all' ? 'all time' : this.filterTime === '7d' ? '7 days' : '30 days',
-      completed: completed.length,
-      completedBytes,
-      failed: failed.length,
-      failReasons: failed.length === 0 ? 'none' : topReasons,
-      successPct,
-      avgDurationLabel,
+      completed: st?.completed ?? 0,
+      completedBytes: st?.completed_bytes ?? 0,
+      failed,
+      failReasons: failed === 0 || !topReasons ? 'none' : topReasons,
+      successPct: st?.success_pct ?? 0,
+      avgDurationLabel:
+        st?.avg_duration_secs != null ? this.formatShortDuration(st.avg_duration_secs) : '—',
     };
   });
 
@@ -456,9 +538,40 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
     this.snack.open(e.output_dir || '(no output path recorded)', 'Close', { duration: 5000 });
   }
 
+  /** Every entry matching the current filters, fetched page by page. */
+  fetchAllMatching(): Observable<HistoryEntry[]> {
+    const filters = this.filterParams();
+    const page = (offset: number) =>
+      this.api
+        .get<HistoryPage>('/history', { offset: String(offset), limit: String(EXPORT_PAGE_SIZE), ...filters })
+        .pipe(map(r => ({ offset, entries: r.entries || [], total: r.total ?? 0 })));
+    return page(0).pipe(
+      expand(p => {
+        const next = p.offset + p.entries.length;
+        return p.entries.length > 0 && next < p.total ? page(next) : EMPTY;
+      }),
+      reduce((all, p) => all.concat(p.entries), [] as HistoryEntry[]),
+    );
+  }
+
   exportCsv(): void {
+    if (this.exporting()) return;
+    this.exporting.set(true);
+    this.fetchAllMatching().subscribe({
+      next: entries => {
+        this.exporting.set(false);
+        this.downloadCsv(entries);
+      },
+      error: () => {
+        this.exporting.set(false);
+        this.snack.open('Failed to export history', 'Close', { duration: 3000 });
+      },
+    });
+  }
+
+  private downloadCsv(entries: HistoryEntry[]): void {
     const rows = [['name', 'category', 'size_bytes', 'average_speed_bps', 'status', 'added_at', 'completed_at', 'error']];
-    for (const e of this.filteredEntries()) {
+    for (const e of entries) {
       rows.push([
         e.name, e.category || '', String(e.total_bytes), String(this.averageSpeed(e)), e.status,
         e.added_at, e.completed_at, e.error_message || '',
