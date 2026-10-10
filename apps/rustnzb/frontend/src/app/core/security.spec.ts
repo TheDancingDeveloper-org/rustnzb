@@ -52,6 +52,7 @@ describe('authInterceptor', () => {
       getAccessToken: vi.fn(() => token),
       refresh: vi.fn(() => refreshResult),
       clearTokens: vi.fn(),
+      discardFailedSession: vi.fn(() => true),
       setToken: (t: string | null) => (token = t),
     };
     const router = { navigate: vi.fn(() => Promise.resolve(true)) };
@@ -154,7 +155,22 @@ describe('authInterceptor', () => {
     await expect(
       firstValueFrom(intercept(new HttpRequest('GET', '/api/queue'), next as HttpHandlerFn)),
     ).rejects.toMatchObject({ status: 403 });
-    expect(auth.clearTokens).toHaveBeenCalledTimes(1);
+    expect(auth.discardFailedSession).toHaveBeenCalledTimes(1);
     expect(router.navigate).toHaveBeenCalledWith(['/login']);
+  });
+
+  it('retries with tokens another tab stored when its own refresh failed (BUG-123)', async () => {
+    const { auth, router } = configure(
+      throwError(() => new HttpErrorResponse({ status: 403 })),
+    );
+    auth.discardFailedSession.mockReturnValue(false);
+    auth.setToken('tab-b-access');
+    const next = vi.fn().mockReturnValueOnce(unauthorized()).mockReturnValueOnce(ok());
+
+    await firstValueFrom(intercept(new HttpRequest('GET', '/api/queue'), next as HttpHandlerFn));
+
+    expect(authHeader(next, 1)).toBe('Bearer tab-b-access');
+    expect(auth.clearTokens).not.toHaveBeenCalled();
+    expect(router.navigate).not.toHaveBeenCalled();
   });
 });
