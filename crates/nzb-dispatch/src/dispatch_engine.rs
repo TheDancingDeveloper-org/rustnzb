@@ -58,6 +58,13 @@ pub trait DispatchEngine: Send + Sync {
     /// Is `job_id` currently known to the dispatcher?
     fn has_job(&self, job_id: &str) -> bool;
 
+    /// Active download time `job_id` has accumulated in this dispatcher,
+    /// excluding pauses, or `None` when the job is not registered. Lets the
+    /// queue checkpoint elapsed time so a restart can carry it forward.
+    fn job_active_secs(&self, _job_id: &str) -> Option<f64> {
+        None
+    }
+
     /// Release a terminal job's dispatcher and assembler resources before
     /// post-processing opens the completed files.
     fn release_completed_job(&self, job_id: &str);
@@ -182,6 +189,10 @@ impl DispatchEngine for DispatchHandle {
 
     fn has_job(&self, job_id: &str) -> bool {
         self.0.has_job(job_id)
+    }
+
+    fn job_active_secs(&self, job_id: &str) -> Option<f64> {
+        self.0.job_active_secs(job_id)
     }
 
     fn release_completed_job(&self, job_id: &str) {

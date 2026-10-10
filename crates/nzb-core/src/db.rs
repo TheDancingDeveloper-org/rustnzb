@@ -777,6 +777,18 @@ impl Database {
 
     /// Move a completed/failed job to history.
     pub fn history_insert(&self, entry: &HistoryEntry) -> Result<(), NzbError> {
+        self.history_insert_with_carried_bytes(entry, 0)
+    }
+
+    /// Move a completed/failed job to history, excluding `carried_bytes`
+    /// from its statistics row. A history retry starts from the failed
+    /// attempt's checkpoint, whose bytes that attempt's own statistics row
+    /// already counts; the history row keeps the job's cumulative total.
+    pub fn history_insert_with_carried_bytes(
+        &self,
+        entry: &HistoryEntry,
+        carried_bytes: u64,
+    ) -> Result<(), NzbError> {
         // Invariant: a Failed row carries exactly one typed failure code, and a
         // non-Failed row carries none. This keeps the terminal history row a
         // trustworthy source of the failure reason.
@@ -819,8 +831,9 @@ impl Database {
                 .max(0) as f64
                 / 1000.0
         });
+        let downloaded_bytes = entry.downloaded_bytes.saturating_sub(carried_bytes);
         let average_speed_bps = if duration_secs > 0.0 {
-            (entry.downloaded_bytes as f64 / duration_secs) as u64
+            (downloaded_bytes as f64 / duration_secs) as u64
         } else {
             0
         };
@@ -834,7 +847,7 @@ impl Database {
                 entry.completed_at.to_rfc3339(),
                 entry.status.to_string(),
                 entry.total_bytes as i64,
-                entry.downloaded_bytes as i64,
+                downloaded_bytes as i64,
                 duration_secs,
                 average_speed_bps as i64,
                 server_stats_json,
@@ -1982,6 +1995,23 @@ mod tests {
         assert_eq!(loaded[0].server_stats.len(), 1);
         assert_eq!(loaded[0].server_stats[0].server_id, "srv-1");
         assert_eq!(loaded[0].server_stats[0].articles_downloaded, 100);
+    }
+
+    #[test]
+    fn test_download_statistics_exclude_carried_bytes() {
+        let db = Database::open_memory().unwrap();
+        let mut entry = make_history("retry-1", "Retried Job");
+        entry.downloaded_bytes = 10_000;
+        entry.download_time_secs = Some(2.0);
+
+        db.history_insert_with_carried_bytes(&entry, 6_000).unwrap();
+
+        // History keeps the job's cumulative progress; the statistics row
+        // counts only what this attempt fetched.
+        assert_eq!(db.history_list(1).unwrap()[0].downloaded_bytes, 10_000);
+        let statistics = db.download_statistics_list().unwrap();
+        assert_eq!(statistics[0].downloaded_bytes, 4_000);
+        assert_eq!(statistics[0].average_speed_bps, 2_000);
     }
 
     #[test]

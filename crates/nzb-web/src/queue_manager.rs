@@ -485,6 +485,17 @@ struct JobCheckpoint {
     /// attempt keeps writing to its own folder instead of reserving another.
     #[serde(default)]
     output_dir: Option<std::path::PathBuf>,
+    /// Active download time accumulated across every engine run of this job,
+    /// so a resumed job's speed covers all of its bytes.
+    #[serde(default)]
+    download_time_secs: f64,
+    /// Bytes a history retry carried in from the failed attempt's
+    /// checkpoint. That attempt's statistics row already counts them.
+    #[serde(default)]
+    carried_bytes: u64,
+    /// Per-server article statistics accumulated so far.
+    #[serde(default)]
+    server_stats: Vec<ServerArticleStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -545,7 +556,18 @@ fn checkpoint_for_job(job: &NzbJob, output_dir_claimed: bool) -> JobCheckpoint {
             .collect(),
         work_dir: Some(job.work_dir.clone()),
         output_dir: output_dir_claimed.then(|| job.output_dir.clone()),
+        download_time_secs: 0.0,
+        carried_bytes: 0,
+        server_stats: job.server_stats.clone(),
     }
+}
+
+/// Restore the download accounting a checkpoint carries across a restart:
+/// per-server statistics into the job, and the accumulated active time and
+/// retry carry-over returned as `(prior_download_secs, carried_bytes)`.
+fn restore_checkpoint_accounting(job: &mut NzbJob, checkpoint: &JobCheckpoint) -> (f64, u64) {
+    job.server_stats = checkpoint.server_stats.clone();
+    (checkpoint.download_time_secs, checkpoint.carried_bytes)
 }
 
 fn apply_checkpoint(job: &mut NzbJob, checkpoint: &JobCheckpoint) {
@@ -1070,8 +1092,15 @@ struct JobState {
     direct_unpacker: Option<DirectUnpacker>,
     /// Hopeless job tracker (None until download starts).
     hopeless_tracker: Option<HopelessTracker>,
-    /// Active worker-pool duration captured at terminal download resolution.
+    /// Active download duration captured at terminal download resolution,
+    /// including `prior_download_secs`.
     download_time_secs: Option<f64>,
+    /// Active download time from engine runs before the current one (a
+    /// restart resumes a job in a fresh engine run).
+    prior_download_secs: f64,
+    /// Bytes this job carried in from a failed attempt's checkpoint when it
+    /// was retried; excluded from this job's statistics row.
+    carried_bytes: u64,
     /// Typed terminal failure code, tracked in memory until it is persisted to
     /// the terminal history row.
     failure_code: Option<JobFailureCode>,
@@ -1766,6 +1795,16 @@ impl QueueManager {
             if let Some(ref data) = nzb_data {
                 let _ = db.queue_store_nzb_data(&job.id, data);
             }
+            // A history retry starts from the failed attempt's checkpoint.
+            // Persist it now so a restart before the first progress write
+            // keeps both the resumed articles and the carried-over bytes.
+            if job.downloaded_bytes > 0 {
+                let mut checkpoint = checkpoint_for_job(&job, false);
+                checkpoint.carried_bytes = job.downloaded_bytes;
+                if let Ok(data) = serde_json::to_vec(&checkpoint) {
+                    let _ = db.queue_store_job_data(&job.id, &data);
+                }
+            }
         }
 
         self.activate_admitted_job(job, nzb_data);
@@ -1847,6 +1886,9 @@ impl QueueManager {
         // A job admitted as Paused (e.g. SABnzbd priority -2) stays paused
         // individually: it must not start, and Resume All must not resume it.
         let requested_paused = job.status == JobStatus::Paused;
+        // Only a history retry is admitted with progress: the bytes it
+        // carries in from the failed attempt's checkpoint.
+        let carried_bytes = job.downloaded_bytes;
 
         // If globally paused, add as paused
         if requested_paused || self.globally_paused.load(Ordering::Relaxed) {
@@ -1859,6 +1901,8 @@ impl QueueManager {
                 direct_unpacker: None,
                 hopeless_tracker: None,
                 download_time_secs: None,
+                prior_download_secs: 0.0,
+                carried_bytes,
                 failure_code: None,
                 output_dir_claimed: false,
             };
@@ -1882,6 +1926,8 @@ impl QueueManager {
             direct_unpacker: None,
             hopeless_tracker: None,
             download_time_secs: None,
+            prior_download_secs: 0.0,
+            carried_bytes,
             failure_code: None,
             output_dir_claimed: false,
         };
@@ -2010,6 +2056,8 @@ impl QueueManager {
                                     serde_json::from_slice::<JobCheckpoint>(&cp_data)
                             {
                                 apply_checkpoint(&mut state.job, &checkpoint);
+                                (state.prior_download_secs, state.carried_bytes) =
+                                    restore_checkpoint_accounting(&mut state.job, &checkpoint);
                                 if !state.output_dir_claimed {
                                     state.output_dir_claimed =
                                         restore_claimed_output_dir(&mut state.job, &checkpoint);
@@ -2575,7 +2623,8 @@ impl QueueManager {
                     {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(&job_id) {
-                            state.download_time_secs = Some(download_time_secs);
+                            state.download_time_secs =
+                                Some(state.prior_download_secs + download_time_secs);
                             state.job.status = JobStatus::PostProcessing;
                             state.job.completed_at = Some(chrono::Utc::now());
                         }
@@ -2608,7 +2657,8 @@ impl QueueManager {
                     {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(&job_id) {
-                            state.download_time_secs = Some(download_time_secs);
+                            state.download_time_secs =
+                                Some(state.prior_download_secs + download_time_secs);
                             state.job.status = JobStatus::Failed;
                             state.job.error_message = Some(reason.clone());
                             state.failure_code = Some(JobFailureCode::ArticlesUnavailable);
@@ -3179,7 +3229,9 @@ impl QueueManager {
                 true
             }
             Ok(None) => {
-                if let Err(e) = db.history_insert(&history_entry) {
+                if let Err(e) =
+                    db.history_insert_with_carried_bytes(&history_entry, state.carried_bytes)
+                {
                     error!(job_id = %state.job.id, "Failed to insert history: {e}");
                     false
                 } else {
@@ -3263,6 +3315,11 @@ impl QueueManager {
     fn persist_job_progress(&self, job_id: &str) {
         let jobs = self.jobs.lock();
         if let Some(state) = jobs.get(job_id) {
+            // Accumulated active time: the final total once the download
+            // resolved, otherwise earlier runs plus the live engine run.
+            let download_time_secs = state.download_time_secs.unwrap_or_else(|| {
+                state.prior_download_secs + self.dispatch.job_active_secs(job_id).unwrap_or(0.0)
+            });
             let db = self.db.lock();
             if let Err(e) = db.queue_update_progress(
                 job_id,
@@ -3276,7 +3333,9 @@ impl QueueManager {
             }
 
             // Build and store checkpoint of downloaded article segments
-            let checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
+            let mut checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
+            checkpoint.download_time_secs = download_time_secs;
+            checkpoint.carried_bytes = state.carried_bytes;
 
             if let Ok(data) = serde_json::to_vec(&checkpoint)
                 && let Err(e) = db.queue_store_job_data(job_id, &data)
@@ -3651,7 +3710,9 @@ impl QueueManager {
                     nzb_data: state.nzb_data.clone(),
                     retry_data: None,
                 };
-                if let Err(e) = db.history_insert(&history_entry) {
+                if let Err(e) =
+                    db.history_insert_with_carried_bytes(&history_entry, state.carried_bytes)
+                {
                     error!(job_id = %id, "Failed to insert history for removed failed job: {e}");
                 } else {
                     self.history_changed();
@@ -4819,6 +4880,9 @@ impl QueueManager {
             // the queue. This keeps memory low with large queues (hundreds of jobs).
             let was_active = job.status == JobStatus::Downloading;
             let mut output_dir_claimed = false;
+            let mut prior_download_secs = 0.0;
+            let mut carried_bytes = 0;
+            let mut download_time_secs = None;
 
             let nzb_data = if was_active {
                 let db = self.db.lock();
@@ -4851,6 +4915,8 @@ impl QueueManager {
                         Ok(checkpoint) => {
                             apply_checkpoint(&mut job, &checkpoint);
                             output_dir_claimed = restore_claimed_output_dir(&mut job, &checkpoint);
+                            (prior_download_secs, carried_bytes) =
+                                restore_checkpoint_accounting(&mut job, &checkpoint);
 
                             let remaining = job
                                 .article_count
@@ -4884,6 +4950,11 @@ impl QueueManager {
                     .and_then(|data| serde_json::from_slice::<JobCheckpoint>(data).ok())
                 {
                     output_dir_claimed = restore_claimed_output_dir(&mut job, &checkpoint);
+                    (prior_download_secs, carried_bytes) =
+                        restore_checkpoint_accounting(&mut job, &checkpoint);
+                    // The download already resolved; its checkpoint holds the
+                    // final active time. Older checkpoints have none.
+                    download_time_secs = (prior_download_secs > 0.0).then_some(prior_download_secs);
                 }
             }
 
@@ -4905,7 +4976,9 @@ impl QueueManager {
                 nzb_data,
                 direct_unpacker: None,
                 hopeless_tracker: None,
-                download_time_secs: None,
+                download_time_secs,
+                prior_download_secs,
+                carried_bytes,
                 failure_code: None,
                 output_dir_claimed,
             };
@@ -5299,6 +5372,8 @@ mod global_pause_tests {
                 direct_unpacker: None,
                 hopeless_tracker: None,
                 download_time_secs: None,
+                prior_download_secs: 0.0,
+                carried_bytes: 0,
                 failure_code: None,
                 output_dir_claimed: false,
             },
@@ -6495,6 +6570,50 @@ mod global_pause_tests {
         assert!(reserved.join("second.mkv").exists());
         assert!(!foreign.join("second.mkv").exists());
         assert!(!foreign.with_file_name("SameName.2").exists());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_carries_download_accounting_across_a_restart() {
+        let (manager, tempdir) = manager();
+        let mut downloading = job("accounting", JobStatus::Downloading, tempdir.path());
+        downloading.downloaded_bytes = 4_000;
+        downloading.server_stats = vec![ServerArticleStats {
+            server_id: "srv".into(),
+            server_name: "Provider".into(),
+            articles_downloaded: 4,
+            articles_failed: 1,
+            bytes_downloaded: 4_000,
+        }];
+        manager.db.lock().queue_insert(&downloading).unwrap();
+        insert_job(&manager, downloading);
+        {
+            let mut jobs = manager.jobs.lock();
+            let state = jobs.get_mut("accounting").unwrap();
+            state.prior_download_secs = 40.0;
+            state.carried_bytes = 1_000;
+        }
+
+        manager.persist_job_progress("accounting");
+
+        let data = manager
+            .db
+            .lock()
+            .queue_load_job_data("accounting")
+            .unwrap()
+            .unwrap();
+        let checkpoint: JobCheckpoint = serde_json::from_slice(&data).unwrap();
+        // The job is not registered with the dispatcher, so no live run adds
+        // to the time accumulated by earlier runs.
+        assert_eq!(checkpoint.download_time_secs, 40.0);
+        assert_eq!(checkpoint.carried_bytes, 1_000);
+        let mut restored = job("accounting", JobStatus::Downloading, tempdir.path());
+        assert_eq!(
+            restore_checkpoint_accounting(&mut restored, &checkpoint),
+            (40.0, 1_000)
+        );
+        assert_eq!(restored.server_stats.len(), 1);
+        assert_eq!(restored.server_stats[0].articles_downloaded, 4);
+        assert_eq!(restored.server_stats[0].articles_failed, 1);
     }
 
     #[test]
