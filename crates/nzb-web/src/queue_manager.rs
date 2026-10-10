@@ -4384,18 +4384,25 @@ impl QueueManager {
             }
         };
 
-        {
-            let jobs = self.jobs.lock();
-            for state in jobs.values() {
-                apply(state.job.added_at, &state.job.server_stats, true);
-            }
-        }
-
         let ledger = {
             let db = self.db.lock();
             db.download_statistics_list().unwrap_or_default()
         };
-        for entry in ledger {
+        {
+            // A terminal job stays in the map for a few seconds after
+            // move_to_history wrote its statistics row; count it once, from
+            // the ledger. Live progress is happening now, whenever the job
+            // was queued.
+            let recorded: HashSet<&str> =
+                ledger.iter().map(|entry| entry.job_id.as_str()).collect();
+            let jobs = self.jobs.lock();
+            for state in jobs.values() {
+                if !recorded.contains(state.job.id.as_str()) {
+                    apply(now, &state.job.server_stats, true);
+                }
+            }
+        }
+        for entry in &ledger {
             apply(entry.completed_at, &entry.server_stats, false);
         }
 
@@ -6584,7 +6591,6 @@ mod global_pause_tests {
             articles_failed: 1,
             bytes_downloaded: 4_000,
         }];
-        manager.db.lock().queue_insert(&downloading).unwrap();
         insert_job(&manager, downloading);
         {
             let mut jobs = manager.jobs.lock();
@@ -6614,6 +6620,74 @@ mod global_pause_tests {
         assert_eq!(restored.server_stats.len(), 1);
         assert_eq!(restored.server_stats[0].articles_downloaded, 4);
         assert_eq!(restored.server_stats[0].articles_failed, 1);
+    }
+
+    fn served(bytes: u64) -> Vec<ServerArticleStats> {
+        vec![ServerArticleStats {
+            server_id: "srv".into(),
+            server_name: "Provider".into(),
+            articles_downloaded: 2,
+            articles_failed: 1,
+            bytes_downloaded: bytes,
+        }]
+    }
+
+    #[tokio::test]
+    async fn server_stats_count_a_job_kept_after_history_once() {
+        let (manager, tempdir) = manager();
+        let mut finished = job("lingering", JobStatus::Completed, tempdir.path());
+        finished.server_stats = served(1_000);
+        finished.completed_at = Some(Utc::now());
+        // move_to_history wrote the history and statistics rows, but the job
+        // stays in the in-memory map for a few seconds afterwards.
+        manager
+            .db
+            .lock()
+            .history_insert(&HistoryEntry {
+                id: finished.id.clone(),
+                name: finished.name.clone(),
+                category: finished.category.clone(),
+                status: JobStatus::Completed,
+                total_bytes: 1_000,
+                downloaded_bytes: 1_000,
+                added_at: finished.added_at,
+                completed_at: Utc::now(),
+                download_time_secs: Some(1.0),
+                output_dir: finished.output_dir.clone(),
+                stages: Vec::new(),
+                error_message: None,
+                failure_code: None,
+                server_stats: finished.server_stats.clone(),
+                nzb_data: None,
+                retry_data: None,
+                delete_archives: None,
+                post_processing: None,
+            })
+            .unwrap();
+        insert_job(&manager, finished);
+
+        let stats = manager.server_stats_get_all(&[]);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].total_bytes, 1_000);
+        assert_eq!(stats[0].total_ok, 2);
+        assert_eq!(stats[0].total_fail, 1);
+        assert_eq!(stats[0].today_bytes, 1_000);
+    }
+
+    #[tokio::test]
+    async fn server_stats_count_live_progress_of_a_long_queued_job_today() {
+        let (manager, tempdir) = manager();
+        let mut downloading = job("old-queued", JobStatus::Downloading, tempdir.path());
+        // Queued two days ago, downloading now.
+        downloading.added_at = Utc::now() - chrono::Duration::days(2);
+        downloading.server_stats = served(500);
+        insert_job(&manager, downloading);
+
+        let stats = manager.server_stats_get_all(&[]);
+        assert_eq!(stats[0].total_bytes, 500);
+        assert_eq!(stats[0].today_bytes, 500);
+        assert_eq!(stats[0].today_ok, 2);
+        assert_eq!(stats[0].week_bytes, 500);
     }
 
     #[test]
