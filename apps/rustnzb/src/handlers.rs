@@ -1652,6 +1652,7 @@ pub async fn h_rss_feed_add(
     Json(feed): Json<RssFeedConfig>,
 ) -> Result<impl IntoResponse, ApiError> {
     validate_feed_poll_interval(&feed)?;
+    validate_feed_filter(&feed)?;
     validate_feed_url(&state, &feed.url).await?;
     state.update_config_with(|config| {
         if config.rss_feeds.iter().any(|f| f.name == feed.name) {
@@ -1673,6 +1674,7 @@ pub async fn h_rss_feed_update(
     Json(feed): Json<RssFeedConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     validate_feed_poll_interval(&feed)?;
+    validate_feed_filter(&feed)?;
     validate_feed_url(&state, &feed.url).await?;
     state.update_config_with(|config| {
         let idx = config
@@ -1806,6 +1808,16 @@ pub struct RssRuleBody {
     pub priority: Option<i32>,
     pub match_regex: String,
     pub enabled: Option<bool>,
+}
+
+/// Reject a feed whose `filter_regex` the RSS monitor could not compile.
+/// The monitor fails closed on a bad filter (the feed is never checked), so
+/// surface the problem as a 400 at save time, with the same bounds as rules.
+fn validate_feed_filter(feed: &RssFeedConfig) -> Result<(), ApiError> {
+    if let Some(pattern) = feed.filter_regex.as_deref() {
+        compile_rss_regex(pattern)?;
+    }
+    Ok(())
 }
 
 /// Longest RSS match pattern we will accept, in bytes.
