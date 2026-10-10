@@ -1552,6 +1552,14 @@ impl WorkerPool {
     pub fn has_job(&self, job_id: &str) -> bool {
         self.job_contexts.lock().contains_key(job_id)
     }
+
+    /// Active (unpaused) download time of a registered job, in seconds.
+    pub fn job_active_secs(&self, job_id: &str) -> Option<f64> {
+        self.job_contexts
+            .lock()
+            .get(job_id)
+            .map(|ctx| ctx.active_elapsed().as_secs_f64())
+    }
 }
 
 async fn await_worker_shutdown(mut handles: Vec<JoinHandle<()>>, timeout: Duration) {
@@ -4264,6 +4272,24 @@ mod tests {
 
         assert!(!pool.has_job(job_id));
         assert_eq!(assembler.get_file_progress(job_id, "file-1"), (0, 0));
+    }
+
+    #[test]
+    fn job_active_secs_reports_registered_jobs_only() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let job = test_job("active-secs", tempdir.path());
+        let pool = worker_pool_without_servers();
+        assert_eq!(pool.job_active_secs(&job.id), None);
+
+        insert_test_context(&pool, &job, Arc::new(FileAssembler::new()));
+        pool.pause_job(&job.id);
+        let paused = pool.job_active_secs(&job.id).expect("registered job");
+        assert!(paused >= 0.0);
+        // A paused job's clock is stopped.
+        assert_eq!(pool.job_active_secs(&job.id), Some(paused));
+
+        pool.release_completed_job(&job.id);
+        assert_eq!(pool.job_active_secs(&job.id), None);
     }
 
     #[cfg(target_os = "linux")]
