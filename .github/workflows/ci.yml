@@ -26,6 +26,18 @@ jobs:
         with:
           toolchain: 1.88
           components: rustfmt,clippy
+      # kache-action v1 (annotated tag -> ad731754, 2026-09-25). Pilot only:
+      # node-local store on the persistent self-hosted runner, no GitHub
+      # Actions cache. The action refuses fork PRs and uploads only from
+      # pushes to protected branches, so this job cannot seed the cache
+      # from a fork.
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed
+        with:
+          node-cache: true
+          cache-dir: /var/cache/kache/rustnzb
+          github-cache: false
+          pr-comment: false
+          job-summary: true
       - run: cargo fmt --all --check
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
