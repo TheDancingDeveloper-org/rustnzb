@@ -1,8 +1,8 @@
 import { HttpInterceptorFn, HttpErrorResponse, HttpRequest } from '@angular/common/http';
 import { inject } from '@angular/core';
 import { Router } from '@angular/router';
-import { catchError, switchMap, throwError } from 'rxjs';
-import { AuthService } from '../services/auth.service';
+import { catchError, of, switchMap, throwError } from 'rxjs';
+import { AuthService, TokenResponse } from '../services/auth.service';
 
 function withToken<T>(req: HttpRequest<T>, token: string): HttpRequest<T> {
   return req.clone({ setHeaders: { Authorization: `Bearer ${token}` } });
@@ -39,6 +39,14 @@ export const authInterceptor: HttpInterceptorFn = (req, next) => {
       // parallel page loads all recover instead of only the first request.
       return authService.refresh().pipe(
         catchError((refreshError) => {
+          // Another tab may have rotated the tokens after ours failed; only a
+          // session nobody has replaced is discarded.
+          if (!authService.discardFailedSession()) {
+            const current = authService.getAccessToken();
+            if (current) {
+              return of({ access_token: current } as TokenResponse);
+            }
+          }
           authService.clearTokens();
           router.navigate(['/login']);
           return throwError(() => refreshError);
