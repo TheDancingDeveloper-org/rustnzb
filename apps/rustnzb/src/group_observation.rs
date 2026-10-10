@@ -21,6 +21,7 @@ pub(crate) use availability::h_article_availability;
 pub(crate) use body_prefix::h_article_body_prefix;
 pub(crate) use clear_search::h_clear_search;
 
+use crate::group_handlers::select_browse_server;
 use contract::{ArticleHeadInput, OverviewRangeInput};
 
 fn blocked(operation: &str, request_id: &str, group: &str, failure_code: &str) -> Json<Value> {
@@ -64,7 +65,7 @@ pub(crate) async fn h_article_head(
 ) -> Result<Json<Value>, ApiError> {
     input.validate().map_err(ApiError::bad_request)?;
     let servers = state.queue_manager.get_servers();
-    let Some(server) = servers.first() else {
+    let Some(server) = select_browse_server(&servers) else {
         return Ok(blocked(
             "article_head",
             &input.request_id,
@@ -215,7 +216,7 @@ pub(crate) async fn h_overview_range(
 ) -> Result<Json<Value>, ApiError> {
     input.validate().map_err(ApiError::bad_request)?;
     let servers = state.queue_manager.get_servers();
-    let Some(server) = servers.first() else {
+    let Some(server) = select_browse_server(&servers) else {
         return Ok(blocked(
             "overview_range",
             &input.request_id,

@@ -1,4 +1,4 @@
-use super::{blocked, contract::ArticleBodyPrefixInput, nntp_failure};
+use super::{blocked, contract::ArticleBodyPrefixInput, nntp_failure, select_browse_server};
 use axum::{Json, extract::State};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use nzb_web::{error::ApiError, nzb_core::nzb_nntp::NntpConnection, state::AppState};
@@ -12,7 +12,7 @@ pub(crate) async fn h_article_body_prefix(
 ) -> Result<Json<Value>, ApiError> {
     input.validate().map_err(ApiError::bad_request)?;
     let servers = state.queue_manager.get_servers();
-    let Some(server) = servers.first() else {
+    let Some(server) = select_browse_server(&servers) else {
         return Ok(blocked(
             "article_body_prefix",
             &input.request_id,
