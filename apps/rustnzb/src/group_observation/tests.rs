@@ -18,10 +18,12 @@ use tempfile::TempDir;
 
 use super::{
     contract::{
-        ArticleBodyPrefixInput, ArticleHeadInput, ClearSearchInput, ClearSearchRangeInput,
-        OverviewRangeInput, clear_search_predicate_digest, now_unix_ms,
+        ArticleAvailabilityInput, ArticleBodyPrefixInput, ArticleHeadInput, ClearSearchInput,
+        ClearSearchRangeInput, OverviewRangeInput, article_availability_digest,
+        clear_search_predicate_digest, now_unix_ms,
     },
-    h_article_body_prefix, h_article_head, h_clear_search, h_overview_range, missing_ranges,
+    h_article_availability, h_article_body_prefix, h_article_head, h_clear_search,
+    h_overview_range, missing_ranges,
 };
 
 fn state_without_provider() -> (Arc<AppState>, TempDir) {
@@ -306,6 +308,125 @@ async fn missing_provider_is_a_typed_blocker_for_every_observation() {
     assert_eq!(body["status"], "blocked");
     assert_eq!(body["failure_code"], "nntp_provider_not_configured");
     assert_eq!(body["request_id"], "body-one");
+}
+
+#[tokio::test]
+async fn observations_use_the_highest_priority_enabled_server() {
+    let group = "esp.binarios.series.misc";
+    let mut groups = std::collections::HashMap::new();
+    groups.insert(group.to_string(), (1, 1, 1));
+    let mut articles = std::collections::HashMap::new();
+    articles.insert("one@example.invalid".to_string(), b"body\r\n".to_vec());
+    let mut heads = std::collections::HashMap::new();
+    heads.insert(1, b"Subject: one\r\n".to_vec());
+    let good = MockNntpServer::start(MockConfig {
+        groups,
+        articles,
+        heads,
+        xover_entries: vec![
+            "1\tOne\tposter\tWed, 07 May 2025 20:50:00 +0000\t<one@example.invalid>\t\t100\t1"
+                .into(),
+        ],
+        xpat_unsupported: true,
+        ..MockConfig::default()
+    })
+    .await;
+    // Every other configured server refuses service, so a response that
+    // completes proves the handler talked to the right one.
+    let refusing = MockNntpServer::start(MockConfig {
+        service_unavailable: true,
+        ..MockConfig::default()
+    })
+    .await;
+    let mut disabled = test_config(refusing.port());
+    disabled.id = "disabled".into();
+    disabled.enabled = false;
+    let mut backup = test_config(refusing.port());
+    backup.id = "backup".into();
+    backup.priority = 5;
+    let mut primary = test_config(good.port());
+    primary.id = "primary".into();
+    primary.priority = 0;
+    let (state, _temporary) = state_with_servers(vec![disabled, backup, primary]);
+
+    let Json(head) = h_article_head(
+        State(Arc::clone(&state)),
+        Json(ArticleHeadInput {
+            request_id: "head-select".to_string(),
+            group: group.to_string(),
+            article_number: 1,
+            max_header_bytes: 64 * 1024,
+        }),
+    )
+    .await
+    .expect("head response");
+    assert_eq!(head["status"], "complete", "{head}");
+
+    let Json(overview) = h_overview_range(
+        State(Arc::clone(&state)),
+        Json(OverviewRangeInput {
+            request_id: "overview-select".to_string(),
+            group: group.to_string(),
+            start_article: 1,
+            end_article: 1,
+            max_headers: 10,
+        }),
+    )
+    .await
+    .expect("overview response");
+    assert_eq!(overview["status"], "complete", "{overview}");
+
+    let message_ids = vec!["one@example.invalid".to_string()];
+    let Json(availability) = h_article_availability(
+        State(Arc::clone(&state)),
+        Json(ArticleAvailabilityInput {
+            request_id: "availability-select".to_string(),
+            sample_sha256: article_availability_digest(&message_ids),
+            message_ids,
+        }),
+    )
+    .await
+    .expect("availability response");
+    assert_eq!(availability["status"], "complete", "{availability}");
+    assert_eq!(availability["available_segment_count"], 1);
+
+    let Json(body) = h_article_body_prefix(
+        State(Arc::clone(&state)),
+        Json(ArticleBodyPrefixInput {
+            request_id: "body-select".to_string(),
+            group: group.to_string(),
+            message_id: "one@example.invalid".to_string(),
+            max_wire_bytes: 64 * 1024,
+            max_payload_bytes: 32 * 1024,
+        }),
+    )
+    .await
+    .expect("body response");
+    assert_eq!(body["status"], "complete", "{body}");
+
+    let Json(clear_search) = h_clear_search(
+        State(state),
+        Json(ClearSearchInput {
+            request_id: "clear-select".to_string(),
+            cancellation_id: "cancel-select".to_string(),
+            group: group.to_string(),
+            ranges: vec![ClearSearchRangeInput {
+                start_article: 1,
+                end_article: 1,
+            }],
+            patterns: vec!["*One*".to_string()],
+            predicate_sha256: clear_search_predicate_digest(&["*One*".to_string()]),
+            max_matches_per_range: 100,
+            max_response_bytes: 1024 * 1024,
+            deadline_at_unix_ms: now_unix_ms().expect("clock") + 10_000,
+        }),
+    )
+    .await
+    .expect("clear search response");
+    assert_eq!(
+        clear_search["execution_state"], "complete",
+        "{clear_search}"
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 use super::{
     contract::{ArticleAvailabilityInput, article_availability_digest},
-    nntp_failure,
+    nntp_failure, select_browse_server,
 };
 use axum::{Json, extract::State};
 use nzb_web::{
@@ -17,7 +17,7 @@ pub(crate) async fn h_article_availability(
 ) -> Result<Json<Value>, ApiError> {
     input.validate().map_err(ApiError::bad_request)?;
     let servers = state.queue_manager.get_servers();
-    let Some(server) = servers.first() else {
+    let Some(server) = select_browse_server(&servers) else {
         return Ok(blocked(&input, "nntp_provider_not_configured"));
     };
     let mut connection = NntpConnection::new(format!("availability-{}", input.request_id));

@@ -1,4 +1,6 @@
-use super::{defective_row_json, format_digest, missing_ranges, nntp_failure, row_json};
+use super::{
+    defective_row_json, format_digest, missing_ranges, nntp_failure, row_json, select_browse_server,
+};
 use crate::group_observation::contract::{ClearSearchInput, ClearSearchRangeInput, now_unix_ms};
 use axum::{Json, extract::State};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -138,7 +140,7 @@ pub(crate) async fn h_clear_search(
 
 async fn observe(state: Arc<AppState>, input: &ClearSearchInput, deadline: &Deadline) -> Value {
     let servers = state.queue_manager.get_servers();
-    let Some(server) = servers.first() else {
+    let Some(server) = select_browse_server(&servers) else {
         return failed_response(
             input,
             Stop {
