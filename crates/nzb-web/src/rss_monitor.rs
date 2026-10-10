@@ -302,25 +302,9 @@ impl RssMonitor {
                     .unwrap_or(false)
             });
 
-            // Auto-download logic:
-            // 1. If a download rule matches → download with rule's category/priority
-            // 2. If feed has auto_download enabled (and no filter_regex) → download all
-            // 3. Otherwise → don't auto-download
-            let (should_download, category, priority) = if let Some(rule) = matched_rule {
-                (
-                    true,
-                    rule.category.clone().or_else(|| feed.category.clone()),
-                    rule.priority,
-                )
-            } else if feed.auto_download && feed.filter_regex.is_none() {
-                (true, feed.category.clone(), 1)
-            } else {
-                (false, None, 1)
-            };
-
-            if !should_download {
+            let Some((category, priority)) = Self::auto_download_target(feed, matched_rule) else {
                 continue;
-            }
+            };
 
             info!(feed = %feed.name, title = %p.title, url = %url, "Auto-downloading RSS item");
 
@@ -345,6 +329,28 @@ impl RssMonitor {
         }
 
         Ok(())
+    }
+
+    /// Auto-download decision for an item that already passed the feed's
+    /// `filter_regex` (if any), returning the category and priority to use:
+    /// 1. a matching download rule → the rule's category/priority;
+    /// 2. the feed's "auto-download matches" flag → every item that passed
+    ///    the feed filter (all items when no filter is set);
+    /// 3. otherwise → not downloaded.
+    fn auto_download_target(
+        feed: &RssFeedConfig,
+        matched_rule: Option<&crate::nzb_core::models::RssRule>,
+    ) -> Option<(Option<String>, i32)> {
+        if let Some(rule) = matched_rule {
+            Some((
+                rule.category.clone().or_else(|| feed.category.clone()),
+                rule.priority,
+            ))
+        } else if feed.auto_download {
+            Some((feed.category.clone(), 1))
+        } else {
+            None
+        }
     }
 
     fn compile_filter(pattern: &str) -> Option<regex::Regex> {
@@ -705,6 +711,49 @@ mod tests {
         monitor.check_feed(&feed).await.expect("feed check");
 
         assert!(queue_manager.get_jobs().is_empty());
+    }
+
+    #[test]
+    fn auto_download_feeds_download_items_that_pass_their_filter() {
+        let feed = |filter_regex: Option<&str>, auto_download: bool| RssFeedConfig {
+            name: "feed".into(),
+            url: "https://example.test/rss".into(),
+            poll_interval_secs: 900,
+            category: Some("tv".into()),
+            filter_regex: filter_regex.map(str::to_string),
+            enabled: true,
+            auto_download,
+            max_age_days: None,
+        };
+        let rule = crate::nzb_core::models::RssRule {
+            id: "r".into(),
+            name: "rule".into(),
+            feed_names: vec!["feed".into()],
+            category: Some("movies".into()),
+            priority: 2,
+            match_regex: ".*".into(),
+            enabled: true,
+        };
+
+        // Items reaching this decision already passed the feed filter, so
+        // "Auto-download matches" downloads them whether or not a filter is set.
+        assert_eq!(
+            RssMonitor::auto_download_target(&feed(Some("(?i)ubuntu"), true), None),
+            Some((Some("tv".into()), 1))
+        );
+        assert_eq!(
+            RssMonitor::auto_download_target(&feed(None, true), None),
+            Some((Some("tv".into()), 1))
+        );
+        assert_eq!(
+            RssMonitor::auto_download_target(&feed(Some("(?i)ubuntu"), false), None),
+            None
+        );
+        // A matching rule wins regardless of the feed's auto_download flag.
+        assert_eq!(
+            RssMonitor::auto_download_target(&feed(None, false), Some(&rule)),
+            Some((Some("movies".into()), 2))
+        );
     }
 
     #[tokio::test]

@@ -39,6 +39,14 @@ describe('RssViewComponent', () => {
     expect(component.maskUrl('https://x.test?apikey=secret&token=other')).toContain('apikey=***');
   });
 
+  it('shows a filter example in the server\'s Rust regex syntax (BUG-122)', () => {
+    const { component } = createComponent();
+    // The server compiles filter_regex with the Rust regex crate: JS-style
+    // /pattern/flags delimiters would be matched literally and never hit.
+    expect(component.filterRegexExample).not.toMatch(/^\/.*\/[a-z]*$/);
+    expect(component.filterRegexExample).toBe('(?i)ubuntu|debian');
+  });
+
   it('validates feeds before making requests and reports API errors', () => {
     const { component, api, snack } = createComponent({ post: vi.fn(() => throwError(() => new Error('failed'))) });
     component.showAddFeed();

@@ -80,7 +80,8 @@ interface RuleFormModel {
             <input type="text" [(ngModel)]="feedForm.category" placeholder="(optional)" />
 
             <label>Filter regex</label>
-            <input type="text" [(ngModel)]="feedForm.filter_regex" placeholder="/ubuntu|debian/i (optional)" />
+            <input type="text" [(ngModel)]="feedForm.filter_regex" [placeholder]="filterRegexExample + ' (optional)'" />
+            <div class="help">Rust regex syntax, no /…/ delimiters; prefix (?i) to ignore case. With auto-download on, every matching item is queued.</div>
 
             <label>Options</label>
             <div style="display:flex;gap:16px">
@@ -292,6 +293,8 @@ interface RuleFormModel {
   `],
 })
 export class RssViewComponent implements OnInit {
+  /** Filter placeholder; the server uses the Rust regex crate, not JS /re/flags. */
+  readonly filterRegexExample = '(?i)ubuntu|debian';
   feeds = signal<RssFeed[]>([]);
   rules = signal<RssRule[]>([]);
   items = signal<RssItem[]>([]);

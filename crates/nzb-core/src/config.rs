@@ -369,14 +369,15 @@ pub struct RssFeedConfig {
     /// Category to assign to downloaded NZBs
     #[serde(default)]
     pub category: Option<String>,
-    /// Regex pattern to filter feed entries by title
+    /// Regex pattern to filter feed entries by title (Rust `regex` syntax,
+    /// e.g. `(?i)ubuntu|debian`; no `/.../flags` delimiters)
     #[serde(default)]
     pub filter_regex: Option<String>,
     /// Whether this feed is active
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Auto-download all items from this feed (no rules needed).
-    /// Ignored when filter_regex is set (use download rules instead).
+    /// Auto-download items from this feed without needing a rule: every item
+    /// that passes `filter_regex`, or every item when no filter is set.
     #[serde(default)]
     pub auto_download: bool,
     /// Ignore entries older than this many days. None disables age filtering.
