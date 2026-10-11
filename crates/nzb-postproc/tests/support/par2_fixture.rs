@@ -186,7 +186,7 @@ impl Par2Fixture {
 
         let packet_len = (32 + data.len()) as u64;
         assert!(
-            packet_len % 4 == 0,
+            packet_len.is_multiple_of(4),
             "PAR2 packet length must be 4-aligned, got {packet_len}"
         );
         let md5: [u8; 16] = Md5::digest(&data).into();

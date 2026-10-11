@@ -1478,6 +1478,9 @@ impl QueueManager {
     fn history_changed(&self) {
         // SABnzbd also uses a wrapping generation rather than a timestamp.
         // Keep zero reserved for clients that have never polled.
+        // `fetch_update` is deprecated on newer stable in favour of
+        // `try_update`, which the pinned toolchain does not have yet.
+        #[allow(deprecated)]
         let _ = self
             .history_update
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
