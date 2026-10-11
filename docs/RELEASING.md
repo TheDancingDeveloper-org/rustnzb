@@ -68,29 +68,56 @@ each crate's `repository` field). This monorepo is the head:
 - **The monorepo owns version numbers.** Change a crate's `version` only in
   `crates/<name>/Cargo.toml`; the standalone repos never originate a bump.
   Keep each new version strictly above the crates.io maximum for that crate.
-- **Standalone repos are sync targets.** `ci/tasks/sync-crate <name>` exports
-  `crates/<name>` at `HEAD` and opens a pull request on that crate's standalone
-  repo. It never publishes and never pushes to the monorepo.
+- **Standalone repos are sync targets.** `ci/tasks/sync-crate <name>` builds
+  the standalone tree for `crates/<name>` at `HEAD` and opens a pull request
+  on that crate's standalone repo. It never publishes and never pushes to the
+  monorepo. `ci/tasks/sync-crate --dry-run <name>` stops before pushing and
+  prints the change, including anything it would delete.
+- **One export, shared by sync and drift.** `ci/crate-export.sh` defines the
+  standalone tree: the crate's tracked files, with each `Cargo.toml` rewritten
+  to build outside this workspace — `<dep>.workspace = true` becomes the
+  `[workspace.dependencies]` entry, sibling `path = "../nzb-*"` is dropped so
+  the version resolves from crates.io, and a nested member's
+  `<crate> = { workspace = true }` becomes `{ path = ".." }`. A crate with
+  nested crates (`crates/<name>/<dir>/Cargo.toml`, such as `nzb-decode`'s
+  `ffi/`) gets a `[workspace] members = [...]` table on export, because that
+  table cannot live in a member manifest here. Any other workspace inheritance
+  is an error, not a silently broken manifest.
 - **Publish only from a synced tag.** After a sync PR merges, publish that
   crate from a `vX.Y.Z` tag on the standalone repo — never from an out-of-sync
-  tree.
+  tree. Publish in dependency order (`nzb-nntp`, `nzb-decode`, `nzb-core`,
+  `nzb-news`, `nzb-postproc`, `nzb-dispatch`, `nzb-web`): the standalone
+  manifests take sibling crates from crates.io.
 - **Drift is gated.** The scheduled `crate-drift` job
   (`.github/workflows/quality-schedule.yml`, via `ci/tasks/crate-drift`) fails
-  when any standalone repo's tree or package version differs from the
-  monorepo. A failure means a crate changed here without a sync; run
+  when any standalone repo's tree or package version differs from the export.
+  A failure means a crate changed here without a sync; run
   `ci/tasks/sync-crate <name>`, merge, and publish from the tag.
 - **A sync never deletes standalone-only files.** `ci/sync-preserve.txt` lists
-  paths the standalone repos own (CI workflows, license, renovate). Both the
+  paths the standalone repos own: CI workflows, license, renovate, the
+  per-repo agent notes (`CLAUDE.md`, `.codesight`) and `Cargo.lock`. Both the
   sync and the drift check leave those alone, unless the monorepo has started
-  shipping the same path, in which case the monorepo copy wins. Everything else
-  in the standalone tree — including a workspace member such as `nzb-decode`'s
-  `ffi/` — must live in the monorepo, or the next sync will not carry it and
-  drift will fail.
+  shipping the same path, in which case the monorepo copy wins. Each standalone
+  repo resolves its own lockfile, so the sync keeps it and refreshes it with
+  cargo's minimal update against the exported manifests; when that cannot
+  resolve yet (a sibling version not on crates.io), the PR says so and the lock
+  needs a refresh once that sibling is published. Everything else in the
+  standalone tree — including `nzb-decode`'s `ffi/` and its README — must live
+  in the monorepo, or the next sync will not carry it and drift will fail.
 - **A sync refuses over unported work.** `sync-crate` exits 3 when a commit
-  since the last `sync: <crate> from rustnzb monorepo` commit on the standalone
-  `main` changes a path the monorepo does not export byte-for-byte. Port that
-  change into the monorepo first. A commit whose every non-preserved path
-  already matches the export is treated as absorbed.
+  since the last sync on the standalone `main` changes a path the export does
+  not carry byte-for-byte. The last sync is the newest commit whose subject
+  starts with `sync` and mentions the `rustnzb monorepo` (case-insensitive;
+  `sync-crate` titles its own commits and PRs `sync: <crate> from rustnzb
+  monorepo <sha>`, so keep that title when squash-merging). Port the change
+  into the monorepo first. A commit whose every non-preserved path already
+  matches the export is treated as absorbed.
+- **Overwriting standalone work is a reviewed exception.** When a standalone
+  commit is superseded or already ported but still differs byte-for-byte (a
+  version bump, a shim the monorepo replaced), list it in
+  `ci/sync-accept.txt` as `<crate> <sha> <reason>`. `sync-crate` then goes
+  ahead, prints each accepted commit with its reason, and names them in the PR
+  body. Entries go stale once that sync merges and can be removed.
 
 ## Rollback
 

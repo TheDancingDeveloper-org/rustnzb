@@ -1,24 +1,35 @@
 #!/bin/sh
 set -eu
 
-# sync-crate <name> — carry one nzb-* crate from the monorepo head to its
-# standalone repo.
+# sync-crate [--dry-run] <name> — carry one nzb-* crate from the monorepo head
+# to its standalone repo.
 #
-# Exports crates/<name> at HEAD (tracked files only), replaces the standalone
-# repo's tree with it, and opens a pull request against that repo's main
-# branch. The monorepo owns version numbers, so the exported Cargo.toml
-# carries the version across untouched. Publishing to crates.io happens from a
-# tag on the standalone repo after this PR merges (see docs/RELEASING.md); this
-# task never publishes and never pushes to the monorepo.
+# Builds the standalone tree for crates/<name> at HEAD (ci/crate-export.sh:
+# tracked files, manifests rewritten to build outside this workspace), replaces
+# the standalone repo's tree with it, and opens a pull request against that
+# repo's main branch. The monorepo owns version numbers, so the exported
+# Cargo.toml carries the version across untouched. Publishing to crates.io
+# happens from a tag on the standalone repo after this PR merges (see
+# docs/RELEASING.md); this task never publishes and never pushes to the
+# monorepo.
+#
+# --dry-run stops after committing in a scratch clone: it prints what the PR
+# would change and pushes nothing, so it needs no token.
 #
 # Requires GH_TOKEN (a token that can push to and open PRs on the standalone
-# repo) and the gh CLI.
+# repo) and the gh CLI, except with --dry-run.
 
-crate=${1:?usage: sync-crate <nzb-crate-name>}
+dry_run=0
+if [ "${1:-}" = "--dry-run" ]; then
+    dry_run=1
+    shift
+fi
+crate=${1:?usage: sync-crate [--dry-run] <nzb-crate-name>}
 
 TASK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$TASK_DIR/../.." && pwd)
 cd "$REPO_ROOT"
+. ci/crate-export.sh
 
 grep -qx "$crate" ci/nzb-crates.txt \
     || { echo "$crate is not a synced nzb-* crate (see ci/nzb-crates.txt)" >&2; exit 2; }
@@ -26,8 +37,10 @@ grep -qx "$crate" ci/nzb-crates.txt \
 manifest="crates/$crate/Cargo.toml"
 [ -f "$manifest" ] || { echo "unknown crate: no $manifest" >&2; exit 2; }
 
-: "${GH_TOKEN:?GH_TOKEN is required}"
-command -v gh >/dev/null 2>&1 || { echo "the gh CLI is required" >&2; exit 127; }
+if [ "$dry_run" -eq 0 ]; then
+    : "${GH_TOKEN:?GH_TOKEN is required}"
+    command -v gh >/dev/null 2>&1 || { echo "the gh CLI is required" >&2; exit 127; }
+fi
 
 manifest_field() { grep -m1 "^$2[[:space:]]*=" "$1" | sed 's/[^"]*"\([^"]*\)".*/\1/'; }
 
@@ -52,41 +65,40 @@ case "$1" in
 esac
 ASK
 chmod 700 "$askpass"
-export GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 GH_TOKEN
+export GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0
+[ -z "${GH_TOKEN:-}" ] || export GH_TOKEN
 
 clone="$workdir/repo"
 git clone --quiet "$repo" "$clone"
 git -C "$clone" checkout -q -B "$branch"
 
+export_tree="$workdir/export"
+crate_export "$crate" "$export_tree"
+
 # Refuse while the standalone repo still carries commits of its own, made since
 # the last sync, whose non-preserved changes the monorepo has not absorbed. A
 # sync replaces the standalone tree, so pushing one over unported work would
-# drop it. The last sync commit is the newest "sync: <crate> from rustnzb
-# monorepo" commit; commits before it were already reconciled. Standalone-only
-# paths (ci/sync-preserve.txt) are infrastructure and do not count. A path that
-# the monorepo now exports byte-for-byte has been absorbed, so a commit whose
-# every non-preserved path matches the export is no longer unported.
-preserve="$REPO_ROOT/ci/sync-preserve.txt"
-export_tree="$workdir/export"
-mkdir -p "$export_tree"
-git archive "HEAD:crates/$crate" | tar -x -C "$export_tree"
-find "$export_tree" -name Cargo.toml -print0 | xargs -0 \
-    sed -i "s#^\\($crate\\)[[:space:]]*=[[:space:]]*{[[:space:]]*workspace[[:space:]]*=[[:space:]]*true[[:space:]]*}#\\1 = { path = \"..\" }#"
-preserved_path() {
-    path=$1
-    [ -f "$preserve" ] || return 1
-    while IFS= read -r rule; do
-        case "$rule" in ''|\#*) continue ;; esac
-        case "$path" in "$rule"|"$rule"/*) return 0 ;; esac
-    done <"$preserve"
-    return 1
-}
-last_sync=$(git -C "$clone" log --format='%H' --grep="^sync: $crate from rustnzb monorepo" -n 1 main || true)
+# drop it. The last sync is the newest commit whose subject starts "sync" and
+# names the rustnzb monorepo (case-insensitive: this task's own "sync: <crate>
+# from rustnzb monorepo <sha>" and the hand-made July 2026 reconciles, one of
+# which reads "Sync web orchestration with rustnzb monorepo"); commits before
+# it were already reconciled. Standalone-only paths (ci/sync-preserve.txt) do
+# not count, and a path the export carries byte-for-byte has been absorbed.
+#
+# A commit listed in ci/sync-accept.txt is a reviewed decision to let the sync
+# overwrite it; it is reported, not refused.
+last_sync=$(git -C "$clone" log --format='%H' -i --grep='^sync.*rustnzb monorepo' -n 1 main || true)
 range=main
 [ -n "$last_sync" ] && range="$last_sync..main"
-unported=$(git -C "$clone" log --format='%h %s' "$range" | while IFS= read -r line; do
+standalone_commits=$(git -C "$clone" log --format='%H %s' "$range")
+unported=""
+accepted=""
+nl='
+'
+while IFS= read -r line; do
     [ -n "$line" ] || continue
     sha=${line%% *}
+    subject=${line#* }
     touched=0
     for path in $(git -C "$clone" diff-tree --no-commit-id --name-only -r "$sha"); do
         preserved_path "$path" && continue
@@ -97,18 +109,29 @@ unported=$(git -C "$clone" log --format='%h %s' "$range" | while IFS= read -r li
         fi
         touched=1
     done
-    [ "$touched" -eq 1 ] && printf '%s\n' "$line" || true
-done)
+    [ "$touched" -eq 1 ] || continue
+    short=$(git -C "$clone" rev-parse --short "$sha")
+    if reason=$(sync_accepted "$crate" "$sha"); then
+        accepted="$accepted$short $subject — accepted: $reason$nl"
+    else
+        unported="$unported$short $subject$nl"
+    fi
+done <<EOT
+$standalone_commits
+EOT
+if [ -n "$accepted" ]; then
+    echo "sync-crate: overwriting standalone commits accepted in ci/sync-accept.txt:" >&2
+    printf '%s' "$accepted" | sed 's/^/    /' >&2
+fi
 if [ -n "$unported" ]; then
     echo "sync-crate: refusing to sync $crate — commits since the last sync touch paths the monorepo does not own yet:" >&2
-    printf '%s\n' "$unported" | sed 's/^/    /' >&2
-    echo "sync-crate: port them into the monorepo first, then re-run." >&2
+    printf '%s' "$unported" | sed 's/^/    /' >&2
+    echo "sync-crate: port them into the monorepo first, or record a reviewed exception in ci/sync-accept.txt, then re-run." >&2
     exit 3
 fi
 
-# Replace the standalone tree with the monorepo crate at HEAD. Clear the old
-# tracked files first so deletions in the monorepo propagate, then extract the
-# crate subtree (git archive emits tracked files only, no target/).
+# Replace the standalone tree with the export. Clear the old tracked files
+# first so deletions in the monorepo propagate, then copy the export in.
 #
 # Paths listed in ci/sync-preserve.txt survive the replace, so a sync never
 # deletes them. A path the monorepo starts shipping is no longer preserved.
@@ -122,6 +145,22 @@ git -C "$clone" -c core.quotePath=false ls-files | while IFS= read -r path; do
 done
 tar -c -C "$export_tree" . | tar -x -C "$clone"
 
+# Cargo.lock is preserved (the standalone repo resolves its own workspace), so
+# bring it up to the exported manifests with cargo's minimal update — the same
+# one any unlocked build makes. Standalone CI builds with --locked. When the
+# manifests need a version crates.io does not have yet (a sibling published
+# after this sync), the lock is left as it was and the PR says so.
+lock_note=""
+if [ -f "$clone/Cargo.lock" ]; then
+    if ! command -v cargo >/dev/null 2>&1; then
+        lock_note="Cargo.lock was not refreshed: cargo is not installed where the sync ran."
+    elif ! cargo metadata --format-version 1 --manifest-path "$clone/Cargo.toml" \
+            >/dev/null 2>"$workdir/lock.err"; then
+        lock_note="Cargo.lock was not refreshed: cargo could not resolve the exported manifests ($(grep -m1 'error' "$workdir/lock.err" | sed 's/^error: //'))."
+    fi
+    [ -z "$lock_note" ] || echo "sync-crate: $lock_note" >&2
+fi
+
 git -C "$clone" add -A
 if git -C "$clone" diff --cached --quiet; then
     echo "sync-crate: $crate already matches the standalone repo at v$version; nothing to do"
@@ -130,12 +169,34 @@ fi
 
 git -C "$clone" commit -q \
     -m "sync: $crate from rustnzb monorepo $head_sha (v$version)"
+
+if [ "$dry_run" -eq 1 ]; then
+    echo "sync-crate: dry run — would open a PR on $slug from $branch (v$version):"
+    git -C "$clone" -c core.quotePath=false diff --stat=200 HEAD~1 HEAD | sed 's/^/    /'
+    deleted=$(git -C "$clone" -c core.quotePath=false diff --name-only --diff-filter=D HEAD~1 HEAD)
+    if [ -n "$deleted" ]; then
+        echo "sync-crate: the sync deletes:"
+        printf '%s\n' "$deleted" | sed 's/^/    /'
+    fi
+    exit 0
+fi
+
 git -C "$clone" push -q --force-with-lease -u origin "$branch"
 
-gh pr create --repo "$slug" --head "$branch" --base main \
-    --title "sync: $crate from rustnzb monorepo $head_sha" \
-    --body "Automated sync of \`crates/$crate\` at rustnzb monorepo commit $head_sha (version $version).
+body="Automated sync of \`crates/$crate\` at rustnzb monorepo commit $head_sha (version $version).
 
-The monorepo owns nzb-* version numbers; this PR carries its current tree across verbatim. After merge, publish v$version from a \`v$version\` tag on this repo — see rustnzb docs/RELEASING.md."
+The monorepo owns nzb-* version numbers; this PR carries its current tree across (manifests rewritten to build standalone by ci/crate-export.sh). After merge, publish v$version from a \`v$version\` tag on this repo — see rustnzb docs/RELEASING.md."
+if [ -n "$accepted" ]; then
+    body="$body
+
+Standalone commits this sync overwrites, accepted in rustnzb ci/sync-accept.txt:
+$(printf '%s' "$accepted" | sed 's/^/- /')"
+fi
+[ -z "$lock_note" ] || body="$body
+
+$lock_note"
+
+gh pr create --repo "$slug" --head "$branch" --base main \
+    --title "sync: $crate from rustnzb monorepo $head_sha" --body "$body"
 
 echo "sync-crate: opened a PR on $slug from branch $branch (v$version)"

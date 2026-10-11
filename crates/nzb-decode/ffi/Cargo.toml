@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # In the monorepo this resolves through the workspace dependency (and the
 # crates.io patch). The standalone repo has no workspace.dependencies table,
-# so ci/tasks/sync-crate rewrites this line back to `{ path = ".." }` on export.
+# so the export (ci/crate-export.sh) rewrites this line to `{ path = ".." }`.
 nzb-decode = { workspace = true }
 crc32fast = "1"
 

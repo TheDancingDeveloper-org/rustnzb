@@ -15,6 +15,7 @@ set -eu
 TASK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$TASK_DIR/../.." && pwd)
 cd "$REPO_ROOT"
+. ci/crate-export.sh
 
 crate_list=ci/nzb-crates.txt
 [ -f "$crate_list" ] || { echo "crate-drift: missing $crate_list" >&2; exit 2; }
@@ -78,18 +79,22 @@ while IFS= read -r crate; do
     # are standalone-only (CI, license) and are excluded on both sides, so a file
     # that exists only there is not drift and a sync will not delete it. Anything
     # else — including a workspace member such as ffi/ — must match both ways.
+    # The monorepo side is the exact tree sync-crate would ship
+    # (ci/crate-export.sh), so the two tasks agree on what "in sync" means.
     snapshot="$workdir/$crate.mono"
-    mkdir -p "$snapshot"
-    git archive "HEAD:crates/$crate" | tar -x -C "$snapshot"
-    # Mirror the rewrite sync-crate applies: the standalone repo cannot resolve
-    # `workspace = true`, so compare against the path form it actually carries.
-    find "$snapshot" -name Cargo.toml -print0 | xargs -0 \
-        sed -i "s#^\\($crate\\)[[:space:]]*=[[:space:]]*{[[:space:]]*workspace[[:space:]]*=[[:space:]]*true[[:space:]]*}#\\1 = { path = \"..\" }#"
+    if ! crate_export "$crate" "$snapshot"; then
+        note_drift "$crate: cannot build the export tree"
+        continue
+    fi
+    rm -rf "$dest/.git"
     preserve="ci/sync-preserve.txt"
     if [ -f "$preserve" ]; then
         while IFS= read -r rule; do
             case "$rule" in ''|\#*) continue ;; esac
-            rm -rf "$dest/$rule" "$snapshot/$rule"
+            # A preserved path the monorepo ships is not standalone-only:
+            # the export wins, so it is compared like any other file.
+            [ -e "$snapshot/$rule" ] && continue
+            rm -rf "$dest/$rule"
         done <"$preserve"
     fi
     if ! git -c core.fileMode=false diff --no-index --quiet "$dest" "$snapshot"; then

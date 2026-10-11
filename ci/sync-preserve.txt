@@ -7,6 +7,10 @@
 #
 # Shared by ci/tasks/sync-crate (keeps them) and ci/tasks/crate-drift (ignores
 # them when comparing trees).
+#
+# Cargo.lock is the standalone repo's own resolution (its workspace is not
+# this one); sync-crate keeps it and refreshes it against the exported
+# manifests. CLAUDE.md and .codesight are per-repo agent notes.
 .github
 .woodpecker.yml
 .gitignore
@@ -14,3 +18,6 @@
 LICENSE
 ci
 renovate.json
+Cargo.lock
+CLAUDE.md
+.codesight
