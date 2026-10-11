@@ -25,9 +25,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;
-use std::time::Duration;
 
-use nzb_nntp::testutil::{MockConfig, MockNntpServer};
+use nzb_nntp::testutil::{ArticleResponseSequences, MockConfig, MockNntpServer};
 
 use crate::par2::Par2Fixture;
 use crate::{FixtureSegment, SAMPLE_GROUP};
@@ -38,8 +37,11 @@ pub const DAMAGE_SLICE_SIZE: u64 = 4096;
 pub const DAMAGE_ARTICLE_SIZE: usize = 10_000;
 /// Recovery slices per volume, in volume order. Exponents run 0..15.
 pub const RECOVERY_VOLUME_BLOCKS: [u32; 4] = [1, 2, 4, 8];
-/// How long the busy-provider article answers 430 after server start.
-pub const BUSY_PROVIDER_DELAY: Duration = Duration::from_secs(1);
+/// How many ARTICLE attempts the busy provider answers 430 before serving.
+/// The fixture's two fast retries both fall inside this, and the next attempt
+/// is served. Built on the published `article_response_sequences`, which only
+/// applies to ARTICLE — the command a downloader issues.
+pub const BUSY_PROVIDER_REFUSALS: usize = 2;
 
 const MKV_SIZE: usize = 120_000;
 const NFO_SIZE: usize = 2_500;
@@ -252,9 +254,10 @@ pub enum DamageScenario {
     MissingEverywhere,
     /// Two articles answer 430 on server A and are served by server B.
     MissingOnPrimaryOnly,
-    /// One article answers 430 on every server for [`BUSY_PROVIDER_DELAY`]
-    /// after start, then is served: two retries within 350 ms both fail and a
-    /// retry a second later succeeds. Must not be counted as damage.
+    /// One article answers 430 on every server for the first
+    /// [`BUSY_PROVIDER_REFUSALS`] ARTICLE attempts, then is served. The two
+    /// fast retries both fail and a later attempt succeeds. Must not be
+    /// counted as damage.
     BusyProvider,
     /// One article answers 430 on server A, and server B, the last server,
     /// stops answering ARTICLE altogether. The outcome is unestablished, not
@@ -325,8 +328,8 @@ impl DamageScenario {
             }
             DamageScenario::BusyProvider => {
                 let mid = mkv(6);
-                a.available_after.insert(mid.clone(), BUSY_PROVIDER_DELAY);
-                b.available_after.insert(mid.clone(), BUSY_PROVIDER_DELAY);
+                a.refuse_first_n.insert(mid.clone(), BUSY_PROVIDER_REFUSALS);
+                b.refuse_first_n.insert(mid.clone(), BUSY_PROVIDER_REFUSALS);
                 expect.transient_articles.insert(mid);
             }
             DamageScenario::TransportTimeoutOnLastServer => {
@@ -445,7 +448,8 @@ impl Expectation {
 struct ServerPlan {
     removed: BTreeSet<String>,
     replaced: BTreeMap<String, Vec<u8>>,
-    available_after: HashMap<String, Duration>,
+    /// ARTICLE attempts to answer 430 before the article is served normally.
+    refuse_first_n: HashMap<String, usize>,
     hang_on_article: bool,
 }
 
@@ -473,10 +477,22 @@ impl ScenarioFixture {
                     articles.insert(mid.clone(), encoded.clone());
                 }
                 let count = articles.len() as u64;
+                let article_response_sequences = (!plan.refuse_first_n.is_empty()).then(|| {
+                    let sequences = ArticleResponseSequences::default();
+                    for (mid, n) in &plan.refuse_first_n {
+                        sequences.lock().insert(
+                            mid.clone(),
+                            (0..*n)
+                                .map(|_| (430u16, format!("No article: <{mid}>")))
+                                .collect(),
+                        );
+                    }
+                    sequences
+                });
                 MockConfig {
                     articles,
                     groups: HashMap::from([(SAMPLE_GROUP.to_string(), (count, 1, count))]),
-                    article_available_after: plan.available_after.clone(),
+                    article_response_sequences,
                     hang_after_command: plan.hang_on_article.then(|| "ARTICLE".to_string()),
                     ..MockConfig::default()
                 }
