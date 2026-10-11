@@ -17,8 +17,8 @@
 #   <dep>.workspace = true           ->  <dep> = <[workspace.dependencies] value>
 #   { version = "x", path = "../y" } ->  { version = "x" }
 #       (sibling nzb-* crates resolve from crates.io in the standalone repo)
-# Any other workspace inheritance, or a sibling path without a version, is a
-# hard error rather than a silently unbuildable manifest.
+# Any other workspace inheritance, a sibling path without a version, or a
+# sibling requirement below that sibling's current version is a hard error rather than a silently unbuildable manifest.
 crate_export_manifest() {
     awk -v crate="$2" -v file="$1" '
         function fail(msg) {
@@ -53,6 +53,19 @@ crate_export_manifest() {
             if (line ~ /workspace[ \t]*=[ \t]*true/) fail("unsupported workspace inheritance: " line)
             if (line ~ /path[ \t]*=[ \t]*"\.\.\//) {
                 if (line !~ /version[ \t]*=/) fail("sibling path dependency without a version: " line)
+                # Here the path wins, so a stale requirement still builds; in
+                # the standalone repo it resolves from crates.io and may pick
+                # a sibling that lacks what this crate uses.
+                match(line, /path[ \t]*=[ \t]*"\.\.\/[^"]*"/)
+                sib = substr(line, RSTART, RLENGTH)
+                sub(/^[^"]*"\.\.\//, "", sib); sub(/"$/, "", sib)
+                mf = "git show HEAD:crates/" sib "/Cargo.toml"
+                want = ""
+                while ((mf | getline l) > 0)
+                    if (want == "" && l ~ /^version[ \t]*=/) { want = l; sub(/^[^"]*"/, "", want); sub(/".*/, "", want) }
+                close(mf)
+                have = line; sub(/.*version[ \t]*=[ \t]*"/, "", have); sub(/".*/, "", have)
+                if (want != "" && have != want) fail(sib " requirement " have " is not its current version " want)
                 gsub(/,[ \t]*path[ \t]*=[ \t]*"\.\.\/[^"]*"/, "", line)
                 gsub(/path[ \t]*=[ \t]*"\.\.\/[^"]*"[ \t]*,[ \t]*/, "", line)
             }

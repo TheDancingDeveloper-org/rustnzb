@@ -1,6 +1,6 @@
 [package]
 name = "nzb-postproc"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 description = "Post-processing pipeline: PAR2 verify/repair, archive extraction"
 license = "MIT"
@@ -12,7 +12,7 @@ default = []
 groups-db = ["nzb-core/groups-db"]
 
 [dependencies]
-nzb-core = { version = "0.2.18", path = "../nzb-core" }
+nzb-core = { version = "0.2.19", path = "../nzb-core" }
 tokio = { version = "1", features = ["rt", "sync", "process", "io-util"] }
 tracing = "0.1"
 opentelemetry.workspace = true

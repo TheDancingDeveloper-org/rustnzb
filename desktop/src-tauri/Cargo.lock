@@ -3093,7 +3093,7 @@ dependencies = [
 
 [[package]]
 name = "nzb-postproc"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "nzb-core",

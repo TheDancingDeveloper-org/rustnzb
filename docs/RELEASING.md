@@ -67,7 +67,13 @@ each crate's `repository` field). This monorepo is the head:
 
 - **The monorepo owns version numbers.** Change a crate's `version` only in
   `crates/<name>/Cargo.toml`; the standalone repos never originate a bump.
-  Keep each new version strictly above the crates.io maximum for that crate.
+  Keep each new version strictly above the crates.io maximum for that crate:
+  a crate whose code changed since its last publish needs a new number even
+  if the old one looks unreleased here. Keep every sibling requirement
+  (`nzb-x = { version = "...", path = "../nzb-x" }`, and the root
+  `[workspace.dependencies]`) at that sibling's current version; the
+  standalone repo resolves it from crates.io, and the export refuses a stale
+  one.
 - **Standalone repos are sync targets.** `ci/tasks/sync-crate <name>` builds
   the standalone tree for `crates/<name>` at `HEAD` and opens a pull request
   on that crate's standalone repo. It never publishes and never pushes to the

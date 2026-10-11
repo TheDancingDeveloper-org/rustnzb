@@ -1,6 +1,6 @@
 [package]
 name = "nzb-news"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 description = "Layered NNTP download engine: persistent per-connection workers, priority-aware dispatch with cascade-retry, pipelined batch fetching. Pure fetch layer — no decode, no assembly."
 license = "MIT"
