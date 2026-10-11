@@ -1675,7 +1675,11 @@ version = "1.5.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crc32fast",
+ "md-5 0.11.0",
  "nzb-nntp",
+ "rust-par2",
+ "tempfile",
  "tokio",
  "yenc-simd",
 ]
