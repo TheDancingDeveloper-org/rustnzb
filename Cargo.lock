@@ -1810,6 +1810,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nzb-decode-ffi"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "nzb-decode",
+]
+
+[[package]]
 name = "nzb-dispatch"
 version = "0.2.9"
 dependencies = [

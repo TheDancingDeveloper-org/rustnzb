@@ -1,0 +1,16 @@
+# Standalone-repo paths a sync must never delete.
+# One path prefix per line; blank lines and #-comments are ignored.
+# Matched against tracked paths in the standalone checkout: an exact path or
+# anything under it is left in place. A path the monorepo also ships is not
+# preserved — the exported tree wins, so bringing a file into crates/<name>
+# is how the monorepo takes ownership of it.
+#
+# Shared by ci/tasks/sync-crate (keeps them) and ci/tasks/crate-drift (ignores
+# them when comparing trees).
+.github
+.woodpecker.yml
+.gitignore
+.cgcignore
+LICENSE
+ci
+renovate.json

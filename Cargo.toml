@@ -5,6 +5,7 @@ members = [
     "crates/mock-nntp-server",
     "crates/nzb-core",
     "crates/nzb-decode",
+    "crates/nzb-decode/ffi",
     "crates/nzb-dispatch",
     "crates/nzb-news",
     "crates/nzb-nntp",

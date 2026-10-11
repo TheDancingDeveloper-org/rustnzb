@@ -58,11 +58,68 @@ clone="$workdir/repo"
 git clone --quiet "$repo" "$clone"
 git -C "$clone" checkout -q -B "$branch"
 
+# Refuse while the standalone repo still carries commits of its own, made since
+# the last sync, that the monorepo has not absorbed. A sync replaces the
+# standalone tree, so pushing one over unported work would drop it. The last
+# sync commit is the newest "sync: <crate> from rustnzb monorepo" commit;
+# commits before it were already reconciled. Standalone-only paths
+# (ci/sync-preserve.txt) are infrastructure and do not count.
+preserve="$REPO_ROOT/ci/sync-preserve.txt"
+last_sync=$(git -C "$clone" log --format='%H' --grep="^sync: $crate from rustnzb monorepo" -n 1 main || true)
+range=main
+[ -n "$last_sync" ] && range="$last_sync..main"
+unported=$(git -C "$clone" log --format='%h %s' "$range" | while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    sha=${line%% *}
+    touched=0
+    for path in $(git -C "$clone" diff-tree --no-commit-id --name-only -r "$sha"); do
+        keep=0
+        if [ -f "$preserve" ]; then
+            while IFS= read -r rule; do
+                case "$rule" in ''|\#*) continue ;; esac
+                case "$path" in "$rule"|"$rule"/*) keep=1 ;; esac
+            done <"$preserve"
+        fi
+        [ "$keep" -eq 0 ] && touched=1
+    done
+    [ "$touched" -eq 1 ] && printf '%s\n' "$line"
+done)
+if [ -n "$unported" ]; then
+    echo "sync-crate: refusing to sync $crate — commits since the last sync touch paths the monorepo does not own yet:" >&2
+    printf '%s\n' "$unported" | sed 's/^/    /' >&2
+    echo "sync-crate: port them into the monorepo first, then re-run." >&2
+    exit 3
+fi
+
 # Replace the standalone tree with the monorepo crate at HEAD. Clear the old
 # tracked files first so deletions in the monorepo propagate, then extract the
 # crate subtree (git archive emits tracked files only, no target/).
-git -C "$clone" ls-files -z | (cd "$clone" && xargs -0 rm -f --)
+#
+# Paths listed in ci/sync-preserve.txt survive the replace, so a sync never
+# deletes them. A path the monorepo starts shipping is no longer preserved.
+git -C "$clone" ls-files -z | while IFS= read -r -d '' path; do
+    keep=0
+    if [ -f "$preserve" ]; then
+        while IFS= read -r rule; do
+            case "$rule" in
+                ''|\#*) continue ;;
+            esac
+            case "$path" in
+                "$rule"|"$rule"/*) keep=1 ;;
+            esac
+        done <"$preserve"
+    fi
+    if [ "$keep" -eq 0 ]; then
+        rm -f "$clone/$path"
+    fi
+done
 git archive "HEAD:crates/$crate" | tar -x -C "$clone"
+
+# The monorepo resolves sibling crates through [workspace.dependencies]; a
+# standalone repo has no such table. Rewrite `workspace = true` dependencies on
+# the crate being exported back to a path dependency before the diff is taken.
+find "$clone" -name Cargo.toml -print0 | xargs -0 \
+    sed -i "s#^\\($crate\\)[[:space:]]*=[[:space:]]*{[[:space:]]*workspace[[:space:]]*=[[:space:]]*true[[:space:]]*}#\\1 = { path = \"..\" }#"
 
 git -C "$clone" add -A
 if git -C "$clone" diff --cached --quiet; then

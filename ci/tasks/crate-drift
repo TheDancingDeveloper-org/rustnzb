@@ -74,11 +74,28 @@ while IFS= read -r crate; do
         note_drift "$crate: version monorepo=$mono_version standalone=$std_version"
     fi
 
-    if ! git -c core.fileMode=false diff --no-index --quiet \
-            "$dest/src" "crates/$crate/src"; then
-        note_drift "$crate: src/ differs from the standalone repo — run: ci/tasks/sync-crate $crate"
+    # Compare the whole tracked tree, not only src/. Paths in ci/sync-preserve.txt
+    # are standalone-only (CI, license) and are excluded on both sides, so a file
+    # that exists only there is not drift and a sync will not delete it. Anything
+    # else — including a workspace member such as ffi/ — must match both ways.
+    snapshot="$workdir/$crate.mono"
+    mkdir -p "$snapshot"
+    git archive "HEAD:crates/$crate" | tar -x -C "$snapshot"
+    # Mirror the rewrite sync-crate applies: the standalone repo cannot resolve
+    # `workspace = true`, so compare against the path form it actually carries.
+    find "$snapshot" -name Cargo.toml -print0 | xargs -0 \
+        sed -i "s#^\\($crate\\)[[:space:]]*=[[:space:]]*{[[:space:]]*workspace[[:space:]]*=[[:space:]]*true[[:space:]]*}#\\1 = { path = \"..\" }#"
+    preserve="ci/sync-preserve.txt"
+    if [ -f "$preserve" ]; then
+        while IFS= read -r rule; do
+            case "$rule" in ''|\#*) continue ;; esac
+            rm -rf "$dest/$rule" "$snapshot/$rule"
+        done <"$preserve"
+    fi
+    if ! git -c core.fileMode=false diff --no-index --quiet "$dest" "$snapshot"; then
+        note_drift "$crate: tree differs from the standalone repo — run: ci/tasks/sync-crate $crate"
         git -c core.fileMode=false diff --no-index --stat \
-            "$dest/src" "crates/$crate/src" 2>/dev/null | sed 's/^/    /' >&2 || true
+            "$dest" "$snapshot" 2>/dev/null | sed 's/^/    /' >&2 || true
     fi
 done <"$crate_list"
 

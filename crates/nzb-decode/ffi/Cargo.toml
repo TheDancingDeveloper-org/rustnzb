@@ -1,0 +1,25 @@
+[package]
+name = "nzb-decode-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "RapidYenc-compatible C ABI over nzb-decode's yEnc decoder, for loading through FFI"
+license = "MIT"
+repository = "https://github.com/TheDancingDeveloper-org/nzb-decode"
+publish = false
+
+[lib]
+name = "nzbyenc"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# In the monorepo this resolves through the workspace dependency (and the
+# crates.io patch). The standalone repo has no workspace.dependencies table,
+# so ci/tasks/sync-crate rewrites this line back to `{ path = ".." }` on export.
+nzb-decode = { workspace = true }
+crc32fast = "1"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[lints.rust]
+unused = "warn"
