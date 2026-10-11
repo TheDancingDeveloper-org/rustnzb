@@ -81,9 +81,16 @@ each crate's `repository` field). This monorepo is the head:
   `ci/tasks/sync-crate <name>`, merge, and publish from the tag.
 - **A sync never deletes standalone-only files.** `ci/sync-preserve.txt` lists
   paths the standalone repos own (CI workflows, license, renovate). Both the
-  sync and the drift check leave those alone. Everything else in the standalone
-  tree — including a workspace member such as `nzb-decode`'s `ffi/` — must live
-  in the monorepo, or the next sync will not carry it and drift will fail.
+  sync and the drift check leave those alone, unless the monorepo has started
+  shipping the same path, in which case the monorepo copy wins. Everything else
+  in the standalone tree — including a workspace member such as `nzb-decode`'s
+  `ffi/` — must live in the monorepo, or the next sync will not carry it and
+  drift will fail.
+- **A sync refuses over unported work.** `sync-crate` exits 3 when a commit
+  since the last `sync: <crate> from rustnzb monorepo` commit on the standalone
+  `main` changes a path the monorepo does not export byte-for-byte. Port that
+  change into the monorepo first. A commit whose every non-preserved path
+  already matches the export is treated as absorbed.
 
 ## Rollback
 
