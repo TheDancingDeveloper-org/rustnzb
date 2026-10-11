@@ -1,3 +1,6 @@
+pub mod damage;
+pub mod par2;
+
 use std::collections::HashMap;
 
 use nzb_nntp::config::ServerConfig;

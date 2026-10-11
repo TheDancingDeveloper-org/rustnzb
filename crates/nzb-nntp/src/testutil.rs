@@ -21,6 +21,9 @@
 //! - `article_response_overrides` — return a custom NNTP response code (430,
 //!   502, 403, etc.) for a specific message-id, regardless of whether the
 //!   article exists. Simulates retention drift, throttling, and access denial.
+//! - `article_available_after` — answer 430 for a message-id until the given
+//!   time has passed since the server started, then serve it normally.
+//!   Simulates a busy provider whose article is briefly unavailable.
 //! - `auth_rate_limit` — reject auth attempts after N within a sliding window.
 //!   State is shared across all connections to the same `MockNntpServer`.
 //!   Simulates account-level rate limiting.
@@ -165,6 +168,11 @@ pub struct MockConfig {
     /// article lookup resumes. This models a stale session returning `400`
     /// followed by a successful fetch on a replacement connection.
     pub article_response_sequences: Option<ArticleResponseSequences>,
+    /// Answer `430` on ARTICLE/BODY/STAT for a message-id until this long has
+    /// passed since the server started, then serve it normally. Measured on
+    /// the tokio clock, so paused-time tests advance it. Models a busy
+    /// provider: an early retry sees 430, a later one succeeds.
+    pub article_available_after: HashMap<String, Duration>,
     /// Cross-connection auth rate limiter. After `max_attempts` AUTHINFO PASS
     /// attempts within the `window`, all subsequent auths return 481.
     pub auth_rate_limit: Option<AuthRateLimit>,
@@ -216,6 +224,7 @@ impl Default for MockConfig {
             response_delay: None,
             article_response_overrides: HashMap::new(),
             article_response_sequences: None,
+            article_available_after: HashMap::new(),
             auth_rate_limit: None,
             capabilities_unsupported: false,
             capabilities_mode_reader: false,
@@ -244,6 +253,7 @@ impl MockNntpServer {
         let listener = TcpListener::bind(bind_addr).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let config = Arc::new(config);
+        let started = tokio::time::Instant::now();
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
         tokio::spawn(async move {
@@ -252,7 +262,7 @@ impl MockNntpServer {
                     result = listener.accept() => {
                         if let Ok((stream, _)) = result {
                             let cfg = config.clone();
-                            tokio::spawn(handle_connection(stream, cfg));
+                            tokio::spawn(handle_connection(stream, cfg, started));
                         }
                     }
                     _ = shutdown_rx.changed() => break,
@@ -384,7 +394,19 @@ macro_rules! mwrite {
 // Connection handler
 // ---------------------------------------------------------------------------
 
-async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig>) {
+/// Whether `article_available_after` still holds `mid` back.
+fn not_yet_available(config: &MockConfig, mid: &str, started: tokio::time::Instant) -> bool {
+    config
+        .article_available_after
+        .get(mid)
+        .is_some_and(|after| started.elapsed() < *after)
+}
+
+async fn handle_connection(
+    stream: tokio::net::TcpStream,
+    config: Arc<MockConfig>,
+    started: tokio::time::Instant,
+) {
     let mut stream = BufReader::new(stream);
 
     // Send welcome banner (or 502 + bail).
@@ -670,6 +692,9 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                     if let Some((code, message)) = sequenced {
                         let resp = format!("{code} {message}\r\n");
                         mwrite!(conn, resp.as_bytes());
+                    } else if not_yet_available(&config, mid, started) {
+                        let resp = format!("430 No article: <{mid}>\r\n");
+                        mwrite!(conn, resp.as_bytes());
                     } else if let Some(&code) = config.article_response_overrides.get(mid) {
                         let resp = format!("{code} <{mid}>\r\n");
                         mwrite!(conn, resp.as_bytes());
@@ -694,7 +719,10 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                         .get(1)
                         .unwrap_or(&"")
                         .trim_matches(|c| c == '<' || c == '>');
-                    if let Some(&code) = config.article_response_overrides.get(mid) {
+                    if not_yet_available(&config, mid, started) {
+                        let resp = format!("430 No article: <{mid}>\r\n");
+                        mwrite!(conn, resp.as_bytes());
+                    } else if let Some(&code) = config.article_response_overrides.get(mid) {
                         let resp = format!("{code} <{mid}>\r\n");
                         mwrite!(conn, resp.as_bytes());
                     } else if let Some(data) = config.articles.get(mid) {
@@ -718,7 +746,10 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                         .get(1)
                         .unwrap_or(&"")
                         .trim_matches(|c| c == '<' || c == '>');
-                    if let Some(&code) = config.article_response_overrides.get(mid) {
+                    if not_yet_available(&config, mid, started) {
+                        let resp = format!("430 No article: <{mid}>\r\n");
+                        mwrite!(conn, resp.as_bytes());
+                    } else if let Some(&code) = config.article_response_overrides.get(mid) {
                         let resp = format!("{code} <{mid}>\r\n");
                         mwrite!(conn, resp.as_bytes());
                     } else if config.articles.contains_key(mid) {
