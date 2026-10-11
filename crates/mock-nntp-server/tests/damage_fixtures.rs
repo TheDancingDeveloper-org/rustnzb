@@ -7,10 +7,10 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mock_nntp_server::damage::{
-    BUSY_PROVIDER_DELAY, DamageRelease, DamageScenario, ScenarioFixture,
+    BUSY_PROVIDER_REFUSALS, DamageRelease, DamageScenario, ScenarioFixture,
 };
 use mock_nntp_server::par2::Par2Fixture;
 use mock_nntp_server::server_config;
@@ -328,28 +328,20 @@ async fn primary_refusal_is_served_by_the_second_server() {
 #[tokio::test]
 async fn busy_provider_refuses_fast_retries_then_serves() {
     let fixture = DamageScenario::BusyProvider.fixture();
-    let started = Instant::now();
     let servers = fixture.start_servers().await;
     let mid = fixture.expect.transient_articles.iter().next().unwrap();
     let segment = fixture.release.segment(mid).unwrap();
 
     for server in &servers {
         let mut connection = connect(server).await;
-        assert_eq!(fetch(&mut connection, mid).await, None);
-        assert_eq!(fetch(&mut connection, mid).await, None);
+        for _ in 0..BUSY_PROVIDER_REFUSALS {
+            assert_eq!(fetch(&mut connection, mid).await, None);
+        }
+        assert_eq!(
+            fetch(&mut connection, mid).await.as_deref(),
+            Some(segment.body.as_slice())
+        );
     }
-    assert!(
-        started.elapsed() < Duration::from_millis(350),
-        "the refused retries must land inside the 350 ms window"
-    );
-
-    tokio::time::sleep(BUSY_PROVIDER_DELAY.saturating_sub(started.elapsed())).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let mut connection = connect(&servers[0]).await;
-    assert_eq!(
-        fetch(&mut connection, mid).await.as_deref(),
-        Some(segment.body.as_slice())
-    );
 }
 
 #[tokio::test]
