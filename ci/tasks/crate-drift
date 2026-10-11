@@ -105,7 +105,7 @@ while IFS= read -r crate; do
 done <"$crate_list"
 
 if [ "$failures" -ne 0 ]; then
-    echo "crate-drift: $failures crate(s) drifted from the monorepo head" >&2
+    echo "crate-drift: $failures drift finding(s) against the monorepo head" >&2
     exit 1
 fi
 echo "crate-drift: all synced crates match the monorepo head"
