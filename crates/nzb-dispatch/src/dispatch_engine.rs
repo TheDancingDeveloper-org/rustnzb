@@ -27,6 +27,11 @@ use parking_lot::Mutex;
 /// Constructed by the facade/queue layer and owned as `Arc<dyn DispatchEngine>`.
 /// All methods are `&self`; implementations use interior mutability to allow
 /// concurrent use across tokio tasks.
+// async_trait stamps `#[must_use]` with no message on the boxed future it
+// returns, and a newer clippy rejects that as double_must_use because the
+// boxed future is already must-use. The attribute is macro-generated, so the
+// suppression has to sit on the trait rather than the method.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait DispatchEngine: Send + Sync {
     /// Spawn workers for all currently enabled servers and start the

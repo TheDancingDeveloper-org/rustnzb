@@ -9,6 +9,6 @@
 # names it in the log and the PR body. An entry is dead once the sync that
 # overwrote it has merged (the last-sync anchor moves past it) and can then be
 # removed.
-nzb-dispatch 11e37b497a822df91ed8df55f0abe3e20218cd01 clippy::double_must_use allow for a newer clippy than the monorepo MSRV gate; monorepo dispatch_engine.rs supersedes the older standalone copy (WI-168)
+nzb-dispatch 11e37b497a822df91ed8df55f0abe3e20218cd01 ported: the clippy::double_must_use allow (needed by the standalone CI's newer clippy) is on DispatchEngine in the monorepo; the rest of dispatch_engine.rs is the newer monorepo copy (WI-168)
 nzb-web 04367ff4578f5e6ce17b2f1385ef9c4a1a379c6b retry_data: None was a compile shim against nzb-core 0.2.18; the monorepo persists real retry checkpoints, and its queue_manager.rs/sabnzbd_compat.rs supersede the older standalone copies (WI-168)
 nzb-decode 98725f7bb8573a3834451021dbe6fa817f7bb9f0 ported, not dropped: ffi/ lives in crates/nzb-decode/ffi (#176), the [workspace] table is added on export, the RapidYenc README section is in the monorepo README, CLAUDE.md and Cargo.lock are preserved; Cargo.toml and ffi/Cargo.toml differ only by monorepo-owned version/deps and a comment (WI-168)
