@@ -1578,10 +1578,86 @@ impl QueueManager {
         }
     }
 
-    /// Set max active downloads and start queued jobs if capacity allows.
+    /// Set max active downloads.
+    ///
+    /// Raising the limit (or setting it to 0, which means unlimited) starts
+    /// queued jobs up to the new capacity. Lowering it requeues the extra
+    /// active downloads — lowest priority, and within a priority the newest
+    /// in queue order — so the active count matches the setting. A requeued
+    /// job is paused in the dispatcher, which keeps its context and progress;
+    /// it resumes through the normal slot claim once capacity frees up.
     pub fn set_max_active_downloads(self: &Arc<Self>, max: usize) {
         self.max_active_downloads.store(max, Ordering::Relaxed);
+        self.requeue_over_limit();
         self.start_next_queued();
+    }
+
+    /// Move downloading jobs above `max_active_downloads` back to `Queued`.
+    ///
+    /// `max == 0` is unlimited and requeues nothing. Selection mirrors
+    /// preemption: the job with the lowest priority loses its slot, and ties
+    /// go to the one furthest down the queue (newest). The dispatcher's
+    /// pause keeps the in-flight context, so progress is not discarded.
+    fn requeue_over_limit(self: &Arc<Self>) {
+        let max = self.max_active_downloads.load(Ordering::Relaxed);
+        if max == 0 {
+            return;
+        }
+        loop {
+            let victim = {
+                let jobs = self.jobs.lock();
+                let order = self.job_order.lock();
+                let active = jobs
+                    .values()
+                    .filter(|s| s.job.status == JobStatus::Downloading)
+                    .count();
+                if active <= max {
+                    return;
+                }
+                let mut worst: Option<(String, u8, usize)> = None;
+                for (idx, id) in order.iter().enumerate() {
+                    if let Some(state) = jobs.get(id)
+                        && state.job.status == JobStatus::Downloading
+                    {
+                        let priority = state.job.priority as u8;
+                        if worst.as_ref().is_none_or(|(_, wp, widx)| {
+                            priority < *wp || (priority == *wp && idx > *widx)
+                        }) {
+                            worst = Some((id.clone(), priority, idx));
+                        }
+                    }
+                }
+                worst.map(|(id, _, _)| id)
+            };
+            let Some(id) = victim else {
+                return;
+            };
+            info!(
+                job_id = %id,
+                max_downloads = max,
+                "Requeueing active download: concurrent-jobs limit lowered"
+            );
+            // Pause first so workers stop pulling this job's articles. The
+            // context stays in the dispatcher; resume unpauses it.
+            self.dispatch.pause_job(&id);
+            let mut jobs = self.jobs.lock();
+            let Some(state) = jobs.get_mut(&id) else {
+                continue;
+            };
+            if state.job.status != JobStatus::Downloading {
+                continue;
+            }
+            state.job.status = JobStatus::Queued;
+            let db = self.db.lock();
+            let _ = db.queue_update_progress(
+                &id,
+                JobStatus::Queued,
+                state.job.downloaded_bytes,
+                state.job.articles_downloaded,
+                state.job.articles_failed,
+                state.job.files_completed,
+            );
+        }
     }
 
     /// Enable or disable automatic remaining-percentage ordering.
@@ -5435,6 +5511,63 @@ mod global_pause_tests {
             },
         );
         manager.job_order.lock().push(id);
+    }
+
+    #[tokio::test]
+    async fn lowering_max_active_downloads_requeues_the_lowest_priority_job() {
+        let (manager, tempdir) = manager();
+        manager.set_max_active_downloads(2);
+
+        let mut first = job("keep", JobStatus::Downloading, tempdir.path());
+        first.priority = Priority::High;
+        first.downloaded_bytes = 40;
+        first.articles_downloaded = 4;
+        let mut second = job("drop", JobStatus::Downloading, tempdir.path());
+        second.priority = Priority::Low;
+        second.downloaded_bytes = 70;
+        second.articles_downloaded = 7;
+        insert_job(&manager, first);
+        insert_job(&manager, second);
+
+        manager.set_max_active_downloads(1);
+
+        let kept = manager.get_job("keep").expect("kept job");
+        let dropped = manager.get_job("drop").expect("requeued job");
+        assert_eq!(kept.status, JobStatus::Downloading);
+        assert_eq!(dropped.status, JobStatus::Queued);
+        // Requeue must not discard progress already on disk.
+        assert_eq!(dropped.downloaded_bytes, 70);
+        assert_eq!(dropped.articles_downloaded, 7);
+        assert_eq!(
+            manager
+                .jobs
+                .lock()
+                .values()
+                .filter(|state| state.job.status == JobStatus::Downloading)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn lowering_max_active_downloads_requeues_the_newest_when_priority_ties() {
+        let (manager, tempdir) = manager();
+        let mut older = job("older", JobStatus::Downloading, tempdir.path());
+        older.downloaded_bytes = 10;
+        let mut newer = job("newer", JobStatus::Downloading, tempdir.path());
+        newer.downloaded_bytes = 20;
+        insert_job(&manager, older);
+        insert_job(&manager, newer);
+
+        manager.set_max_active_downloads(1);
+
+        assert_eq!(
+            manager.get_job("older").unwrap().status,
+            JobStatus::Downloading
+        );
+        let requeued = manager.get_job("newer").unwrap();
+        assert_eq!(requeued.status, JobStatus::Queued);
+        assert_eq!(requeued.downloaded_bytes, 20);
     }
 
     #[tokio::test]
