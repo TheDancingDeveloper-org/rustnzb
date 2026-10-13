@@ -2521,7 +2521,7 @@ impl QueueManager {
 
                     // Batch DB writes (every 2 seconds)
                     if last_db_update.elapsed() >= Duration::from_secs(2) {
-                        self.persist_job_progress(&job_id);
+                        self.persist_job_progress_blocking(&job_id).await;
                         last_db_update = Instant::now();
                     }
                     if self.auto_sort_remaining_pct() {
@@ -2797,7 +2797,7 @@ impl QueueManager {
                             self.move_to_history(state, Vec::new());
                         }
                     }
-                    self.persist_job_progress(&job_id);
+                    self.persist_job_progress_blocking(&job_id).await;
                     self.start_next_queued();
                     let jid = job_id.clone();
                     let qm = Arc::clone(&self);
@@ -2876,7 +2876,7 @@ impl QueueManager {
             )
         };
         // Record the reserved folder so a restart resumes into it.
-        self.persist_job_progress(job_id);
+        self.persist_job_progress_blocking(job_id).await;
 
         // Repair and extraction can write to both the incomplete and the
         // category output volumes. Apply the same guard to both paths before
@@ -2885,8 +2885,7 @@ impl QueueManager {
             self.min_free_space(),
             [work_dir.as_path(), output_dir.as_path()].as_slice(),
         ) {
-            let mut jobs = self.jobs.lock();
-            if let Some(state) = jobs.get_mut(job_id) {
+            if let Some(state) = self.jobs.lock().get_mut(job_id) {
                 let message = "Insufficient free disk space for post-processing".to_string();
                 state.job.status = JobStatus::Failed;
                 state.job.error_message = Some(message.clone());
@@ -2900,8 +2899,7 @@ impl QueueManager {
                     }],
                 );
             }
-            drop(jobs);
-            self.persist_job_progress(job_id);
+            self.persist_job_progress_blocking(job_id).await;
             self.start_next_queued();
             let qm = Arc::clone(self);
             let jid = job_id.to_string();
@@ -3068,7 +3066,7 @@ impl QueueManager {
         }
 
         // Persist final state
-        self.persist_job_progress(job_id);
+        self.persist_job_progress_blocking(job_id).await;
 
         // Keep the completed/failed job visible in the queue briefly so the
         // UI has a chance to show the transition.  Fast downloads can go from
@@ -3428,36 +3426,74 @@ impl QueueManager {
 
     /// Persist current job progress to the database, including article-level
     /// checkpoint data for resume support.
+    /// Persist a job's progress counters and resume checkpoint.
+    ///
+    /// The snapshot is taken under the job-list lock, which is released
+    /// before the checkpoint is serialised and before the database lock is
+    /// taken: the two locks are never held together, so `get_jobs()` (queue
+    /// and status polls) never waits behind a database write or a slow query.
     fn persist_job_progress(&self, job_id: &str) {
-        let jobs = self.jobs.lock();
-        if let Some(state) = jobs.get(job_id) {
-            // Accumulated active time: the final total once the download
-            // resolved, otherwise earlier runs plus the live engine run.
-            let download_time_secs = state.download_time_secs.unwrap_or_else(|| {
-                state.prior_download_secs + self.dispatch.job_active_secs(job_id).unwrap_or(0.0)
-            });
-            let db = self.db.lock();
-            if let Err(e) = db.queue_update_progress(
-                job_id,
+        let snapshot = {
+            let jobs = self.jobs.lock();
+            let Some(state) = jobs.get(job_id) else {
+                return;
+            };
+            let mut checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
+            checkpoint.carried_bytes = state.carried_bytes;
+            (
                 state.job.status,
                 state.job.downloaded_bytes,
                 state.job.articles_downloaded,
                 state.job.articles_failed,
                 state.job.files_completed,
-            ) {
-                warn!(job_id = %job_id, "Failed to persist progress: {e}");
-            }
+                state.download_time_secs,
+                state.prior_download_secs,
+                checkpoint,
+            )
+        };
+        let (
+            status,
+            downloaded_bytes,
+            articles_downloaded,
+            articles_failed,
+            files_completed,
+            final_download_secs,
+            prior_download_secs,
+            mut checkpoint,
+        ) = snapshot;
+        // Accumulated active time: the final total once the download
+        // resolved, otherwise earlier runs plus the live engine run.
+        checkpoint.download_time_secs = final_download_secs.unwrap_or_else(|| {
+            prior_download_secs + self.dispatch.job_active_secs(job_id).unwrap_or(0.0)
+        });
+        let data = serde_json::to_vec(&checkpoint);
 
-            // Build and store checkpoint of downloaded article segments
-            let mut checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
-            checkpoint.download_time_secs = download_time_secs;
-            checkpoint.carried_bytes = state.carried_bytes;
+        let db = self.db.lock();
+        if let Err(e) = db.queue_update_progress(
+            job_id,
+            status,
+            downloaded_bytes,
+            articles_downloaded,
+            articles_failed,
+            files_completed,
+        ) {
+            warn!(job_id = %job_id, "Failed to persist progress: {e}");
+        }
+        if let Ok(data) = data
+            && let Err(e) = db.queue_store_job_data(job_id, &data)
+        {
+            warn!(job_id = %job_id, "Failed to persist checkpoint: {e}");
+        }
+    }
 
-            if let Ok(data) = serde_json::to_vec(&checkpoint)
-                && let Err(e) = db.queue_store_job_data(job_id, &data)
-            {
-                warn!(job_id = %job_id, "Failed to persist checkpoint: {e}");
-            }
+    /// [`Self::persist_job_progress`] on a blocking thread, for async callers:
+    /// the database write never runs on an async worker.
+    async fn persist_job_progress_blocking(self: &Arc<Self>, job_id: &str) {
+        let qm = Arc::clone(self);
+        let job_id = job_id.to_string();
+        if let Err(e) = tokio::task::spawn_blocking(move || qm.persist_job_progress(&job_id)).await
+        {
+            warn!("Progress persist task failed: {e}");
         }
     }
 
@@ -6787,6 +6823,55 @@ mod global_pause_tests {
         assert!(reserved.join("second.mkv").exists());
         assert!(!foreign.join("second.mkv").exists());
         assert!(!foreign.with_file_name("SameName.2").exists());
+    }
+
+    /// A progress save waiting on the database (a slow history query, say)
+    /// must not hold the job list: queue and status polls read `get_jobs()`
+    /// and have to answer while the save is still pending.
+    #[tokio::test]
+    async fn queue_reads_are_not_blocked_behind_a_pending_progress_save() {
+        let (manager, tempdir) = manager();
+        insert_job(
+            &manager,
+            job("busy", JobStatus::Downloading, tempdir.path()),
+        );
+
+        let db_guard = manager.db.lock();
+        let saver = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || manager.persist_job_progress("busy"))
+        };
+        // Let the save take its snapshot and block on the database lock.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !saver.is_finished(),
+            "save should be waiting on the DB lock"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                let _ = tx.send(manager.get_jobs().len());
+            })
+        };
+        let seen = rx.recv_timeout(Duration::from_secs(2));
+        drop(db_guard);
+        saver.join().unwrap();
+        reader.join().unwrap();
+        assert_eq!(
+            seen.expect("get_jobs() blocked behind a pending progress save"),
+            1
+        );
+        assert!(
+            manager
+                .db
+                .lock()
+                .queue_load_job_data("busy")
+                .unwrap()
+                .is_some(),
+            "the save completes once the database is free"
+        );
     }
 
     #[tokio::test]
