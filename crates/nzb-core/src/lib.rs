@@ -13,7 +13,7 @@ pub use config::AppConfig;
 pub use damage_ledger::{
     ArticleKey, ConfirmNeeded, Consult, LedgerRecord, LedgerState, Outcome, server_fingerprint,
 };
-pub use db::Database;
+pub use db::{Database, HistoryFilter, HistorySummary};
 pub use error::{NzbError, Result};
 pub use models::*;
 pub use nzb_nntp;

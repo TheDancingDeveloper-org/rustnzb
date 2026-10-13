@@ -192,3 +192,22 @@ async fn huge_days_query_is_rejected_instead_of_panicking() {
         Ok(_) => panic!("an overflowing days window must be rejected, not listed"),
     }
 }
+
+#[tokio::test]
+async fn status_filter_is_case_insensitive_and_unknown_status_matches_nothing() {
+    let (state, _dir) = state_with_history();
+
+    let failed = list(&state, "status=FAILED&limit=100").await;
+    assert_eq!(failed["total"], 15);
+    assert!(ids(&failed).iter().all(|id| id.as_str() >= "h100"));
+
+    let unknown = list(&state, "status=bogus").await;
+    assert_eq!(unknown["total"], 0);
+    assert!(ids(&unknown).is_empty());
+    // Categories and stats still describe the window.
+    assert_eq!(unknown["stats"]["failed"], 15);
+    assert_eq!(unknown["categories"].as_array().unwrap().len(), 3);
+
+    let combined = list(&state, "status=completed&category=old&search=RELEASE.11").await;
+    assert_eq!(ids(&combined), vec!["h115", "h116", "h117", "h118", "h119"]);
+}
