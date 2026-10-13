@@ -1643,6 +1643,45 @@ pub async fn h_disk_guards_set(
 }
 
 // ---------------------------------------------------------------------------
+// Debug logging
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+pub struct DebugLoggingBody {
+    pub enabled: bool,
+}
+
+/// GET /api/config/debug-logging -- Whether verbose download tracing is on.
+pub async fn h_debug_logging_get(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<DebugLoggingBody>, ApiError> {
+    Ok(Json(DebugLoggingBody {
+        enabled: state.config().general.log_level == "debug",
+    }))
+}
+
+/// PUT /api/config/debug-logging -- Turn verbose download tracing on or off.
+///
+/// Applies immediately: the tracing filter is rebuilt and the choice is
+/// persisted, so it survives a restart.
+pub async fn h_debug_logging_set(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DebugLoggingBody>,
+) -> Result<Json<SimpleResponse>, ApiError> {
+    let level = if body.enabled { "debug" } else { "info" };
+    if !crate::set_log_filter(level) {
+        return Err(ApiError::bad_request(
+            "the log filter is not reloadable in this process",
+        ));
+    }
+    state.update_config_with(|config| {
+        config.general.log_level = level.to_string();
+        Ok::<_, ApiError>(())
+    })?;
+    Ok(Json(SimpleResponse { status: true }))
+}
+
+// ---------------------------------------------------------------------------
 // RSS feed handlers
 // ---------------------------------------------------------------------------
 

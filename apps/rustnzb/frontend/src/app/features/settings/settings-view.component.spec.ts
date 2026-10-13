@@ -17,6 +17,7 @@ function makeComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {})
         '/config/max-active-downloads': { max_active_downloads: 4 },
         '/config/history-retention': { retention: 14 },
         '/config/disk-guards': { min_free_space_bytes: 2 * 1024 ** 3, abort_hopeless: false },
+        '/config/debug-logging': { enabled: false },
         '/config/sabnzbd-api-key': { api_key: 'key' },
         '/status': { webdav_available: false, webdav_enabled: false },
         '/config': { general: { data_dir: '/data', incomplete_dir: '/incomplete', complete_dir: '/complete', watch_dir: null } },
