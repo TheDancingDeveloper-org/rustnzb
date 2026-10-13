@@ -1121,6 +1121,9 @@ struct JobState {
     /// reserved for itself. Reserving happens when output is first written,
     /// not at add time, so queued jobs never hold a name.
     output_dir_claimed: bool,
+    /// The status the last progress save wrote to the queue row, so the save
+    /// only takes the job-list and database locks together on a transition.
+    persisted_status: Option<JobStatus>,
 }
 
 /// Field a manual queue sort orders by.
@@ -1648,6 +1651,7 @@ impl QueueManager {
                 continue;
             }
             state.job.status = JobStatus::Queued;
+            state.persisted_status = Some(JobStatus::Queued);
             let db = self.db.lock();
             let _ = db.queue_update_progress(
                 &id,
@@ -1827,6 +1831,7 @@ impl QueueManager {
                 if let Some(tracker) = state.hopeless_tracker.as_mut() {
                     tracker.reset_progress_clock();
                 }
+                state.persisted_status = Some(JobStatus::Downloading);
                 let db = self.db.lock();
                 let _ = db.queue_update_progress(
                     job_id,
@@ -2001,6 +2006,7 @@ impl QueueManager {
                 carried_bytes,
                 failure_code: None,
                 output_dir_claimed: false,
+                persisted_status: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             if !requested_paused {
@@ -2026,6 +2032,7 @@ impl QueueManager {
             carried_bytes,
             failure_code: None,
             output_dir_claimed: false,
+            persisted_status: None,
         };
         self.jobs.lock().insert(job_id.clone(), state);
         self.job_order.lock().push(job_id);
@@ -3441,7 +3448,7 @@ impl QueueManager {
             let mut checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
             checkpoint.carried_bytes = state.carried_bytes;
             (
-                state.job.status,
+                state.persisted_status != Some(state.job.status),
                 state.job.downloaded_bytes,
                 state.job.articles_downloaded,
                 state.job.articles_failed,
@@ -3452,7 +3459,7 @@ impl QueueManager {
             )
         };
         let (
-            status,
+            status_changed,
             downloaded_bytes,
             articles_downloaded,
             articles_failed,
@@ -3468,21 +3475,42 @@ impl QueueManager {
         });
         let data = serde_json::to_vec(&checkpoint);
 
-        let db = self.db.lock();
-        if let Err(e) = db.queue_update_progress(
-            job_id,
-            status,
-            downloaded_bytes,
-            articles_downloaded,
-            articles_failed,
-            files_completed,
-        ) {
-            warn!(job_id = %job_id, "Failed to persist progress: {e}");
-        }
-        if let Ok(data) = data
-            && let Err(e) = db.queue_store_job_data(job_id, &data)
+        // Counters and checkpoint only: the snapshot's status may already be
+        // stale (a pause or resume can land before the database lock is
+        // free), so it is never written from here.
         {
-            warn!(job_id = %job_id, "Failed to persist checkpoint: {e}");
+            let db = self.db.lock();
+            if let Err(e) = db.queue_update_counters(
+                job_id,
+                downloaded_bytes,
+                articles_downloaded,
+                articles_failed,
+                files_completed,
+            ) {
+                warn!(job_id = %job_id, "Failed to persist progress: {e}");
+            }
+            if let Ok(data) = data
+                && let Err(e) = db.queue_store_job_data(job_id, &data)
+            {
+                warn!(job_id = %job_id, "Failed to persist checkpoint: {e}");
+            }
+        }
+
+        // On a status transition, write the job list's current status under
+        // jobs -> db, the same order the pause and resume paths use.
+        if status_changed {
+            let mut jobs = self.jobs.lock();
+            let Some(state) = jobs.get_mut(job_id) else {
+                return;
+            };
+            let status = state.job.status;
+            if state.persisted_status != Some(status) {
+                let db = self.db.lock();
+                match db.queue_update_status(job_id, status) {
+                    Ok(()) => state.persisted_status = Some(status),
+                    Err(e) => warn!(job_id = %job_id, "Failed to persist status: {e}"),
+                }
+            }
         }
     }
 
@@ -3644,6 +3672,7 @@ impl QueueManager {
                         if let Some(state) = jobs.get_mut(d_id.as_str()) {
                             state.job.status = JobStatus::Paused;
                             // Persist to DB
+                            state.persisted_status = Some(JobStatus::Paused);
                             let db = self.db.lock();
                             let _ = db.queue_update_progress(
                                 d_id,
@@ -3691,6 +3720,7 @@ impl QueueManager {
                 state.job.error_message = None;
             }
 
+            state.persisted_status = Some(JobStatus::Paused);
             let db = self.db.lock();
             db.queue_update_progress(
                 id,
@@ -3746,6 +3776,7 @@ impl QueueManager {
                 // paused in the pool; `start_next_queued` resumes it once a
                 // slot frees up.
                 state.job.status = JobStatus::Queued;
+                state.persisted_status = Some(JobStatus::Queued);
                 let db = self.db.lock();
                 let _ = db.queue_update_progress(
                     id,
@@ -3771,6 +3802,7 @@ impl QueueManager {
                 if let Some(tracker) = state.hopeless_tracker.as_mut() {
                     tracker.reset_progress_clock();
                 }
+                state.persisted_status = Some(JobStatus::Downloading);
                 let db = self.db.lock();
                 let _ = db.queue_update_progress(
                     id,
@@ -5168,6 +5200,7 @@ impl QueueManager {
                 carried_bytes,
                 failure_code: None,
                 output_dir_claimed,
+                persisted_status: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);
@@ -5572,6 +5605,7 @@ mod global_pause_tests {
                 carried_bytes: 0,
                 failure_code: None,
                 output_dir_claimed: false,
+                persisted_status: None,
             },
         );
         manager.job_order.lock().push(id);
@@ -6872,6 +6906,80 @@ mod global_pause_tests {
                 .is_some(),
             "the save completes once the database is free"
         );
+    }
+
+    fn db_status(manager: &QueueManager, id: &str) -> JobStatus {
+        manager
+            .db
+            .lock()
+            .queue_list()
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == id)
+            .expect("queue row")
+            .status
+    }
+
+    /// Run a progress save that snapshots `from`, then, while it waits on the
+    /// database, apply a pause or resume the way the control paths do (job
+    /// list, then database) and let the save finish. The database must keep
+    /// the newer status.
+    fn status_change_during_pending_save(from: JobStatus, to: JobStatus) {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("raced", from, tempdir.path()));
+        manager.persist_job_progress("raced");
+        assert_eq!(db_status(&manager, "raced"), from);
+
+        let db_guard = manager.db.lock();
+        let saver = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || manager.persist_job_progress("raced"))
+        };
+        // Let the save take its snapshot and block on the database lock.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !saver.is_finished(),
+            "save should be waiting on the DB lock"
+        );
+        {
+            let mut jobs = manager.jobs.lock();
+            let state = jobs.get_mut("raced").unwrap();
+            state.job.status = to;
+            state.persisted_status = Some(to);
+            db_guard
+                .queue_update_progress("raced", to, 0, 0, 0, 0)
+                .unwrap();
+        }
+        drop(db_guard);
+        saver.join().unwrap();
+
+        assert_eq!(
+            db_status(&manager, "raced"),
+            to,
+            "a stale progress save overwrote the newer status"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_progress_save_does_not_undo_a_pause() {
+        status_change_during_pending_save(JobStatus::Downloading, JobStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn pending_progress_save_does_not_undo_a_resume() {
+        status_change_during_pending_save(JobStatus::Paused, JobStatus::Downloading);
+    }
+
+    /// A status set only in memory (pause all, say) still reaches the
+    /// database through the next progress save.
+    #[tokio::test]
+    async fn progress_save_persists_an_in_memory_status_change() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("mem", JobStatus::Downloading, tempdir.path()));
+        manager.persist_job_progress("mem");
+        manager.jobs.lock().get_mut("mem").unwrap().job.status = JobStatus::Paused;
+        manager.persist_job_progress("mem");
+        assert_eq!(db_status(&manager, "mem"), JobStatus::Paused);
     }
 
     #[tokio::test]
