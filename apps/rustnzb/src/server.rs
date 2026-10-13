@@ -342,6 +342,8 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/config/speed-limit", put(handlers::h_set_speed_limit))
         .route("/config/disk-guards", get(handlers::h_disk_guards_get))
         .route("/config/disk-guards", put(handlers::h_disk_guards_set))
+        .route("/config/debug-logging", get(handlers::h_debug_logging_get))
+        .route("/config/debug-logging", put(handlers::h_debug_logging_set))
         .route("/browse-directory", get(handlers::h_browse_directory))
         // Newsgroup browsing
         .route("/groups", get(group_handlers::h_group_list))
