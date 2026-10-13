@@ -111,6 +111,14 @@ function emptyServer(): ServerConfig {
   };
 }
 
+/** GET/PUT /api/config/debug-logging: the effective log level and whether an
+ * environment or command-line override beats the saved choice. */
+interface DebugLoggingState {
+  enabled: boolean;
+  effective: string;
+  overridden: boolean;
+}
+
 function emptyCategory(): CategoryConfig {
   return { name: '', output_dir: null, post_processing: 3 };
 }
@@ -927,16 +935,26 @@ function emptyCategory(): CategoryConfig {
                     <input
                       type="checkbox"
                       [(ngModel)]="debugLogging"
+                      [disabled]="debugLoggingOverridden"
                       (change)="saveDebugLogging()"
                     />
                     <span>Log every stage of a download at debug level</span>
                   </label>
                 </div>
-                <div class="dim">
-                  Applies at once and is kept across restarts. It raises the log volume
-                  sharply while a queue is running, so turn it off again once you have
-                  what you need.
-                </div>
+                @if (debugLoggingOverridden) {
+                  <div class="dim">
+                    Overridden by the environment: this process runs
+                    <code>{{ debugLoggingEffective }}</code>. RUST_LOG, --log-level or
+                    RUSTNZB_LOG_LEVEL beats the saved choice, so this switch does not change it.
+                  </div>
+                } @else {
+                  <div class="dim">
+                    Effective level: <code>{{ debugLoggingEffective }}</code>. Applies at
+                    once and is kept across restarts; turning it off restores the previous
+                    level. It raises the log volume sharply while a queue is running, so
+                    turn it off again once you have what you need.
+                  </div>
+                }
               </div>
             </div>
           </div>
@@ -1402,6 +1420,8 @@ export class SettingsViewComponent implements OnInit {
   maxActiveDownloads = 3;
   historyRetention: number | null = null;
   debugLogging = false;
+  debugLoggingOverridden = false;
+  debugLoggingEffective = '';
 
   // Disk guards
   minFreeSpaceGB = 1;
@@ -1735,8 +1755,8 @@ export class SettingsViewComponent implements OnInit {
         },
         error: () => {},
       });
-    this.api.get<{ enabled: boolean }>('/config/debug-logging').subscribe({
-      next: (r) => (this.debugLogging = r.enabled),
+    this.api.get<DebugLoggingState>('/config/debug-logging').subscribe({
+      next: (r) => this.applyDebugLogging(r),
       error: () => {},
     });
   }
@@ -1791,16 +1811,26 @@ export class SettingsViewComponent implements OnInit {
     });
   }
 
+  private applyDebugLogging(r: DebugLoggingState): void {
+    this.debugLogging = r.enabled;
+    this.debugLoggingOverridden = r.overridden;
+    this.debugLoggingEffective = r.effective;
+  }
+
   saveDebugLogging(): void {
-    this.api.put('/config/debug-logging', { enabled: this.debugLogging }).subscribe({
-      next: () =>
-        this.snack.open(
-          this.debugLogging ? 'Debug logging on' : 'Debug logging off',
-          'Close',
-          { duration: 2000 },
-        ),
-      error: (err) => showHttpError(this.snack, err, 'Failed to change debug logging'),
-    });
+    this.api
+      .put<DebugLoggingState>('/config/debug-logging', { enabled: this.debugLogging })
+      .subscribe({
+        next: (r) => {
+          this.applyDebugLogging(r);
+          this.snack.open(
+            this.debugLogging ? 'Debug logging on' : 'Debug logging off',
+            'Close',
+            { duration: 2000 },
+          );
+        },
+        error: (err) => showHttpError(this.snack, err, 'Failed to change debug logging'),
+      });
   }
 
   saveMaxActive(): void {

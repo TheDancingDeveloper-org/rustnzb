@@ -18,6 +18,7 @@ pub mod article_failure;
 pub mod bandwidth;
 pub mod dispatch_engine;
 pub mod download_engine;
+pub mod telemetry;
 pub mod util;
 
 // Convenience re-exports — the types downstream crates reach for.

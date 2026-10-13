@@ -29,6 +29,23 @@ fn increment_counter(name: &'static str) {
         .add(1, &[]);
 }
 
+/// One observation of `rustnzb.stage.duration` for `stage`, in seconds. The
+/// histogram is built once; the global meter is a noop until `main` installs a
+/// provider, so this is safe to call from tests.
+fn record_stage(stage: &'static str, seconds: f64) {
+    use opentelemetry::KeyValue;
+    use opentelemetry::metrics::Histogram;
+    static H: std::sync::OnceLock<Histogram<f64>> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        opentelemetry::global::meter("rustnzb")
+            .f64_histogram("rustnzb.stage.duration")
+            .with_unit("s")
+            .with_description("Wall or cumulative time per download stage")
+            .build()
+    })
+    .record(seconds, &[KeyValue::new("stage", stage)]);
+}
+
 /// Outcome of the combined verify+repair spawn_blocking task.
 /// Keeps VerifyResult (which is !Send) on the blocking thread, then returns
 /// only Send-safe data back to the async context.
@@ -361,14 +378,18 @@ async fn run_stages(
             // spawn_blocking call. This keeps CPU-intensive work off the async
             // runtime and keeps each non-Send VerifyResult on one thread so the
             // repair can reuse it — no redundant second verification pass.
-            let outcomes = tokio::task::spawn_blocking(move || {
-                file_sets
-                    .iter()
-                    .map(|file_set| verify_repair_set(file_set, &dir))
-                    .collect::<Vec<_>>()
-            })
+            let outcomes = tracing::Instrument::instrument(
+                tokio::task::spawn_blocking(move || {
+                    file_sets
+                        .iter()
+                        .map(|file_set| verify_repair_set(file_set, &dir))
+                        .collect::<Vec<_>>()
+                }),
+                tracing::info_span!("par2_verify", recovery_sets = recovery_set_count),
+            )
             .await;
             let duration = started.elapsed().as_secs_f64();
+            record_stage("par2_verify", duration);
 
             match outcomes {
                 Ok(outcomes) => {
@@ -518,12 +539,15 @@ async fn run_stages(
         } else {
             None
         };
-        let (result, processed_archives, extract_failure_code) = run_extract_stage(
-            source_dir,
-            job_dir_archives,
-            output_dir,
-            config.password.as_deref(),
-            config.max_nested_archive_depth,
+        let (result, processed_archives, extract_failure_code) = tracing::Instrument::instrument(
+            run_extract_stage(
+                source_dir,
+                job_dir_archives,
+                output_dir,
+                config.password.as_deref(),
+                config.max_nested_archive_depth,
+            ),
+            tracing::info_span!("extract"),
         )
         .await;
         extracted_archives = processed_archives;
@@ -542,14 +566,18 @@ async fn run_stages(
     // ------------------------------------------------------------------
     if unpack && pipeline_ok && config.cleanup_after_extract {
         let cleanup_root = config.output_dir.as_deref().unwrap_or(job_dir);
-        let result = run_cleanup_stage_with_rules(
-            job_dir,
-            cleanup_root,
-            &extracted_archives,
-            cleanup_patterns,
-            unwanted_extensions,
-            config.delete_archives,
-        );
+        let started = Instant::now();
+        let result = tracing::info_span!("cleanup").in_scope(|| {
+            run_cleanup_stage_with_rules(
+                job_dir,
+                cleanup_root,
+                &extracted_archives,
+                cleanup_patterns,
+                unwanted_extensions,
+                config.delete_archives,
+            )
+        });
+        record_stage("cleanup", started.elapsed().as_secs_f64());
         stages.push(result);
     }
 
@@ -821,6 +849,7 @@ async fn run_extract_stage(
 
     if !extracted_any {
         info!("No archives found — skipping extraction");
+        record_stage("extract", start.elapsed().as_secs_f64());
         return (
             StageResult {
                 name: "Extract".to_string(),
@@ -833,6 +862,7 @@ async fn run_extract_stage(
         );
     }
 
+    record_stage("extract", start.elapsed().as_secs_f64());
     (
         StageResult {
             name: "Extract".to_string(),
@@ -1003,6 +1033,7 @@ fn run_cleanup_stage_with_rules(
         StageStatus::Failed
     };
 
+    record_stage("extract_cleanup", start.elapsed().as_secs_f64());
     StageResult {
         name: "Cleanup".to_string(),
         status,

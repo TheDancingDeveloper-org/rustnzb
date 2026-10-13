@@ -581,6 +581,9 @@ pub(crate) struct JobContext {
     /// Avoid repeatedly reporting the same all-provider outage while the
     /// workers wait for circuit-breaker cooldown.
     waiting_for_providers_reported: AtomicBool,
+    /// The job's download-phase span. Taken and closed when the job reaches
+    /// its terminal state; carries the cumulative decode and assemble times.
+    span: Mutex<Option<tracing::Span>>,
 }
 
 pub(crate) type JobContextMap = Arc<Mutex<HashMap<String, Arc<JobContext>>>>;
@@ -619,6 +622,17 @@ impl JobContext {
             pinned_file_sizes: Mutex::new(HashMap::new()),
             finished: AtomicBool::new(false),
             waiting_for_providers_reported: AtomicBool::new(false),
+            span: Mutex::new(Some(tracing::info_span!(
+                parent: None,
+                "download",
+                job_id = %job.id,
+                job_name = %job.name,
+                articles_decoded = tracing::field::Empty,
+                total_bytes = tracing::field::Empty,
+                decode_secs = tracing::field::Empty,
+                assemble_secs = tracing::field::Empty,
+                active_secs = tracing::field::Empty,
+            ))),
         }
     }
 
@@ -722,6 +736,16 @@ impl JobContext {
             assemble_pct = format!("{:.1}", assemble_total_us as f64 / elapsed_us as f64 * 100.0),
             "Decode timing summary (cumulative across all workers)"
         );
+        crate::telemetry::record_stage("download", None, download_elapsed.as_secs_f64());
+        crate::telemetry::record_stage("decode", None, decode_total_us as f64 / 1_000_000.0);
+        crate::telemetry::record_stage("assemble", None, assemble_total_us as f64 / 1_000_000.0);
+        if let Some(span) = self.span.lock().take() {
+            span.record("articles_decoded", articles_decoded);
+            span.record("total_bytes", self.total_bytes);
+            span.record("decode_secs", decode_total_us as f64 / 1_000_000.0);
+            span.record("assemble_secs", assemble_total_us as f64 / 1_000_000.0);
+            span.record("active_secs", active_elapsed.as_secs_f64());
+        }
 
         let abort_reason = self.abort_reason.lock().clone();
         if let Some(reason) = abort_reason {
@@ -1686,12 +1710,21 @@ async fn pool_worker(
         // entire fetch. Now any line read from the socket keeps it alive.
         // Matches SABnzbd's `nw.timeout` model (newswrapper.py:315).
         conn.set_io_heartbeat(last_progress.clone(), pool.created_at());
-        if let Err(e) = connect_with_retry(
-            &mut conn,
-            &primary_server,
-            &worker_id,
-            &pool.server_health,
-            &pool.servers,
+        let connect_started = Instant::now();
+        let connect_span = tracing::info_span!(
+            "nntp_connect",
+            server = %primary_server.name,
+            worker = %worker_id,
+        );
+        if let Err(e) = tracing::Instrument::instrument(
+            connect_with_retry(
+                &mut conn,
+                &primary_server,
+                &worker_id,
+                &pool.server_health,
+                &pool.servers,
+            ),
+            connect_span,
         )
         .await
         {
@@ -1708,6 +1741,11 @@ async fn pool_worker(
             tokio::time::sleep(RECONNECT_DELAY).await;
             continue 'reconnect;
         }
+        crate::telemetry::record_stage(
+            "connect",
+            Some(&primary_server.name),
+            connect_started.elapsed().as_secs_f64(),
+        );
         pool.report_providers_available();
         let pipe_depth = primary_server.pipelining.max(1);
         let active_conns = pool.conn_tracker.total();
@@ -2341,6 +2379,12 @@ async fn run_worker_pipelined(
                                         yield_ms = perf_yield_us / 1000,
                                         bw_wait_ms = perf_bandwidth_us / 1000,
                                         "Worker perf summary"
+                                    );
+                                    crate::telemetry::record_server_window(
+                                        &primary_server.name,
+                                        perf_bytes,
+                                        perf_articles,
+                                        perf_receive_us as f64 / 1_000_000.0,
                                     );
                                     perf_articles = 0;
                                     perf_bytes = 0;

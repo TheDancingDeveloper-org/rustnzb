@@ -2013,7 +2013,10 @@ impl QueueManager {
         nzb_data: &[u8],
         retry_data: Option<&[u8]>,
     ) -> crate::nzb_core::Result<NzbJob> {
-        let mut job = nzb_parser::parse_nzb(&entry.name, nzb_data)?;
+        let parse_started = std::time::Instant::now();
+        let mut job = tracing::info_span!("nzb_parse", name = %entry.name, bytes = nzb_data.len())
+            .in_scope(|| nzb_parser::parse_nzb(&entry.name, nzb_data))?;
+        crate::record_stage("parse", parse_started.elapsed().as_secs_f64());
         job.category = entry.category.clone();
         job.output_dir = self.output_dir_for(&job.category, &job.name)?;
         job.work_dir = self.incomplete_dir().join(&job.id);
@@ -2131,9 +2134,16 @@ impl QueueManager {
             return;
         }
 
+        // Dispatch/queue wait: time since the job was queued. A job resumed
+        // after a restart counts from its original add time.
+        let queue_wait = (chrono::Utc::now() - job.added_at)
+            .to_std()
+            .unwrap_or_default();
+        crate::record_stage("queue_wait", queue_wait.as_secs_f64());
         info!(
             job_id = %job_id,
             name = %job.name,
+            queue_wait_secs = queue_wait.as_secs_f64(),
             total_bytes = job.total_bytes,
             article_count = job.article_count,
             file_count = job.file_count,
@@ -2898,18 +2908,26 @@ impl QueueManager {
                 max_nested_archive_depth: self.max_nested_archive_depth,
             };
 
+            let pp_span = tracing::info_span!(parent: None, "postproc", job_id = %job_id, pp_level);
             let result = if pp_level >= 2 {
-                run_pipeline_with_cleanup(
-                    &work_dir,
-                    &config,
-                    Some(&self.postproc_resources),
-                    &cleanup_patterns,
-                    &unwanted_extensions,
+                tracing::Instrument::instrument(
+                    run_pipeline_with_cleanup(
+                        &work_dir,
+                        &config,
+                        Some(&self.postproc_resources),
+                        &cleanup_patterns,
+                        &unwanted_extensions,
+                    ),
+                    pp_span,
                 )
                 .await
             } else {
                 // Repair only (SABnzbd `pp=1`): the archives are the output.
-                run_repair_pipeline(&work_dir, &config, Some(&self.postproc_resources)).await
+                tracing::Instrument::instrument(
+                    run_repair_pipeline(&work_dir, &config, Some(&self.postproc_resources)),
+                    pp_span,
+                )
+                .await
             };
 
             info!(
