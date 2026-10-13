@@ -571,13 +571,13 @@ pub(crate) struct JobContext {
     active_elapsed: Mutex<Duration>,
     /// Total bytes across all files (for perf summary throughput).
     pub total_bytes: u64,
-    /// The `=ybegin size=` values seen per file, as `(min, max, logged)`.
+    /// The `=ybegin size=` values seen per file, as `(first, min, max, logged)`.
     /// The range is logged once per file, the first time a later segment
     /// widens it. When the NZB declared a size, the record is only that log:
     /// obfuscated reposts put a different original file's `size=` on every
     /// segment, and rejecting those articles corrupts a file that PAR2 would
-    /// verify clean. When the NZB declared none, `min` is the write bound,
-    /// because it is the first `size=` seen.
+    /// verify clean. When the NZB declared none, `first` is the write bound;
+    /// a later, smaller `size=` lowers `min` but never the bound.
     pinned_file_sizes: Mutex<HashMap<String, YencSizeRange>>,
     /// Ensures JobFinished/JobAborted is only emitted once.
     finished: AtomicBool,
@@ -3217,9 +3217,10 @@ enum ArticleError {
     Cancelled,
 }
 
-/// `(min, max, logged)`: the `=ybegin size=` range seen for one file, and
-/// whether the one disagreement line for it has been emitted.
-type YencSizeRange = (u64, u64, bool);
+/// `(first, min, max, logged)`: the first `=ybegin size=` recorded for one
+/// file, the range seen since, and whether the one disagreement line for it
+/// has been emitted.
+type YencSizeRange = (u64, u64, u64, bool);
 
 /// Choose the file offset a decoded article is written at, rejecting headers
 /// that would place it outside the file.
@@ -3326,7 +3327,7 @@ fn decode_and_assemble(
             let mut sizes = sizes.lock();
             match sizes.entry(item.file_id.clone()) {
                 std::collections::hash_map::Entry::Occupied(mut existing) => {
-                    let (min, max, logged) = *existing.get();
+                    let (first, min, max, logged) = *existing.get();
                     let widened = size < min || size > max;
                     if widened && !logged {
                         // Once per file. Arrival order is random, so logging on
@@ -3340,17 +3341,17 @@ fn decode_and_assemble(
                         );
                     }
                     if widened || !logged {
-                        existing.insert((min.min(size), max.max(size), logged || widened));
+                        existing.insert((first, min.min(size), max.max(size), logged || widened));
                     }
-                    Some(min)
+                    Some(first)
                 }
                 std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert((size, size, false));
+                    slot.insert((size, size, size, false));
                     Some(size)
                 }
             }
         }
-        (Some(sizes), None) => sizes.lock().get(&item.file_id).map(|(min, _, _)| *min),
+        (Some(sizes), None) => sizes.lock().get(&item.file_id).map(|(first, ..)| *first),
         (None, size) => size,
     };
     // With an NZB size the record above is only a log. Without one, the first
@@ -3808,7 +3809,10 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"AAAABBBB");
         assert_eq!(assembler.get_file_progress("j1", "f1"), (2, 2));
         // The record keeps the range and does not grow a new entry per segment.
-        assert_eq!(pinned.lock().get("f1").copied(), Some((4000, 9000, true)));
+        assert_eq!(
+            pinned.lock().get("f1").copied(),
+            Some((4000, 4000, 9000, true))
+        );
     }
 
     #[test]
@@ -3831,7 +3835,7 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), b"AAAABBBB");
         assert_eq!(assembler.get_file_progress("j1", "f1"), (2, 2));
-        assert_eq!(pinned.lock().get("f1").copied(), Some((8, 8, false)));
+        assert_eq!(pinned.lock().get("f1").copied(), Some((8, 8, 8, false)));
     }
 
     #[test]
@@ -3863,7 +3867,34 @@ mod tests {
         assert_eq!(assembler.get_file_progress("j1", "f1"), (1, 2));
         // The range is still recorded, and logged once, even though the write
         // was rejected.
-        assert_eq!(pinned.lock().get("f1").copied(), Some((8, 12, true)));
+        assert_eq!(pinned.lock().get("f1").copied(), Some((8, 8, 12, true)));
+    }
+
+    #[test]
+    fn decode_keeps_the_first_yenc_size_as_the_bound_after_a_smaller_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        // No NZB size. Segments arrive with size= 12, then 8, then 12. The
+        // smaller size= of segment 2 widens the recorded range but must not
+        // lower the bound, so segment 3 (bytes 8..12) still fits the first
+        // size and is written, as it was before the range was recorded.
+        assembler
+            .register_file("j1", "f1", path.clone(), 3)
+            .unwrap();
+
+        let (seg1, _) = yenc_simd::encode_article(b"AAAA", "out.bin", 1, 3, 0, 12);
+        let (seg2, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 3, 4, 8);
+        let (seg3, _) = yenc_simd::encode_article(b"CCCC", "out.bin", 3, 3, 8, 12);
+
+        let pinned = Mutex::new(HashMap::new());
+        decode_and_assemble(&decode_test_item("j1", 1), &seg1, &assembler, Some(&pinned)).unwrap();
+        decode_and_assemble(&decode_test_item("j1", 2), &seg2, &assembler, Some(&pinned)).unwrap();
+        decode_and_assemble(&decode_test_item("j1", 3), &seg3, &assembler, Some(&pinned)).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"AAAABBBBCCCC");
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (3, 3));
+        assert_eq!(pinned.lock().get("f1").copied(), Some((12, 8, 12, true)));
     }
 
     #[test]
