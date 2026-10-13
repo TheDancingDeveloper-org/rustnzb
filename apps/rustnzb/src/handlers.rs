@@ -1649,36 +1649,155 @@ pub async fn h_disk_guards_set(
 #[derive(Serialize, Deserialize)]
 pub struct DebugLoggingBody {
     pub enabled: bool,
+    /// The filter that is actually in effect, which may differ from the saved
+    /// choice when `RUST_LOG`, `--log-level` or `RUSTNZB_LOG_LEVEL` overrides it.
+    #[serde(default)]
+    pub effective: String,
+    /// True when an environment or command-line override beats the saved level,
+    /// so the toggle cannot change what this process logs.
+    #[serde(default)]
+    pub overridden: bool,
 }
 
 /// GET /api/config/debug-logging -- Whether verbose download tracing is on.
+///
+/// Reports the effective state. When `RUST_LOG`, `--log-level` or
+/// `RUSTNZB_LOG_LEVEL` is set it wins over the saved choice, and the response
+/// says so instead of reporting the config value.
 pub async fn h_debug_logging_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DebugLoggingBody>, ApiError> {
-    Ok(Json(DebugLoggingBody {
-        enabled: state.config().general.log_level == "debug",
-    }))
+    let saved = state.config().general.log_level.clone();
+    Ok(Json(debug_logging_state(&saved)))
+}
+
+/// The state the settings page shows: the saved level, unless an override is
+/// present, in which case the override is what the process actually runs.
+fn debug_logging_state(saved_level: &str) -> DebugLoggingBody {
+    let (effective, overridden) = match crate::log_level_override() {
+        Some(level) => (level, true),
+        None => (saved_level.to_string(), false),
+    };
+    DebugLoggingBody {
+        enabled: crate::filter_is_debug(&effective),
+        effective,
+        overridden,
+    }
 }
 
 /// PUT /api/config/debug-logging -- Turn verbose download tracing on or off.
 ///
 /// Applies immediately: the tracing filter is rebuilt and the choice is
-/// persisted, so it survives a restart.
+/// persisted, so it survives a restart. Turning it on installs
+/// [`crate::DEBUG_LOG_DIRECTIVE`], scoped to rustnzb's own crates, and
+/// remembers the level it replaced; turning it off restores that level. When
+/// an environment or command-line override is active the choice is still
+/// saved, but the live filter is left alone and the response says so.
 pub async fn h_debug_logging_set(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DebugLoggingBody>,
-) -> Result<Json<SimpleResponse>, ApiError> {
-    let level = if body.enabled { "debug" } else { "info" };
-    if !crate::set_log_filter(level) {
+) -> Result<Json<DebugLoggingStatus>, ApiError> {
+    let general = state.config().general.clone();
+    let (level, before) = toggle_log_level(
+        &general.log_level,
+        general.log_level_before_debug.as_deref(),
+        body.enabled,
+    );
+    let overridden = crate::log_level_override().is_some();
+    if !overridden && !crate::set_log_filter(&level) {
         return Err(ApiError::bad_request(
             "the log filter is not reloadable in this process",
         ));
     }
     state.update_config_with(|config| {
-        config.general.log_level = level.to_string();
+        config.general.log_level = level.clone();
+        config.general.log_level_before_debug = before.clone();
         Ok::<_, ApiError>(())
     })?;
-    Ok(Json(SimpleResponse { status: true }))
+    Ok(Json(DebugLoggingStatus {
+        status: true,
+        state: debug_logging_state(&level),
+    }))
+}
+
+/// The saved level and remembered prior level after flipping the toggle.
+///
+/// On: install the scoped debug directive and remember the current level,
+/// unless debug is already on (then keep whatever was remembered). Off:
+/// restore the remembered level; with nothing remembered, a debug level drops
+/// to `info` and any other level is left as it is.
+fn toggle_log_level(
+    current: &str,
+    remembered: Option<&str>,
+    enable: bool,
+) -> (String, Option<String>) {
+    let current = current.trim();
+    if enable {
+        if crate::filter_is_debug(current) {
+            return (current.to_string(), remembered.map(str::to_string));
+        }
+        let prior = if current.is_empty() { "info" } else { current };
+        return (
+            crate::DEBUG_LOG_DIRECTIVE.to_string(),
+            Some(prior.to_string()),
+        );
+    }
+    match remembered.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(prior) => (prior.to_string(), None),
+        None if crate::filter_is_debug(current) || current.is_empty() => ("info".to_string(), None),
+        None => (current.to_string(), None),
+    }
+}
+
+#[cfg(test)]
+mod debug_toggle_tests {
+    use super::toggle_log_level;
+    use crate::DEBUG_LOG_DIRECTIVE;
+
+    #[test]
+    fn on_then_off_restores_a_custom_level() {
+        let (on, before) = toggle_log_level("warn,nzb_nntp=info", None, true);
+        assert_eq!(on, DEBUG_LOG_DIRECTIVE);
+        assert_eq!(before.as_deref(), Some("warn,nzb_nntp=info"));
+        let (off, before) = toggle_log_level(&on, before.as_deref(), false);
+        assert_eq!(off, "warn,nzb_nntp=info");
+        assert_eq!(before, None);
+    }
+
+    #[test]
+    fn enabling_twice_keeps_the_original_level() {
+        let (on, before) = toggle_log_level("warn", None, true);
+        let (again, before) = toggle_log_level(&on, before.as_deref(), true);
+        assert_eq!(again, DEBUG_LOG_DIRECTIVE);
+        assert_eq!(before.as_deref(), Some("warn"));
+    }
+
+    #[test]
+    fn off_without_memory_only_lowers_debug() {
+        assert_eq!(toggle_log_level("debug", None, false).0, "info");
+        assert_eq!(toggle_log_level("warn", None, false).0, "warn");
+        assert_eq!(toggle_log_level("", None, false).0, "info");
+    }
+
+    #[test]
+    fn debug_directive_leaves_transport_crates_at_info() {
+        for quiet in ["h2", "hyper", "tonic", "reqwest", "opentelemetry"] {
+            assert!(
+                !DEBUG_LOG_DIRECTIVE.contains(quiet),
+                "{quiet} must stay at the default level"
+            );
+        }
+        assert!(DEBUG_LOG_DIRECTIVE.starts_with("info,"));
+        assert!(crate::filter_is_debug(DEBUG_LOG_DIRECTIVE));
+        assert!(!crate::filter_is_debug("info,h2=debug"));
+    }
+}
+
+#[derive(Serialize)]
+pub struct DebugLoggingStatus {
+    pub status: bool,
+    #[serde(flatten)]
+    pub state: DebugLoggingBody,
 }
 
 // ---------------------------------------------------------------------------

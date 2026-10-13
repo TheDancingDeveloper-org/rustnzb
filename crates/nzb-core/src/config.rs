@@ -52,6 +52,10 @@ pub struct GeneralConfig {
     pub cache_size: u64,
     /// Log level
     pub log_level: String,
+    /// The level the debug-logging toggle replaced, restored when it is
+    /// turned off again. Unset while the toggle is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level_before_debug: Option<String>,
     /// Log file path (None = stdout only)
     pub log_file: Option<PathBuf>,
     /// History retention: how many NZBs to keep in history.
@@ -216,6 +220,7 @@ impl Default for GeneralConfig {
             speed_limit_bps: 0,
             cache_size: 500 * 1024 * 1024, // 500 MB
             log_level: "info".into(),
+            log_level_before_debug: None,
             log_file: None,
             history_retention: None, // keep all
             max_active_downloads: 1,

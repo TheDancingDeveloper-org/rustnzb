@@ -340,28 +340,21 @@ async fn config_routes_validate_duplicates_and_persist_successful_updates() {
 }
 
 #[tokio::test]
+#[serial_test::serial(rust_log_override)]
 async fn debug_logging_persists_and_reports_its_state() {
     let app = start_app(false).await;
     let client = reqwest::Client::new();
     let access = setup_access(&app, &client).await;
-
-    // The in-process harness never installs the reloadable subscriber, so the
-    // live reload is refused and nothing is written.
-    let refused = client
-        .put(format!("{}/api/config/debug-logging", app.base_url))
-        .bearer_auth(&access)
-        .json(&serde_json::json!({"enabled": true}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
-    assert_ne!(
-        AppConfig::load(&app.config_path).unwrap().general.log_level,
-        "debug"
-    );
-
-    // With a filter installed the choice applies and survives in the config.
+    // The harness shares one process, so the reload handle persists across
+    // tests. Install it here too, which is a no-op once another test has.
     install_test_log_filter();
+    // Cargo exports RUST_LOG into the test process. That is a real override,
+    // so clear it for the part of the test that checks the saved choice.
+    let saved_rust_log = std::env::var("RUST_LOG").ok();
+    unsafe {
+        std::env::remove_var("RUST_LOG");
+    }
+
     let enabled = client
         .put(format!("{}/api/config/debug-logging", app.base_url))
         .bearer_auth(&access)
@@ -369,23 +362,102 @@ async fn debug_logging_persists_and_reports_its_state() {
         .send()
         .await
         .unwrap();
-    assert_eq!(enabled.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        client
-            .get(format!("{}/api/config/debug-logging", app.base_url))
-            .bearer_auth(&access)
-            .send()
-            .await
-            .unwrap()
-            .json::<serde_json::Value>()
-            .await
-            .unwrap()["enabled"],
-        true
-    );
+    let status = enabled.status();
+    let enabled_body = enabled.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{enabled_body}");
+    let got = client
+        .get(format!("{}/api/config/debug-logging", app.base_url))
+        .bearer_auth(&access)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(got["enabled"], true, "{got}");
+    assert_eq!(got["overridden"], false, "{got}");
+    assert_eq!(got["effective"], rustnzb::DEBUG_LOG_DIRECTIVE, "{got}");
+    let saved = AppConfig::load(&app.config_path).unwrap().general;
+    assert_eq!(saved.log_level, rustnzb::DEBUG_LOG_DIRECTIVE);
+    assert_eq!(saved.log_level_before_debug.as_deref(), Some("info"));
+
+    // Turning it off restores the level it replaced and reports it.
+    let disabled = client
+        .put(format!("{}/api/config/debug-logging", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({"enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), reqwest::StatusCode::OK);
+    let off = client
+        .get(format!("{}/api/config/debug-logging", app.base_url))
+        .bearer_auth(&access)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(off["enabled"], false);
+    assert_eq!(off["overridden"], false);
+    assert_eq!(off["effective"], "info");
     assert_eq!(
         AppConfig::load(&app.config_path).unwrap().general.log_level,
-        "debug"
+        "info"
     );
+
+    // An unauthenticated request is rejected and changes nothing.
+    let anonymous = client
+        .put(format!("{}/api/config/debug-logging", app.base_url))
+        .json(&serde_json::json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let anonymous_get = client
+        .get(format!("{}/api/config/debug-logging", app.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous_get.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        AppConfig::load(&app.config_path).unwrap().general.log_level,
+        "info"
+    );
+    if let Some(value) = saved_rust_log {
+        unsafe {
+            std::env::set_var("RUST_LOG", value);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(rust_log_override)]
+async fn debug_logging_reports_an_environment_override() {
+    let app = start_app(false).await;
+    let client = reqwest::Client::new();
+    let access = setup_access(&app, &client).await;
+    install_test_log_filter();
+
+    unsafe {
+        std::env::set_var("RUST_LOG", "warn");
+    }
+    let body = client
+        .get(format!("{}/api/config/debug-logging", app.base_url))
+        .bearer_auth(&access)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    unsafe {
+        std::env::remove_var("RUST_LOG");
+    }
+    assert_eq!(body["overridden"], true);
+    assert_eq!(body["effective"], "warn");
+    assert_eq!(body["enabled"], false);
 }
 
 /// Install the reloadable log filter the debug-logging endpoint drives. The
