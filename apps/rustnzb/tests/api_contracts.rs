@@ -340,6 +340,68 @@ async fn config_routes_validate_duplicates_and_persist_successful_updates() {
 }
 
 #[tokio::test]
+async fn debug_logging_persists_and_reports_its_state() {
+    let app = start_app(false).await;
+    let client = reqwest::Client::new();
+    let access = setup_access(&app, &client).await;
+
+    // The in-process harness never installs the reloadable subscriber, so the
+    // live reload is refused and nothing is written.
+    let refused = client
+        .put(format!("{}/api/config/debug-logging", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_ne!(
+        AppConfig::load(&app.config_path).unwrap().general.log_level,
+        "debug"
+    );
+
+    // With a filter installed the choice applies and survives in the config.
+    install_test_log_filter();
+    let enabled = client
+        .put(format!("{}/api/config/debug-logging", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enabled.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        client
+            .get(format!("{}/api/config/debug-logging", app.base_url))
+            .bearer_auth(&access)
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["enabled"],
+        true
+    );
+    assert_eq!(
+        AppConfig::load(&app.config_path).unwrap().general.log_level,
+        "debug"
+    );
+}
+
+/// Install the reloadable log filter the debug-logging endpoint drives. The
+/// subscriber can only be installed once per process, so later tests share it.
+fn install_test_log_filter() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let (filter, handle) =
+        tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+    if rustnzb::LOG_FILTER.set(handle).is_ok() {
+        let _ = tracing_subscriber::registry().with(filter).try_init();
+    }
+}
+
+#[tokio::test]
 async fn logs_response_carries_the_log_buffer_boot_id() {
     let app = start_app(false).await;
     let client = reqwest::Client::new();

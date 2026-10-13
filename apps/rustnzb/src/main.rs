@@ -281,6 +281,8 @@ async fn main() -> anyhow::Result<()> {
         &config.general.log_level,
     );
     let filter = EnvFilter::new(&filter_spec);
+    let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
+    let _ = rustnzb::LOG_FILTER.set(filter_handle);
     let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
     let log_layer = LogBufferLayer::new(log_buffer.clone());
 
