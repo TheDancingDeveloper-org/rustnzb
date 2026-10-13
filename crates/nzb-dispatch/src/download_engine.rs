@@ -571,13 +571,14 @@ pub(crate) struct JobContext {
     active_elapsed: Mutex<Duration>,
     /// Total bytes across all files (for perf summary throughput).
     pub total_bytes: u64,
-    /// The `=ybegin size=` values seen per file, as `(min, max)`. Recorded so a
-    /// file whose segments name different sizes is logged once. It is not a
-    /// bound and it is not compared with the NZB size: obfuscated reposts put a
-    /// different original file's `size=` on every segment, and rejecting or
-    /// truncating those articles corrupts a file that PAR2 would verify clean.
-    /// The NZB-declared size is what bounds the write.
-    pinned_file_sizes: Mutex<HashMap<String, (u64, u64)>>,
+    /// The `=ybegin size=` values seen per file, as `(min, max, logged)`.
+    /// The range is logged once per file, the first time a later segment
+    /// widens it. When the NZB declared a size, the record is only that log:
+    /// obfuscated reposts put a different original file's `size=` on every
+    /// segment, and rejecting those articles corrupts a file that PAR2 would
+    /// verify clean. When the NZB declared none, `min` is the write bound,
+    /// because it is the first `size=` seen.
+    pinned_file_sizes: Mutex<HashMap<String, YencSizeRange>>,
     /// Ensures JobFinished/JobAborted is only emitted once.
     finished: AtomicBool,
     /// Avoid repeatedly reporting the same all-provider outage while the
@@ -3216,6 +3217,10 @@ enum ArticleError {
     Cancelled,
 }
 
+/// `(min, max, logged)`: the `=ybegin size=` range seen for one file, and
+/// whether the one disagreement line for it has been emitted.
+type YencSizeRange = (u64, u64, bool);
+
 /// Choose the file offset a decoded article is written at, rejecting headers
 /// that would place it outside the file.
 ///
@@ -3223,9 +3228,10 @@ enum ArticleError {
 /// position. The bound is the size the NZB declared for the file
 /// (`declared_bytes`), not the `size=` the article itself claims: a forged
 /// `size=2e12 begin=1e12` would otherwise create a terabyte sparse file.
-/// `pinned_size` is only the fallback bound, and only when the NZB declared
-/// nothing: segments of one NZB file routinely carry different `=ybegin
-/// size=` values (obfuscated reposts), so disagreement is not corruption.
+/// `pinned_size` is the fallback bound, and only when the NZB declared
+/// nothing. It is the first `size=` seen for the file, not this article's:
+/// a later segment whose `size=` differs is still written, as long as it
+/// fits that first size.
 /// A multi-segment file with no bound at all — no NZB size and no `size=` —
 /// is rejected, as is a `part_end` that does not describe exactly the decoded
 /// bytes. A missing `=ypart` on a later segment would overwrite the start of
@@ -3294,7 +3300,7 @@ fn decode_and_assemble(
     item: &WorkItem,
     raw_data: &[u8],
     assembler: &FileAssembler,
-    pinned_file_sizes: Option<&Mutex<HashMap<String, (u64, u64)>>>,
+    pinned_file_sizes: Option<&Mutex<HashMap<String, YencSizeRange>>>,
 ) -> Result<ProcessResult, ArticleError> {
     let decode_start = Instant::now();
     let decoded = decode_yenc(raw_data).map_err(|e| {
@@ -3306,42 +3312,45 @@ fn decode_and_assemble(
     let decode_us = decode_start.elapsed().as_micros();
 
     // Remember the `=ybegin size=` values seen for this file, but only a real
-    // one: an article that omits `size=` must not become the record. The record
-    // is not a bound. Obfuscated reposts put a different original file's
-    // `size=` on every segment of one NZB `<file>`, so the values scatter both
-    // above and below whatever arrived first; that is not the NZB size (which
-    // is the sum of encoded segment `bytes`) and it is not corruption. The
-    // scatter is logged once per file. The NZB size is what bounds the write,
-    // and `size=` is the bound only for a file the NZB gave no size for.
+    // one: an article that omits `size=` must not become the record. Obfuscated
+    // reposts put a different original file's `size=` on every segment of one
+    // NZB `<file>`, so the values scatter both above and below whatever arrived
+    // first; that is not the NZB size (which is the sum of encoded segment
+    // `bytes`) and it is not corruption. The range is logged once per file, the
+    // first time a segment widens it. The NZB size is what bounds the write.
+    // Without one, the first `size=` recorded is the only bound the write has,
+    // and a later segment is written only when it fits that first size.
     let declared = assembler.declared_bytes(&item.job_id, &item.file_id);
     let pinned_size = match (pinned_file_sizes, decoded.file_size) {
         (Some(sizes), Some(size)) => {
             let mut sizes = sizes.lock();
             match sizes.entry(item.file_id.clone()) {
                 std::collections::hash_map::Entry::Occupied(mut existing) => {
-                    let (min, max) = *existing.get();
-                    if size < min || size > max {
-                        existing.insert((min.min(size), max.max(size)));
-                        // One line per file, on the first segment that widens
-                        // the range. Later segments of an obfuscated file would
-                        // otherwise log this once each.
+                    let (min, max, logged) = *existing.get();
+                    let widened = size < min || size > max;
+                    if widened && !logged {
+                        // Once per file. Arrival order is random, so logging on
+                        // every widening would be about 2·ln(n) lines per file.
                         info!(
                             file_id = %item.file_id,
                             segment_number = item.segment_number,
                             size_min = min.min(size),
                             size_max = max.max(size),
-                            "=ybegin size= differs between segments of one NZB file; bytes are written, the NZB size bounds the write"
+                            "=ybegin size= differs between segments of one NZB file; bytes are written, bounded by the NZB size or the first size= seen"
                         );
                     }
-                    None
+                    if widened || !logged {
+                        existing.insert((min.min(size), max.max(size), logged || widened));
+                    }
+                    Some(min)
                 }
                 std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert((size, size));
-                    None
+                    slot.insert((size, size, false));
+                    Some(size)
                 }
             }
         }
-        (Some(sizes), None) => sizes.lock().get(&item.file_id).map(|(min, _)| *min),
+        (Some(sizes), None) => sizes.lock().get(&item.file_id).map(|(min, _, _)| *min),
         (None, size) => size,
     };
     // With an NZB size the record above is only a log. Without one, the first
@@ -3799,7 +3808,62 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"AAAABBBB");
         assert_eq!(assembler.get_file_progress("j1", "f1"), (2, 2));
         // The record keeps the range and does not grow a new entry per segment.
-        assert_eq!(pinned.lock().get("f1").copied(), Some((4000, 9000)));
+        assert_eq!(pinned.lock().get("f1").copied(), Some((4000, 9000, true)));
+    }
+
+    #[test]
+    fn decode_bounds_undeclared_file_by_the_first_yenc_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        // No NZB size: a segment omitted or garbled its `bytes` attribute.
+        // The first `size=` seen is the write bound, so both segments of a
+        // file whose headers agree are written.
+        assembler
+            .register_file("j1", "f1", path.clone(), 2)
+            .unwrap();
+
+        let (seg1, _) = yenc_simd::encode_article(b"AAAA", "out.bin", 1, 2, 0, 8);
+        let (seg2, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 4, 8);
+        let pinned = Mutex::new(HashMap::new());
+        decode_and_assemble(&decode_test_item("j1", 1), &seg1, &assembler, Some(&pinned)).unwrap();
+        decode_and_assemble(&decode_test_item("j1", 2), &seg2, &assembler, Some(&pinned)).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"AAAABBBB");
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (2, 2));
+        assert_eq!(pinned.lock().get("f1").copied(), Some((8, 8, false)));
+    }
+
+    #[test]
+    fn decode_rejects_undeclared_segment_past_the_first_yenc_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        // No NZB size, and the segments disagree on `size=`. The first one
+        // wins as the bound; a later segment whose own header places it past
+        // that bound is rejected rather than growing the file to whatever the
+        // header names.
+        assembler
+            .register_file("j1", "f1", path.clone(), 2)
+            .unwrap();
+
+        let (seg1, _) = yenc_simd::encode_article(b"AAAA", "out.bin", 1, 2, 0, 8);
+        let (seg2, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 8, 12);
+
+        let pinned = Mutex::new(HashMap::new());
+        decode_and_assemble(&decode_test_item("j1", 1), &seg1, &assembler, Some(&pinned)).unwrap();
+        let result =
+            decode_and_assemble(&decode_test_item("j1", 2), &seg2, &assembler, Some(&pinned));
+
+        assert!(
+            matches!(result, Err(ArticleError::DecodeError(_))),
+            "a segment past the first size= must be rejected, got {result:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"AAAA");
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (1, 2));
+        // The range is still recorded, and logged once, even though the write
+        // was rejected.
+        assert_eq!(pinned.lock().get("f1").copied(), Some((8, 12, true)));
     }
 
     #[test]
