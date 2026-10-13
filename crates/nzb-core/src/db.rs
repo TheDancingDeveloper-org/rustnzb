@@ -929,25 +929,72 @@ impl Database {
 
     /// List history entries, most recent first.
     pub fn history_list(&self, limit: usize) -> Result<Vec<HistoryEntry>, NzbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
-             CASE WHEN nzb_data IS NOT NULL THEN 1 ELSE 0 END as has_nzb, failure_code,
-             post_processing, delete_archives
-             FROM history ORDER BY completed_at DESC LIMIT ?1",
-        )?;
-
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {HISTORY_LIST_COLUMNS} FROM history ORDER BY completed_at DESC LIMIT ?1"
+        ))?;
         let entries = stmt
-            .query_map(params![limit as i64], |row| {
-                let stages_json: String = row.get::<_, Option<String>>(10)?.unwrap_or_default();
-                let stages: Vec<StageResult> =
-                    serde_json::from_str(&stages_json).unwrap_or_default();
-                let stats_json: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
-                let server_stats: Vec<ServerArticleStats> =
-                    serde_json::from_str(&stats_json).unwrap_or_default();
-                let has_nzb: i64 = row.get(13)?;
+            .query_map(params![limit as i64], history_list_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(entries)
+    }
 
-                Ok(HistoryEntry {
+    /// One page of history matching `filter`, most recent first, plus the
+    /// total number of matching rows. Filtering, ordering and paging all run
+    /// in SQL, and the stored NZB and retry blobs are never read.
+    pub fn history_page(
+        &self,
+        filter: &HistoryFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<HistoryEntry>, usize), NzbError> {
+        let (where_sql, args) = filter.to_sql();
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM history{where_sql}"),
+            rusqlite::params_from_iter(args.iter()),
+            |row| row.get(0),
+        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&history_page_sql(&where_sql, args.len()))?;
+        let mut page_args = args;
+        page_args.push(Box::new(limit.min(i64::MAX as usize) as i64));
+        page_args.push(Box::new(offset.min(i64::MAX as usize) as i64));
+        let entries = stmt
+            .query_map(
+                rusqlite::params_from_iter(page_args.iter()),
+                history_list_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((entries, total as usize))
+    }
+
+    /// Distinct non-empty history categories, sorted.
+    pub fn history_categories(&self) -> Result<Vec<String>, NzbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT category FROM history WHERE category <> '' ORDER BY category",
+        )?;
+        let categories = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(categories)
+    }
+
+    /// Lightweight view of every history row matching `filter`, most recent
+    /// first. Only the columns stored ahead of the NZB blob are read, so this
+    /// stays cheap however large the stored NZBs are.
+    pub fn history_summaries(
+        &self,
+        filter: &HistoryFilter,
+    ) -> Result<Vec<HistorySummary>, NzbError> {
+        let (where_sql, args) = filter.to_sql();
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, name, category, status, total_bytes, downloaded_bytes, added_at,
+             completed_at, output_dir, error_message
+             FROM history{where_sql} ORDER BY completed_at DESC"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                Ok(HistorySummary {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     category: row.get(2)?,
@@ -956,21 +1003,26 @@ impl Database {
                     downloaded_bytes: row.get::<_, i64>(5)? as u64,
                     added_at: parse_datetime(&row.get::<_, String>(6)?),
                     completed_at: parse_datetime(&row.get::<_, String>(7)?),
-                    download_time_secs: row.get(8)?,
-                    output_dir: row.get::<_, String>(9)?.into(),
-                    stages,
-                    error_message: row.get(11)?,
-                    failure_code: parse_failure_code(row.get(14)?)?,
-                    post_processing: row.get(15)?,
-                    delete_archives: row.get(16)?,
-                    server_stats,
-                    // Don't load actual blob in list - just note if it exists
-                    nzb_data: if has_nzb != 0 { Some(Vec::new()) } else { None },
-                    retry_data: None,
+                    output_dir: row.get::<_, String>(8)?.into(),
+                    error_message: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 
+    /// List-shaped history entries for `ids`, in the order given. Unknown ids
+    /// are skipped. Like [`Database::history_list`], blobs are not loaded.
+    pub fn history_get_listed(&self, ids: &[String]) -> Result<Vec<HistoryEntry>, NzbError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {HISTORY_LIST_COLUMNS} FROM history WHERE id = ?1"
+        ))?;
+        let mut entries = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(entry) = stmt.query_row(params![id], history_list_row).optional()? {
+                entries.push(entry);
+            }
+        }
         Ok(entries)
     }
 
@@ -1405,6 +1457,110 @@ impl Database {
 // ---------------------------------------------------------------------------
 // Parse helpers
 // ---------------------------------------------------------------------------
+
+/// Columns of a history list row. `has_nzb` uses `typeof()`, which SQLite
+/// answers from the record header without loading the blob itself; neither
+/// `nzb_data` nor `retry_data` content is ever read for a list row.
+const HISTORY_LIST_COLUMNS: &str = "id, name, category, status, total_bytes, downloaded_bytes,
+     added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
+     typeof(nzb_data) <> 'null' AS has_nzb, failure_code, post_processing, delete_archives";
+
+fn history_page_sql(where_sql: &str, arg_count: usize) -> String {
+    format!(
+        "SELECT {HISTORY_LIST_COLUMNS} FROM history{where_sql}
+         ORDER BY completed_at DESC LIMIT ?{} OFFSET ?{}",
+        arg_count + 1,
+        arg_count + 2
+    )
+}
+
+fn history_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
+    let stages_json: String = row.get::<_, Option<String>>(10)?.unwrap_or_default();
+    let stages: Vec<StageResult> = serde_json::from_str(&stages_json).unwrap_or_default();
+    let stats_json: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
+    let server_stats: Vec<ServerArticleStats> =
+        serde_json::from_str(&stats_json).unwrap_or_default();
+    let has_nzb: bool = row.get(13)?;
+
+    Ok(HistoryEntry {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        category: row.get(2)?,
+        status: parse_status(&row.get::<_, String>(3)?),
+        total_bytes: row.get::<_, i64>(4)? as u64,
+        downloaded_bytes: row.get::<_, i64>(5)? as u64,
+        added_at: parse_datetime(&row.get::<_, String>(6)?),
+        completed_at: parse_datetime(&row.get::<_, String>(7)?),
+        download_time_secs: row.get(8)?,
+        output_dir: row.get::<_, String>(9)?.into(),
+        stages,
+        error_message: row.get(11)?,
+        failure_code: parse_failure_code(row.get(14)?)?,
+        post_processing: row.get(15)?,
+        delete_archives: row.get(16)?,
+        server_stats,
+        // Don't load actual blob in list - just note if it exists
+        nzb_data: if has_nzb { Some(Vec::new()) } else { None },
+        retry_data: None,
+    })
+}
+
+/// SQL-side history filter. Every set field narrows the match.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryFilter {
+    /// Only rows completed at or after this instant.
+    pub completed_since: Option<chrono::DateTime<Utc>>,
+    /// Exact status, compared case-insensitively.
+    pub status: Option<JobStatus>,
+    /// Exact category.
+    pub category: Option<String>,
+    /// Case-insensitive substring of the name.
+    pub search: Option<String>,
+}
+
+impl HistoryFilter {
+    fn to_sql(&self) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(since) = self.completed_since {
+            args.push(Box::new(since.to_rfc3339()));
+            clauses.push(format!("completed_at >= ?{}", args.len()));
+        }
+        if let Some(status) = self.status {
+            args.push(Box::new(status.to_string()));
+            clauses.push(format!("status = ?{} COLLATE NOCASE", args.len()));
+        }
+        if let Some(category) = &self.category {
+            args.push(Box::new(category.clone()));
+            clauses.push(format!("category = ?{}", args.len()));
+        }
+        if let Some(search) = &self.search {
+            args.push(Box::new(search.to_lowercase()));
+            clauses.push(format!("instr(lower(name), ?{}) > 0", args.len()));
+        }
+        if clauses.is_empty() {
+            (String::new(), args)
+        } else {
+            (format!(" WHERE {}", clauses.join(" AND ")), args)
+        }
+    }
+}
+
+/// The history columns stored ahead of the NZB blob: enough to filter,
+/// count, total and delete without touching the blob's overflow pages.
+#[derive(Debug, Clone)]
+pub struct HistorySummary {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub status: JobStatus,
+    pub total_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub added_at: chrono::DateTime<Utc>,
+    pub completed_at: chrono::DateTime<Utc>,
+    pub output_dir: std::path::PathBuf,
+    pub error_message: Option<String>,
+}
 
 fn parse_status(s: &str) -> JobStatus {
     match s.to_lowercase().as_str() {
@@ -2369,5 +2525,186 @@ mod tests {
     fn test_settings_missing_key() {
         let db = Database::open_memory().unwrap();
         assert_eq!(db.get_setting("nonexistent"), None);
+    }
+
+    fn seeded_history_db() -> (Database, Vec<HistoryEntry>) {
+        let db = Database::open_memory().unwrap();
+        let base = Utc::now();
+        for i in 0..40u32 {
+            let mut entry = make_history(&format!("h{i:02}"), &format!("Show.S01E{i:02}"));
+            if i % 3 == 0 {
+                entry.name = format!("Movie.Ünïcode.{i}");
+            }
+            entry.category = ["movies", "tv", ""][i as usize % 3].into();
+            if i % 4 == 0 {
+                entry.status = JobStatus::Failed;
+                entry.failure_code = Some(JobFailureCode::ArchivePasswordRequired);
+                entry.error_message = Some("Password required: archive".into());
+            }
+            entry.completed_at = base - chrono::Duration::hours(i64::from(i) * 7);
+            entry.added_at = entry.completed_at - chrono::Duration::minutes(5);
+            if i % 5 == 0 {
+                entry.nzb_data = Some(vec![7u8; 64 * 1024]);
+                entry.retry_data = Some(vec![9u8; 64 * 1024]);
+            }
+            db.history_insert(&entry).unwrap();
+        }
+        let all = db.history_list(usize::MAX).unwrap();
+        (db, all)
+    }
+
+    #[test]
+    fn history_page_matches_the_in_memory_filter() {
+        let (db, all) = seeded_history_db();
+        let now = Utc::now();
+        let filters = [
+            HistoryFilter::default(),
+            HistoryFilter {
+                completed_since: Some(now - chrono::Duration::days(3)),
+                ..Default::default()
+            },
+            HistoryFilter {
+                status: Some(JobStatus::Failed),
+                ..Default::default()
+            },
+            HistoryFilter {
+                category: Some("tv".into()),
+                search: Some("s01e1".into()),
+                ..Default::default()
+            },
+            HistoryFilter {
+                completed_since: Some(now - chrono::Duration::days(7)),
+                status: Some(JobStatus::Completed),
+                category: Some("movies".into()),
+                search: Some("MOVIE".into()),
+            },
+        ];
+        for filter in &filters {
+            let expected: Vec<&HistoryEntry> = all
+                .iter()
+                .filter(|e| filter.completed_since.is_none_or(|c| e.completed_at >= c))
+                .filter(|e| filter.status.is_none_or(|s| e.status == s))
+                .filter(|e| filter.category.as_ref().is_none_or(|c| &e.category == c))
+                .filter(|e| {
+                    filter
+                        .search
+                        .as_ref()
+                        .is_none_or(|s| e.name.to_lowercase().contains(&s.to_lowercase()))
+                })
+                .collect();
+            for (offset, limit) in [(0, 50), (0, 3), (2, 5), (100, 10)] {
+                let (page, total) = db.history_page(filter, offset, limit).unwrap();
+                assert_eq!(total, expected.len(), "{filter:?}");
+                let want: Vec<&str> = expected
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|e| e.id.as_str())
+                    .collect();
+                let got: Vec<&str> = page.iter().map(|e| e.id.as_str()).collect();
+                assert_eq!(got, want, "{filter:?} offset {offset} limit {limit}");
+            }
+            let summaries: Vec<String> = db
+                .history_summaries(filter)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            let want: Vec<String> = expected.iter().map(|e| e.id.clone()).collect();
+            assert_eq!(summaries, want, "{filter:?}");
+        }
+        assert_eq!(db.history_categories().unwrap(), vec!["movies", "tv"]);
+    }
+
+    #[test]
+    fn history_list_rows_flag_stored_nzbs_and_keep_full_fields() {
+        let (db, all) = seeded_history_db();
+        let (page, _) = db.history_page(&HistoryFilter::default(), 0, 100).unwrap();
+        assert_eq!(page.len(), all.len());
+        for entry in &page {
+            let has_nzb = entry.id[1..].parse::<u32>().unwrap() % 5 == 0;
+            assert_eq!(entry.nzb_data.is_some(), has_nzb, "{}", entry.id);
+            assert!(entry.nzb_data.as_ref().is_none_or(Vec::is_empty));
+            assert!(entry.retry_data.is_none());
+            assert_eq!(entry.stages.len(), 1);
+        }
+        let ids = vec!["h05".to_string(), "missing".to_string(), "h01".to_string()];
+        let listed = db.history_get_listed(&ids).unwrap();
+        let got: Vec<&str> = listed.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(got, ["h05", "h01"]);
+        assert!(listed[0].nzb_data.is_some());
+    }
+
+    /// A list page must never load `nzb_data` or `retry_data` content: the
+    /// only access to `nzb_data` is the header-only `typeof()` probe
+    /// (OP_Column with OPFLAG_TYPEOFARG), and `retry_data` is not touched.
+    #[test]
+    fn history_page_query_does_not_read_blob_columns() {
+        const OPFLAG_TYPEOFARG: i64 = 0x80;
+        let (db, _) = seeded_history_db();
+        let column_index = |name: &str| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT cid FROM pragma_table_info('history') WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let nzb_col = column_index("nzb_data");
+        let retry_col = column_index("retry_data");
+        let root: i64 = db
+            .conn
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'history'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let filters = [
+            HistoryFilter::default(),
+            HistoryFilter {
+                completed_since: Some(Utc::now()),
+                status: Some(JobStatus::Failed),
+                category: Some("tv".into()),
+                search: Some("x".into()),
+            },
+        ];
+        for filter in &filters {
+            let (where_sql, args) = filter.to_sql();
+            let sql = format!("EXPLAIN {}", history_page_sql(&where_sql, args.len()));
+            let mut stmt = db.conn.prepare(&sql).unwrap();
+            let ops: Vec<(String, i64, i64, i64)> = stmt
+                .query_map(
+                    rusqlite::params_from_iter(
+                        args.iter()
+                            .map(|a| a.as_ref())
+                            .chain([&1i64 as &dyn rusqlite::ToSql, &0i64]),
+                    ),
+                    |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(6)?)),
+                )
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let table_cursors: Vec<i64> = ops
+                .iter()
+                .filter(|(op, _, p2, _)| op == "OpenRead" && *p2 == root)
+                .map(|(_, p1, _, _)| *p1)
+                .collect();
+            assert!(!table_cursors.is_empty());
+            let mut probed_nzb = false;
+            for (op, p1, p2, p5) in &ops {
+                if op != "Column" || !table_cursors.contains(p1) {
+                    continue;
+                }
+                assert_ne!(*p2, retry_col, "list page reads retry_data");
+                if *p2 == nzb_col {
+                    assert_ne!(p5 & OPFLAG_TYPEOFARG, 0, "list page loads nzb_data");
+                    probed_nzb = true;
+                }
+            }
+            assert!(probed_nzb, "has_nzb probe missing from the plan");
+        }
     }
 }

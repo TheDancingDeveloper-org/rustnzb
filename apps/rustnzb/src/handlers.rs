@@ -29,6 +29,7 @@ use nzb_web::nzb_core::config::{
 use nzb_web::nzb_core::models::*;
 use nzb_web::nzb_core::nzb_parser;
 use nzb_web::nzb_core::sabnzbd_import;
+use nzb_web::nzb_core::{HistoryFilter, HistorySummary};
 use nzb_web::queue_manager::PauseReason;
 
 use nzb_web::HistoryRetryOutcome;
@@ -203,7 +204,7 @@ pub struct HistoryFailReason {
 }
 
 impl HistoryStats {
-    fn from_entries<'a>(entries: impl Iterator<Item = &'a HistoryEntry>) -> Self {
+    fn from_entries<'a>(entries: impl Iterator<Item = &'a HistorySummary>) -> Self {
         let mut stats = Self::default();
         let mut duration_total = 0.0;
         let mut reasons: Vec<HistoryFailReason> = Vec::new();
@@ -878,64 +879,56 @@ pub async fn h_queue_pause_for(
 // ---------------------------------------------------------------------------
 
 /// GET /api/history -- List completed/failed jobs.
+///
+/// Filtering, paging, the category list and the window stats all run in SQL
+/// on a blocking thread, so neither the history size nor the stored NZB blobs
+/// cost the async runtime anything.
 pub async fn h_history_list(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HistoryQuery>,
 ) -> Result<Json<HistoryResponse>, ApiError> {
     let limit = q.limit.unwrap_or(50);
     let offset = q.offset.unwrap_or(0);
-    // Filtering, totals and stats need the whole history (newest first), as
-    // the SABnzbd history endpoint already does.
-    let all = state
-        .queue_manager
-        .history_list(i64::MAX as usize)
-        .map_err(ApiError::from)?;
-
-    let mut categories: Vec<String> = all
-        .iter()
-        .filter(|e| !e.category.is_empty())
-        .map(|e| e.category.clone())
-        .collect();
-    categories.sort();
-    categories.dedup();
-
     if q.days.is_some_and(|d| d > MAX_HISTORY_DAYS) {
         return Err(ApiError::bad_request("days must be at most 36500"));
     }
-    let cutoff = q
+    let completed_since = q
         .days
         .map(|d| chrono::Utc::now() - chrono::Duration::days(i64::from(d)));
-    let in_window = |e: &&HistoryEntry| cutoff.is_none_or(|c| e.completed_at >= c);
-    let stats = HistoryStats::from_entries(all.iter().filter(in_window));
-
+    let window = HistoryFilter {
+        completed_since,
+        ..Default::default()
+    };
     let status = q.status.as_deref().filter(|s| !s.is_empty() && *s != "all");
-    let category = q.category.as_deref().filter(|c| !c.is_empty());
-    let search = q
-        .search
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_lowercase);
-    let matching: Vec<HistoryEntry> = all
-        .into_iter()
-        .filter(|e| in_window(&e))
-        .filter(|e| status.is_none_or(|s| e.status.to_string().eq_ignore_ascii_case(s)))
-        .filter(|e| category.is_none_or(|c| e.category == c))
-        .filter(|e| {
-            search
-                .as_deref()
-                .is_none_or(|s| e.name.to_lowercase().contains(s))
-        })
-        .collect();
-    let total = matching.len();
-    let entries: Vec<HistoryResponseEntry> = matching
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(Into::into)
-        .collect();
+    // An unknown status matches nothing, as the string comparison it replaces did.
+    let status_filter = status.map(parse_history_status);
+    let filter = HistoryFilter {
+        status: status_filter.flatten(),
+        category: q.category.clone().filter(|c| !c.is_empty()),
+        search: q
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        ..window.clone()
+    };
+    let unknown_status = matches!(status_filter, Some(None));
+
+    let (entries, total, categories, stats) = db_blocking(&state, move |db| {
+        let categories = db.history_categories()?;
+        let stats = HistoryStats::from_entries(db.history_summaries(&window)?.iter());
+        let (entries, total) = if unknown_status {
+            (Vec::new(), 0)
+        } else {
+            db.history_page(&filter, offset, limit)?
+        };
+        Ok((entries, total, categories, stats))
+    })
+    .await?;
+
     Ok(Json(HistoryResponse {
-        entries,
+        entries: entries.into_iter().map(Into::into).collect(),
         total,
         offset,
         limit,
@@ -944,15 +937,57 @@ pub async fn h_history_list(
     }))
 }
 
+/// The terminal or in-flight status named by `s`, case-insensitively.
+fn parse_history_status(s: &str) -> Option<JobStatus> {
+    [
+        JobStatus::Queued,
+        JobStatus::Downloading,
+        JobStatus::Paused,
+        JobStatus::Verifying,
+        JobStatus::Repairing,
+        JobStatus::Extracting,
+        JobStatus::PostProcessing,
+        JobStatus::Completed,
+        JobStatus::Failed,
+    ]
+    .into_iter()
+    .find(|status| status.to_string().eq_ignore_ascii_case(s))
+}
+
+/// Run `query` against the database on a blocking thread, so the shared
+/// database mutex is never waited on from an async worker.
+async fn db_blocking<F, R>(state: &AppState, query: F) -> Result<R, ApiError>
+where
+    F: FnOnce(&nzb_web::nzb_core::Database) -> Result<R, NzbError> + Send + 'static,
+    R: Send + 'static,
+{
+    let qm = state.queue_manager.clone();
+    tokio::task::spawn_blocking(move || qm.with_db(query))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Database task failed: {e}")))?
+        .map_err(ApiError::from)
+}
+
+/// Run `f` with the queue manager on a blocking thread.
+async fn qm_blocking<F, R>(state: &AppState, f: F) -> Result<R, ApiError>
+where
+    F: FnOnce(&Arc<nzb_web::queue_manager::QueueManager>) -> Result<R, NzbError> + Send + 'static,
+    R: Send + 'static,
+{
+    let qm = state.queue_manager.clone();
+    tokio::task::spawn_blocking(move || f(&qm))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Database task failed: {e}")))?
+        .map_err(ApiError::from)
+}
+
 /// GET /api/history/{id} -- Detailed information for one completed/failed job.
 pub async fn h_history_get(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<HistoryResponseEntry>, ApiError> {
-    let entry = state
-        .queue_manager
-        .history_get(&id)
-        .map_err(ApiError::from)?
+    let entry = qm_blocking(&state, move |qm| qm.history_get(&id))
+        .await?
         .ok_or_else(|| ApiError::not_found("History entry not found"))?;
     Ok(Json(entry.into()))
 }
@@ -962,10 +997,7 @@ pub async fn h_history_delete(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
-    state
-        .queue_manager
-        .history_remove(&id)
-        .map_err(ApiError::from)?;
+    qm_blocking(&state, move |qm| qm.history_remove(&id)).await?;
     Ok(Json(SimpleResponse { status: true }))
 }
 
@@ -973,10 +1005,7 @@ pub async fn h_history_delete(
 pub async fn h_history_clear(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
-    state
-        .queue_manager
-        .history_clear()
-        .map_err(ApiError::from)?;
+    qm_blocking(&state, |qm| qm.history_clear()).await?;
     Ok(Json(SimpleResponse { status: true }))
 }
 
@@ -991,17 +1020,12 @@ pub async fn h_history_retry(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let entry = state
-        .queue_manager
-        .history_get(&id)
-        .map_err(ApiError::from)?
+    let lookup_id = id.clone();
+    let entry = qm_blocking(&state, move |qm| qm.history_get(&lookup_id))
+        .await?
         .ok_or(ApiError::not_found("History entry not found"))?;
 
-    let job_id = match state
-        .queue_manager
-        .retry_history_entry(&entry)
-        .map_err(ApiError::from)?
-    {
+    let job_id = match qm_blocking(&state, move |qm| qm.retry_history_entry(&entry)).await? {
         HistoryRetryOutcome::Started(job_id) => job_id,
         HistoryRetryOutcome::InProgress(job_id) => {
             tracing::info!(
