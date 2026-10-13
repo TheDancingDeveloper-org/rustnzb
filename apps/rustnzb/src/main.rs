@@ -107,6 +107,40 @@ fn init_otel_metrics(
     Some(provider)
 }
 
+/// A batching span exporter. Returns the provider so the caller can shut it
+/// down, and the tracer the tracing layer needs.
+fn init_otel_tracing(
+    endpoint: &str,
+    service_name: &str,
+) -> Option<(
+    opentelemetry_sdk::trace::SdkTracerProvider,
+    opentelemetry_sdk::trace::Tracer,
+)> {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+
+    let exporter = SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()
+        .map_err(|e| eprintln!("Failed to create OTLP span exporter: {e}"))
+        .ok()?;
+
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name(service_name.to_string())
+                .build(),
+        )
+        .build();
+
+    let tracer = provider.tracer("rustnzb");
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    eprintln!("OpenTelemetry traces exporting to {endpoint}");
+    Some((provider, tracer))
+}
+
 const LOG_LEVEL_NAMES: [&str; 6] = ["trace", "debug", "info", "warn", "error", "off"];
 
 /// Whether `spec` is a usable log filter: either a bare level name or a full
@@ -280,6 +314,17 @@ async fn main() -> anyhow::Result<()> {
         args.log_level.as_deref(),
         &config.general.log_level,
     );
+    // Record whether an environment or command-line source beat the saved
+    // level, so the settings page can say the toggle has no effect.
+    let rust_log_wins = rust_log
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty() && EnvFilter::try_new(v).is_ok());
+    let cli_wins = args
+        .log_level
+        .as_deref()
+        .is_some_and(|v| !v.trim().is_empty());
+    let _ = rustnzb::LOG_OVERRIDE.set((rust_log_wins || cli_wins).then(|| filter_spec.clone()));
     let filter = EnvFilter::new(&filter_spec);
     let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
     let _ = rustnzb::LOG_FILTER.set(filter_handle);
@@ -288,9 +333,13 @@ async fn main() -> anyhow::Result<()> {
 
     let _otel_log_provider;
     let _otel_meter_provider;
+    let _otel_tracer_provider;
 
     let otel_logs_enabled = config.otel.logs_enabled();
     let otel_metrics_enabled = config.otel.metrics_enabled();
+    // Spans ride with logs: one endpoint, one switch. They are the per-stage
+    // durations the debug-logging work item asks for.
+    let otel_traces_enabled = otel_logs_enabled;
 
     if otel_logs_enabled || otel_metrics_enabled {
         eprintln!(
@@ -312,6 +361,12 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         };
+        let otel_tracer = if otel_traces_enabled {
+            init_otel_tracing(config.otel.logs_endpoint(), &config.otel.service_name)
+        } else {
+            None
+        };
+        _otel_tracer_provider = otel_tracer.as_ref().map(|(provider, _)| provider.clone());
 
         if let Some(ref mp) = _otel_meter_provider {
             opentelemetry::global::set_meter_provider(mp.clone());
@@ -320,11 +375,24 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref lp) = _otel_log_provider {
             let otel_log_layer =
                 opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(lp);
+            let registry = tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt_layer)
+                .with(log_layer)
+                .with(otel_log_layer);
+            if let Some((_, tracer)) = otel_tracer {
+                registry
+                    .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                    .init();
+            } else {
+                registry.init();
+            }
+        } else if let Some((_, tracer)) = otel_tracer {
             tracing_subscriber::registry()
                 .with(filter)
                 .with(fmt_layer)
                 .with(log_layer)
-                .with(otel_log_layer)
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .init();
         } else {
             tracing_subscriber::registry()
@@ -336,6 +404,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         _otel_log_provider = None;
         _otel_meter_provider = None;
+        _otel_tracer_provider = None;
 
         tracing_subscriber::registry()
             .with(filter)
@@ -455,6 +524,13 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(feature = "webdav"))]
     {
         rustnzb::server::run(result.state).await?;
+    }
+
+    // Flush the last spans. The provider only drops them on shutdown.
+    if let Some(provider) = _otel_tracer_provider {
+        if let Err(e) = provider.shutdown() {
+            eprintln!("OpenTelemetry trace shutdown failed: {e}");
+        }
     }
 
     Ok(())

@@ -34,3 +34,9 @@ pub(crate) fn increment_counter(name: &'static str) {
         .build()
         .add(1, &[]);
 }
+
+/// One observation of `rustnzb.stage.duration` for `stage`, in seconds. The
+/// histogram carries a `stage` attribute; see `docs/OBSERVABILITY.md`.
+pub(crate) fn record_stage(stage: &'static str, seconds: f64) {
+    nzb_dispatch::telemetry::record_stage(stage, None, seconds);
+}
