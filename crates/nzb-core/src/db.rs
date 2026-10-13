@@ -737,6 +737,41 @@ impl Database {
         Ok(())
     }
 
+    /// Update a job's progress counters without touching its status, for the
+    /// periodic progress save: status is written separately, from the job
+    /// list's current value, so a stale snapshot never overwrites a pause or
+    /// resume.
+    pub fn queue_update_counters(
+        &self,
+        id: &str,
+        downloaded_bytes: u64,
+        articles_downloaded: usize,
+        articles_failed: usize,
+        files_completed: usize,
+    ) -> Result<(), NzbError> {
+        self.conn.execute(
+            "UPDATE queue SET downloaded_bytes=?2, articles_downloaded=?3,
+             articles_failed=?4, files_completed=?5 WHERE id=?1",
+            params![
+                id,
+                downloaded_bytes as i64,
+                articles_downloaded as i64,
+                articles_failed as i64,
+                files_completed as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update only a queued job's status.
+    pub fn queue_update_status(&self, id: &str, status: JobStatus) -> Result<(), NzbError> {
+        self.conn.execute(
+            "UPDATE queue SET status=?2 WHERE id=?1",
+            params![id, status.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Update the non-terminal, user-visible queue message for a job.
     pub fn queue_update_error_message(
         &self,
