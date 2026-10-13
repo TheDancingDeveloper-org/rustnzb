@@ -4763,20 +4763,6 @@ mod tests {
         server
     }
 
-    /// Priorities the live workers were spawned with, keyed by server id.
-    fn spawned_priorities(pool: &WorkerPool) -> HashMap<String, Vec<u8>> {
-        pool.workers
-            .lock()
-            .iter()
-            .map(|(id, list)| {
-                (
-                    id.clone(),
-                    list.iter().map(|w| w.spawned_with.priority).collect(),
-                )
-            })
-            .collect()
-    }
-
     fn spawned_endpoints(pool: &WorkerPool) -> HashMap<String, Vec<(String, u16)>> {
         pool.workers
             .lock()
@@ -4793,57 +4779,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raising_server_priority_recycles_workers_so_items_stay_poppable() {
-        // Two servers, A worse than B. Items are already in flight (queued,
-        // tried by nobody). Raising A above B must recycle both sides: if
-        // either kept its old priority the gate would wait on the other and
-        // nothing would pop.
-        let a = server("a", 2);
-        let b = server("b", 1);
+    async fn raising_server_priority_keeps_downloads_flowing() {
+        // Real workers against two mock servers that both carry the article.
+        // A starts worse than B; the edit raises A above B. If A's workers
+        // keep their spawn-time priority they still treat B as higher and
+        // wait for B to try the item, while B's workers read A's new
+        // priority from the live list and wait for A. Nothing pops, nothing
+        // fails, and the download stalls.
+        use nzb_nntp::testutil::{MockConfig, MockNntpServer, test_config};
+
+        let (encoded, _) = yenc_simd::encode_article(b"payload", "out.bin", 1, 1, 0, 7);
+        let mut articles = HashMap::new();
+        articles.insert("msg@test".to_string(), encoded);
+        let mock_a = MockNntpServer::start(MockConfig {
+            articles: articles.clone(),
+            ..MockConfig::default()
+        })
+        .await;
+        let mock_b = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let mock_server = |id: &str, port: u16, priority: u8| {
+            let mut s = test_config(port);
+            s.id = id.to_string();
+            s.name = id.to_string();
+            s.connections = 1;
+            s.priority = priority;
+            s
+        };
+        let a = mock_server("a", mock_a.port(), 2);
+        let b = mock_server("b", mock_b.port(), 1);
+
         let pool = pool_with(vec![a.clone(), b.clone()]);
         pool.reconcile_servers();
 
-        pool.work_queue
-            .submit_items(vec![make_item("j1", "msg-1", "file.rar")]);
-        assert!(
-            pool.work_queue
-                .pop_workable("b", &pool.higher_priority_servers(b.priority, "b"))
-                .is_some(),
-            "B is primary before the edit"
-        );
-        pool.work_queue
-            .submit_items(vec![make_item("j1", "msg-2", "file.rar")]);
-
         let mut raised = a.clone();
         raised.priority = 0;
-        *pool.servers.lock() = vec![raised.clone(), b.clone()];
+        *pool.servers.lock() = vec![raised, b];
         pool.reconcile_servers();
 
-        let priorities = spawned_priorities(&pool);
-        assert_eq!(
-            priorities["a"],
-            vec![0],
-            "A's worker must see its new priority"
-        );
-        assert_eq!(
-            priorities["b"],
-            vec![1],
-            "B was unchanged and must not recycle"
-        );
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = Arc::new(FileAssembler::new());
+        assembler
+            .register_file("j1", "f1", path.clone(), 1)
+            .unwrap();
+        insert_test_context(&pool, &test_job("j1", temp.path()), Arc::clone(&assembler));
+        pool.work_queue
+            .submit_items(vec![make_item("j1", "msg@test", "out.bin")]);
 
-        let popped = pool
-            .work_queue
-            .pop_workable("a", &pool.higher_priority_servers(0, "a"));
-        assert!(
-            popped.is_some(),
-            "raised server must be able to take the queued item"
-        );
-        assert!(
-            pool.work_queue
-                .pop_workable("b", &pool.higher_priority_servers(b.priority, "b"))
-                .is_none(),
-            "demoted-relative server must now wait on A"
-        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while assembler.get_file_progress("j1", "f1") != (1, 1) {
+            assert!(
+                Instant::now() < deadline,
+                "download stalled after raising A's priority: queue_len={}",
+                pool.work_queue.len()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+        pool.shutdown().await;
     }
 
     #[tokio::test]
