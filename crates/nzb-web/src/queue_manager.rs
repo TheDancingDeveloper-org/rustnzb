@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::nzb_core::config::{CategoryConfig, ServerConfig, normalize_history_retention};
-use crate::nzb_core::db::Database;
+use crate::nzb_core::db::{Database, HistoryFilter, HistorySummary};
 use crate::nzb_core::models::*;
 use crate::nzb_core::nzb_parser;
 use nzb_postproc::{
@@ -4407,6 +4407,29 @@ impl QueueManager {
         db.history_list(limit)
     }
 
+    /// One SQL-filtered page of history plus the total match count.
+    pub fn history_page(
+        &self,
+        filter: &HistoryFilter,
+        offset: usize,
+        limit: usize,
+    ) -> crate::nzb_core::Result<(Vec<HistoryEntry>, usize)> {
+        self.db.lock().history_page(filter, offset, limit)
+    }
+
+    /// Lightweight rows for every history entry matching `filter`.
+    pub fn history_summaries(
+        &self,
+        filter: &HistoryFilter,
+    ) -> crate::nzb_core::Result<Vec<HistorySummary>> {
+        self.db.lock().history_summaries(filter)
+    }
+
+    /// List-shaped history entries for `ids`, in the order given.
+    pub fn history_get_listed(&self, ids: &[String]) -> crate::nzb_core::Result<Vec<HistoryEntry>> {
+        self.db.lock().history_get_listed(ids)
+    }
+
     /// Aggregate per-server article and byte statistics from active jobs and
     /// persisted history for display in the settings UI.
     pub fn server_stats_get_all(&self, servers: &[ServerConfig]) -> Vec<ServerStatsData> {
@@ -4646,7 +4669,7 @@ impl QueueManager {
             let entry = db.history_get(id)?;
             let retained = entry
                 .as_ref()
-                .map(|entry| self.history_work_dirs(&db, entry))
+                .map(|entry| self.history_work_dirs(&db, &entry.id, entry.status))
                 .unwrap_or_default();
             db.history_remove(id)?;
             if entry.is_some() {
@@ -4666,9 +4689,9 @@ impl QueueManager {
             let db = self.db.lock();
             let had_entries = db.history_count()? != 0;
             let retained: Vec<_> = db
-                .history_list(i64::MAX as usize)?
+                .history_summaries(&HistoryFilter::default())?
                 .iter()
-                .flat_map(|entry| self.history_work_dirs(&db, entry))
+                .flat_map(|entry| self.history_work_dirs(&db, &entry.id, entry.status))
                 .collect();
             db.history_clear()?;
             if had_entries {
@@ -4685,10 +4708,15 @@ impl QueueManager {
     /// Incomplete work directories a history row may have retained: its own
     /// `incomplete/<id>` and, for a failed row, the directory its retry
     /// checkpoint names (a retry reuses an earlier attempt's directory).
-    fn history_work_dirs(&self, db: &Database, entry: &HistoryEntry) -> Vec<std::path::PathBuf> {
-        let mut dirs = vec![self.incomplete_dir().join(&entry.id)];
-        if entry.status == JobStatus::Failed
-            && let Ok(Some(data)) = db.history_get_retry_data(&entry.id)
+    fn history_work_dirs(
+        &self,
+        db: &Database,
+        id: &str,
+        status: JobStatus,
+    ) -> Vec<std::path::PathBuf> {
+        let mut dirs = vec![self.incomplete_dir().join(id)];
+        if status == JobStatus::Failed
+            && let Ok(Some(data)) = db.history_get_retry_data(id)
             && let Some(work_dir) = retry_checkpoint_work_dir(&data)
             && !dirs.contains(&work_dir)
         {
@@ -4722,7 +4750,7 @@ impl QueueManager {
         {
             let db = self.db.lock();
             paths.extend(db.queue_list()?.into_iter().map(|job| job.work_dir));
-            for entry in db.history_list(i64::MAX as usize)? {
+            for entry in db.history_summaries(&HistoryFilter::default())? {
                 paths.push(incomplete.join(&entry.id));
                 if entry.status != JobStatus::Failed {
                     continue;
