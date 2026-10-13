@@ -566,3 +566,119 @@ async fn downloader_survives_total_wrapper_retirement_on_one_server() {
         .await
         .expect("downloader did not shut down within 5s");
 }
+
+/// One job owning the whole connection pool versus two jobs sharing it.
+///
+/// The downloader keeps a single pool (`server.connections` sockets) and a
+/// shared work queue, so two concurrent jobs cannot each have the pool: they
+/// split it. With a fixed per-article server delay the combined article rate
+/// should stay flat and each job should get about half. A large drop in the
+/// combined rate would mean scheduling or decode contention on top of the
+/// split; this asserts there is none beyond the share.
+#[tokio::test]
+async fn two_jobs_share_one_connection_pool_without_extra_slowdown() {
+    const ARTICLES_PER_JOB: usize = 24;
+    const CONNECTIONS: u8 = 4;
+
+    async fn timed(jobs: usize) -> Duration {
+        let mut articles = HashMap::new();
+        for job in 0..jobs {
+            for n in 0..ARTICLES_PER_JOB {
+                articles.insert(format!("j{job}-{n}"), vec![0u8; 64]);
+            }
+        }
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            // Large enough that connection setup is noise, small enough that
+            // the test stays well under a second per run.
+            response_delay: Some(Duration::from_millis(15)),
+            ..Default::default()
+        })
+        .await;
+
+        let mut sc = test_config(server.port());
+        sc.id = "shared".into();
+        sc.priority = 1;
+        sc.connections = u16::from(CONNECTIONS);
+        sc.ramp_up_delay_ms = 0;
+
+        let (handle, outcomes) = spawn_downloader(DownloaderConfig {
+            servers: vec![sc],
+            max_concurrent_fetches: CONNECTIONS as usize,
+            article_timeout: Duration::from_secs(10),
+            work_channel_capacity: 256,
+            outcome_channel_capacity: 256,
+            probe_policy: None,
+        });
+
+        for job_idx in 0..jobs {
+            let job_id = format!("j{job_idx}");
+            let file = Arc::new(NzbFile::new(
+                format!("f{job_idx}"),
+                job_id.clone(),
+                "demo.r00",
+                u32::try_from(ARTICLES_PER_JOB).unwrap(),
+            ));
+            let job = Arc::new(NzbObject::new(
+                job_id.clone(),
+                "demo",
+                u64::try_from(ARTICLES_PER_JOB).unwrap(),
+                64,
+                vec![file.clone()],
+            ));
+            for n in 0..ARTICLES_PER_JOB {
+                let art = Arc::new(Article::new(
+                    format!("j{job_idx}-{n}"),
+                    format!("f{job_idx}"),
+                    job_id.clone(),
+                    64,
+                    0,
+                    n as u64,
+                ));
+                handle
+                    .submit(WorkItem {
+                        tag: (job_idx * ARTICLES_PER_JOB + n) as u64,
+                        article: art,
+                        file: file.clone(),
+                        job: job.clone(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let got = run_until_complete(
+            &handle,
+            outcomes,
+            jobs * ARTICLES_PER_JOB,
+            Duration::from_secs(30),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            got.iter()
+                .all(|o| matches!(o, FetchOutcome::Success { .. })),
+            "every article should succeed"
+        );
+        handle.shutdown();
+        handle.join().await;
+        elapsed
+    }
+
+    let one = timed(1).await;
+    let two = timed(2).await;
+    eprintln!(
+        "pool share: 1 job {one:?} for {ARTICLES_PER_JOB} articles, 2 jobs {two:?} for {} articles ({CONNECTIONS} connections)",
+        2 * ARTICLES_PER_JOB
+    );
+
+    // Twice the articles on the same pool should take about twice as long.
+    // Allow generous slack for connection setup and scheduling; fail only if
+    // two jobs are dramatically slower than simply splitting the pool.
+    let ratio = two.as_secs_f64() / one.as_secs_f64();
+    assert!(
+        (1.2..3.2).contains(&ratio),
+        "two jobs took {ratio:.2}x one job ({two:?} vs {one:?}); expected ~2x from sharing {CONNECTIONS} connections, not extra contention"
+    );
+}
