@@ -12,6 +12,7 @@ use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
+use crate::nzb_core::db::{HistoryFilter, HistorySummary};
 use crate::nzb_core::models::*;
 use crate::nzb_core::nzb_parser;
 
@@ -150,7 +151,14 @@ pub async fn h_sabnzbd_api_get(
         .await;
     }
 
-    let result = dispatch_mode(&state, mode, &req);
+    // Modes read the database and the job list under their mutexes; run them
+    // on a blocking thread so a slow query never stalls an async worker.
+    let result = tokio::task::spawn_blocking(move || {
+        let mode = req.mode.as_deref().unwrap_or("");
+        dispatch_mode(&state, mode, &req)
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow::anyhow!("SABnzbd API task failed: {e}")))?;
     Ok(result)
 }
 
@@ -1668,7 +1676,11 @@ fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Val
         return Json(unchanged_history_response());
     }
 
-    let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
+    // Filter, count and total over the light pre-blob columns; only the
+    // returned page is loaded in full.
+    let summaries = qm
+        .history_summaries(&HistoryFilter::default())
+        .unwrap_or_default();
     let postprocessing: Vec<_> = qm
         .get_jobs()
         .into_iter()
@@ -1687,33 +1699,113 @@ fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Val
         })
         .collect();
 
-    Json(build_history_response(
-        &entries,
+    Json(build_history_response_with(
+        &summaries,
         &postprocessing,
         req,
         history_update,
+        |ids| qm.history_get_listed(ids).unwrap_or_default(),
     ))
 }
 
+#[cfg(test)]
 fn build_history_response(
     entries: &[HistoryEntry],
     postprocessing: &[(NzbJob, u8)],
     req: &SabApiRequest,
     history_update: u64,
 ) -> serde_json::Value {
-    let mut slots: Vec<SabHistorySlot> = postprocessing
+    let summaries: Vec<HistorySummary> = entries.iter().map(history_summary_of).collect();
+    build_history_response_with(&summaries, postprocessing, req, history_update, |ids| {
+        ids.iter()
+            .filter_map(|id| entries.iter().find(|entry| &entry.id == id).cloned())
+            .collect()
+    })
+}
+
+#[cfg(test)]
+fn history_summary_of(entry: &HistoryEntry) -> HistorySummary {
+    HistorySummary {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        category: entry.category.clone(),
+        status: entry.status,
+        total_bytes: entry.total_bytes,
+        downloaded_bytes: entry.downloaded_bytes,
+        added_at: entry.added_at,
+        completed_at: entry.completed_at,
+        output_dir: entry.output_dir.clone(),
+        error_message: entry.error_message.clone(),
+    }
+}
+
+/// A history entry carrying only the summary columns. Its slot has every
+/// field the SAB history filters read; the page is rebuilt from full rows.
+fn summary_entry(summary: &HistorySummary) -> HistoryEntry {
+    HistoryEntry {
+        id: summary.id.clone(),
+        name: summary.name.clone(),
+        category: summary.category.clone(),
+        status: summary.status,
+        total_bytes: summary.total_bytes,
+        downloaded_bytes: summary.downloaded_bytes,
+        added_at: summary.added_at,
+        completed_at: summary.completed_at,
+        download_time_secs: None,
+        output_dir: summary.output_dir.clone(),
+        stages: Vec::new(),
+        error_message: summary.error_message.clone(),
+        failure_code: None,
+        post_processing: None,
+        delete_archives: None,
+        server_stats: Vec::new(),
+        nzb_data: None,
+        retry_data: None,
+    }
+}
+
+/// Build the SAB history response from summary rows, loading full rows
+/// (via `load_full`, in the order given) only for the history slots on the
+/// requested page.
+fn build_history_response_with(
+    summaries: &[HistorySummary],
+    postprocessing: &[(NzbJob, u8)],
+    req: &SabApiRequest,
+    history_update: u64,
+    load_full: impl FnOnce(&[String]) -> Vec<HistoryEntry>,
+) -> serde_json::Value {
+    let mut slots: Vec<(Option<&str>, SabHistorySlot)> = postprocessing
         .iter()
-        .map(|(job, level)| SabHistorySlot::from_postprocessing(job, *level))
-        .chain(entries.iter().map(SabHistorySlot::from_entry))
-        .filter(|slot| history_slot_matches(slot, req))
+        .map(|(job, level)| (None, SabHistorySlot::from_postprocessing(job, *level)))
+        .chain(summaries.iter().map(|summary| {
+            (
+                Some(summary.id.as_str()),
+                SabHistorySlot::from_entry(&summary_entry(summary)),
+            )
+        }))
+        .filter(|(_, slot)| history_slot_matches(slot, req))
         .collect();
     let noofslots = slots.len();
-    let ppslots = slots.iter().filter(|slot| slot.postprocessing).count();
+    let ppslots = slots.iter().filter(|(_, slot)| slot.postprocessing).count();
     let start = req.start.unwrap_or(0).min(slots.len());
     let limit = req.limit.filter(|limit| *limit != 0).unwrap_or(50);
     let end = start.saturating_add(limit).min(slots.len());
-    slots = slots.drain(start..end).collect();
+    let page: Vec<_> = slots.drain(start..end).collect();
+    let ids: Vec<String> = page
+        .iter()
+        .filter_map(|(id, _)| id.map(str::to_owned))
+        .collect();
+    let full = load_full(&ids);
+    let slots: Vec<SabHistorySlot> = page
+        .into_iter()
+        .map(|(id, slot)| {
+            // A row deleted since the summary scan keeps its summary slot.
+            id.and_then(|id| full.iter().find(|entry| entry.id == id))
+                .map_or(slot, SabHistorySlot::from_entry)
+        })
+        .collect();
 
+    let entries = summaries;
     let total_bytes: u64 = entries.iter().map(|entry| entry.downloaded_bytes).sum();
     let now = chrono::Utc::now();
     let period_bytes = |days| {
@@ -1737,6 +1829,12 @@ fn build_history_response(
             "version": SABNZBD_COMPAT_VERSION
         }
     })
+}
+
+/// Every history row's summary columns, newest first; empty on a DB error.
+fn history_summaries(qm: &crate::queue_manager::QueueManager) -> Vec<HistorySummary> {
+    qm.history_summaries(&HistoryFilter::default())
+        .unwrap_or_default()
 }
 
 fn history_is_unchanged(requested: Option<u64>, current: u64) -> bool {
@@ -1829,7 +1927,7 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
     let del_files = req.del_files.as_deref().is_some_and(sab_query_bool);
 
     if target.eq_ignore_ascii_case("all") {
-        let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
+        let entries = history_summaries(qm);
         return match qm.history_clear() {
             Ok(()) => {
                 if del_files {
@@ -1854,7 +1952,7 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
         None
     };
     if let Some(status) = status_filter {
-        let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
+        let entries = history_summaries(qm);
         let (removed, kept): (Vec<_>, Vec<_>) = entries
             .iter()
             .cloned()
@@ -1878,7 +1976,7 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
         return Json(serde_json::json!({ "status": true }));
     }
 
-    let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
+    let entries = history_summaries(qm);
     let mut removed = Vec::new();
     for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
         let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
@@ -1909,8 +2007,8 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
 /// is not strictly inside the complete directory or a category directory.
 fn delete_history_files(
     qm: &crate::queue_manager::QueueManager,
-    removed: &[crate::nzb_core::models::HistoryEntry],
-    kept: &[crate::nzb_core::models::HistoryEntry],
+    removed: &[HistorySummary],
+    kept: &[HistorySummary],
 ) {
     let mut protected: Vec<std::path::PathBuf> = kept
         .iter()
@@ -2083,7 +2181,7 @@ fn handle_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
 
     // Also try history if not found in queue
     if !found {
-        let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
+        let entries = history_summaries(qm);
         for entry in &entries {
             if job_id_matches(&entry.id, search_id) {
                 let _ = qm.history_remove(&entry.id);
@@ -2107,12 +2205,11 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     }
 
     let search_id = target_id.strip_prefix("SABnzbd_nzo_").unwrap_or(target_id);
-    let Some(entry) = state
-        .queue_manager
-        .history_list(i64::MAX as usize)
-        .unwrap_or_default()
+    let qm = &state.queue_manager;
+    let Some(entry) = history_summaries(qm)
         .into_iter()
         .find(|entry| job_id_matches(&entry.id, search_id))
+        .and_then(|summary| qm.history_get_listed(&[summary.id]).ok()?.pop())
     else {
         return Json(serde_json::json!({ "status": false, "error": "History job not found" }));
     };
@@ -2131,9 +2228,14 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
 /// `{"status": [nzo_id, ...]}`, one element per attempted entry and `null`
 /// where that retry failed, so this does the same.
 fn handle_retry_all(state: &AppState) -> Json<serde_json::Value> {
+    let failed = HistoryFilter {
+        status: Some(JobStatus::Failed),
+        ..Default::default()
+    };
     let entries = state
         .queue_manager
-        .history_list(i64::MAX as usize)
+        .history_page(&failed, 0, usize::MAX)
+        .map(|(entries, _)| entries)
         .unwrap_or_default();
     let nzo_ids: Vec<Option<String>> = entries
         .iter()
@@ -3567,6 +3669,46 @@ mod tests {
         let id_response = build_history_response(&entries, &[], &id_request, 3);
         assert_eq!(id_response["history"]["noofslots"], 1);
         assert_eq!(id_response["history"]["slots"][0]["name"], "TV Episode");
+    }
+
+    #[test]
+    fn history_loads_full_rows_only_for_the_requested_page() {
+        let mut entries: Vec<HistoryEntry> = (0..6)
+            .map(|i| {
+                history_entry(
+                    &format!("job-{i}"),
+                    &format!("Job {i}"),
+                    "tv",
+                    JobStatus::Failed,
+                    i,
+                )
+            })
+            .collect();
+        for entry in &mut entries {
+            entry.nzb_data = Some(Vec::new());
+        }
+        let summaries: Vec<HistorySummary> = entries.iter().map(history_summary_of).collect();
+        let request = SabApiRequest {
+            start: Some(2),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let mut loaded = Vec::new();
+        let response = build_history_response_with(&summaries, &[], &request, 1, |ids| {
+            loaded = ids.to_vec();
+            ids.iter()
+                .filter_map(|id| entries.iter().find(|e| &e.id == id).cloned())
+                .collect()
+        });
+
+        assert_eq!(loaded, ["job-2", "job-3"]);
+        let history = &response["history"];
+        assert_eq!(history["noofslots"], 6);
+        let slots = history["slots"].as_array().unwrap();
+        assert_eq!(slots.len(), 2);
+        // Fields only the full row carries come through on the page.
+        assert_eq!(slots[0]["name"], "Job 2");
+        assert_eq!(slots[0]["retry"], true);
     }
 
     #[test]
