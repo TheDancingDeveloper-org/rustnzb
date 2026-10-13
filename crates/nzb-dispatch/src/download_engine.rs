@@ -1042,7 +1042,27 @@ struct ActiveWorker {
     /// "definitive progress" event (successful decode or definitive
     /// failure). The supervisor reads this to detect zombie workers.
     last_progress: Arc<AtomicU64>,
+    /// `ServerConfig` this worker was spawned with. The worker owns its own
+    /// copy and never re-reads it, so a later edit to priority or connection
+    /// parameters (host, port, TLS, credentials) is invisible until the
+    /// worker is recycled. `reconcile_servers` compares this snapshot.
+    spawned_with: ServerConfig,
     handle: JoinHandle<()>,
+}
+
+/// Fields a running worker captured at spawn and will not notice until it is
+/// recycled. `connections` and `enabled` are handled separately (shrink/grow
+/// and retire), so they are not part of this comparison.
+fn connection_identity_changed(spawned: &ServerConfig, current: &ServerConfig) -> bool {
+    spawned.priority != current.priority
+        || spawned.host != current.host
+        || spawned.port != current.port
+        || spawned.ssl != current.ssl
+        || spawned.ssl_verify != current.ssl_verify
+        || spawned.username != current.username
+        || spawned.password != current.password
+        || spawned.trusted_fingerprint != current.trusted_fingerprint
+        || spawned.proxy_url != current.proxy_url
 }
 
 /// Long-lived worker pool that services all active download jobs.
@@ -1208,6 +1228,12 @@ impl WorkerPool {
     /// exist. Extra workers (from a shrunk limit or disabled server) have
     /// their per-worker shutdown flag flipped so they exit gracefully after
     /// the current article.
+    ///
+    /// A worker keeps the `ServerConfig` it was spawned with. When that
+    /// snapshot's priority or connection parameters (host, port, TLS,
+    /// credentials, proxy, certificate pin) no longer match the live config,
+    /// every worker for that server is recycled so the new values take
+    /// effect. An identical config does not recycle.
     pub fn reconcile_servers(self: &Arc<Self>) {
         if self.shutdown.load(Ordering::Relaxed) {
             return;
@@ -1216,11 +1242,16 @@ impl WorkerPool {
         let servers_snapshot: Vec<ServerConfig> = self.servers.lock().clone();
         let mut workers = self.workers.lock();
 
-        // First pass: retire workers for servers that are gone or disabled.
+        // First pass: retire workers for servers that are gone, disabled, or
+        // whose priority / connection parameters changed under them.
         let mut retire: Vec<String> = Vec::new();
-        for key in workers.keys() {
-            let still_active = servers_snapshot.iter().any(|s| s.enabled && &s.id == key);
-            if !still_active {
+        for (key, list) in workers.iter() {
+            let current = servers_snapshot.iter().find(|s| s.enabled && &s.id == key);
+            let stale = current.is_none_or(|server| {
+                list.iter()
+                    .any(|w| connection_identity_changed(&w.spawned_with, server))
+            });
+            if stale {
                 retire.push(key.clone());
             }
         }
@@ -1268,6 +1299,7 @@ impl WorkerPool {
                 entry.push(ActiveWorker {
                     shutdown: worker_shutdown,
                     last_progress,
+                    spawned_with: server.clone(),
                     handle,
                 });
             }
@@ -4707,5 +4739,162 @@ mod tests {
         ] {
             assert!(!counts_against_circuit_breaker(&e), "{e}");
         }
+    }
+
+    fn pool_with(servers: Vec<ServerConfig>) -> Arc<WorkerPool> {
+        let tracker = Arc::new(ConnectionTracker::new());
+        for server in &servers {
+            tracker.set_limit(&server.id, &server.name, server.connections as usize);
+        }
+        WorkerPool::new(
+            Arc::new(Mutex::new(servers)),
+            Arc::new(BandwidthLimiter::new(Default::default())),
+            tracker,
+            0,
+        )
+    }
+
+    fn server(id: &str, priority: u8) -> ServerConfig {
+        let mut server = ServerConfig::new(id, format!("{id}.example"));
+        server.name = id.to_string();
+        server.priority = priority;
+        server.connections = 1;
+        server.port = 563;
+        server
+    }
+
+    /// Priorities the live workers were spawned with, keyed by server id.
+    fn spawned_priorities(pool: &WorkerPool) -> HashMap<String, Vec<u8>> {
+        pool.workers
+            .lock()
+            .iter()
+            .map(|(id, list)| {
+                (
+                    id.clone(),
+                    list.iter().map(|w| w.spawned_with.priority).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn spawned_endpoints(pool: &WorkerPool) -> HashMap<String, Vec<(String, u16)>> {
+        pool.workers
+            .lock()
+            .iter()
+            .map(|(id, list)| {
+                (
+                    id.clone(),
+                    list.iter()
+                        .map(|w| (w.spawned_with.host.clone(), w.spawned_with.port))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn raising_server_priority_recycles_workers_so_items_stay_poppable() {
+        // Two servers, A worse than B. Items are already in flight (queued,
+        // tried by nobody). Raising A above B must recycle both sides: if
+        // either kept its old priority the gate would wait on the other and
+        // nothing would pop.
+        let a = server("a", 2);
+        let b = server("b", 1);
+        let pool = pool_with(vec![a.clone(), b.clone()]);
+        pool.reconcile_servers();
+
+        pool.work_queue
+            .submit_items(vec![make_item("j1", "msg-1", "file.rar")]);
+        assert!(
+            pool.work_queue
+                .pop_workable("b", &pool.higher_priority_servers(b.priority, "b"))
+                .is_some(),
+            "B is primary before the edit"
+        );
+        pool.work_queue
+            .submit_items(vec![make_item("j1", "msg-2", "file.rar")]);
+
+        let mut raised = a.clone();
+        raised.priority = 0;
+        *pool.servers.lock() = vec![raised.clone(), b.clone()];
+        pool.reconcile_servers();
+
+        let priorities = spawned_priorities(&pool);
+        assert_eq!(
+            priorities["a"],
+            vec![0],
+            "A's worker must see its new priority"
+        );
+        assert_eq!(
+            priorities["b"],
+            vec![1],
+            "B was unchanged and must not recycle"
+        );
+
+        let popped = pool
+            .work_queue
+            .pop_workable("a", &pool.higher_priority_servers(0, "a"));
+        assert!(
+            popped.is_some(),
+            "raised server must be able to take the queued item"
+        );
+        assert!(
+            pool.work_queue
+                .pop_workable("b", &pool.higher_priority_servers(b.priority, "b"))
+                .is_none(),
+            "demoted-relative server must now wait on A"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_or_port_edit_recycles_workers_onto_new_config() {
+        let a = server("a", 0);
+        let pool = pool_with(vec![a.clone()]);
+        pool.reconcile_servers();
+        assert_eq!(
+            spawned_endpoints(&pool)["a"],
+            vec![("a.example".to_string(), 563)]
+        );
+
+        let mut moved = a.clone();
+        moved.host = "news.example".to_string();
+        moved.port = 119;
+        *pool.servers.lock() = vec![moved];
+        pool.reconcile_servers();
+
+        assert_eq!(
+            spawned_endpoints(&pool)["a"],
+            vec![("news.example".to_string(), 119)],
+            "recycled workers must connect with the edited host and port"
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_config_does_not_recycle_workers() {
+        let a = server("a", 1);
+        let pool = pool_with(vec![a.clone()]);
+        pool.reconcile_servers();
+
+        let before: Vec<_> = pool
+            .workers
+            .lock()
+            .get("a")
+            .unwrap()
+            .iter()
+            .map(|w| w.handle.id())
+            .collect();
+
+        *pool.servers.lock() = vec![a];
+        pool.reconcile_servers();
+
+        let after: Vec<_> = pool
+            .workers
+            .lock()
+            .get("a")
+            .unwrap()
+            .iter()
+            .map(|w| w.handle.id())
+            .collect();
+        assert_eq!(before, after, "a no-op update must keep the same workers");
     }
 }
