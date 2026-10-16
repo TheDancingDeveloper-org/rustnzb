@@ -279,12 +279,12 @@ function emptyCategory(): CategoryConfig {
                       </div>
                     </div>
                     @if (st.last_active) {
-                      <div style="font-size:11px;color:var(--mute);margin-top:6px">
+                      <div class="help" style="margin-top:6px">
                         Last activity: {{ st.last_active }}
                       </div>
                     }
                   } @else {
-                    <div style="color:var(--mute);font-size:12px">
+                    <div class="help">
                       No data yet — stats accumulate as downloads complete.
                     </div>
                   }
@@ -355,7 +355,7 @@ function emptyCategory(): CategoryConfig {
                   <label>Priority</label>
                   <div class="inline">
                     <input type="number" [(ngModel)]="editingServer.priority" min="0" />
-                    <span style="color:var(--mute);font-size:11px"
+                    <span class="help"
                       >0 = primary, higher = fallback</span
                     >
                   </div>
@@ -363,7 +363,7 @@ function emptyCategory(): CategoryConfig {
                   <label>Pipelining</label>
                   <div class="inline">
                     <input type="number" [(ngModel)]="editingServer.pipelining" min="0" />
-                    <span style="color:var(--mute);font-size:11px"
+                    <span class="help"
                       >Max inflight ARTICLE commands per conn</span
                     >
                   </div>
@@ -371,7 +371,7 @@ function emptyCategory(): CategoryConfig {
                   <label>Ramp-up delay</label>
                   <div class="inline">
                     <input type="number" [(ngModel)]="editingServer.ramp_up_delay_ms" min="0" />
-                    <span style="color:var(--mute);font-size:11px">ms between opening conns</span>
+                    <span class="help">ms between opening conns</span>
                   </div>
 
                   <label>Connection timeout</label>
@@ -381,7 +381,7 @@ function emptyCategory(): CategoryConfig {
                       [(ngModel)]="editingServer.connect_timeout_secs"
                       min="1"
                     />
-                    <span style="color:var(--mute);font-size:11px"
+                    <span class="help"
                       >seconds to wait before treating this server as unreachable</span
                     >
                   </div>
@@ -389,7 +389,7 @@ function emptyCategory(): CategoryConfig {
                   <label>Retention</label>
                   <div class="inline">
                     <input type="number" [(ngModel)]="editingServer.retention" min="0" />
-                    <span style="color:var(--mute);font-size:11px">days (informational)</span>
+                    <span class="help">days (informational)</span>
                   </div>
 
                   <label>Compression</label>
@@ -430,7 +430,7 @@ function emptyCategory(): CategoryConfig {
           <div class="panel">
             <h3>About RSS configuration</h3>
             <div class="body">
-              <p style="margin:0;color:var(--mute);font-size:13px">
+              <p class="prose-secondary" style="margin:0">
                 Feed URLs, regex filters, poll intervals, and auto-enqueue are configured per feed
                 on the
                 <a routerLink="/rss">RSS page</a>. This section is reserved for global defaults
@@ -537,7 +537,7 @@ function emptyCategory(): CategoryConfig {
 
           <div class="panel">
             <h3>Par2 repair <span class="hint">rust-par2 · no external binary</span></h3>
-            <div class="body" style="font-size:13px;color:var(--mute)">
+            <div class="body prose-secondary">
               Par2 behaviour is currently controlled per-category (see
               <a (click)="tab = 'categories'" style="cursor:pointer">Categories</a>). Global toggles
               (mode, memory limit, threads) will live here once the backend exposes them.
@@ -546,7 +546,7 @@ function emptyCategory(): CategoryConfig {
 
           <div class="panel">
             <h3>Extraction</h3>
-            <div class="body" style="font-size:13px;color:var(--mute)">
+            <div class="body prose-secondary">
               System <code>unrar</code> and <code>7z</code> are detected at startup. Run
               <code>--smoke-test</code> to verify the runtime tools.
             </div>
@@ -554,7 +554,7 @@ function emptyCategory(): CategoryConfig {
 
           <div class="panel">
             <h3>Cleanup</h3>
-            <div class="body" style="font-size:13px;color:var(--mute)">
+            <div class="body prose-secondary">
               On success, .rar / .par2 are removed from the output directory; sample files under 50
               MB are pruned. On failure, partial files are kept for retry.
             </div>
@@ -799,7 +799,7 @@ function emptyCategory(): CategoryConfig {
                     </div>
                   </div>
                 </div>
-                <div class="dim" style="margin-top: 10px; font-size: 11px;">
+                <div class="dim dav-note">
                   Note: WebDAV clients must use the root URL <b>without a trailing slash</b>
                   (Axum nest quirk). Append-paths shown above already follow this rule.
                 </div>
@@ -909,7 +909,7 @@ function emptyCategory(): CategoryConfig {
                 <label>Concurrent jobs</label>
                 <div class="inline">
                   <input type="number" [(ngModel)]="maxActiveDownloads" min="1" />
-                  <span style="color:var(--mute);font-size:11px"
+                  <span class="help"
                     >Max jobs in Downloading state</span
                   >
                   <button class="btn sm" (click)="saveMaxActive()">Save</button>
@@ -971,18 +971,21 @@ function emptyCategory(): CategoryConfig {
 
           <div class="panel">
             <h3>SABnzbd endpoint</h3>
-            <div class="body" style="font-size:13px">
+            <div class="body">
               <p style="margin:0 0 10px">
                 Point Sonarr/Radarr at this host — category matching is done by category name.
               </p>
-              <code>{{ sabnzbdExample }}</code>
+              <div class="url-cell">
+                <code>{{ sabnzbdExample }}</code>
+                <button class="btn sm" (click)="copy(sabnzbdExample)" type="button">Copy</button>
+              </div>
               <div class="form" style="margin-top:16px">
                 <label>Supported modes</label>
-                <div style="font-size:12px">
-                  <code>addfile</code> <code>addurl</code> <code>queue</code> <code>history</code>
-                  <code>config</code> <code>fullstatus</code> <code>version</code>
-                  <code>pause</code> <code>resume</code> <code>delete</code> <code>retry</code>
-                </div>
+                <ul class="code-list">
+                  @for (mode of sabnzbdModes; track mode) {
+                    <li><code>{{ mode }}</code></li>
+                  }
+                </ul>
               </div>
             </div>
           </div>
@@ -1034,8 +1037,8 @@ function emptyCategory(): CategoryConfig {
           </div>
 
           <div class="panel">
-            <h3>tracing</h3>
-            <div class="body" style="font-size:13px;line-height:1.8">
+            <h3>Tracing</h3>
+            <div class="body">
               Configured via env at startup: <code>RUSTNZB_LOG_LEVEL</code> (default
               <code>info</code>) or <code>RUST_LOG</code> for fine-grained per-target filters (e.g.
               <code>nzb_nntp=debug,nzb_web=info</code>). Live logs are on the
@@ -1045,7 +1048,7 @@ function emptyCategory(): CategoryConfig {
 
           <div class="panel">
             <h3>OpenTelemetry (OTLP gRPC)</h3>
-            <div class="body" style="font-size:13px;line-height:1.8">
+            <div class="body">
               Enabled via <code>OTEL_ENABLED=true</code>, <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>,
               <code>OTEL_SERVICE_NAME</code>. A mutable UI for these will land once the backend
               exposes a config endpoint.
@@ -1117,7 +1120,7 @@ function emptyCategory(): CategoryConfig {
       }
       .settings-side .sg {
         color: var(--mute);
-        font-size: 10px;
+        font-size: 12px;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.7px;
@@ -1181,6 +1184,8 @@ function emptyCategory(): CategoryConfig {
       }
       .title.dim {
         color: var(--mute);
+        /* Dim only: keep the size of the enabled row (overrides the global .dim size) */
+        font-size: inherit;
       }
       .host {
         color: var(--mute);
@@ -1336,7 +1341,7 @@ function emptyCategory(): CategoryConfig {
       .dir-hint {
         grid-column: 2;
         color: var(--mute);
-        font-size: 11px;
+        font-size: 12px;
         margin-top: -2px;
       }
       .settings-main .sub,
@@ -1391,9 +1396,15 @@ function emptyCategory(): CategoryConfig {
       .theme-swatch[data-preview-theme='light'] i { background: #2563eb; }
       .theme-copy { min-width: 0; display: flex; flex-direction: column; }
       .theme-copy b { font-size: 12px; }
-      .setting-description { color: var(--mute); font-size: 11px; margin-top: 2px; }
+      .setting-description { color: var(--mute); font-size: 12px; margin-top: 2px; }
+      .help { color: var(--mute); font-size: 12px; }
+      .prose-secondary { color: var(--mute); font-size: 13px; }
+      .dav-note { margin-top: 10px; }
       @media (max-width: 850px) {
         .theme-grid { grid-template-columns: 1fr; }
+      }
+      @media (max-width: 720px) {
+        .settings-shell { grid-template-columns: 1fr; }
       }
     `,
   ],
@@ -1401,6 +1412,10 @@ function emptyCategory(): CategoryConfig {
 export class SettingsViewComponent implements OnInit {
   tab: Tab = 'servers';
 
+  readonly sabnzbdModes = [
+    'addfile', 'addurl', 'queue', 'history', 'config', 'fullstatus',
+    'version', 'pause', 'resume', 'delete', 'retry',
+  ];
   readonly sabnzbdExample = `${typeof location !== 'undefined' ? location.origin : 'http://host:9090'}/sabnzbd/api?apikey=...&mode=queue`;
 
   // Servers
