@@ -912,4 +912,4 @@ Each has a recommendation; none blocks Phase 1.
   `h_dav_config_get` returns the struct as is). Phase 1 should start with tests
   that prove them.
 - The SABnzbd section is from SABnzbd source and docs as cited there; items
-  marked *unverified* were not confirmed in source.
+  marked "inferred" were reasoned from the code, not observed running.
