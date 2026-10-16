@@ -3027,6 +3027,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
+ "toml_edit 0.25.12+spec-1.1.0",
  "tracing",
  "unicode-normalization",
  "uuid",
@@ -5728,6 +5729,7 @@ dependencies = [
  "indexmap 2.14.0",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.3",
 ]
 

@@ -109,7 +109,10 @@ impl AppState {
 
     /// Save `next` as the file layer, then publish it with the overrides
     /// applied. Nothing changes if the save fails.
-    fn commit_config(&self, file: &mut AppConfig, next: AppConfig) -> anyhow::Result<()> {
+    fn commit_config(&self, file: &mut AppConfig, mut next: AppConfig) -> anyhow::Result<()> {
+        // Overridden keys keep their file value: a save never persists an
+        // override, whichever handler built `next`.
+        self.overrides.keep_file_values(&mut next, file);
         next.save(&self.config_path)?;
         self.config.store(Arc::new(self.overrides.overlay(&next)));
         *file = next;
