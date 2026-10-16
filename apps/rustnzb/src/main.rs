@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use nzb_web::nzb_core::config::AppConfig;
+use nzb_web::nzb_core::config::{AppConfig, GeneralConfig};
 use nzb_web::{LogBuffer, LogBufferLayer, StartupConfig};
 
 use rustnzb::handlers;
@@ -272,6 +272,21 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Warn about settings that are accepted but have no effect, so a user who
+/// set them is not left guessing. `cache_size` is flagged when it differs from
+/// the default, since the file does not record whether the key was written.
+fn warn_unused_settings(config: &AppConfig, cli_log_file: Option<&std::path::Path>) {
+    if cli_log_file.is_some() {
+        tracing::warn!("--log-file / RUSTNZB_LOG_FILE is unused and has no effect");
+    }
+    if config.general.log_file.is_some() {
+        tracing::warn!("general.log_file in config.toml is unused and has no effect");
+    }
+    if config.general.cache_size != GeneralConfig::default().cache_size {
+        tracing::warn!("general.cache_size is unused and has no effect");
+    }
+}
+
 fn apply_runtime_config_overrides(config: &mut AppConfig) -> bool {
     let dav_enabled = env_flag_enabled("RUSTNZB_DAV_ENABLED") || env_flag_enabled("ENABLE_DAV");
     if dav_enabled && !config.dav.enabled {
@@ -417,6 +432,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(warning) = log_filter_warning {
         tracing::warn!("{warning}");
     }
+    warn_unused_settings(&config, args.log_file.as_deref());
 
     // Initialize the engine (config, DB, queue manager, background services)
     let result = nzb_web::startup::initialize(

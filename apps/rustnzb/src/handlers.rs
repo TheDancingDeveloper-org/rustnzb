@@ -1136,12 +1136,20 @@ pub async fn h_logs(
 
 /// GET /api/config -- Get current configuration.
 ///
-/// Server passwords are replaced with `********`. The stored value is never
-/// returned; an update that sends the mask back keeps it.
+/// Secrets are replaced with `********`: server passwords, `general.api_key`,
+/// and the `user:pass@` part of server proxy URLs. The stored value is never
+/// returned; an update that sends the mask back keeps it. The dead settings
+/// `general.cache_size` and `general.log_file` are left out of the response.
 pub async fn h_config_get(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<nzb_web::nzb_core::config::AppConfig>, ApiError> {
-    Ok(Json(masked_config(&state.config())))
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut value =
+        serde_json::to_value(masked_config(&state.config())).map_err(anyhow::Error::from)?;
+    if let Some(general) = value.get_mut("general").and_then(|g| g.as_object_mut()) {
+        general.remove("cache_size");
+        general.remove("log_file");
+    }
+    Ok(Json(value))
 }
 
 /// GET /api/config/sabnzbd-api-key -- Return the current SABnzbd API key.
@@ -1190,12 +1198,65 @@ fn masked_config(
     config: &nzb_web::nzb_core::config::AppConfig,
 ) -> nzb_web::nzb_core::config::AppConfig {
     let mut config = config.clone();
+    if config.general.api_key.is_some() {
+        config.general.api_key = Some(PASSWORD_MASK.to_string());
+    }
+    if config.dav.password.is_some() {
+        config.dav.password = Some(PASSWORD_MASK.to_string());
+    }
+    if config.dav.api_key.is_some() {
+        config.dav.api_key = Some(PASSWORD_MASK.to_string());
+    }
     for server in &mut config.servers {
         if server.password.is_some() {
             server.password = Some(PASSWORD_MASK.to_string());
         }
+        if let Some(url) = server.proxy_url.as_deref() {
+            server.proxy_url = Some(mask_proxy_userinfo(url));
+        }
     }
     config
+}
+
+/// Replace the `user:pass@` part of a proxy URL with the mask. A URL without
+/// userinfo is returned unchanged.
+fn mask_proxy_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return url.to_string();
+    };
+    let rest = &url[scheme_end..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].rfind('@') else {
+        return url.to_string();
+    };
+    format!("{}{PASSWORD_MASK}@{}", &url[..scheme_end], &rest[at + 1..])
+}
+
+/// Whether a submitted proxy URL is the masked form of the stored one, which
+/// means "keep the stored URL" (it still carries the real credentials).
+fn proxy_url_unchanged(submitted: Option<&str>, stored: Option<&str>) -> bool {
+    match (submitted, stored) {
+        (Some(s), Some(stored)) => s == mask_proxy_userinfo(stored),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "webdav")]
+/// Resolve a submitted secret field against the stored one. An absent key,
+/// an empty string, or the mask keeps the stored value; JSON `null` clears
+/// it; any other string replaces it.
+fn resolve_secret(
+    body: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    stored: Option<String>,
+) -> Option<String> {
+    match body.get(key) {
+        None => stored,
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.is_empty() || s == PASSWORD_MASK => stored,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(_) => stored,
+    }
 }
 
 /// POST /api/config/servers -- Add a new server.
@@ -1210,6 +1271,14 @@ pub async fn h_server_add(
     sanitize_server_config(&mut server);
     if server.password.as_deref() == Some(PASSWORD_MASK) {
         server.password = None;
+    }
+    // A new server has no stored URL to fall back on, so a masked one is dropped.
+    if server
+        .proxy_url
+        .as_deref()
+        .is_some_and(|u| u.contains(&format!("{PASSWORD_MASK}@")))
+    {
+        server.proxy_url = None;
     }
 
     state.update_config_with(|config| {
@@ -1251,12 +1320,16 @@ fn keep_unchanged_password(server: &mut ServerConfig, existing: &ServerConfig) {
 ///
 /// The body may be partial: fields it omits keep their stored values.
 /// An empty or absent `password`, or the mask `********`, keeps the stored
-/// password; any other value replaces it.
+/// password; JSON `null` clears it; any other value replaces it. A
+/// `proxy_url` that is the masked form of the stored one keeps the stored URL.
 pub async fn h_server_update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(patch): Json<serde_json::Value>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
+    let clears_password = patch
+        .get("password")
+        .is_some_and(serde_json::Value::is_null);
     state.update_config_with(|config| {
         let idx = config
             .servers
@@ -1264,8 +1337,16 @@ pub async fn h_server_update(
             .position(|s| s.id == id)
             .ok_or_else(|| ApiError::from(NzbError::ServerNotFound(id.clone())))?;
 
-        let mut server = merge_server_update(&config.servers[idx], patch)?;
-        keep_unchanged_password(&mut server, &config.servers[idx]);
+        let stored = config.servers[idx].clone();
+        let mut server = merge_server_update(&stored, patch)?;
+        if clears_password {
+            server.password = None;
+        } else {
+            keep_unchanged_password(&mut server, &stored);
+        }
+        if proxy_url_unchanged(server.proxy_url.as_deref(), stored.proxy_url.as_deref()) {
+            server.proxy_url = stored.proxy_url.clone();
+        }
         if server.id.is_empty() {
             server.id = id.clone();
         }
@@ -1372,6 +1453,9 @@ pub async fn h_server_test_inline(
 ) -> Result<Json<ServerTestResponse>, ApiError> {
     if let Some(existing) = state.config().servers.iter().find(|s| s.id == server.id) {
         keep_unchanged_password(&mut server, existing);
+        if proxy_url_unchanged(server.proxy_url.as_deref(), existing.proxy_url.as_deref()) {
+            server.proxy_url = existing.proxy_url.clone();
+        }
     } else if server.password.as_deref() == Some(PASSWORD_MASK) {
         server.password = None;
     }
@@ -2169,7 +2253,10 @@ pub struct UpdateGeneralBody {
     pub complete_dir: Option<String>,
     pub data_dir: Option<String>,
     pub watch_dir: Option<String>,
-    pub cache_size: Option<u64>,
+    /// Dead setting: nothing reads it. Accepted so older clients still get a
+    /// 200, but never stored (see the warning in `h_general_update`).
+    #[serde(default)]
+    pub cache_size: Option<serde::de::IgnoredAny>,
     pub max_active_downloads: Option<usize>,
     pub max_post_processing_jobs: Option<usize>,
     pub max_repair_workers: Option<usize>,
@@ -2192,9 +2279,6 @@ pub struct UpdateGeneralBody {
     pub early_failure_check: Option<bool>,
 }
 
-/// Article cache size bounds accepted by the API (bytes).
-const CACHE_SIZE_MIN: u64 = 16 * 1024 * 1024;
-const CACHE_SIZE_MAX: u64 = 64 * 1024 * 1024 * 1024;
 /// Upper bound for `max_active_downloads`; `0` still means unlimited.
 const MAX_ACTIVE_DOWNLOADS_LIMIT: usize = 100;
 /// Upper bound for the post-processing job and worker pool sizes.
@@ -2226,14 +2310,6 @@ fn validate_max_active_downloads(value: usize) -> Result<(), ApiError> {
 /// Reject out-of-range values before anything is applied, so a bad request
 /// never half-updates the config or the live queue manager.
 fn validate_general_update(body: &UpdateGeneralBody) -> Result<(), ApiError> {
-    if let Some(size) = body.cache_size
-        && !(CACHE_SIZE_MIN..=CACHE_SIZE_MAX).contains(&size)
-    {
-        return Err(general_field_error(
-            "cache_size",
-            &format!("must be between {CACHE_SIZE_MIN} and {CACHE_SIZE_MAX} bytes"),
-        ));
-    }
     if let Some(max) = body.max_active_downloads {
         validate_max_active_downloads(max)?;
     }
@@ -2289,6 +2365,9 @@ pub async fn h_general_update(
     let Json(body) =
         body.map_err(|rejection| ApiError::from((StatusCode::BAD_REQUEST, rejection.body_text())))?;
     validate_general_update(&body)?;
+    if body.cache_size.is_some() {
+        tracing::warn!("general.cache_size is unused; the submitted value was ignored");
+    }
     state.update_config_with(|config| {
         if let Some(dir) = body.incomplete_dir {
             config.general.incomplete_dir = dir.into();
@@ -2306,9 +2385,6 @@ pub async fn h_general_update(
             } else {
                 Some(dir.into())
             };
-        }
-        if let Some(cs) = body.cache_size {
-            config.general.cache_size = cs;
         }
         if let Some(mad) = body.max_active_downloads {
             state.queue_manager.set_max_active_downloads(mad);
@@ -3039,27 +3115,41 @@ pub async fn h_dav_add(
 // ---------------------------------------------------------------------------
 
 /// GET /api/config/dav -- Get DAV auto-send configuration.
+///
+/// `password` and `api_key` are replaced with `********` when set.
 #[cfg(feature = "webdav")]
 pub async fn h_dav_config_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DavConfig>, ApiError> {
-    Ok(Json(state.config().dav.clone()))
+    Ok(Json(masked_config(&state.config()).dav))
 }
 
 /// PUT /api/config/dav -- Update DAV auto-send configuration.
+///
+/// The block is replaced as a whole, except for the secrets `password` and
+/// `api_key`, which follow the write rules in [`resolve_secret`]: absent, empty
+/// or masked keeps the stored value, `null` clears it.
 ///
 /// When `auto_send_all` is true the `category_rules` list is cleared — the two
 /// modes are mutually exclusive.
 #[cfg(feature = "webdav")]
 pub async fn h_dav_config_set(
     State(state): State<Arc<AppState>>,
-    Json(mut body): Json<DavConfig>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if body.auto_send_all {
-        body.category_rules.clear();
+    let serde_json::Value::Object(fields) = &body else {
+        return Err(ApiError::bad_request("DAV config must be a JSON object"));
+    };
+    let mut dav: DavConfig = serde_json::from_value(body.clone()).map_err(|e| {
+        ApiError::from((StatusCode::BAD_REQUEST, format!("Invalid DAV config: {e}")))
+    })?;
+    if dav.auto_send_all {
+        dav.category_rules.clear();
     }
     state.update_config_with(|config| {
-        config.dav = body;
+        dav.password = resolve_secret(fields, "password", config.dav.password.clone());
+        dav.api_key = resolve_secret(fields, "api_key", config.dav.api_key.clone());
+        config.dav = dav;
         Ok::<_, ApiError>(())
     })?;
     Ok(Json(serde_json::json!({ "status": true })))
@@ -3067,7 +3157,12 @@ pub async fn h_dav_config_set(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_RSS_REGEX_LEN, compile_rss_regex, sanitize_server_config};
+    #[cfg(feature = "webdav")]
+    use super::resolve_secret;
+    use super::{
+        MAX_RSS_REGEX_LEN, compile_rss_regex, mask_proxy_userinfo, proxy_url_unchanged,
+        sanitize_server_config,
+    };
 
     use nzb_web::nzb_core::config::ServerConfig;
 
@@ -3087,6 +3182,69 @@ mod tests {
         let pattern = "a".repeat(MAX_RSS_REGEX_LEN + 1);
         let err = compile_rss_regex(&pattern).unwrap_err();
         assert!(err.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn mask_proxy_userinfo_hides_credentials_only() {
+        assert_eq!(
+            mask_proxy_userinfo("socks5://user:pass@proxy.example.net:1080"),
+            "socks5://********@proxy.example.net:1080"
+        );
+        assert_eq!(
+            mask_proxy_userinfo("http://u@host:3128/path@x"),
+            "http://********@host:3128/path@x"
+        );
+        assert_eq!(
+            mask_proxy_userinfo("socks5://proxy.example.net:1080"),
+            "socks5://proxy.example.net:1080"
+        );
+        assert_eq!(mask_proxy_userinfo("not a url"), "not a url");
+    }
+
+    #[test]
+    fn proxy_url_unchanged_only_matches_the_masked_stored_form() {
+        let stored = Some("socks5://user:pass@proxy:1080");
+        assert!(proxy_url_unchanged(
+            Some("socks5://********@proxy:1080"),
+            stored
+        ));
+        assert!(!proxy_url_unchanged(
+            Some("socks5://other@proxy:1080"),
+            stored
+        ));
+        assert!(!proxy_url_unchanged(None, stored));
+        assert!(!proxy_url_unchanged(
+            Some("socks5://********@proxy:1080"),
+            None
+        ));
+    }
+
+    #[cfg(feature = "webdav")]
+    #[test]
+    fn resolve_secret_follows_absent_mask_null_rules() {
+        let stored = || Some("stored".to_string());
+        let body = |v: serde_json::Value| v.as_object().cloned().unwrap();
+
+        assert_eq!(
+            resolve_secret(&body(serde_json::json!({})), "k", stored()),
+            stored()
+        );
+        assert_eq!(
+            resolve_secret(&body(serde_json::json!({"k": "********"})), "k", stored()),
+            stored()
+        );
+        assert_eq!(
+            resolve_secret(&body(serde_json::json!({"k": ""})), "k", stored()),
+            stored()
+        );
+        assert_eq!(
+            resolve_secret(&body(serde_json::json!({"k": null})), "k", stored()),
+            None
+        );
+        assert_eq!(
+            resolve_secret(&body(serde_json::json!({"k": "new"})), "k", stored()),
+            Some("new".to_string())
+        );
     }
 
     #[test]
