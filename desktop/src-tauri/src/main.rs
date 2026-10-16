@@ -203,6 +203,7 @@ async fn start_engine() -> anyhow::Result<(Arc<QueueManager>, u16, RetainedInsta
             port: None,
             data_dir: Some(data_dir),
             log_level: Some("info".to_string()),
+            from_desktop_shell: true,
         },
         Some(log_buffer),
     )

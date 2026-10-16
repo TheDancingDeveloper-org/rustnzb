@@ -80,6 +80,7 @@ async fn start_test_server_inner(
         otel: base.otel,
         rss_feeds: base.rss_feeds,
         dav: base.dav,
+        config_version: base.config_version,
     };
 
     let db = Database::open_memory().expect("Failed to create in-memory database");

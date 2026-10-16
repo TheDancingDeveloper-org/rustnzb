@@ -22,6 +22,7 @@ async fn initialize_creates_custom_directories() {
         port: None,
         data_dir: Some(data_dir.clone()),
         log_level: None,
+        from_desktop_shell: false,
     };
 
     // `initialize` only overrides data_dir via StartupConfig; incomplete/complete
@@ -66,6 +67,7 @@ async fn initialize_reports_context_on_unwritable_data_dir() {
         port: None,
         data_dir: Some(data_dir.clone()),
         log_level: None,
+        from_desktop_shell: false,
     };
 
     let result = startup::initialize(startup_cfg, None).await;
