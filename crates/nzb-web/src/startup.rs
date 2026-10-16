@@ -7,6 +7,7 @@ use tracing::{info, warn};
 
 use crate::nzb_core::config::AppConfig;
 use crate::nzb_core::db::Database;
+use crate::nzb_core::overrides::{OverrideSet, OverrideSource, OverrideValue};
 
 use crate::auth::{CredentialStore, TokenStore};
 use crate::log_buffer::LogBuffer;
@@ -37,13 +38,83 @@ fn sanitize_loaded_config(config: &mut AppConfig) {
     }
 }
 
-fn env_flag_enabled(name: &str) -> Option<bool> {
-    std::env::var(name).ok().map(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn flag_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Build the overrides in force for this process from the startup values
+/// and from the environment (`env` reads one variable).
+///
+/// A value given to a startup field is labelled `env:NAME` when its variable
+/// is set, because the CLI reads the variable itself, and `cli` otherwise.
+/// Values from a desktop shell are labelled `desktop`.
+pub fn build_overrides(
+    listen_addr: Option<&str>,
+    port: Option<u16>,
+    data_dir: Option<&Path>,
+    from_desktop: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> OverrideSet {
+    let mut set = OverrideSet::default();
+    let startup_source = |name: &'static str| {
+        if from_desktop {
+            OverrideSource::Desktop
+        } else if env(name).is_some() {
+            OverrideSource::Env(name)
+        } else {
+            OverrideSource::Cli
+        }
+    };
+    if let Some(addr) = listen_addr {
+        let source = startup_source("RUSTNZB_LISTEN_ADDR");
+        set.set(OverrideValue::ListenAddr(addr.to_string()), source);
+    }
+    if let Some(port) = port {
+        let source = startup_source("RUSTNZB_PORT");
+        set.set(OverrideValue::Port(port), source);
+    }
+    if let Some(dir) = data_dir {
+        let source = startup_source("RUSTNZB_DATA_DIR");
+        set.set(OverrideValue::DataDir(dir.to_path_buf()), source);
+    }
+
+    let flag = |name: &'static str| env(name).map(|v| (name, flag_value(&v)));
+    let text = |name: &'static str| env(name).map(|v| (name, v));
+    let env_source = |name: &'static str| OverrideSource::Env(name);
+
+    if let Some((name, val)) = flag("OTEL_ENABLED") {
+        set.set(OverrideValue::OtelEnabled(val), env_source(name));
+    }
+    if let Some((name, val)) = text("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        set.set(OverrideValue::OtelEndpoint(val), env_source(name));
+    }
+    if let Some((name, val)) = flag("OTEL_LOGS_ENABLED") {
+        set.set(OverrideValue::OtelLogsEnabled(val), env_source(name));
+    }
+    if let Some((name, val)) = text("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") {
+        set.set(OverrideValue::OtelLogsEndpoint(val), env_source(name));
+    }
+    if let Some((name, val)) = flag("OTEL_METRICS_ENABLED") {
+        set.set(OverrideValue::OtelMetricsEnabled(val), env_source(name));
+    }
+    if let Some((name, val)) = text("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") {
+        set.set(OverrideValue::OtelMetricsEndpoint(val), env_source(name));
+    }
+    if let Some((name, val)) = text("OTEL_SERVICE_NAME") {
+        set.set(OverrideValue::OtelServiceName(val), env_source(name));
+    }
+
+    // DAV is only forced on: a falsy variable leaves the file's choice alone.
+    for name in ["RUSTNZB_DAV_ENABLED", "ENABLE_DAV"] {
+        if flag(name).is_some_and(|(_, on)| on) {
+            set.set(OverrideValue::DavEnabled(true), env_source(name));
+            break;
+        }
+    }
+    set
 }
 
 /// Create a data directory (e.g. `data_dir`/`incomplete_dir`/`complete_dir`), attaching
@@ -91,6 +162,9 @@ pub struct StartupConfig {
     pub data_dir: Option<PathBuf>,
     /// Log level filter string (e.g. "info", "debug").
     pub log_level: Option<String>,
+    /// Set by the desktop shell, whose listen address and data directory are
+    /// fixed by the shell rather than by the user. Labels them `desktop`.
+    pub from_desktop_shell: bool,
 }
 
 /// Result of engine initialization — everything needed to run the server.
@@ -211,42 +285,20 @@ pub async fn initialize(
     log_buffer: Option<LogBuffer>,
 ) -> anyhow::Result<StartupResult> {
     let config_path = startup.config_path;
-    let mut config = AppConfig::load(&config_path)?;
-    sanitize_loaded_config(&mut config);
+    let mut file = AppConfig::load(&config_path)?;
+    sanitize_loaded_config(&mut file);
 
-    // Apply overrides
-    if let Some(addr) = startup.listen_addr {
-        config.general.listen_addr = addr;
-    }
-    if let Some(port) = startup.port {
-        config.general.port = port;
-    }
-    if let Some(data_dir) = startup.data_dir {
-        config.general.data_dir = data_dir;
-    }
-
-    // Apply env var overrides for OpenTelemetry
-    if let Some(val) = env_flag_enabled("OTEL_ENABLED") {
-        config.otel.enabled = val;
-    }
-    if let Ok(val) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
-        config.otel.endpoint = val;
-    }
-    if let Some(val) = env_flag_enabled("OTEL_LOGS_ENABLED") {
-        config.otel.logs_enabled = Some(val);
-    }
-    if let Ok(val) = std::env::var("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") {
-        config.otel.logs_endpoint = Some(val);
-    }
-    if let Some(val) = env_flag_enabled("OTEL_METRICS_ENABLED") {
-        config.otel.metrics_enabled = Some(val);
-    }
-    if let Ok(val) = std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") {
-        config.otel.metrics_endpoint = Some(val);
-    }
-    if let Ok(val) = std::env::var("OTEL_SERVICE_NAME") {
-        config.otel.service_name = val;
-    }
+    // The file layer is what gets saved. Overrides from the command line,
+    // the environment and the desktop shell apply on top of it, for this
+    // process only.
+    let overrides = build_overrides(
+        startup.listen_addr.as_deref(),
+        startup.port,
+        startup.data_dir.as_deref(),
+        startup.from_desktop_shell,
+        |name| std::env::var(name).ok(),
+    );
+    let config = overrides.overlay(&file);
 
     warn_unsafe_categories(&config);
 
@@ -336,14 +388,17 @@ pub async fn initialize(
     let shared_config = Arc::new(ArcSwap::new(Arc::new(config)));
 
     // Build shared application state
-    let state = Arc::new(AppState::new(
-        Arc::clone(&shared_config),
-        config_path,
-        Arc::clone(&queue_manager),
-        log_buffer.clone(),
-        token_store,
-        credential_store,
-    ));
+    let state = Arc::new(
+        AppState::new(
+            Arc::clone(&shared_config),
+            config_path,
+            Arc::clone(&queue_manager),
+            log_buffer.clone(),
+            token_store,
+            credential_store,
+        )
+        .with_overrides(file, overrides),
+    );
 
     // Always start the RSS monitor so feeds added later via the API are polled.
     // Every committed config change wakes it, so a new or re-enabled feed is
@@ -457,6 +512,73 @@ mod tests {
         );
         drop(retained);
         acquire_instance_lock(&data_dir).expect("released on drop");
+    }
+
+    #[test]
+    fn overrides_are_labelled_by_where_they_came_from() {
+        use crate::nzb_core::overrides::{OverrideSource, OverrideValue};
+
+        // The CLI reads RUSTNZB_PORT itself, so a set variable means env wins
+        // the label; with no variable the value came from the flag.
+        let env = |name: &str| (name == "RUSTNZB_PORT").then(|| "8123".to_string());
+        let set = super::build_overrides(Some("0.0.0.0"), Some(8123), None, false, env);
+        assert_eq!(
+            set.get("general.port").unwrap().source,
+            OverrideSource::Env("RUSTNZB_PORT")
+        );
+        assert_eq!(
+            set.get("general.listen_addr").unwrap().source,
+            OverrideSource::Cli
+        );
+        assert!(set.get("general.data_dir").is_none());
+
+        // The desktop shell fixes its own address and data directory.
+        let set = super::build_overrides(
+            Some("127.0.0.1"),
+            None,
+            Some(std::path::Path::new("/desk/data")),
+            true,
+            |_| None,
+        );
+        let listen = set.get("general.listen_addr").unwrap();
+        assert_eq!(listen.value, OverrideValue::ListenAddr("127.0.0.1".into()));
+        assert_eq!(listen.source, OverrideSource::Desktop);
+        assert_eq!(
+            set.get("general.data_dir").unwrap().source,
+            OverrideSource::Desktop
+        );
+    }
+
+    #[test]
+    fn otel_and_dav_environment_become_overrides() {
+        let env = |name: &str| match name {
+            "OTEL_ENABLED" => Some("yes".to_string()),
+            "OTEL_EXPORTER_OTLP_ENDPOINT" => Some("http://collector:4317".to_string()),
+            "OTEL_SERVICE_NAME" => Some("rustnzb-test".to_string()),
+            // A falsy DAV variable leaves the file's choice alone...
+            "RUSTNZB_DAV_ENABLED" => Some("0".to_string()),
+            // ...but the alias forces it on.
+            "ENABLE_DAV" => Some("true".to_string()),
+            _ => None,
+        };
+        let set = super::build_overrides(None, None, None, false, env);
+        let mut config = AppConfig::default();
+        set.apply(&mut config);
+        assert!(config.otel.enabled);
+        assert_eq!(config.otel.endpoint, "http://collector:4317");
+        assert_eq!(config.otel.service_name, "rustnzb-test");
+        assert!(config.dav.enabled);
+        assert_eq!(
+            set.get("dav.enabled").unwrap().source.to_string(),
+            "env:ENABLE_DAV"
+        );
+
+        let falsy = |name: &str| (name == "RUSTNZB_DAV_ENABLED").then(|| "off".to_string());
+        assert!(
+            super::build_overrides(None, None, None, false, falsy)
+                .get("dav.enabled")
+                .is_none()
+        );
     }
 
     #[test]

@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    /// Schema version of the file, stamped on every save. A file without it
+    /// is version 0 and is migrated on load (see `config_store::migrate`).
+    #[serde(default)]
+    pub config_version: u32,
     pub general: GeneralConfig,
     pub servers: Vec<ServerConfig>,
     pub categories: Vec<CategoryConfig>,
@@ -21,6 +25,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            config_version: crate::config_store::CONFIG_VERSION,
             general: GeneralConfig::default(),
             servers: Vec::new(),
             categories: vec![CategoryConfig::default()],
@@ -432,6 +437,14 @@ impl AppConfig {
                 .with_context(|| format!("Failed to read config file: {}", path.display()))?;
             let mut config: AppConfig = toml::from_str(&contents)?;
             config.assign_missing_server_ids();
+            if config.config_version < crate::config_store::CONFIG_VERSION {
+                // Saving backs up the old file first. A read-only file still
+                // loads; the upgrade is then applied on the next save.
+                crate::config_store::migrate(&mut config);
+                if let Err(e) = config.save(path) {
+                    tracing::warn!(error = %e, "could not write upgraded config file");
+                }
+            }
             Ok(config)
         } else {
             let config = AppConfig::default();
@@ -465,17 +478,13 @@ impl AppConfig {
         }
     }
 
-    /// Save config to a TOML file.
+    /// Save this config as the file layer of `path`.
+    ///
+    /// Comments and formatting already in the file are kept, the write is
+    /// atomic and private, and the previous file is backed up. See
+    /// [`crate::config_store::write_file_layer`].
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create config directory: {}", parent.display())
-            })?;
-        }
-        let contents = toml::to_string_pretty(self)?;
-        std::fs::write(path, &contents)
-            .with_context(|| format!("Failed to write config file: {}", path.display()))?;
-        Ok(())
+        crate::config_store::write_file_layer(self, path)
     }
 
     /// Find a category by name.

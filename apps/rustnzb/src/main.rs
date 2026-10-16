@@ -260,18 +260,6 @@ fn run_smoke_tests() -> i32 {
     if failed > 0 { 1 } else { 0 }
 }
 
-fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
 /// Warn about settings that are accepted but have no effect, so a user who
 /// set them is not left guessing. `cache_size` is flagged when it differs from
 /// the default, since the file does not record whether the key was written.
@@ -285,15 +273,6 @@ fn warn_unused_settings(config: &AppConfig, cli_log_file: Option<&std::path::Pat
     if config.general.cache_size != GeneralConfig::default().cache_size {
         tracing::warn!("general.cache_size is unused and has no effect");
     }
-}
-
-fn apply_runtime_config_overrides(config: &mut AppConfig) -> bool {
-    let dav_enabled = env_flag_enabled("RUSTNZB_DAV_ENABLED") || env_flag_enabled("ENABLE_DAV");
-    if dav_enabled && !config.dav.enabled {
-        config.dav.enabled = true;
-        return true;
-    }
-    false
 }
 
 #[tokio::main]
@@ -317,9 +296,16 @@ async fn main() -> anyhow::Result<()> {
     for srv in config.servers.iter_mut() {
         handlers::sanitize_server_config(srv);
     }
-    if apply_runtime_config_overrides(&mut config) {
-        config.save(&args.config)?;
-    }
+    // Command-line and environment overrides apply to this process only. They
+    // are never saved, so the file keeps the value the user chose.
+    nzb_web::startup::build_overrides(
+        args.listen_addr.as_deref(),
+        args.port,
+        args.data_dir.as_deref(),
+        false,
+        |name| std::env::var(name).ok(),
+    )
+    .apply(&mut config);
 
     // Initialize logging (must happen before startup::initialize)
     let log_buffer = LogBuffer::new();
@@ -442,6 +428,7 @@ async fn main() -> anyhow::Result<()> {
             port: args.port,
             data_dir: args.data_dir,
             log_level: Some(filter_spec),
+            from_desktop_shell: false,
         },
         Some(log_buffer),
     )
@@ -543,10 +530,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Flush the last spans. The provider only drops them on shutdown.
-    if let Some(provider) = _otel_tracer_provider {
-        if let Err(e) = provider.shutdown() {
-            eprintln!("OpenTelemetry trace shutdown failed: {e}");
-        }
+    if let Some(provider) = _otel_tracer_provider
+        && let Err(e) = provider.shutdown()
+    {
+        eprintln!("OpenTelemetry trace shutdown failed: {e}");
     }
 
     Ok(())
