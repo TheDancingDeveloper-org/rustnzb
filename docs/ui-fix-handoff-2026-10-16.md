@@ -98,8 +98,8 @@ These are listed under "Open decisions" in the audit.
 
   Chromium is at `~/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome`,
   and Playwright is at
-  `/home/sprooty/Working/Active/rustnzb/e2e/node_modules/playwright`.
-- **Live instance** (https://sabnzbd.sprooty.com) is **read-only**. Get the
+  `e2e/node_modules/playwright`.
+- **Live instance** (the live Node B instance) is **read-only**. Get the
   login from the operator; it isn't in Cadastre or Infisical. In Playwright,
   abort every non-GET request except `/auth/login` and `/auth/refresh`. Never
   pause or resume, change settings or touch jobs.
