@@ -130,7 +130,7 @@ type Period = 'today' | 'week' | 'month' | 'lifetime';
   styles: [`
     :host { display: block; }
     .periods { display: flex; gap: 5px; }
-    .periods .active { color: #fff; background: var(--accent); border-color: var(--accent); }
+    .periods .active { color: #fff; background: var(--accent-fill); border-color: var(--accent-fill); }
     .empty { padding: 28px !important; text-align: center; color: var(--mute); }
     @media (max-width: 900px) {
       .section-head { align-items: flex-start; gap: 12px; flex-direction: column; }

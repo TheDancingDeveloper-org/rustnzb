@@ -359,7 +359,7 @@ export function isBareRoute(url: string): boolean {
         outline: none;
       }
       .pm-go {
-        background: var(--accent);
+        background: var(--accent-fill);
         color: #fff;
         border: none;
         padding: 5px 10px;
