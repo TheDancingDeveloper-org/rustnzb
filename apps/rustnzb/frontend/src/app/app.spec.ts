@@ -1,7 +1,7 @@
 import '@angular/compiler';
 
 import { signal } from '@angular/core';
-import { Subject, of } from 'rxjs';
+import { Subject, of, throwError } from 'rxjs';
 import { describe, expect, it, vi } from 'vitest';
 
 import { App, isBareRoute, isDemoPath } from './app';
@@ -34,7 +34,7 @@ function makeApp(postResult = new Subject<unknown>()) {
     pauseState,
     snack as never,
   );
-  return { app, api, pauseState, postResult, snack };
+  return { app, api, auth, pauseState, postResult, snack };
 }
 
 describe('App global pause control', () => {
@@ -58,6 +58,63 @@ describe('App global pause control', () => {
     expect(snack.open).toHaveBeenCalledWith('Failed to pause downloads', 'Close', {
       duration: 5000,
     });
+  });
+});
+
+describe('status pill loading and offline states', () => {
+  const status = {
+    speed_bps: 1024,
+    paused: false,
+    queue_size: 3,
+    disk_space_free: 2048,
+    webdav_enabled: false,
+  };
+
+  it('shows dashes and no data before the first successful poll', () => {
+    const { app } = makeApp();
+
+    expect(app.loaded()).toBe(false);
+    expect(app.offline()).toBe(false);
+  });
+
+  it('marks the status loaded after a successful poll', () => {
+    const { app, api, auth } = makeApp();
+    auth.authenticated.set(true);
+    api.get.mockReturnValue(of(status));
+
+    app.pollStatus();
+
+    expect(app.loaded()).toBe(true);
+    expect(app.offline()).toBe(false);
+    expect(app.queueCount()).toBe(3);
+  });
+
+  it('goes offline when the poll fails and keeps the last known values', () => {
+    const { app, api, auth } = makeApp();
+    auth.authenticated.set(true);
+    api.get.mockReturnValueOnce(of(status));
+    app.pollStatus();
+
+    api.get.mockReturnValueOnce(throwError(() => new Error('down')));
+    app.pollStatus();
+
+    expect(app.offline()).toBe(true);
+    expect(app.loaded()).toBe(true);
+    expect(app.queueCount()).toBe(3);
+  });
+
+  it('recovers from offline on the next successful poll', () => {
+    const { app, api, auth } = makeApp();
+    auth.authenticated.set(true);
+    api.get.mockReturnValueOnce(throwError(() => new Error('down')));
+    app.pollStatus();
+    expect(app.offline()).toBe(true);
+
+    api.get.mockReturnValueOnce(of(status));
+    app.pollStatus();
+
+    expect(app.offline()).toBe(false);
+    expect(app.loaded()).toBe(true);
   });
 });
 
