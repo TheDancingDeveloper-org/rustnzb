@@ -113,6 +113,11 @@ change is green.
 - **Generated output is never committed.** `target/`, `.ci-output/`,
   `.ci-artifacts/`, `node_modules/`, and frontend build directories stay out of
   commits.
+- **Web UI follows [DESIGN.md](DESIGN.md).** Colours, type sizes, spacing and
+  component states come from its role tokens (implemented in
+  `apps/rustnzb/frontend/src/styles.scss`). No inline `style="font-size…"`, no
+  hex colours in components, no `outline: none` without the focus ring. Check
+  UI changes at 1440px and 390px before review.
 
 ---
 
