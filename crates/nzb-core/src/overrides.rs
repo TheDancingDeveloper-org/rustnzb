@@ -118,6 +118,43 @@ impl OverrideSet {
         }
     }
 
+    /// Copy `file`'s value into `next` for every overridden key, so a save
+    /// never writes an override value. A GUI round-trip sends the effective
+    /// value back, and this drops it again.
+    pub fn keep_file_values(&self, next: &mut AppConfig, file: &AppConfig) {
+        for entry in &self.entries {
+            match &entry.value {
+                OverrideValue::ListenAddr(_) => {
+                    next.general.listen_addr = file.general.listen_addr.clone();
+                }
+                OverrideValue::Port(_) => next.general.port = file.general.port,
+                OverrideValue::DataDir(_) => {
+                    next.general.data_dir = file.general.data_dir.clone();
+                }
+                OverrideValue::OtelEnabled(_) => next.otel.enabled = file.otel.enabled,
+                OverrideValue::OtelEndpoint(_) => {
+                    next.otel.endpoint = file.otel.endpoint.clone();
+                }
+                OverrideValue::OtelLogsEnabled(_) => {
+                    next.otel.logs_enabled = file.otel.logs_enabled;
+                }
+                OverrideValue::OtelLogsEndpoint(_) => {
+                    next.otel.logs_endpoint = file.otel.logs_endpoint.clone();
+                }
+                OverrideValue::OtelMetricsEnabled(_) => {
+                    next.otel.metrics_enabled = file.otel.metrics_enabled;
+                }
+                OverrideValue::OtelMetricsEndpoint(_) => {
+                    next.otel.metrics_endpoint = file.otel.metrics_endpoint.clone();
+                }
+                OverrideValue::OtelServiceName(_) => {
+                    next.otel.service_name = file.otel.service_name.clone();
+                }
+                OverrideValue::DavEnabled(_) => next.dav.enabled = file.dav.enabled,
+            }
+        }
+    }
+
     /// The effective configuration: `file` with every override applied.
     pub fn overlay(&self, file: &AppConfig) -> AppConfig {
         let mut effective = file.clone();
@@ -157,6 +194,28 @@ mod tests {
         assert!(effective.dav.enabled);
         assert_eq!(file.general.port, 9090);
         assert!(!file.dav.enabled);
+    }
+
+    #[test]
+    fn keep_file_values_drops_override_values_from_a_save() {
+        let mut file = AppConfig::default();
+        file.general.data_dir = "/srv/file".into();
+        file.dav.enabled = false;
+        let mut set = OverrideSet::default();
+        set.set(OverrideValue::DataDir("/data".into()), OverrideSource::Cli);
+        set.set(
+            OverrideValue::DavEnabled(true),
+            OverrideSource::Env("RUSTNZB_DAV_ENABLED"),
+        );
+
+        // A GUI save carries the effective values back, plus a real edit.
+        let mut next = set.overlay(&file);
+        next.general.speed_limit_bps = 42;
+        set.keep_file_values(&mut next, &file);
+
+        assert_eq!(next.general.data_dir, PathBuf::from("/srv/file"));
+        assert!(!next.dav.enabled);
+        assert_eq!(next.general.speed_limit_bps, 42);
     }
 
     #[test]

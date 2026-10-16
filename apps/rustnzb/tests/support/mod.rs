@@ -10,6 +10,7 @@ use crc32fast::Hasher;
 use nzb_web::auth::{CredentialStore, TokenStore};
 use nzb_web::nzb_core::config::{AppConfig, CategoryConfig, ServerConfig};
 use nzb_web::nzb_core::db::Database;
+use nzb_web::nzb_core::overrides::OverrideSet;
 use nzb_web::{AppState, QueueManager};
 use rustnzb::server::build_router;
 use tempfile::TempDir;
@@ -26,6 +27,8 @@ fn workspace_path(path: &str) -> PathBuf {
 pub struct TestApp {
     pub base_url: String,
     pub complete_dir: PathBuf,
+    /// The `config.toml` the server saves to, inside the test's temp dir.
+    pub config_path: PathBuf,
     /// Shared app state behind the router, for seeding fixtures directly.
     pub state: Arc<AppState>,
     _tmp_dir: TempDir,
@@ -39,13 +42,19 @@ impl Drop for TestApp {
 }
 
 pub async fn start_test_server(server_configs: Vec<ServerConfig>) -> TestApp {
-    start_test_server_inner(server_configs, false, &[]).await
+    start_test_server_inner(server_configs, false, &[], OverrideSet::default()).await
+}
+
+/// Like [`start_test_server`], with `overrides` (CLI, env or desktop values)
+/// applied over the default file layer, as a real startup would apply them.
+pub async fn start_test_server_with_overrides(overrides: OverrideSet) -> TestApp {
+    start_test_server_inner(Vec::new(), false, &[], overrides).await
 }
 
 /// Like [`start_test_server`], with extra categories configured next to
 /// the default one.
 pub async fn start_test_server_with_categories(categories: &[&str]) -> TestApp {
-    start_test_server_inner(Vec::new(), false, categories).await
+    start_test_server_inner(Vec::new(), false, categories, OverrideSet::default()).await
 }
 
 /// Like [`start_test_server`], but points the incomplete directory at a
@@ -55,13 +64,14 @@ pub async fn start_test_server_with_categories(categories: &[&str]) -> TestApp {
 /// permission-based failure would not trigger. Used to exercise the enqueue
 /// failure path (rustnzb#129) without depending on filesystem permissions.
 pub async fn start_test_server_broken_storage() -> TestApp {
-    start_test_server_inner(Vec::new(), true, &[]).await
+    start_test_server_inner(Vec::new(), true, &[], OverrideSet::default()).await
 }
 
 async fn start_test_server_inner(
     server_configs: Vec<ServerConfig>,
     broken_incomplete_dir: bool,
     extra_categories: &[&str],
+    overrides: OverrideSet,
 ) -> TestApp {
     let base = AppConfig::default();
     let mut categories = base.categories;
@@ -117,14 +127,21 @@ async fn start_test_server_inner(
     );
     let token_store = Arc::new(TokenStore::new());
     let credential_store = Arc::new(CredentialStore::new(tmp_dir.path().to_path_buf()));
-    let state = Arc::new(AppState::new(
-        Arc::new(ArcSwap::from_pointee(config)),
-        PathBuf::from("config.toml"),
-        qm,
-        log_buffer,
-        token_store,
-        credential_store,
-    ));
+    // The file layer lives in the temp dir, so a save is visible to the test
+    // and never lands in the crate directory.
+    let config_path = tmp_dir.path().join("config.toml");
+    config.save(&config_path).expect("write test config file");
+    let state = Arc::new(
+        AppState::new(
+            Arc::new(ArcSwap::from_pointee(config.clone())),
+            config_path.clone(),
+            qm,
+            log_buffer,
+            token_store,
+            credential_store,
+        )
+        .with_overrides(config, overrides),
+    );
 
     let router = build_router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -142,6 +159,7 @@ async fn start_test_server_inner(
     TestApp {
         base_url,
         complete_dir,
+        config_path,
         state,
         _tmp_dir: tmp_dir,
         handle,
