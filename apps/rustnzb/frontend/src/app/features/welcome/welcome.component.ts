@@ -302,8 +302,8 @@ interface ImportPreview {
       display: inline-flex; align-items: center; gap: 8px; justify-content: center;
     }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-    .btn.primary:hover:not(:disabled) { background: #2563eb; border-color: #2563eb; }
+    .btn.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: #fff; }
+    .btn.primary:hover:not(:disabled) { background: var(--accent-fill-hover); border-color: var(--accent-fill-hover); }
     .btn.secondary { background: var(--panel2); border-color: var(--line); color: var(--text); }
     .btn.secondary:hover:not(:disabled) { background: var(--line); }
     .btn.ghost { background: transparent; border-color: var(--line); color: var(--mute); }

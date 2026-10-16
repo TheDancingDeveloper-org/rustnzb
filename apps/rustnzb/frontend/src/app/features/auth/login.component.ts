@@ -127,11 +127,11 @@ import { httpErrorDetail } from '../../core/http/http-error';
     .form-input::placeholder { color: var(--mute); opacity: 0.7; }
 
     .submit-btn {
-      background: var(--accent); border: 1px solid var(--accent); border-radius: 6px;
+      background: var(--accent-fill); border: 1px solid var(--accent-fill); border-radius: 6px;
       padding: 10px 16px; color: #ffffff; font-size: 14px; font-weight: 600;
       cursor: pointer; transition: background 0.15s ease; margin-top: 4px;
     }
-    .submit-btn:hover:not(:disabled) { background: #2563eb; border-color: #2563eb; }
+    .submit-btn:hover:not(:disabled) { background: var(--accent-fill-hover); border-color: var(--accent-fill-hover); }
     .submit-btn:disabled { opacity: 0.6; cursor: not-allowed; }
   `],
 })

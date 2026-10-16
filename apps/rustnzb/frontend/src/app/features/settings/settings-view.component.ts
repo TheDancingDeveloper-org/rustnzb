@@ -1206,9 +1206,9 @@ function emptyCategory(): CategoryConfig {
         flex-wrap: wrap;
       }
       .btn.sm.active {
-        background: var(--accent);
+        background: var(--accent-fill);
         color: #fff;
-        border-color: var(--accent);
+        border-color: var(--accent-fill);
       }
 
       /* Server stats panel */
