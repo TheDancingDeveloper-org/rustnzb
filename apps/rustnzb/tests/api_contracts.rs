@@ -1597,8 +1597,6 @@ async fn general_config_rejects_unknown_fields_and_out_of_range_values() {
             "abort_hopeless",
         ),
         // Out-of-range values.
-        (serde_json::json!({"cache_size": 0}), "cache_size"),
-        (serde_json::json!({"cache_size": 1_u64 << 40}), "cache_size"),
         (
             serde_json::json!({"max_active_downloads": 99_999}),
             "max_active_downloads",
@@ -1647,12 +1645,12 @@ async fn general_config_rejects_unknown_fields_and_out_of_range_values() {
     }
 
     // A rejected request must not apply any part of itself: the valid
-    // `direct_unpack` change is discarded along with the bad cache size.
+    // `direct_unpack` change is discarded along with the out-of-range value.
     let (status, body) = call(
         client
             .put(&url)
             .bearer_auth(&access)
-            .json(&serde_json::json!({"direct_unpack": false, "cache_size": 0})),
+            .json(&serde_json::json!({"direct_unpack": false, "max_active_downloads": 99_999})),
     )
     .await;
     assert_eq!(status, 400, "{body}");
@@ -1686,6 +1684,7 @@ async fn general_config_persists_previously_unreachable_settings() {
                 "max_nested_archive_depth": 0,
                 "direct_unpack": false,
                 "early_failure_check": false,
+                // Dead setting: accepted for old clients, never stored.
                 "cache_size": 16 * 1024 * 1024,
                 "max_active_downloads": 0,
                 "max_post_processing_jobs": 64,
@@ -1706,7 +1705,7 @@ async fn general_config_persists_previously_unreachable_settings() {
         assert_eq!(general.max_nested_archive_depth, 0);
         assert!(!general.direct_unpack);
         assert!(!general.early_failure_check);
-        assert_eq!(general.cache_size, 16 * 1024 * 1024);
+        assert_eq!(general.cache_size, AppConfig::default().general.cache_size);
         assert_eq!(general.max_active_downloads, 0);
         assert_eq!(general.max_post_processing_jobs, 64);
         assert_eq!(general.max_repair_workers, 2);
