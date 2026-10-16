@@ -63,13 +63,19 @@ export function isBareRoute(url: string): boolean {
             @if (demoMode) {
               <a class="action demo-exit" href="/">Exit demo</a>
             }
-            <div class="status">
-              <span class="pill" [class.ok]="!paused()" [class.warn]="paused()">
-                ● {{ paused() ? 'Paused' : 'Live' }}
-              </span>
-              <span class="pill">{{ formatSpeed(speed()) }}</span>
-              <span class="pill">{{ queueCount() }} queued</span>
-              <span class="pill">{{ formatBytes(diskFree()) }} free</span>
+            <div class="status" [class.stale]="offline()" [attr.title]="offline() ? 'Stale: showing the last known values' : null">
+              @if (offline()) {
+                <span class="pill err" role="status">● Offline</span>
+              } @else if (!loaded()) {
+                <span class="pill" role="status">—</span>
+              } @else {
+                <span class="pill" [class.ok]="!paused()" [class.warn]="paused()" role="status">
+                  ● {{ paused() ? 'Paused' : 'Live' }}
+                </span>
+              }
+              <span class="pill">{{ loaded() ? formatSpeed(speed()) : '—' }}</span>
+              <span class="pill">{{ loaded() ? queueCount() : '—' }} queued</span>
+              <span class="pill">{{ loaded() ? formatBytes(diskFree()) : '—' }} free</span>
             </div>
             <div class="mode-toggle" role="group" aria-label="Layout width">
               <button
@@ -223,6 +229,7 @@ export function isBareRoute(url: string): boolean {
         gap: 6px;
         align-items: center;
       }
+      .status.stale .pill:not(.err) { opacity: 0.6; }
 
       nav.topbar {
         background: var(--panel);
@@ -422,6 +429,10 @@ export class App implements OnInit, OnDestroy {
   paused: WritableSignal<boolean>;
   queueCount = signal(0);
   diskFree = signal(0);
+  // Nothing is shown as data until the first status poll succeeds. An error
+  // turns the top-bar pill into Offline and keeps the last known values.
+  loaded = signal(false);
+  offline = signal(false);
   webdavEnabled = signal(false);
   readonly authenticated: Signal<boolean>;
   private readonly currentUrl = signal('');
@@ -485,8 +496,10 @@ export class App implements OnInit, OnDestroy {
         this.diskFree.set(s.disk_space_free);
         this.webdavEnabled.set(!!s.webdav_enabled);
         if (s.version) this.version.set(s.version);
+        this.loaded.set(true);
+        this.offline.set(false);
       },
-      error: () => {},
+      error: () => this.offline.set(true),
     });
   }
 
