@@ -70,17 +70,22 @@ const EXPORT_PAGE_SIZE = 200;
       </h3>
       <div class="body">
         <div class="search-bar">
-          <input placeholder="Filter name…" [(ngModel)]="nameFilter" (ngModelChange)="onNameFilterChanged()" />
-          <select [(ngModel)]="filterStatus" (ngModelChange)="onFiltersChanged()">
+          <input
+            placeholder="Filter name…"
+            aria-label="Filter history by name"
+            [(ngModel)]="nameFilter"
+            (ngModelChange)="onNameFilterChanged()"
+          />
+          <select aria-label="Filter history by status" [(ngModel)]="filterStatus" (ngModelChange)="onFiltersChanged()">
             <option value="all">All statuses</option>
             <option value="completed">Completed</option>
             <option value="failed">Failed</option>
           </select>
-          <select [(ngModel)]="filterCategory" (ngModelChange)="onFiltersChanged()">
+          <select aria-label="Filter history by category" [(ngModel)]="filterCategory" (ngModelChange)="onFiltersChanged()">
             <option value="">All categories</option>
             @for (cat of categoryOptions(); track cat) { <option [value]="cat">{{ cat }}</option> }
           </select>
-          <select [(ngModel)]="filterTime" (ngModelChange)="onFiltersChanged()">
+          <select aria-label="Filter history by time range" [(ngModel)]="filterTime" (ngModelChange)="onFiltersChanged()">
             <option value="7d">Last 7 days</option>
             <option value="30d">Last 30 days</option>
             <option value="all">All time</option>
