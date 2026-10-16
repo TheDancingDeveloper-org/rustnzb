@@ -336,6 +336,7 @@ interface PipelineStep {
               <th style="width:32px">
                 <input
                   type="checkbox"
+                  aria-label="Select all downloads"
                   [checked]="allFilteredSelected()"
                   (change)="toggleSelectAll($event)"
                   [disabled]="filteredJobs().length === 0"
