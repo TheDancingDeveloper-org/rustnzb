@@ -121,7 +121,7 @@ custom properties in `apps/rustnzb/frontend/src/styles.scss`, and that file and
 this document must agree. Change both in the same commit.
 
 This guide was written from the incumbent UI and the
-[2026-10-16 audit](docs/ui-audit-2026-10-16.md). Where the code still differs
+[2026-10-16 audit](design/audits/ui-audit-2026-10-16.md). Where the code still differs
 from it, the guide is the target and the audit lists the gap.
 
 ## Overview
