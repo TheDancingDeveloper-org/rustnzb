@@ -10,7 +10,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
@@ -39,6 +39,32 @@ pub fn migrate(config: &mut AppConfig) {
     if config.config_version < CONFIG_VERSION {
         config.config_version = CONFIG_VERSION;
     }
+}
+
+/// Resolve the config path given on the command line or in `RUSTNZB_CONFIG`.
+///
+/// Call this once at startup, before any path is derived from it. The path is
+/// operator input only: no API request can change it, so this is the single
+/// point where it is checked. It must not contain `..`. Its directory is
+/// created and canonicalised, so the temp file and `config-backups/` are always
+/// built under a resolved base directory.
+pub fn resolve_operator_config_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if path.components().any(|c| c == Component::ParentDir) {
+        anyhow::bail!("config path must not contain '..': {}", path.display());
+    }
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("config path has no file name: {}", path.display()))?;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create config directory: {}", dir.display()))?;
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve config directory: {}", dir.display()))?;
+    Ok(dir.join(file_name))
 }
 
 /// Write `config` to `path` as the file layer.
@@ -142,7 +168,7 @@ fn merge_item(existing: &mut Item, new: &Item) {
 fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     let tmp = tmp_path(path);
     {
-        let mut file = open_private(&tmp, true)
+        let mut file = open_private(&tmp, false)
             .with_context(|| format!("Failed to create {}", tmp.display()))?;
         file.write_all(contents)
             .with_context(|| format!("Failed to write {}", tmp.display()))?;
@@ -167,10 +193,16 @@ fn tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Create (or truncate) a file readable and writable by its owner only.
-fn open_private(path: &Path, truncate: bool) -> std::io::Result<File> {
+/// Create a file readable and writable by its owner only. With `create_new`
+/// the call fails if the file exists; otherwise an existing file is truncated.
+fn open_private(path: &Path, create_new: bool) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
-    options.create(true).write(true).truncate(truncate);
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -205,22 +237,25 @@ fn backup(config_dir: &Path, previous: &[u8]) -> anyhow::Result<()> {
     fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     let stamp = Utc::now().format(BACKUP_TIME_FORMAT).to_string();
 
-    // Two saves in the same millisecond must not share a name.
+    // Two saves in the same millisecond must not share a name. Each candidate
+    // is created exclusively, so no other save can take the name in between.
     let mut n = 0;
-    let target = loop {
+    let (target, mut file) = loop {
         let name = if n == 0 {
             format!("{BACKUP_PREFIX}{stamp}.toml")
         } else {
             format!("{BACKUP_PREFIX}{stamp}-{n}.toml")
         };
         let candidate = dir.join(name);
-        if !candidate.exists() {
-            break candidate;
+        match open_private(&candidate, true) {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to create backup {}", candidate.display()));
+            }
         }
-        n += 1;
     };
-    let mut file = open_private(&target, true)
-        .with_context(|| format!("Failed to create backup {}", target.display()))?;
     file.write_all(previous)
         .and_then(|()| file.sync_all())
         .with_context(|| format!("Failed to write backup {}", target.display()))?;
@@ -374,6 +409,21 @@ mod tests {
             .filter(|n| n.ends_with(".tmp") && n != "config.toml.4242-0.tmp")
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn operator_config_path_is_resolved_and_confined() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("cfg");
+
+        let resolved = resolve_operator_config_path(&nested.join("config.toml")).unwrap();
+        assert!(nested.is_dir(), "the config directory is created");
+        assert_eq!(resolved, nested.canonicalize().unwrap().join("config.toml"));
+
+        let escape = nested.join("..").join("config.toml");
+        assert!(resolve_operator_config_path(&escape).is_err());
+        assert!(resolve_operator_config_path(Path::new("../config.toml")).is_err());
+        assert!(resolve_operator_config_path(Path::new("/")).is_err());
     }
 
     #[test]
