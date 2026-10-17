@@ -4,7 +4,7 @@ import { signal } from '@angular/core';
 import { Subject, of, throwError } from 'rxjs';
 import { describe, expect, it, vi } from 'vitest';
 
-import { App, documentTitle, isBareRoute, isDemoPath } from './app';
+import { App, MENU_WIDTH, documentTitle, isBareRoute, isDemoPath } from './app';
 import { AddNzbService } from './core/services/add-nzb.service';
 import { PauseStateService } from './core/services/pause-state.service';
 
@@ -257,7 +257,10 @@ describe('header menus', () => {
 
     try {
       app.toggleSpeedMenu(trigger({ left: 380, right: 420, bottom: 40 }));
-      expect(app.menuAnchor.left).toBe(390 - 220);
+      // The whole menu, not just its anchor, must sit inside the viewport.
+      const rightEdge = app.menuAnchor.left + MENU_WIDTH;
+      expect(app.menuAnchor.left).toBeGreaterThanOrEqual(8);
+      expect(rightEdge).toBeLessThanOrEqual(390 - 8);
     } finally {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
     }
