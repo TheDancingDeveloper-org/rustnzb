@@ -90,7 +90,7 @@ fn seeded_config() -> AppConfig {
 
 fn assert_no_secret(body: &str) {
     for secret in [API_KEY, SERVER_PASSWORD, "proxysecret", "seeded-dav"] {
-        assert!(!body.contains(secret), "config read leaked `{secret}`");
+        assert!(!body.contains(secret), "config read leaked a stored secret");
     }
 }
 
