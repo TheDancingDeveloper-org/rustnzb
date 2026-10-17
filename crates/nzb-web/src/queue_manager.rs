@@ -17,8 +17,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 
-use crate::nzb_core::config::{CategoryConfig, ServerConfig, normalize_history_retention};
-use crate::nzb_core::db::{Database, HistoryFilter, HistorySummary};
+use crate::nzb_core::config::{
+    CategoryConfig, DuplicatePolicy, ServerConfig, normalize_history_retention,
+};
+use crate::nzb_core::db::{Database, HistoryFilter, HistorySummary, nzb_digest};
 use crate::nzb_core::models::*;
 use crate::nzb_core::nzb_parser;
 use nzb_postproc::{
@@ -1282,6 +1284,8 @@ pub struct QueueManager {
     history_retries: Mutex<HashMap<String, String>>,
     /// Automatically keep the queue ordered by remaining percentage.
     auto_sort_remaining_pct: AtomicBool,
+    /// What admission does with an NZB matching a queued or history job.
+    duplicate_policy: Mutex<DuplicatePolicy>,
     /// Optional bounded post-processing hooks.
     postproc_scripts: Mutex<PostProcScriptConfig>,
     /// Stage-specific resource gates shared by all post-processing jobs.
@@ -1410,6 +1414,7 @@ impl QueueManager {
             max_active_downloads: AtomicUsize::new(max_active_downloads),
             history_retries: Mutex::new(HashMap::new()),
             auto_sort_remaining_pct: AtomicBool::new(false),
+            duplicate_policy: Mutex::new(DuplicatePolicy::default()),
             postproc_scripts: Mutex::new(PostProcScriptConfig::default()),
             postproc_resources: PostProcResourcePool::new(postproc_limits),
             categories: Mutex::new(categories),
@@ -1664,6 +1669,16 @@ impl QueueManager {
         }
     }
 
+    /// Set what admission does with an NZB that matches a queued or history
+    /// job by name or content digest.
+    pub fn set_duplicate_policy(&self, policy: DuplicatePolicy) {
+        *self.duplicate_policy.lock() = policy;
+    }
+
+    pub fn duplicate_policy(&self) -> DuplicatePolicy {
+        *self.duplicate_policy.lock()
+    }
+
     /// Enable or disable automatic remaining-percentage ordering.
     pub fn set_auto_sort_remaining_pct(&self, enabled: bool) {
         self.auto_sort_remaining_pct
@@ -1859,6 +1874,18 @@ impl QueueManager {
         job: NzbJob,
         nzb_data: Option<Vec<u8>>,
     ) -> crate::nzb_core::Result<()> {
+        self.admit_job(job, nzb_data, true)
+    }
+
+    /// Shared admission path for [`Self::add_job`] and history retries. A
+    /// retry passes `enforce_duplicates: false`, because its own history row
+    /// would otherwise match the job it is re-queuing.
+    fn admit_job(
+        self: &Arc<Self>,
+        job: NzbJob,
+        nzb_data: Option<Vec<u8>>,
+        enforce_duplicates: bool,
+    ) -> crate::nzb_core::Result<()> {
         if crate::nzb_core::path::safe_component(&job.category).is_none() {
             return Err(crate::nzb_core::NzbError::Other(
                 "category must be a single safe path component".to_string(),
@@ -1885,12 +1912,17 @@ impl QueueManager {
                 "job output directory is outside configured storage roots".to_string(),
             ));
         }
-        // Ensure work directory exists
-        std::fs::create_dir_all(&job.work_dir)?;
-
-        // Persist to DB
+        // Persist to DB. The duplicate check runs under the same lock as the
+        // insert, so two identical uploads cannot both pass it.
         {
             let db = self.db.lock();
+            if enforce_duplicates {
+                let digest = nzb_data.as_deref().map(nzb_digest);
+                self.check_duplicate_admission(&db, &job, digest.as_deref())?;
+            }
+            // Ensure work directory exists. This follows the check so a
+            // refused NZB leaves no directory behind.
+            std::fs::create_dir_all(&job.work_dir)?;
             db.queue_insert(&job)?;
             // Store raw NZB data if available
             if let Some(ref data) = nzb_data {
@@ -1932,11 +1964,16 @@ impl QueueManager {
             return Ok(QueueAdmissionOutcome::Existing(observation.admission));
         }
 
-        std::fs::create_dir_all(&job.work_dir)?;
-        let outcome =
-            self.db
-                .lock()
-                .queue_admit(&job, &nzb_data, idempotency_key, payload_digest)?;
+        let outcome = {
+            let mut db = self.db.lock();
+            // The policy applies to a first admission only. A key that is
+            // already bound is answered as a replay, not as a duplicate.
+            if db.queue_admission_observe(idempotency_key)?.is_none() {
+                self.check_duplicate_admission(&db, &job, Some(&nzb_digest(&nzb_data)))?;
+            }
+            std::fs::create_dir_all(&job.work_dir)?;
+            db.queue_admit(&job, &nzb_data, idempotency_key, payload_digest)?
+        };
         match &outcome {
             QueueAdmissionOutcome::Inserted(_) => {
                 self.activate_admitted_job(job, Some(nzb_data));
@@ -1961,6 +1998,55 @@ impl QueueManager {
         idempotency_key: &str,
     ) -> crate::nzb_core::Result<Option<QueueAdmissionObservation>> {
         self.db.lock().queue_admission_observe(idempotency_key)
+    }
+
+    /// Apply the duplicate policy to an incoming job. The caller holds the
+    /// database lock, so the match cannot change before the job is inserted.
+    /// `Skip` refuses the job; `Warn` admits it and records the match.
+    fn check_duplicate_admission(
+        &self,
+        db: &Database,
+        job: &NzbJob,
+        digest: Option<&str>,
+    ) -> crate::nzb_core::Result<()> {
+        let policy = self.duplicate_policy();
+        if policy == DuplicatePolicy::Allow {
+            return Ok(());
+        }
+        let matches = db.find_duplicate_candidates(&job.name, digest)?;
+        let Some(first) = matches
+            .iter()
+            .find(|candidate| candidate.by_digest)
+            .or(matches.first())
+        else {
+            return Ok(());
+        };
+        let location = match first.location {
+            DuplicateLocation::Queue => "queue",
+            DuplicateLocation::History => "history",
+        };
+        let matched_by = match (first.by_name, first.by_digest) {
+            (true, true) => "name and content",
+            (true, false) => "name",
+            _ => "content",
+        };
+        if policy == DuplicatePolicy::Skip {
+            crate::increment_counter("jobs.duplicate_refused");
+            return Err(crate::nzb_core::NzbError::DuplicateNzb(format!(
+                "\"{}\" duplicates {location} job \"{}\" by {matched_by}",
+                job.name, first.name
+            )));
+        }
+        crate::increment_counter("jobs.duplicate_admitted");
+        warn!(
+            name = %job.name,
+            matched_id = %first.id,
+            matched_name = %first.name,
+            location,
+            matched_by,
+            "NZB duplicates an existing job; admitted because duplicate_policy is warn"
+        );
+        Ok(())
     }
 
     /// Activate an already-persisted job: emit the added event and place it in
@@ -2079,7 +2165,7 @@ impl QueueManager {
             original_id = %entry.id,
             "Retrying NZB from history"
         );
-        self.add_job(job, Some(nzb_data))?;
+        self.admit_job(job, Some(nzb_data), false)?;
         retries.insert(entry.id.clone(), job_id.clone());
         Ok(HistoryRetryOutcome::Started(job_id))
     }
@@ -5577,6 +5663,164 @@ mod global_pause_tests {
         job.pp_override = None;
         job.category = "unconfigured".into();
         assert_eq!(manager.post_processing_level(&job), 3);
+    }
+
+    const DUPLICATE_NZB: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="poster@example.com" date="1234567890" subject="show.s01e01.rar (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="100" number="1">show-s01e01-1@example.com</segment></segments>
+  </file>
+</nzb>"#;
+
+    fn duplicate_payload_variant() -> Vec<u8> {
+        String::from_utf8(DUPLICATE_NZB.to_vec())
+            .unwrap()
+            .replace("show-s01e01-1@", "show-s01e01-2@")
+            .into_bytes()
+    }
+
+    fn admit_duplicate_candidate(
+        manager: &Arc<QueueManager>,
+        tempdir: &tempfile::TempDir,
+        name: &str,
+        payload: &[u8],
+    ) -> crate::nzb_core::Result<String> {
+        let mut job = nzb_parser::parse_nzb(name, payload).expect("parse");
+        job.work_dir = tempdir.path().join("incomplete").join(&job.id);
+        job.output_dir = tempdir.path().join("complete").join(&job.name);
+        let id = job.id.clone();
+        manager.add_job(job, Some(payload.to_vec()))?;
+        Ok(id)
+    }
+
+    /// The default `warn` policy admits a repeat, as before, and records the match.
+    #[tokio::test]
+    async fn same_nzb_is_admitted_twice_under_default_warn_policy() {
+        let (manager, tempdir) = manager();
+        assert_eq!(manager.duplicate_policy(), DuplicatePolicy::Warn);
+        for _ in 0..2 {
+            admit_duplicate_candidate(&manager, &tempdir, "Show.S01E01", DUPLICATE_NZB)
+                .expect("warn admits");
+        }
+        assert_eq!(manager.queue_size(), 2);
+    }
+
+    #[tokio::test]
+    async fn skip_policy_refuses_a_repeat_and_leaves_no_directory() {
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Skip);
+        admit_duplicate_candidate(&manager, &tempdir, "Show.S01E01", DUPLICATE_NZB)
+            .expect("first copy admitted");
+
+        let refused = admit_duplicate_candidate(&manager, &tempdir, "Show.S01E01", DUPLICATE_NZB);
+        assert!(
+            matches!(refused, Err(crate::nzb_core::NzbError::DuplicateNzb(ref message)) if message.contains("queue job")),
+            "{refused:?}"
+        );
+        assert_eq!(manager.queue_size(), 1);
+        let refused_job = nzb_parser::parse_nzb("Show.S01E01", DUPLICATE_NZB).unwrap();
+        assert!(
+            !tempdir
+                .path()
+                .join("incomplete")
+                .join(&refused_job.id)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_policy_matches_by_name_when_the_payload_differs() {
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Skip);
+        admit_duplicate_candidate(&manager, &tempdir, "Show.S01E01", DUPLICATE_NZB)
+            .expect("first copy admitted");
+
+        let renamed_payload = duplicate_payload_variant();
+        let refused =
+            admit_duplicate_candidate(&manager, &tempdir, "show.s01e01", &renamed_payload);
+        assert!(matches!(
+            refused,
+            Err(crate::nzb_core::NzbError::DuplicateNzb(_))
+        ));
+        assert_eq!(manager.queue_size(), 1);
+    }
+
+    #[tokio::test]
+    async fn allow_policy_admits_repeats_without_checking() {
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Allow);
+        for _ in 0..2 {
+            admit_duplicate_candidate(&manager, &tempdir, "Show.S01E01", DUPLICATE_NZB)
+                .expect("allow admits");
+        }
+        assert_eq!(manager.queue_size(), 2);
+    }
+
+    #[tokio::test]
+    async fn skip_policy_refuses_a_repeat_of_a_finished_job() {
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Skip);
+        let finished = HistoryEntry {
+            id: "finished-show".into(),
+            name: "Show.S01E01".into(),
+            category: "Default".into(),
+            status: JobStatus::Completed,
+            total_bytes: 100,
+            downloaded_bytes: 100,
+            added_at: Utc::now(),
+            completed_at: Utc::now(),
+            download_time_secs: None,
+            output_dir: tempdir.path().join("complete").join("Show.S01E01"),
+            stages: Vec::new(),
+            error_message: None,
+            failure_code: None,
+            post_processing: None,
+            delete_archives: None,
+            server_stats: Vec::new(),
+            nzb_data: Some(DUPLICATE_NZB.to_vec()),
+            retry_data: None,
+        };
+        manager.db.lock().history_insert(&finished).unwrap();
+
+        let refused = admit_duplicate_candidate(&manager, &tempdir, "Show.S01E01", DUPLICATE_NZB);
+        assert!(matches!(
+            refused,
+            Err(crate::nzb_core::NzbError::DuplicateNzb(ref message)) if message.contains("history job")
+        ));
+    }
+
+    #[tokio::test]
+    async fn history_retry_is_not_refused_by_its_own_history_row() {
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Skip);
+        let failed = HistoryEntry {
+            id: "failed-show".into(),
+            name: "Show.S01E01".into(),
+            category: "Default".into(),
+            status: JobStatus::Failed,
+            total_bytes: 100,
+            downloaded_bytes: 10,
+            added_at: Utc::now(),
+            completed_at: Utc::now(),
+            download_time_secs: None,
+            output_dir: tempdir.path().join("complete").join("Show.S01E01"),
+            stages: Vec::new(),
+            error_message: Some("incomplete".into()),
+            failure_code: Some(JobFailureCode::ArticlesUnavailable),
+            post_processing: None,
+            delete_archives: None,
+            server_stats: Vec::new(),
+            nzb_data: Some(DUPLICATE_NZB.to_vec()),
+            retry_data: None,
+        };
+        manager.db.lock().history_insert(&failed).unwrap();
+
+        let outcome = manager
+            .retry_history_entry(&failed)
+            .expect("retry is not a duplicate of itself");
+        assert!(matches!(outcome, HistoryRetryOutcome::Started(_)));
+        assert_eq!(manager.queue_size(), 1);
     }
 
     fn manager() -> (Arc<QueueManager>, tempfile::TempDir) {

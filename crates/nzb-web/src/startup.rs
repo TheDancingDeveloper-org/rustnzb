@@ -354,6 +354,7 @@ pub async fn initialize(
     // Set history retention (the setter folds 0 into "keep all").
     queue_manager.set_history_retention(config.general.history_retention);
     queue_manager.set_auto_sort_remaining_pct(config.general.auto_sort_remaining_pct);
+    queue_manager.set_duplicate_policy(config.general.duplicate_policy);
     queue_manager.set_postproc_scripts(
         config.general.scripts_dir.clone(),
         config.general.script_success.clone(),

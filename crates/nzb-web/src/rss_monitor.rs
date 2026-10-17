@@ -318,6 +318,20 @@ impl RssMonitor {
                         .rss_item_mark_downloaded(&p.item.id, category.as_deref());
                     info!(title = %p.title, "RSS item enqueued successfully");
                 }
+                Err(e)
+                    if matches!(
+                        e.downcast_ref::<crate::nzb_core::NzbError>(),
+                        Some(crate::nzb_core::NzbError::DuplicateNzb(_))
+                    ) =>
+                {
+                    // Refused by the duplicate policy: the queue or history
+                    // already holds this release, so mark the item handled
+                    // rather than fetching and refusing it on every poll.
+                    let _ = self
+                        .queue_manager
+                        .rss_item_mark_downloaded(&p.item.id, category.as_deref());
+                    info!(title = %p.title, error = %e, "RSS item skipped as a duplicate");
+                }
                 Err(e) => {
                     warn!(title = %p.title, error = %e, "Failed to enqueue RSS item");
                 }
@@ -697,6 +711,45 @@ mod tests {
                 .expect("database query")
                 .expect("stored item")
                 .downloaded
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_policy_marks_a_duplicate_feed_item_handled_without_queueing_it() {
+        const RELEASE_NZB: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p@example.com" date="1234567890" subject="show.rar (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="100" number="1">existing-1@example.com</segment></segments>
+  </file>
+</nzb>"#;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (monitor, queue_manager, feed) = monitor_with_local_feed(temp.path().into()).await;
+        // A job with the feed item's title is already queued.
+        let mut existing = crate::nzb_core::nzb_parser::parse_nzb("Show.S01E01.1080p", RELEASE_NZB)
+            .expect("parse");
+        existing.work_dir = temp.path().join("incomplete").join(&existing.id);
+        existing.output_dir = queue_manager
+            .output_dir_for(&existing.category, &existing.name)
+            .expect("output dir");
+        queue_manager
+            .add_job(existing, None)
+            .expect("admit existing");
+        queue_manager.set_duplicate_policy(crate::nzb_core::config::DuplicatePolicy::Skip);
+        queue_manager
+            .rss_rule_insert(&rule(Vec::new()))
+            .expect("insert rule");
+
+        monitor.check_feed(&feed).await.expect("feed check");
+
+        assert_eq!(queue_manager.get_jobs().len(), 1);
+        assert!(
+            queue_manager
+                .rss_item_get("new-item")
+                .expect("database query")
+                .expect("stored item")
+                .downloaded,
+            "a refused duplicate is handled, not retried on every poll"
         );
     }
 
