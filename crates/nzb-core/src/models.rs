@@ -638,3 +638,25 @@ mod tests {
         assert_eq!(restored.bytes_downloaded, 75_000_000);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Duplicate detection
+// ---------------------------------------------------------------------------
+
+/// Where a duplicate candidate was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateLocation {
+    Queue,
+    History,
+}
+
+/// A queued or history job that an incoming NZB matches by name (ignoring
+/// ASCII case) or by content digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateMatch {
+    pub id: String,
+    pub name: String,
+    pub location: DuplicateLocation,
+    pub by_name: bool,
+    pub by_digest: bool,
+}
