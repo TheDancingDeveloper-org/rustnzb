@@ -13,5 +13,36 @@ Group=rustnzb
 StateDirectory=rustnzb
 CacheDirectory=rustnzb
 
+# Hardening. The service listens on an unprivileged port and only makes
+# outbound NNTP/HTTP connections, so it needs no capabilities and no
+# privilege escalation.
+#
+# ProtectSystem=full makes /usr, /boot and /etc read-only. Download and data
+# directories outside those paths stay writable. If incomplete_dir,
+# complete_dir or data_dir point under /home, ProtectHome=read-only blocks
+# writes there: add the path with ReadWritePaths= or move the directory.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
 [Install]
 WantedBy=multi-user.target
