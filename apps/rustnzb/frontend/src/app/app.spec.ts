@@ -4,7 +4,7 @@ import { signal } from '@angular/core';
 import { Subject, of, throwError } from 'rxjs';
 import { describe, expect, it, vi } from 'vitest';
 
-import { App, isBareRoute, isDemoPath } from './app';
+import { App, MENU_WIDTH, documentTitle, isBareRoute, isDemoPath } from './app';
 import { AddNzbService } from './core/services/add-nzb.service';
 import { PauseStateService } from './core/services/pause-state.service';
 
@@ -12,6 +12,7 @@ function makeApp(postResult = new Subject<unknown>()) {
   const api = {
     get: vi.fn(() => of({})),
     post: vi.fn(() => postResult.asObservable()),
+    put: vi.fn(() => of({})),
   };
   const auth = {
     authenticated: signal(false),
@@ -129,6 +130,160 @@ describe('demo path detection', () => {
     expect(isDemoPath('/')).toBe(false);
     expect(isDemoPath('/downloads')).toBe(false);
     expect(isDemoPath('/demonstration')).toBe(false);
+  });
+});
+
+describe('browser tab title', () => {
+  const live = { paused: false, speedBps: 12.3 * 1024 * 1024, queueSize: 4 };
+
+  it('shows live speed and queue depth on the downloads page', () => {
+    expect(documentTitle('/downloads', live)).toBe('↓ 12.3 MB/s · 4 left – rustnzb');
+  });
+
+  it('shows Paused in place of speed while paused', () => {
+    expect(documentTitle('/downloads', { ...live, paused: true })).toBe('Paused · 4 left – rustnzb');
+  });
+
+  it('names the page after the live state, except on the home page', () => {
+    expect(documentTitle('/statistics', live)).toBe('↓ 12.3 MB/s · 4 left · Statistics – rustnzb');
+    expect(documentTitle('/statistics', null)).toBe('Statistics – rustnzb');
+  });
+
+  it('falls back to the app name when idle or when live state is unknown', () => {
+    expect(documentTitle('/downloads', { paused: false, speedBps: 0, queueSize: 0 })).toBe('rustnzb');
+    expect(documentTitle('/downloads', null)).toBe('rustnzb');
+  });
+
+  it('keeps the legacy queue and history paths on their old tab names', () => {
+    expect(documentTitle('/queue', null)).toBe('rustnzb');
+    expect(documentTitle('/history?x=1', null)).toBe('History – rustnzb');
+  });
+
+  it('is updated from the status poll and drops live values when offline', () => {
+    const { app, api, auth } = makeApp();
+    auth.authenticated.set(true);
+    api.get.mockReturnValueOnce(of({ speed_bps: 2048, paused: false, queue_size: 2, disk_space_free: 0, webdav_enabled: false }));
+    app.pollStatus();
+    expect(document.title).toBe('↓ 2.0 KB/s · 2 left – rustnzb');
+
+    api.get.mockReturnValueOnce(throwError(() => new Error('down')));
+    app.pollStatus();
+    expect(document.title).toBe('rustnzb');
+  });
+});
+
+describe('quick speed limit', () => {
+  it('sends the chosen limit and marks it as the current one', () => {
+    const { app, api, snack } = makeApp();
+    app.speedMenuOpen = true;
+
+    app.setSpeedLimit(5 * 1024 * 1024);
+
+    expect(api.put).toHaveBeenCalledWith('/config/speed-limit', { speed_limit_bps: 5 * 1024 * 1024 });
+    expect(app.speedLimit()).toBe(5 * 1024 * 1024);
+    expect(app.speedMenuOpen).toBe(false);
+    expect(snack.open).toHaveBeenCalledWith('Speed limit set to 5.0 MB/s', 'Close', { duration: 2000 });
+  });
+
+  it('converts a custom MB/s value and ignores empty input', () => {
+    const { app, api } = makeApp();
+
+    app.customSpeedMb = null;
+    app.setCustomSpeedLimit();
+    expect(api.put).not.toHaveBeenCalled();
+
+    app.customSpeedMb = 2.5;
+    app.setCustomSpeedLimit();
+    expect(api.put).toHaveBeenCalledWith('/config/speed-limit', { speed_limit_bps: 2.5 * 1024 * 1024 });
+    expect(app.customSpeedMb).toBeNull();
+  });
+
+  it('reports a failed save and leaves the limit unchanged', () => {
+    const { app, api, snack } = makeApp();
+    api.put.mockReturnValueOnce(throwError(() => new Error('nope')));
+
+    app.setSpeedLimit(1024);
+
+    expect(app.speedLimit()).toBe(0);
+    expect(snack.open).toHaveBeenCalledWith('Failed to set speed limit', 'Close', expect.anything());
+  });
+});
+
+describe('first-run server banner', () => {
+  it('counts servers only once the list has loaded', () => {
+    const { app, api, auth } = makeApp();
+    auth.authenticated.set(true);
+    expect(app.noServers()).toBe(false);
+
+    api.get.mockReturnValueOnce(of([]));
+    app.loadServerCount();
+    expect(app.noServers()).toBe(true);
+
+    api.get.mockReturnValueOnce(of([{ id: 'a' }]));
+    app.loadServerCount();
+    expect(app.noServers()).toBe(false);
+  });
+
+  it('shows no banner when the server check fails', () => {
+    const { app, api, auth } = makeApp();
+    auth.authenticated.set(true);
+    api.get.mockReturnValueOnce(throwError(() => new Error('down')));
+
+    app.loadServerCount();
+
+    expect(app.serverCount()).toBeNull();
+    expect(app.noServers()).toBe(false);
+  });
+});
+
+describe('header menus', () => {
+  const trigger = (rect: { left: number; right: number; bottom: number }) =>
+    ({ getBoundingClientRect: () => ({ ...rect, top: 0, width: 0, height: 0, x: 0, y: 0, toJSON: () => ({}) }) }) as unknown as HTMLElement;
+
+  it('anchors the speed menu just below its trigger and opens it', () => {
+    const { app } = makeApp();
+
+    app.toggleSpeedMenu(trigger({ left: 300, right: 360, bottom: 40 }));
+
+    expect(app.speedMenuOpen).toBe(true);
+    expect(app.menuAnchor.top).toBe(44);
+    expect(app.menuAnchor.left).toBe(300);
+  });
+
+  it('keeps the speed menu inside the viewport on narrow screens', () => {
+    const { app } = makeApp();
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+
+    try {
+      app.toggleSpeedMenu(trigger({ left: 380, right: 420, bottom: 40 }));
+      // The whole menu, not just its anchor, must sit inside the viewport.
+      const rightEdge = app.menuAnchor.left + MENU_WIDTH;
+      expect(app.menuAnchor.left).toBeGreaterThanOrEqual(8);
+      expect(rightEdge).toBeLessThanOrEqual(390 - 8);
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
+    }
+  });
+
+  it('anchors the pause menu from the right edge and closes the other menu', () => {
+    const { app } = makeApp();
+    app.speedMenuOpen = true;
+
+    app.togglePauseMenu(trigger({ left: 900, right: 940, bottom: 40 }));
+
+    expect(app.pauseMenuOpen).toBe(true);
+    expect(app.speedMenuOpen).toBe(false);
+    expect(app.menuAnchor.right).toBe(window.innerWidth - 940);
+  });
+
+  it('closes both menus on window resize', () => {
+    const { app } = makeApp();
+    app.togglePauseMenu(trigger({ left: 900, right: 940, bottom: 40 }));
+
+    app.onWindowResize();
+
+    expect(app.pauseMenuOpen).toBe(false);
+    expect(app.speedMenuOpen).toBe(false);
   });
 });
 

@@ -1,6 +1,7 @@
 import {
   Component,
   ElementRef,
+  HostListener,
   OnInit,
   OnDestroy,
   Signal,
@@ -33,6 +34,53 @@ export function isDemoPath(pathname: string): boolean {
 export function isBareRoute(url: string): boolean {
   const path = url.split(/[?#]/)[0];
   return path === '/login' || path === '/welcome';
+}
+
+const MIB = 1024 * 1024;
+
+// Width of the header menus. The CSS sets the same width (border-box), so the
+// viewport clamp in anchorMenu() matches what is actually rendered.
+export const MENU_WIDTH = 240;
+const VIEWPORT_GUTTER = 8;
+
+// Browser-tab name for each page. The legacy /queue and /history paths keep the
+// tab names they had, so a bookmarked tab still reads the same.
+const PAGE_TITLES: Record<string, string> = {
+  '/downloads': 'Downloads',
+  '/queue': 'Downloads',
+  '/history': 'History',
+  '/groups': 'Search',
+  '/rss': 'RSS',
+  '/media': 'Media',
+  '/logs': 'Logs',
+  '/statistics': 'Statistics',
+  '/settings': 'Settings',
+  '/welcome': 'Welcome',
+  '/login': 'Sign in',
+};
+
+export interface LiveTitleState {
+  paused: boolean;
+  speedBps: number;
+  queueSize: number;
+}
+
+/**
+ * Title for the browser tab: live transfer state first, then the page name.
+ * Pass `null` for live state when it is unknown or stale (offline, not signed in).
+ * The Downloads page is left out of the suffix because it is the home page.
+ */
+export function documentTitle(url: string, live: LiveTitleState | null): string {
+  const path = url.split(/[?#]/)[0];
+  const parts: string[] = [];
+  if (live) {
+    if (live.paused) parts.push('Paused');
+    else if (live.speedBps > 0) parts.push(`↓ ${formatSpeed(live.speedBps)}`);
+    if (live.queueSize > 0) parts.push(`${live.queueSize} left`);
+  }
+  const page = PAGE_TITLES[path];
+  if (page && page !== 'Downloads') parts.push(page);
+  return parts.length ? `${parts.join(' · ')} – rustnzb` : 'rustnzb';
 }
 
 @Component({
@@ -73,7 +121,53 @@ export function isBareRoute(url: string): boolean {
                   ● {{ paused() ? 'Paused' : 'Live' }}
                 </span>
               }
-              <span class="pill">{{ loaded() ? formatSpeed(speed()) : '—' }}</span>
+              <div class="speed-group" (keydown.escape)="closeSpeedMenu()">
+                <button
+                  #speedBtn
+                  type="button"
+                  class="pill pill-btn"
+                  (click)="toggleSpeedMenu(speedBtn)"
+                  title="Set speed limit"
+                  aria-haspopup="true"
+                  [attr.aria-expanded]="speedMenuOpen"
+                >
+                  {{ loaded() ? formatSpeed(speed()) : '—' }}
+                </button>
+                @if (speedMenuOpen) {
+                  <div
+                    class="speed-menu"
+                    role="menu"
+                    [style.top.px]="menuAnchor.top"
+                    [style.left.px]="menuAnchor.left"
+                    (click)="$event.stopPropagation()"
+                  >
+                    <div class="pm-title">Speed limit</div>
+                    <div class="pm-current">Current: {{ speedLimit() > 0 ? formatSpeed(speedLimit()) : 'off' }}</div>
+                    @for (opt of speedPresets; track opt.bps) {
+                      <button
+                        class="pm-item"
+                        [class.current]="speedLimit() === opt.bps"
+                        role="menuitem"
+                        (click)="setSpeedLimit(opt.bps)"
+                      >
+                        {{ opt.label }}
+                      </button>
+                    }
+                    <div class="pm-custom">
+                      <input
+                        type="number"
+                        min="0.1"
+                        step="any"
+                        placeholder="MB/s"
+                        aria-label="Custom speed limit in MB/s"
+                        [(ngModel)]="customSpeedMb"
+                        (keydown.enter)="setCustomSpeedLimit()"
+                      />
+                      <button class="pm-go" (click)="setCustomSpeedLimit()">Set</button>
+                    </div>
+                  </div>
+                }
+              </div>
               <span class="pill">{{ loaded() ? queueCount() : '—' }} queued</span>
               <span class="pill">{{ loaded() ? formatBytes(diskFree()) : '—' }} free</span>
             </div>
@@ -128,7 +222,7 @@ export function isBareRoute(url: string): boolean {
                 <button
                   #pauseCaretBtn
                   class="action pause-caret"
-                  (click)="pauseMenuOpen = !pauseMenuOpen"
+                  (click)="togglePauseMenu(pauseCaretBtn)"
                   title="Pause for…"
                   aria-label="Pause for…"
                   aria-haspopup="true"
@@ -137,7 +231,13 @@ export function isBareRoute(url: string): boolean {
                   <app-icon name="chevron-down" [size]="11" />
                 </button>
                 @if (pauseMenuOpen) {
-                  <div class="pause-menu" role="menu" (click)="$event.stopPropagation()">
+                  <div
+                    class="pause-menu"
+                    role="menu"
+                    [style.top.px]="menuAnchor.top"
+                    [style.right.px]="menuAnchor.right"
+                    (click)="$event.stopPropagation()"
+                  >
                     <div class="pm-title">Pause for…</div>
                     @for (opt of pauseTimerOptions; track opt.secs) {
                       <button class="pm-item" role="menuitem" (click)="pauseFor(opt.secs)">
@@ -162,6 +262,15 @@ export function isBareRoute(url: string): boolean {
             <button class="action muted" (click)="onLogout()" title="Sign out">Sign out</button>
           </div>
         </nav>
+
+        @if (noServers()) {
+          <div class="setup-banner" role="status">
+            <div class="wrap">
+              <span>No news servers are set up yet, so downloads will not start.</span>
+              <a routerLink="/welcome">Add a server →</a>
+            </div>
+          </div>
+        }
 
         <main>
           <div class="wrap">
@@ -310,11 +419,64 @@ export function isBareRoute(url: string): boolean {
         font-size: 11px !important;
         margin-left: -6px;
       }
-      .pause-menu {
-        position: absolute;
-        top: 100%;
-        right: 0;
-        margin-top: 4px;
+      /* Speed-limit pill: a button that opens a popover under the status pills. */
+      .speed-group {
+        position: relative;
+        display: flex;
+        align-items: center;
+      }
+      .pill-btn {
+        font: inherit;
+        color: inherit;
+        cursor: pointer;
+      }
+      .pill-btn:hover {
+        border-color: var(--accent);
+      }
+      .pm-current {
+        font-size: 12px;
+        color: var(--mute);
+        padding: 0 8px 6px;
+      }
+      .pm-item.current {
+        color: var(--accent);
+        font-weight: 600;
+      }
+
+      /* First-run banner: shown under the header until a server is configured. */
+      .setup-banner {
+        flex-shrink: 0;
+        background: var(--panel2);
+        border-bottom: 1px solid var(--line);
+        border-left: 3px solid var(--warn);
+        font-size: 13px;
+      }
+      .setup-banner .wrap {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px 16px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+      }
+      .setup-banner a {
+        color: var(--accent);
+        font-weight: 600;
+        text-decoration: none;
+      }
+      .setup-banner a:hover {
+        text-decoration: underline;
+      }
+
+      /* Menus are fixed to the viewport, positioned from the trigger's rect on open
+         (see anchorMenu). The nav scrolls horizontally, so an absolutely positioned
+         menu inside it would be clipped to the nav's height. */
+      .pause-menu,
+      .speed-menu {
+        position: fixed;
+        box-sizing: border-box;
+        width: 240px; /* MENU_WIDTH in TS: keep in step */
+        max-width: calc(100vw - 16px);
         background: var(--panel);
         border: 1px solid var(--line);
         border-radius: 6px;
@@ -450,11 +612,26 @@ export class App implements OnInit, OnDestroy {
     { label: '1 hour', secs: 60 * 60 },
     { label: '2 hours', secs: 2 * 60 * 60 },
   ];
+  // Global speed limit, from the status poll. 0 means unlimited.
+  speedLimit = signal(0);
+  speedMenuOpen = false;
+  customSpeedMb: number | null = null;
+  readonly speedPresets = [
+    { label: 'Unlimited', bps: 0 },
+    { label: '1 MB/s', bps: 1 * MIB },
+    { label: '5 MB/s', bps: 5 * MIB },
+    { label: '10 MB/s', bps: 10 * MIB },
+    { label: '25 MB/s', bps: 25 * MIB },
+    { label: '50 MB/s', bps: 50 * MIB },
+  ];
+  // Null until the server list has loaded, so the banner never shows on a guess.
+  readonly serverCount = signal<number | null>(null);
+  readonly noServers = computed(() => this.serverCount() === 0);
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private docClickHandler = (e: MouseEvent) => {
-    if (!this.pauseMenuOpen) return;
-    const el = (e.target as HTMLElement).closest('.pause-group');
-    if (!el) this.pauseMenuOpen = false;
+    const target = e.target as HTMLElement;
+    if (this.pauseMenuOpen && !target.closest('.pause-group')) this.pauseMenuOpen = false;
+    if (this.speedMenuOpen && !target.closest('.speed-group')) this.speedMenuOpen = false;
   };
 
   constructor(
@@ -472,11 +649,17 @@ export class App implements OnInit, OnDestroy {
     this.currentUrl.set(router.url);
     router.events
       .pipe(filter((e): e is NavigationEnd => e instanceof NavigationEnd))
-      .subscribe((e) => this.currentUrl.set(e.urlAfterRedirects));
+      .subscribe((e) => {
+        this.currentUrl.set(e.urlAfterRedirects);
+        this.updateTitle();
+        // Re-check after each navigation so the banner clears once a server is added.
+        this.loadServerCount();
+      });
   }
 
   ngOnInit(): void {
     this.pollStatus();
+    this.loadServerCount();
     this.pollTimer = setInterval(() => this.pollStatus(), 2000);
     document.addEventListener('click', this.docClickHandler);
   }
@@ -491,6 +674,7 @@ export class App implements OnInit, OnDestroy {
     this.api.get<StatusResponse>('/status').subscribe({
       next: (s) => {
         this.speed.set(s.speed_bps);
+        this.speedLimit.set(s.speed_limit_bps ?? 0);
         this.paused.set(s.paused);
         this.queueCount.set(s.queue_size);
         this.diskFree.set(s.disk_space_free);
@@ -498,9 +682,88 @@ export class App implements OnInit, OnDestroy {
         if (s.version) this.version.set(s.version);
         this.loaded.set(true);
         this.offline.set(false);
+        this.updateTitle();
       },
-      error: () => this.offline.set(true),
+      error: () => {
+        this.offline.set(true);
+        this.updateTitle();
+      },
     });
+  }
+
+  loadServerCount(): void {
+    if (!this.authenticated()) return;
+    this.api.get<unknown[]>('/config/servers').subscribe({
+      next: (servers) => this.serverCount.set(Array.isArray(servers) ? servers.length : null),
+      // A failed check leaves the count unknown, so no banner is shown on a guess.
+      error: () => this.serverCount.set(null),
+    });
+  }
+
+  private updateTitle(): void {
+    const live =
+      this.loaded() && !this.offline()
+        ? { paused: this.paused(), speedBps: this.speed(), queueSize: this.queueCount() }
+        : null;
+    document.title = documentTitle(this.currentUrl(), live);
+  }
+
+  // Viewport position for whichever menu is open. Only one menu is open at a time.
+  menuAnchor = { top: 0, left: 0, right: 0 };
+
+  /** Place a fixed menu just below its trigger, kept inside the viewport. */
+  private anchorMenu(trigger: HTMLElement): void {
+    const r = trigger.getBoundingClientRect();
+    const maxLeft = Math.max(VIEWPORT_GUTTER, window.innerWidth - MENU_WIDTH - VIEWPORT_GUTTER);
+    this.menuAnchor = {
+      top: r.bottom + 4,
+      left: Math.min(Math.max(VIEWPORT_GUTTER, r.left), maxLeft),
+      right: Math.max(VIEWPORT_GUTTER, window.innerWidth - r.right),
+    };
+  }
+
+  togglePauseMenu(trigger: HTMLElement): void {
+    this.pauseMenuOpen = !this.pauseMenuOpen;
+    if (this.pauseMenuOpen) this.anchorMenu(trigger);
+    this.speedMenuOpen = false;
+  }
+
+  toggleSpeedMenu(trigger: HTMLElement): void {
+    this.speedMenuOpen = !this.speedMenuOpen;
+    if (this.speedMenuOpen) this.anchorMenu(trigger);
+    this.pauseMenuOpen = false;
+  }
+
+  @HostListener('window:resize')
+  onWindowResize(): void {
+    // A menu anchored to the old layout would sit in the wrong place, so close it.
+    this.pauseMenuOpen = false;
+    this.speedMenuOpen = false;
+  }
+
+  closeSpeedMenu(): void {
+    this.speedMenuOpen = false;
+  }
+
+  setSpeedLimit(bps: number): void {
+    this.api.put('/config/speed-limit', { speed_limit_bps: bps }).subscribe({
+      next: () => {
+        this.speedLimit.set(bps);
+        this.speedMenuOpen = false;
+        this.snack.open(bps > 0 ? `Speed limit set to ${formatSpeed(bps)}` : 'Speed limit off', 'Close', {
+          duration: 2000,
+        });
+        this.pollStatus();
+      },
+      error: (err) => showHttpError(this.snack, err, 'Failed to set speed limit'),
+    });
+  }
+
+  setCustomSpeedLimit(): void {
+    const mb = this.customSpeedMb;
+    if (!mb || mb <= 0) return;
+    this.setSpeedLimit(Math.round(mb * MIB));
+    this.customSpeedMb = null;
   }
 
   onLogout(): void {
