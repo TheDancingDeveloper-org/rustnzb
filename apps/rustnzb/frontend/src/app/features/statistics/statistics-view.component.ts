@@ -56,7 +56,12 @@ type Period = 'today' | 'week' | 'month' | 'lifetime';
     <div class="section-head">
       <div>
         <h2>Statistics</h2>
-        <div class="sub">Persistent download, speed, news server, and article availability totals.</div>
+        <div class="sub">
+          Persistent download, speed, news server, and article availability totals.
+          @if (statistics()) {
+            Updated {{ relativeTime(statistics()!.generated_at) }}.
+          }
+        </div>
       </div>
       <div class="periods" role="group" aria-label="Statistics period">
         @for (period of periodOptions; track period.id) {
@@ -124,7 +129,12 @@ type Period = 'today' | 'week' | 'month' | 'lifetime';
         </div>
       </div>
     } @else {
-      <div class="panel"><div class="body empty">Statistics could not be loaded.</div></div>
+      <div class="panel">
+        <div class="body empty" role="alert">
+          Statistics could not be loaded.
+          <button class="btn sm" (click)="load()">Retry</button>
+        </div>
+      </div>
     }
   `,
   styles: [`
@@ -155,6 +165,11 @@ export class StatisticsViewComponent implements OnInit {
   constructor(private api: ApiService) {}
 
   ngOnInit(): void {
+    this.load();
+  }
+
+  load(): void {
+    this.loading.set(true);
     this.api.get<GlobalStatistics>('/statistics').subscribe({
       next: statistics => { this.statistics.set(statistics); this.loading.set(false); },
       error: () => this.loading.set(false),
