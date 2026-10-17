@@ -9,7 +9,7 @@ import { StatusResponse } from '../../core/models/queue.model';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
 import { AppTheme, ThemeService } from '../../core/services/theme.service';
-import { showHttpError } from '../../core/http/http-error';
+import { httpErrorMessage, showHttpError } from '../../core/http/http-error';
 
 interface ServerConfig {
   id: string;
@@ -119,6 +119,34 @@ interface DebugLoggingState {
   overridden: boolean;
 }
 
+/** Each setting that Save writes back. Save stays blocked until its own GET succeeds. */
+type SettingsKey =
+  | 'servers'
+  | 'categories'
+  | 'speedLimit'
+  | 'maxActive'
+  | 'historyRetention'
+  | 'diskGuards'
+  | 'debugLogging'
+  | 'dav'
+  | 'sabApiKey';
+
+type LoadState = { status: 'loading' } | { status: 'loaded' } | { status: 'failed'; message: string };
+
+function allLoading(): Record<SettingsKey, LoadState> {
+  return {
+    servers: { status: 'loading' },
+    categories: { status: 'loading' },
+    speedLimit: { status: 'loading' },
+    maxActive: { status: 'loading' },
+    historyRetention: { status: 'loading' },
+    diskGuards: { status: 'loading' },
+    debugLogging: { status: 'loading' },
+    dav: { status: 'loading' },
+    sabApiKey: { status: 'loading' },
+  };
+}
+
 function emptyCategory(): CategoryConfig {
   return { name: '', output_dir: null, post_processing: 3 };
 }
@@ -161,13 +189,19 @@ function emptyCategory(): CategoryConfig {
       <div class="settings-main">
         <!-- =========== SERVERS =========== -->
         @if (tab === 'servers') {
+          @if (loadFailure('servers'); as message) {
+            <div class="load-error" role="alert">
+              {{ message }}. Saving is paused until the list loads.
+              <button class="btn sm" (click)="loadServers()">Retry</button>
+            </div>
+          }
           <div class="section-head">
             <div>
               <h2>News servers</h2>
               <div class="sub">Priority 0 is tried first; higher priorities fill gaps.</div>
             </div>
             @if (!editingServer) {
-              <button class="btn primary" (click)="addServer()">+ Add server</button>
+              <button class="btn primary" (click)="addServer()" [disabled]="!canSave('servers')">+ Add server</button>
             }
           </div>
 
@@ -291,7 +325,7 @@ function emptyCategory(): CategoryConfig {
                 </div>
               }
             }
-            @if (servers().length === 0 && !editingServer) {
+            @if (servers().length === 0 && !editingServer && canSave('servers')) {
               <div class="empty">
                 No servers configured. Click <b>+ Add server</b> to get started.
               </div>
@@ -407,7 +441,7 @@ function emptyCategory(): CategoryConfig {
                 </div>
 
                 <div class="form-actions">
-                  <button class="btn primary" (click)="saveServer()">Save</button>
+                  <button class="btn primary" (click)="saveServer()" [disabled]="!canSave('servers')">Save</button>
                   <button class="btn" (click)="testEditingServer()">Test connection</button>
                   <button class="btn" (click)="cancelServerEdit()">Cancel</button>
                 </div>
@@ -443,6 +477,12 @@ function emptyCategory(): CategoryConfig {
 
         <!-- =========== CATEGORIES =========== -->
         @if (tab === 'categories') {
+          @if (loadFailure('categories'); as message) {
+            <div class="load-error" role="alert">
+              {{ message }}. Saving is paused until the list loads.
+              <button class="btn sm" (click)="loadCategories()">Retry</button>
+            </div>
+          }
           <div class="section-head">
             <div>
               <h2>Categories</h2>
@@ -451,7 +491,7 @@ function emptyCategory(): CategoryConfig {
               </div>
             </div>
             @if (!editingCategory) {
-              <button class="btn primary" (click)="addCategory()">+ Add category</button>
+              <button class="btn primary" (click)="addCategory()" [disabled]="!canSave('categories')">+ Add category</button>
             }
           </div>
 
@@ -484,7 +524,7 @@ function emptyCategory(): CategoryConfig {
                       </td>
                     </tr>
                   }
-                  @if (categories().length === 0 && !editingCategory) {
+                  @if (categories().length === 0 && !editingCategory && canSave('categories')) {
                     <tr>
                       <td colspan="4" class="empty-cell">No categories configured.</td>
                     </tr>
@@ -518,7 +558,7 @@ function emptyCategory(): CategoryConfig {
                   </select>
                 </div>
                 <div class="form-actions">
-                  <button class="btn primary" (click)="saveCategory()">Save</button>
+                  <button class="btn primary" (click)="saveCategory()" [disabled]="!canSave('categories')">Save</button>
                   <button class="btn" (click)="cancelCategoryEdit()">Cancel</button>
                 </div>
               </div>
@@ -563,6 +603,12 @@ function emptyCategory(): CategoryConfig {
 
         <!-- =========== PATHS & DISK (read-only preview) =========== -->
         @if (tab === 'paths') {
+          @if (loadFailure('diskGuards'); as message) {
+            <div class="load-error" role="alert">
+              {{ message }}. Saving is paused until the setting loads.
+              <button class="btn sm" (click)="loadDiskGuards()">Retry</button>
+            </div>
+          }
           <div class="section-head">
             <div>
               <h2>Paths &amp; disk</h2>
@@ -628,7 +674,7 @@ function emptyCategory(): CategoryConfig {
                 <div class="inline">
                   <input type="number" [(ngModel)]="minFreeSpaceGB" min="0" step="0.1" />
                   <span style="color:var(--mute)">GB · 0 = disabled · restart to apply</span>
-                  <button class="btn sm" (click)="saveDiskGuards()">Save</button>
+                  <button class="btn sm" (click)="saveDiskGuards()" [disabled]="!canSave('diskGuards')">Save</button>
                 </div>
                 <label>Abort hopeless</label>
                 <div class="inline">
@@ -648,6 +694,12 @@ function emptyCategory(): CategoryConfig {
 
         <!-- =========== MEDIA LIBRARY (DAV) =========== -->
         @if (tab === 'dav') {
+          @if (loadFailure('dav'); as message) {
+            <div class="load-error" role="alert">
+              {{ message }}. Saving is paused until the settings load.
+              <button class="btn sm" (click)="loadDavConfig()">Retry</button>
+            </div>
+          }
           <div class="section-head">
             <div>
               <h2>Media Library (DAV)</h2>
@@ -679,7 +731,7 @@ function emptyCategory(): CategoryConfig {
               }
 
               <div class="form-actions">
-                <button class="btn primary" (click)="saveDavConfig()">Save</button>
+                <button class="btn primary" (click)="saveDavConfig()" [disabled]="!canSave('dav')">Save</button>
               </div>
             </div>
           </div>
@@ -741,7 +793,7 @@ function emptyCategory(): CategoryConfig {
                 </div>
 
                 <div class="form-actions">
-                  <button class="btn primary" (click)="saveDavConfig()">Save</button>
+                  <button class="btn primary" (click)="saveDavConfig()" [disabled]="!canSave('dav')">Save</button>
                 </div>
               </div>
             </div>
@@ -844,7 +896,7 @@ function emptyCategory(): CategoryConfig {
                   }
                 </div>
                 <div class="form-actions">
-                  <button class="btn primary" (click)="saveDavConfig()">Save</button>
+                  <button class="btn primary" (click)="saveDavConfig()" [disabled]="!canSave('dav')">Save</button>
                 </div>
               </div>
             </div>
@@ -862,6 +914,12 @@ function emptyCategory(): CategoryConfig {
 
         <!-- =========== GENERAL =========== -->
         @if (tab === 'general') {
+          @if (loadFailure('speedLimit') ?? loadFailure('maxActive') ?? loadFailure('historyRetention') ?? loadFailure('debugLogging'); as message) {
+            <div class="load-error" role="alert">
+              {{ message }}. Saving is paused until the settings load.
+              <button class="btn sm" (click)="loadGeneralSettings()">Retry</button>
+            </div>
+          }
           <div class="section-head">
             <div>
               <h2>General</h2>
@@ -903,7 +961,7 @@ function emptyCategory(): CategoryConfig {
                 <div class="inline">
                   <input type="number" [(ngModel)]="speedLimit" min="0" />
                   <span style="color:var(--mute)">bytes/sec · 0 = unlimited</span>
-                  <button class="btn sm" (click)="saveSpeedLimit()">Save</button>
+                  <button class="btn sm" (click)="saveSpeedLimit()" [disabled]="!canSave('speedLimit')">Save</button>
                 </div>
 
                 <label>Concurrent jobs</label>
@@ -912,14 +970,14 @@ function emptyCategory(): CategoryConfig {
                   <span class="help"
                     >Max jobs in Downloading state</span
                   >
-                  <button class="btn sm" (click)="saveMaxActive()">Save</button>
+                  <button class="btn sm" (click)="saveMaxActive()" [disabled]="!canSave('maxActive')">Save</button>
                 </div>
 
                 <label>History retention</label>
                 <div class="inline">
                   <input type="number" [(ngModel)]="historyRetention" min="0" />
                   <span style="color:var(--mute)">days · blank = keep all</span>
-                  <button class="btn sm" (click)="saveRetention()">Save</button>
+                  <button class="btn sm" (click)="saveRetention()" [disabled]="!canSave('historyRetention')">Save</button>
                 </div>
               </div>
             </div>
@@ -935,7 +993,7 @@ function emptyCategory(): CategoryConfig {
                     <input
                       type="checkbox"
                       [(ngModel)]="debugLogging"
-                      [disabled]="debugLoggingOverridden"
+                      [disabled]="debugLoggingOverridden || !canSave('debugLogging')"
                       (change)="saveDebugLogging()"
                     />
                     <span>Log every stage of a download at debug level</span>
@@ -962,6 +1020,12 @@ function emptyCategory(): CategoryConfig {
 
         <!-- =========== API / SABnzbd =========== -->
         @if (tab === 'api') {
+          @if (loadFailure('sabApiKey'); as message) {
+            <div class="load-error" role="alert">
+              {{ message }}. Generating or rotating the key is paused until it loads.
+              <button class="btn sm" (click)="loadSabApiKey()">Retry</button>
+            </div>
+          }
           <div class="section-head">
             <div>
               <h2>API &amp; SABnzbd compatibility</h2>
@@ -1011,7 +1075,7 @@ function emptyCategory(): CategoryConfig {
                 <button class="btn sm" [disabled]="!sabApiKey" (click)="copy(sabApiKey!)" type="button">
                   Copy
                 </button>
-                <button class="btn sm danger" (click)="rotateSabApiKey()" type="button">
+                <button class="btn sm danger" (click)="rotateSabApiKey()" [disabled]="!canSave('sabApiKey')" type="button">
                   {{ sabApiKey ? 'Rotate' : 'Generate' }}
                 </button>
               </div>
@@ -1284,6 +1348,24 @@ function emptyCategory(): CategoryConfig {
         font-size: 12px;
       }
 
+      .btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .load-error {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px;
+        background: rgba(239, 68, 68, 0.08);
+        border: 1px solid var(--danger);
+        color: var(--text);
+        border-radius: 6px;
+        padding: 10px 12px;
+        margin-bottom: 14px;
+        font-size: 13px;
+        line-height: 1.5;
+      }
       .dav-warn {
         background: rgba(255, 180, 0, 0.08);
         border: 1px solid rgba(255, 180, 0, 0.35);
@@ -1464,6 +1546,10 @@ export class SettingsViewComponent implements OnInit {
   // Directory paths (from /api/config)
   dirs = signal<GeneralDirs | null>(null);
 
+  // Load state per setting. A form's values are only defaults until its GET succeeds,
+  // so Save stays blocked until then; otherwise it would write those defaults over the real config.
+  loads = signal<Record<SettingsKey, LoadState>>(allLoading());
+
   constructor(
     private api: ApiService,
     private snack: MatSnackBar,
@@ -1480,30 +1566,54 @@ export class SettingsViewComponent implements OnInit {
     this.loadDirs();
   }
 
+  canSave(key: SettingsKey): boolean {
+    return this.loads()[key].status === 'loaded';
+  }
+
+  loadFailure(key: SettingsKey): string | null {
+    const state = this.loads()[key];
+    return state.status === 'failed' ? state.message : null;
+  }
+
+  private setLoad(key: SettingsKey, state: LoadState): void {
+    this.loads.update((all) => ({ ...all, [key]: state }));
+  }
+
+  /** GET one setting. `apply` runs only on success; a failure is recorded and shown, and keeps Save blocked. */
+  private loadSetting<T>(key: SettingsKey, path: string, fallback: string, apply: (r: T) => void): void {
+    this.setLoad(key, { status: 'loading' });
+    this.api.get<T>(path).subscribe({
+      next: (r) => {
+        apply(r);
+        this.setLoad(key, { status: 'loaded' });
+      },
+      error: (err) => this.setLoad(key, { status: 'failed', message: httpErrorMessage(err, fallback) }),
+    });
+  }
+
   loadStatus(): void {
     this.api.get<StatusResponse>('/status').subscribe({
       next: (s) => {
         this.status.set(s);
         if (s.webdav_available) this.loadDavConfig();
       },
-      error: () => {},
+      error: (err) => showHttpError(this.snack, err, 'Failed to load server status'),
     });
   }
 
   loadDirs(): void {
     this.api.get<{ general: GeneralDirs }>('/config').subscribe({
       next: (cfg) => this.dirs.set(cfg.general),
-      error: () => {},
+      error: (err) => showHttpError(this.snack, err, 'Failed to load directory paths'),
     });
   }
 
   // ======================== SERVERS ========================
 
   loadServers(): void {
-    this.api.get<ServerConfig[]>('/config/servers').subscribe({
-      next: (r) => this.servers.set(r),
-      error: () => {},
-    });
+    this.loadSetting<ServerConfig[]>('servers', '/config/servers', 'Failed to load news servers', (r) =>
+      this.servers.set(r),
+    );
     this.loadServerStats();
   }
 
@@ -1514,7 +1624,7 @@ export class SettingsViewComponent implements OnInit {
         for (const s of r) map[s.server_id] = s;
         this.serverStats.set(map);
       },
-      error: () => {},
+      error: (err) => showHttpError(this.snack, err, 'Failed to load server stats'),
     });
   }
 
@@ -1561,7 +1671,7 @@ export class SettingsViewComponent implements OnInit {
   }
 
   saveServer(): void {
-    if (!this.editingServer) return;
+    if (!this.editingServer || !this.canSave('servers')) return;
     const server = { ...this.editingServer };
     if (!server.host.trim()) {
       this.snack.open('Host is required', 'Close', { duration: 3000 });
@@ -1658,10 +1768,9 @@ export class SettingsViewComponent implements OnInit {
   // ======================== CATEGORIES ========================
 
   loadCategories(): void {
-    this.api.get<CategoryConfig[]>('/config/categories').subscribe({
-      next: (r) => this.categories.set(r),
-      error: () => {},
-    });
+    this.loadSetting<CategoryConfig[]>('categories', '/config/categories', 'Failed to load categories', (r) =>
+      this.categories.set(r),
+    );
   }
 
   addCategory(): void {
@@ -1680,7 +1789,7 @@ export class SettingsViewComponent implements OnInit {
   }
 
   saveCategory(): void {
-    if (!this.editingCategory) return;
+    if (!this.editingCategory || !this.canSave('categories')) return;
     const cat = { ...this.editingCategory };
     if (!cat.output_dir) cat.output_dir = null;
 
@@ -1749,41 +1858,54 @@ export class SettingsViewComponent implements OnInit {
   }
 
   loadGeneralSettings(): void {
-    this.api.get<{ speed_limit_bps: number }>('/config/speed-limit').subscribe({
-      next: (r) => (this.speedLimit = r.speed_limit_bps),
-      error: () => {},
-    });
-    this.api.get<{ max_active_downloads: number }>('/config/max-active-downloads').subscribe({
-      next: (r) => (this.maxActiveDownloads = r.max_active_downloads),
-      error: () => {},
-    });
-    this.api.get<{ retention: number | null }>('/config/history-retention').subscribe({
-      next: (r) => (this.historyRetention = r.retention),
-      error: () => {},
-    });
-    this.api
-      .get<{ min_free_space_bytes: number; abort_hopeless: boolean }>('/config/disk-guards')
-      .subscribe({
-        next: (r) => {
-          this.minFreeSpaceGB = r.min_free_space_bytes / 1024 ** 3;
-          this.abortHopeless = r.abort_hopeless;
-        },
-        error: () => {},
-      });
-    this.api.get<DebugLoggingState>('/config/debug-logging').subscribe({
-      next: (r) => this.applyDebugLogging(r),
-      error: () => {},
-    });
+    this.loadSetting<{ speed_limit_bps: number }>(
+      'speedLimit',
+      '/config/speed-limit',
+      'Failed to load speed limit',
+      (r) => (this.speedLimit = r.speed_limit_bps),
+    );
+    this.loadSetting<{ max_active_downloads: number }>(
+      'maxActive',
+      '/config/max-active-downloads',
+      'Failed to load max downloads',
+      (r) => (this.maxActiveDownloads = r.max_active_downloads),
+    );
+    this.loadSetting<{ retention: number | null }>(
+      'historyRetention',
+      '/config/history-retention',
+      'Failed to load history retention',
+      (r) => (this.historyRetention = r.retention),
+    );
+    this.loadDiskGuards();
+    this.loadSetting<DebugLoggingState>('debugLogging', '/config/debug-logging', 'Failed to load debug logging', (r) =>
+      this.applyDebugLogging(r),
+    );
+  }
+
+  loadDiskGuards(): void {
+    this.loadSetting<{ min_free_space_bytes: number; abort_hopeless: boolean }>(
+      'diskGuards',
+      '/config/disk-guards',
+      'Failed to load disk guards',
+      (r) => {
+        this.minFreeSpaceGB = r.min_free_space_bytes / 1024 ** 3;
+        this.abortHopeless = r.abort_hopeless;
+      },
+    );
   }
 
   loadSabApiKey(): void {
-    this.api.get<SabApiKeyResponse>('/config/sabnzbd-api-key').subscribe({
-      next: (response) => (this.sabApiKey = response.api_key),
-      error: (err) => showHttpError(this.snack, err, 'Failed to load SABnzbd API key'),
-    });
+    this.loadSetting<SabApiKeyResponse>(
+      'sabApiKey',
+      '/config/sabnzbd-api-key',
+      'Failed to load SABnzbd API key',
+      (response) => (this.sabApiKey = response.api_key),
+    );
   }
 
   rotateSabApiKey(): void {
+    // Without a loaded key the button reads "Generate", and rotating then would replace a real key.
+    if (!this.canSave('sabApiKey')) return;
     const action = this.sabApiKey ? 'Rotate' : 'Generate';
     this.confirmSvc
       .confirm({
@@ -1808,6 +1930,7 @@ export class SettingsViewComponent implements OnInit {
   }
 
   saveDiskGuards(): void {
+    if (!this.canSave('diskGuards')) return;
     this.api
       .put('/config/disk-guards', {
         min_free_space_bytes: Math.round(this.minFreeSpaceGB * 1024 ** 3),
@@ -1820,6 +1943,7 @@ export class SettingsViewComponent implements OnInit {
   }
 
   saveSpeedLimit(): void {
+    if (!this.canSave('speedLimit')) return;
     this.api.put('/config/speed-limit', { speed_limit_bps: this.speedLimit }).subscribe({
       next: () => this.snack.open('Speed limit saved', 'Close', { duration: 2000 }),
       error: (err) => showHttpError(this.snack, err, 'Failed to save speed limit'),
@@ -1833,6 +1957,7 @@ export class SettingsViewComponent implements OnInit {
   }
 
   saveDebugLogging(): void {
+    if (!this.canSave('debugLogging')) return;
     this.api
       .put<DebugLoggingState>('/config/debug-logging', { enabled: this.debugLogging })
       .subscribe({
@@ -1849,6 +1974,7 @@ export class SettingsViewComponent implements OnInit {
   }
 
   saveMaxActive(): void {
+    if (!this.canSave('maxActive')) return;
     this.api
       .put('/config/max-active-downloads', { max_active_downloads: this.maxActiveDownloads })
       .subscribe({
@@ -1858,6 +1984,7 @@ export class SettingsViewComponent implements OnInit {
   }
 
   saveRetention(): void {
+    if (!this.canSave('historyRetention')) return;
     this.api.put('/config/history-retention', { retention: this.historyRetention }).subscribe({
       next: () => this.snack.open('History retention saved', 'Close', { duration: 2000 }),
       error: (err) => showHttpError(this.snack, err, 'Failed to save retention'),
@@ -1867,9 +1994,8 @@ export class SettingsViewComponent implements OnInit {
   // ======================== DAV CONFIG ========================
 
   loadDavConfig(): void {
-    this.api.get<DavConfig>('/config/dav').subscribe({
-      next: (cfg) => (this.davConfig = { ...cfg }),
-      error: () => {},
+    this.loadSetting<DavConfig>('dav', '/config/dav', 'Failed to load Media Library settings', (cfg) => {
+      this.davConfig = { ...cfg };
     });
   }
 
@@ -1891,6 +2017,7 @@ export class SettingsViewComponent implements OnInit {
   }
 
   saveDavConfig(): void {
+    if (!this.canSave('dav')) return;
     // Send empty strings as null so the backend treats blanks as "unset".
     const payload: DavConfig = {
       ...this.davConfig,
