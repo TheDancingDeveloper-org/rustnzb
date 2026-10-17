@@ -179,14 +179,24 @@ Most settings can be configured through the web UI. See
 [`apps/rustnzb/config.example.toml`](apps/rustnzb/config.example.toml) for the
 full reference.
 
+Unknown keys are an error, and the error names the file and key. To check a
+config without starting the server, run `rustnzb --config <path> --check-config`:
+it exits 0 when the file is usable and 1 with the problems listed. Config files
+are written with owner-only permissions (0600) because they hold passwords and
+API keys.
+
+The HTTP API exposes `/api/health` (liveness) and `/api/ready` (readiness,
+503 once shutdown has begun) for probes and load balancers.
+
 ### Key environment variables
 
 | Variable | Description |
 |----------|-------------|
-| `RUSTNZB_CONFIG` | Config file path |
+| `RUSTNZB_CONFIG` | Config file path. A path given here must exist; without one, the default is `$XDG_CONFIG_HOME/rustnzb/config.toml` (or `~/.config/rustnzb/config.toml`), created on first start |
 | `RUSTNZB_PORT` | Listen port |
 | `RUSTNZB_LOG_LEVEL` | Log level (trace/debug/info/warn/error) |
 | `RUSTNZB_LOG_FILE` | Also write logs to this file (daily rotation, newest 7 kept); see [Logging](docs/OBSERVABILITY.md#log-file) |
+| `RUSTNZB_LOG_FORMAT` | `text` (default) or `json` (one JSON object per log line) |
 | `RUSTNZB_DAV_ENABLED` | Enable the Media Library (DAV) at startup |
 | `OTEL_ENABLED` | Toggle for OTEL logs + metrics export |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint |

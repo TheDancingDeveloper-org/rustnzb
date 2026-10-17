@@ -4,8 +4,11 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 /// Top-level application configuration.
+///
+/// Unknown keys are rejected at parse time (`deny_unknown_fields`), so a typo
+/// in `config.toml` fails loudly instead of silently keeping the default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     /// Schema version of the file, stamped on every save. A file without it
     /// is version 0 and is migrated on load (see `config_store::migrate`).
@@ -37,7 +40,7 @@ impl Default for AppConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GeneralConfig {
     /// HTTP API listen address
     pub listen_addr: String,
@@ -157,6 +160,15 @@ pub struct GeneralConfig {
     /// oldest are pruned first. 0 keeps all fetched headers. Default: 100000.
     #[serde(default = "default_group_max_headers")]
     pub group_max_headers: usize,
+    /// Seconds to wait on shutdown for open HTTP connections and in-flight
+    /// downloads to finish before the process exits anyway. 0 waits forever.
+    /// Default: 30.
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
+}
+
+fn default_shutdown_timeout_secs() -> u64 {
+    30
 }
 
 fn default_group_max_headers() -> usize {
@@ -251,13 +263,14 @@ impl Default for GeneralConfig {
             fetch_allow_private: false,
             fetch_allowed_hosts: Vec::new(),
             group_max_headers: default_group_max_headers(),
+            shutdown_timeout_secs: default_shutdown_timeout_secs(),
         }
     }
 }
 
 /// OpenTelemetry configuration. All values can be overridden via env vars.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OtelConfig {
     /// Enable both OTEL logs and metrics. Retained as a shared fallback for
     /// existing configs; prefer the per-signal fields below for new setups.
@@ -405,7 +418,7 @@ fn default_true() -> bool {
 
 /// DAV pipeline auto-send configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DavConfig {
     /// Whether the WebDAV media library is mounted at runtime.
     pub enabled: bool,
@@ -430,13 +443,81 @@ pub struct DavConfig {
 }
 
 impl AppConfig {
+    /// The config path used when none is given: an absolute path under the
+    /// user's config directory (`$XDG_CONFIG_HOME/rustnzb/config.toml`, else
+    /// `~/.config/rustnzb/config.toml`). Falls back to `config.toml` in the
+    /// current directory, made absolute, when neither variable is usable.
+    pub fn default_path() -> PathBuf {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute());
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(".config"));
+        match xdg.or(home) {
+            Some(dir) => dir.join("rustnzb").join("config.toml"),
+            None => std::path::absolute("config.toml").unwrap_or_else(|_| "config.toml".into()),
+        }
+    }
+
+    /// Read and parse an existing config file. Unknown keys and malformed
+    /// values fail here, and the error names the file. Does not create the
+    /// file and does not validate values; see [`AppConfig::validate`].
+    pub fn read(path: &std::path::Path) -> anyhow::Result<Self> {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        let mut config: AppConfig = toml::from_str(&contents)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        config.assign_missing_server_ids();
+        Ok(config)
+    }
+
+    /// Check values that the parser cannot: each returned string is one
+    /// problem, phrased with the setting's path. An empty list means the
+    /// config can run. Category rules are checked separately, by
+    /// [`CategoryConfig::validate`], because startup only warns about them.
+    pub fn validate(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.general.port == 0 {
+            problems.push("general.port must be between 1 and 65535".to_string());
+        }
+        if self.general.listen_addr.trim().is_empty() {
+            problems.push("general.listen_addr must not be empty".to_string());
+        }
+        let mut seen_ids = std::collections::HashSet::new();
+        for (i, server) in self.servers.iter().enumerate() {
+            let label = format!("servers[{i}] ({})", server.id);
+            if server.host.trim().is_empty() {
+                problems.push(format!("{label}: host must not be empty"));
+            }
+            if server.port == 0 {
+                problems.push(format!("{label}: port must be between 1 and 65535"));
+            }
+            if server.connections == 0 {
+                problems.push(format!("{label}: connections must be at least 1"));
+            }
+            if !seen_ids.insert(server.id.as_str()) {
+                problems.push(format!("{label}: duplicate server id"));
+            }
+        }
+        for (i, feed) in self.rss_feeds.iter().enumerate() {
+            if let Some(pattern) = feed.filter_regex.as_deref()
+                && let Err(e) = regex::Regex::new(pattern)
+            {
+                problems.push(format!(
+                    "rss_feeds[{i}] ({}): filter_regex does not compile: {e}",
+                    feed.name
+                ));
+            }
+        }
+        problems
+    }
+
     /// Load config from a TOML file, creating default if it doesn't exist.
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         if path.exists() {
-            let contents = std::fs::read_to_string(path)
-                .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-            let mut config: AppConfig = toml::from_str(&contents)?;
-            config.assign_missing_server_ids();
+            let mut config = Self::read(path)?;
             if config.config_version < crate::config_store::CONFIG_VERSION {
                 // Saving backs up the old file first. A read-only file still
                 // loads; the upgrade is then applied on the next save.
@@ -825,6 +906,94 @@ ssl = false
         assert!(dav.username.is_none());
         assert!(dav.password.is_none());
         assert!(dav.api_key.is_none());
+    }
+
+    #[test]
+    fn read_rejects_unknown_keys_and_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[general]\nprot = 9090\n").unwrap();
+
+        let err = format!("{:#}", AppConfig::read(&path).unwrap_err());
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("unknown field `prot`"), "{err}");
+    }
+
+    #[test]
+    fn read_does_not_create_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.toml");
+
+        assert!(AppConfig::read(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn default_config_and_example_config_validate_and_parse_strictly() {
+        assert!(AppConfig::default().validate().is_empty());
+
+        let example = include_str!("../../../apps/rustnzb/config.example.toml");
+        let config: AppConfig = toml::from_str(example).unwrap();
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn validate_reports_each_bad_value_with_its_path() {
+        let mut cfg = AppConfig::default();
+        cfg.general.port = 0;
+        cfg.general.listen_addr = "  ".into();
+        let mut first = ServerConfig::new("dup", "news.example.com");
+        first.connections = 0;
+        let mut second = ServerConfig::new("dup", "");
+        second.port = 0;
+        cfg.servers = vec![first, second];
+        cfg.rss_feeds.push(RssFeedConfig {
+            name: "Bad".into(),
+            url: "https://example.com/rss".into(),
+            poll_interval_secs: 900,
+            category: None,
+            filter_regex: Some("(unclosed".into()),
+            enabled: true,
+            auto_download: false,
+            max_age_days: None,
+        });
+
+        let problems = cfg.validate();
+        for expected in [
+            "general.port",
+            "general.listen_addr",
+            "servers[0] (dup): connections",
+            "servers[1] (dup): host",
+            "servers[1] (dup): port",
+            "servers[1] (dup): duplicate server id",
+            "rss_feeds[0] (Bad): filter_regex",
+        ] {
+            assert!(
+                problems.iter().any(|p| p.contains(expected)),
+                "missing {expected:?} in {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_path_is_absolute() {
+        assert!(AppConfig::default_path().is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_is_owner_only_even_over_a_looser_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        AppConfig::default().save(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

@@ -3022,6 +3022,7 @@ dependencies = [
  "nzb-nntp",
  "parking_lot",
  "quick-xml",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

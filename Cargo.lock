@@ -1781,6 +1781,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "quick-xml 0.41.0",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

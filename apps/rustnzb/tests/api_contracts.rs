@@ -107,6 +107,16 @@ async fn protected_routes_reject_missing_credentials_and_preserve_auth_contracts
             .status(),
         reqwest::StatusCode::OK
     );
+    let ready = client
+        .get(format!("{}/api/ready", app.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        ready.json::<serde_json::Value>().await.unwrap()["status"],
+        "ready"
+    );
     let bad_login = client
         .post(format!("{}/api/auth/login", app.base_url))
         .json(&serde_json::json!({"username":"admin","password":"wrong"}))

@@ -14,12 +14,33 @@ use nzb_web::{LogBuffer, LogBufferLayer, StartupConfig};
 
 use rustnzb::handlers;
 
+/// Output format for log lines on stdout/stderr.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+enum LogFormat {
+    /// Human-readable lines (default)
+    #[default]
+    Text,
+    /// One JSON object per line, for log shippers
+    Json,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "rustnzb", version, about = "Usenet NZB download client")]
 struct Args {
-    /// Path to config file
-    #[arg(short, long, default_value = "config.toml", env = "RUSTNZB_CONFIG")]
-    config: PathBuf,
+    /// Path to config file. When omitted, the user config directory is used
+    /// and a default file is created there on first start. A path given
+    /// here must already exist.
+    #[arg(short, long, env = "RUSTNZB_CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Parse and validate the config file, print the result and exit (0 if
+    /// usable, 1 if not). Does not create the file or start the server.
+    #[arg(long)]
+    check_config: bool,
+
+    /// Log output format (text or json)
+    #[arg(long, env = "RUSTNZB_LOG_FORMAT", value_enum)]
+    log_format: Option<LogFormat>,
 
     /// Override listen address
     #[arg(long, env = "RUSTNZB_LISTEN_ADDR")]
@@ -287,6 +308,44 @@ fn run_smoke_tests() -> i32 {
     if failed > 0 { 1 } else { 0 }
 }
 
+/// Parse and validate the config at `path` for `--check-config`. Prints the
+/// problems and returns 0 when the config is usable, 1 otherwise.
+fn run_check_config(path: &Path) -> i32 {
+    if !path.exists() {
+        eprintln!("config file {} does not exist", path.display());
+        return 1;
+    }
+    let config = match AppConfig::read(path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("{e:#}");
+            return 1;
+        }
+    };
+    let mut problems = config.validate();
+    for category in &config.categories {
+        if let Err(reason) = category.validate() {
+            problems.push(format!("categories[{}]: {reason}", category.name));
+        }
+    }
+    if problems.is_empty() {
+        println!(
+            "{}: OK ({} servers, {} categories, {} RSS feeds)",
+            path.display(),
+            config.servers.len(),
+            config.categories.len(),
+            config.rss_feeds.len()
+        );
+        0
+    } else {
+        eprintln!("{}: {} problem(s)", path.display(), problems.len());
+        for problem in problems {
+            eprintln!("  - {problem}");
+        }
+        1
+    }
+}
+
 /// Warn about settings that are accepted but have no effect, so a user who
 /// set them is not left guessing. `cache_size` is flagged when it differs from
 /// the default, since the file does not record whether the key was written.
@@ -309,9 +368,20 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(run_smoke_tests());
     }
 
+    let config_path = args.config.clone().unwrap_or_else(AppConfig::default_path);
+    if args.check_config {
+        std::process::exit(run_check_config(&config_path));
+    }
+    if args.config.is_some() && !config_path.exists() {
+        anyhow::bail!(
+            "config file {} does not exist; create it, or omit --config to use {}",
+            config_path.display(),
+            AppConfig::default_path().display()
+        );
+    }
     // The operator's --config / RUSTNZB_CONFIG path is resolved once here, and
     // only the resolved path is used after this point.
-    let config_path = nzb_web::nzb_core::config_store::resolve_operator_config_path(&args.config)?;
+    let config_path = nzb_web::nzb_core::config_store::resolve_operator_config_path(&config_path)?;
 
     // Load config early to check OTEL settings before initializing tracing
     let mut config = AppConfig::load(&config_path)?;
@@ -354,7 +424,10 @@ async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::new(&filter_spec);
     let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
     let _ = rustnzb::LOG_FILTER.set(filter_handle);
-    let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
+    let log_format = args.log_format.unwrap_or_default();
+    let fmt_text =
+        (log_format == LogFormat::Text).then(|| tracing_subscriber::fmt::layer().with_target(true));
+    let fmt_json = (log_format == LogFormat::Json).then(|| tracing_subscriber::fmt::layer().json());
     // The file sink is additive: stdout keeps every line. CLI/env beats TOML.
     let (file_layer, _log_file_guard) =
         match args.log_file.or_else(|| config.general.log_file.clone()) {
@@ -416,7 +489,8 @@ async fn main() -> anyhow::Result<()> {
                 opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(lp);
             let registry = tracing_subscriber::registry()
                 .with(filter)
-                .with(fmt_layer)
+                .with(fmt_text)
+                .with(fmt_json)
                 .with(file_layer)
                 .with(log_layer)
                 .with(otel_log_layer);
@@ -430,7 +504,8 @@ async fn main() -> anyhow::Result<()> {
         } else if let Some((_, tracer)) = otel_tracer {
             tracing_subscriber::registry()
                 .with(filter)
-                .with(fmt_layer)
+                .with(fmt_text)
+                .with(fmt_json)
                 .with(file_layer)
                 .with(log_layer)
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
@@ -438,7 +513,8 @@ async fn main() -> anyhow::Result<()> {
         } else {
             tracing_subscriber::registry()
                 .with(filter)
-                .with(fmt_layer)
+                .with(fmt_text)
+                .with(fmt_json)
                 .with(file_layer)
                 .with(log_layer)
                 .init();
@@ -450,17 +526,45 @@ async fn main() -> anyhow::Result<()> {
 
         tracing_subscriber::registry()
             .with(filter)
-            .with(fmt_layer)
+            .with(fmt_text)
+            .with(fmt_json)
             .with(file_layer)
             .with(log_layer)
             .init();
     }
 
-    info!("rustnzb v{}", env!("RUSTNZB_BUILD_VERSION"));
+    info!("rustnzb v{} starting", env!("RUSTNZB_BUILD_VERSION"));
     if let Some(warning) = log_filter_warning {
         tracing::warn!("{warning}");
     }
     warn_unused_settings(&config);
+    let listen_addr = args
+        .listen_addr
+        .clone()
+        .unwrap_or_else(|| config.general.listen_addr.clone());
+    let port = args.port.unwrap_or(config.general.port);
+    let data_dir = args
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| config.general.data_dir.clone());
+    info!(
+        config = %config_path.display(),
+        data_dir = %data_dir.display(),
+        listen = %format!("{listen_addr}:{port}"),
+        log_level = %filter_spec,
+        log_format = ?log_format,
+        "Startup configuration"
+    );
+    info!(
+        servers = config.servers.len(),
+        categories = config.categories.len(),
+        rss_feeds = config.rss_feeds.len(),
+        webdav = config.dav.enabled,
+        otel_logs = otel_logs_enabled,
+        otel_metrics = otel_metrics_enabled,
+        shutdown_timeout_secs = config.general.shutdown_timeout_secs,
+        "Subsystems"
+    );
 
     // Initialize the engine (config, DB, queue manager, background services)
     let result = nzb_web::startup::initialize(
@@ -583,9 +687,74 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, open_log_file, resolve_log_filter};
+    use super::{Args, LogFormat, open_log_file, resolve_log_filter, run_check_config};
     use clap::Parser;
     use serial_test::serial;
+
+    #[test]
+    fn check_config_exit_codes_follow_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let valid = dir.path().join("valid.toml");
+        std::fs::write(&valid, "[general]\nport = 9191\n").unwrap();
+        assert_eq!(run_check_config(&valid), 0);
+
+        let typo = dir.path().join("typo.toml");
+        std::fs::write(&typo, "[general]\nprot = 9191\n").unwrap();
+        assert_eq!(run_check_config(&typo), 1);
+
+        let bad_value = dir.path().join("bad.toml");
+        std::fs::write(&bad_value, "[general]\nport = 0\n").unwrap();
+        assert_eq!(run_check_config(&bad_value), 1);
+
+        // A check never creates the file it was asked about.
+        let missing = dir.path().join("missing.toml");
+        assert_eq!(run_check_config(&missing), 1);
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    #[serial(rustnzb_log_format_env)]
+    fn log_format_defaults_to_text_and_accepts_json() {
+        unsafe {
+            std::env::remove_var("RUSTNZB_LOG_FORMAT");
+        }
+        assert_eq!(Args::parse_from(["rustnzb"]).log_format, None);
+        assert_eq!(
+            Args::parse_from(["rustnzb", "--log-format", "json"]).log_format,
+            Some(LogFormat::Json)
+        );
+        assert!(Args::try_parse_from(["rustnzb", "--log-format", "xml"]).is_err());
+        assert_eq!(LogFormat::default(), LogFormat::Text);
+    }
+
+    #[test]
+    #[serial(rustnzb_log_format_env)]
+    fn log_format_env_var_is_read() {
+        unsafe {
+            std::env::set_var("RUSTNZB_LOG_FORMAT", "json");
+        }
+        let args = Args::parse_from(["rustnzb"]);
+        unsafe {
+            std::env::remove_var("RUSTNZB_LOG_FORMAT");
+        }
+        assert_eq!(args.log_format, Some(LogFormat::Json));
+    }
+
+    #[test]
+    #[serial(rustnzb_config_env)]
+    fn config_has_no_implicit_relative_default() {
+        unsafe {
+            std::env::remove_var("RUSTNZB_CONFIG");
+        }
+        // None means "use the absolute default", so a relative path can never
+        // be the implicit choice.
+        assert_eq!(Args::parse_from(["rustnzb"]).config, None);
+        assert_eq!(
+            Args::parse_from(["rustnzb", "-c", "x.toml"]).config,
+            Some(std::path::PathBuf::from("x.toml"))
+        );
+    }
 
     // These tests mutate the real process environment, so they must run
     // serialized against each other (see issue #62 follow-up: the Docker

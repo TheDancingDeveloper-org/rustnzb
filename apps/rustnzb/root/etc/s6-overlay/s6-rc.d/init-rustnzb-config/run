@@ -2,5 +2,13 @@
 
 mkdir -p /config /data /downloads/incomplete /downloads/complete
 
+# rustnzb refuses a --config path that does not exist, so seed an empty file
+# on first boot. An empty file parses to the defaults, and the first save
+# writes the full config.
+if [ ! -e /config/config.toml ]; then
+    : > /config/config.toml
+    chmod 600 /config/config.toml
+fi
+
 chown -R abc:abc /config /data
 chown abc:abc /downloads /downloads/incomplete /downloads/complete 2>/dev/null || true
