@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest a change or addition to rustnzb.
+labels: ["enhancement"]
+body:
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched the existing issues and found no duplicate.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility considerations
+      description: Would this change the native `/api/...` or the SABnzbd-compatible `/sabnzbd/api` responses that *arr and mobile clients depend on?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
