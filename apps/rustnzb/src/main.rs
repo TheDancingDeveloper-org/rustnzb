@@ -1,8 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
 use tracing::info;
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -37,13 +39,38 @@ struct Args {
     #[arg(long, env = "RUSTNZB_LOG_LEVEL")]
     log_level: Option<String>,
 
-    /// Log file path
+    /// Also write logs to this file, in addition to stdout. The file rotates
+    /// daily (`<name>.YYYY-MM-DD`) and keeps the newest 7. Overrides
+    /// `general.log_file` in config.toml.
     #[arg(long, env = "RUSTNZB_LOG_FILE")]
     log_file: Option<PathBuf>,
 
     /// Run smoke tests to verify external tools (7z, optional unrar) work, then exit
     #[arg(long)]
     smoke_test: bool,
+}
+
+/// Daily log files kept on disk before the oldest is removed.
+const LOG_FILES_KEPT: usize = 7;
+
+/// Open the `--log-file` sink: a daily-rotating appender named after `path`'s
+/// file name, in its parent directory. The returned guard flushes buffered
+/// lines when dropped, so the caller must keep it alive until exit.
+fn open_log_file(path: &Path) -> anyhow::Result<(NonBlocking, WorkerGuard)> {
+    let Some(file_name) = path.file_name() else {
+        anyhow::bail!("log file path {} has no file name", path.display());
+    };
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let appender = RollingFileAppender::builder()
+        .rotation(Rotation::DAILY)
+        .filename_prefix(file_name.to_string_lossy().into_owned())
+        .max_log_files(LOG_FILES_KEPT)
+        .build(dir)
+        .map_err(|e| anyhow::anyhow!("failed to open log file {}: {e}", path.display()))?;
+    Ok(tracing_appender::non_blocking(appender))
 }
 
 fn init_otel_logging(
@@ -329,6 +356,19 @@ async fn main() -> anyhow::Result<()> {
     let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
     let _ = rustnzb::LOG_FILTER.set(filter_handle);
     let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
+    // The file sink is additive: stdout keeps every line. CLI/env beats TOML.
+    let (file_layer, _log_file_guard) =
+        match args.log_file.or_else(|| config.general.log_file.clone()) {
+            Some(path) => {
+                let (writer, guard) = open_log_file(&path)?;
+                let layer = tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .with_ansi(false)
+                    .with_writer(writer);
+                (Some(layer), Some(guard))
+            }
+            None => (None, None),
+        };
     let log_layer = LogBufferLayer::new(log_buffer.clone());
 
     let _otel_log_provider;
@@ -378,6 +418,7 @@ async fn main() -> anyhow::Result<()> {
             let registry = tracing_subscriber::registry()
                 .with(filter)
                 .with(fmt_layer)
+                .with(file_layer)
                 .with(log_layer)
                 .with(otel_log_layer);
             if let Some((_, tracer)) = otel_tracer {
@@ -391,6 +432,7 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::registry()
                 .with(filter)
                 .with(fmt_layer)
+                .with(file_layer)
                 .with(log_layer)
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .init();
@@ -398,6 +440,7 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::registry()
                 .with(filter)
                 .with(fmt_layer)
+                .with(file_layer)
                 .with(log_layer)
                 .init();
         }
@@ -409,6 +452,7 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt_layer)
+            .with(file_layer)
             .with(log_layer)
             .init();
     }
@@ -538,7 +582,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, resolve_log_filter};
+    use super::{Args, open_log_file, resolve_log_filter};
     use clap::Parser;
     use serial_test::serial;
 
@@ -674,5 +718,33 @@ mod tests {
         }
         assert_eq!(from_env.log_level.as_deref(), Some("debug"));
         assert_eq!(from_flag.log_level.as_deref(), Some("warn"));
+    }
+
+    #[test]
+    fn log_file_writes_under_its_name_in_the_given_directory() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rustnzb.log");
+        let (mut writer, guard) = open_log_file(&path).unwrap();
+        writeln!(writer, "log file smoke line").unwrap();
+        drop(guard);
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let rotated = names
+            .iter()
+            .find(|n| n.starts_with("rustnzb.log."))
+            .unwrap_or_else(|| panic!("no rotated rustnzb.log.* in {names:?}"));
+        let contents = std::fs::read_to_string(dir.path().join(rotated)).unwrap();
+        assert!(contents.contains("log file smoke line"), "{contents}");
+    }
+
+    #[test]
+    fn log_file_path_without_a_name_is_rejected() {
+        let err = open_log_file(std::path::Path::new("/")).unwrap_err();
+        assert!(err.to_string().contains("no file name"), "{err}");
     }
 }

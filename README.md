@@ -172,6 +172,7 @@ full reference.
 | `RUSTNZB_CONFIG` | Config file path |
 | `RUSTNZB_PORT` | Listen port |
 | `RUSTNZB_LOG_LEVEL` | Log level (trace/debug/info/warn/error) |
+| `RUSTNZB_LOG_FILE` | Also write logs to this file (daily rotation, newest 7 kept); see [Logging](docs/OBSERVABILITY.md#log-file) |
 | `RUSTNZB_DAV_ENABLED` | Enable the Media Library (DAV) at startup |
 | `OTEL_ENABLED` | Toggle for OTEL logs + metrics export |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint |
