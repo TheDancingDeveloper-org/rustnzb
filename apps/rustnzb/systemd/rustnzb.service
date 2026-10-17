@@ -18,13 +18,16 @@ CacheDirectory=rustnzb
 # privilege escalation.
 #
 # ProtectSystem=full makes /usr, /boot and /etc read-only. Download and data
-# directories outside those paths stay writable. If incomplete_dir,
-# complete_dir or data_dir point under /home, ProtectHome=read-only blocks
-# writes there: add the path with ReadWritePaths= or move the directory.
+# directories outside those paths stay writable. The web UI saves settings to
+# /etc/rustnzb/config.toml, so that directory is re-opened for writing below.
+# The config file and directory must be writable by the rustnzb user. If
+# incomplete_dir, complete_dir or data_dir point under /home, ProtectHome=read-only
+# blocks writes there: add the path with ReadWritePaths= or move the directory.
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=full
+ReadWritePaths=/etc/rustnzb
 ProtectHome=read-only
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

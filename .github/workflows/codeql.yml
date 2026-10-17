@@ -11,9 +11,9 @@ name: CodeQL
 on:
   push:
     branches: [main]
-    paths-ignore: ["*.md", "docs/**", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"]
+    paths-ignore: ["*.md", "docs/**", "design/**", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"]
   pull_request:
-    paths-ignore: ["*.md", "docs/**", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"]
+    paths-ignore: ["*.md", "docs/**", "design/**", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"]
   schedule:
     # Weekly, so advisories that appear after a quiet period are still caught.
     - cron: "27 4 * * 1"
