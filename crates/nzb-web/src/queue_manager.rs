@@ -424,6 +424,161 @@ async fn read_script_output<R: AsyncRead + Unpin>(
     Ok((output, truncated))
 }
 
+/// Run one operator script from `cwd` with `args` and `env`, capturing its
+/// output up to the configured bound and killing it at the timeout. The
+/// outcome is a `Script` stage that started at `started`.
+async fn run_bounded_script(
+    script: &std::path::Path,
+    cwd: &std::path::Path,
+    args: &[String],
+    env: Vec<(&'static str, String)>,
+    config: &PostProcScriptConfig,
+    started: Instant,
+) -> StageResult {
+    let failed = |message: String| StageResult {
+        name: "Script".into(),
+        status: StageStatus::Failed,
+        message: Some(message),
+        duration_secs: started.elapsed().as_secs_f64(),
+    };
+    let mut command = tokio::process::Command::new(script);
+    command
+        .current_dir(cwd)
+        .args(args)
+        .envs(env)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return failed(format!("Unable to start post-processing script: {error}")),
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let max_output_bytes = config.max_output_bytes;
+    let result = async {
+        let stdout_reader = async {
+            match stdout {
+                Some(reader) => read_script_output(reader, max_output_bytes).await,
+                None => Ok((Vec::new(), false)),
+            }
+        };
+        let stderr_reader = async {
+            match stderr {
+                Some(reader) => read_script_output(reader, max_output_bytes).await,
+                None => Ok((Vec::new(), false)),
+            }
+        };
+        let (stdout, stderr) = tokio::join!(stdout_reader, stderr_reader);
+        let stdout = stdout?;
+        let stderr = stderr?;
+        let status = child.wait().await?;
+        Ok::<_, io::Error>((status, stdout, stderr))
+    };
+
+    match tokio::time::timeout(config.timeout, result).await {
+        Ok(Ok((status, stdout, stderr))) if status.success() => StageResult {
+            name: "Script".into(),
+            status: StageStatus::Success,
+            message: Some(script_output_message(&stdout, &stderr)),
+            duration_secs: started.elapsed().as_secs_f64(),
+        },
+        Ok(Ok((status, stdout, stderr))) => failed(format!(
+            "Post-processing script exited with {status}: {}",
+            script_output_message(&stdout, &stderr)
+        )),
+        Ok(Err(error)) => failed(format!("Post-processing script failed: {error}")),
+        Err(_) => failed(format!(
+            "Post-processing script exceeded {} second timeout",
+            config.timeout.as_secs()
+        )),
+    }
+}
+
+/// SABnzbd's positional arguments to a post-processing script: final
+/// directory, original NZB name, job name, report number, category, group,
+/// post-processing status and failure URL. RustNZB keeps no separate NZB file
+/// name, so the second argument repeats the job name, and the report number,
+/// group and URL are empty.
+fn postproc_script_args(job: &NzbJob, stages: &[StageResult]) -> Vec<String> {
+    vec![
+        job.output_dir.to_string_lossy().into_owned(),
+        job.name.clone(),
+        job.name.clone(),
+        String::new(),
+        job.category.clone(),
+        String::new(),
+        postproc_status_code(stages).to_string(),
+        String::new(),
+    ]
+}
+
+/// Environment for a post-processing script: the `SAB_*` names RustNZB has
+/// always sent, and the `NZBPP_*` names SABnzbd scripts read. The `NZBPP_*`
+/// set is a subset of SABnzbd's: identity, directory, category, outcome, size
+/// and the verify and unpack flags.
+fn postproc_script_env(
+    job: &NzbJob,
+    final_status: JobStatus,
+    stages: &[StageResult],
+) -> Vec<(&'static str, String)> {
+    let file_list = regular_output_files(&job.output_dir)
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let code = postproc_status_code(stages);
+    let outcome = if final_status == JobStatus::Completed {
+        "SUCCESS"
+    } else {
+        "FAILURE"
+    };
+    let directory = job.output_dir.to_string_lossy().into_owned();
+    vec![
+        ("SAB_STATUS", final_status.to_string()),
+        ("SAB_JOB", job.name.clone()),
+        ("SAB_CAT", job.category.clone()),
+        ("SAB_FILENAME", job.name.clone()),
+        ("SAB_COMPLETE", directory.clone()),
+        ("SAB_BYTES", job.total_bytes.to_string()),
+        ("SAB_BYTES_DOWNLOADED", job.downloaded_bytes.to_string()),
+        ("SAB_FILES", file_list),
+        ("RUSTNZB_STATUS", final_status.to_string()),
+        ("NZBPP_NZBID", job.id.clone()),
+        ("NZBPP_NZBNAME", job.name.clone()),
+        ("NZBPP_DIRECTORY", directory),
+        ("NZBPP_CATEGORY", job.category.clone()),
+        ("NZBPP_STATUS", outcome.to_string()),
+        ("NZBPP_TOTALSIZE", job.total_bytes.to_string()),
+        ("NZBPP_PARSTATUS", u8::from((code & 1) != 0).to_string()),
+        ("NZBPP_UNPACKSTATUS", u8::from((code & 2) != 0).to_string()),
+    ]
+}
+
+/// SABnzbd's post-processing status code: 0 when verification and extraction
+/// both succeeded, 1 when verification or repair failed, 2 when extraction
+/// failed, and 3 when both failed.
+fn postproc_status_code(stages: &[StageResult]) -> u8 {
+    let failed = |name: &str| {
+        stages
+            .iter()
+            .any(|stage| stage.name == name && stage.status == StageStatus::Failed)
+    };
+    let verify_failed = failed("Verify") || failed("Repair");
+    let extract_failed = failed("Extract");
+    u8::from(verify_failed) + 2 * u8::from(extract_failed)
+}
+
+/// Whether `job_id` has just finished and no other job in the queue is still
+/// active, so the queue has drained. Called under the jobs lock straight
+/// after the job moves to history, so exactly one completion sees the drain.
+fn queue_drained_by(jobs: &HashMap<String, JobState>, job_id: &str) -> bool {
+    jobs.contains_key(job_id)
+        && jobs.iter().all(|(id, state)| {
+            id == job_id || matches!(state.job.status, JobStatus::Completed | JobStatus::Failed)
+        })
+}
+
 fn regular_output_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut pending = vec![root.to_path_buf()];
     let mut files = Vec::new();
@@ -1284,6 +1439,8 @@ pub struct QueueManager {
     auto_sort_remaining_pct: AtomicBool,
     /// Optional bounded post-processing hooks.
     postproc_scripts: Mutex<PostProcScriptConfig>,
+    /// Action run once the queue drains, set by `change_complete_action`.
+    complete_action: Mutex<Option<String>>,
     /// Stage-specific resource gates shared by all post-processing jobs.
     postproc_resources: Arc<PostProcResourcePool>,
     /// Category configs for post-processing decisions.
@@ -1313,6 +1470,7 @@ pub struct QueueManager {
 impl QueueManager {
     const GLOBAL_PAUSED_JOBS_SETTING: &'static str = "globally_paused_job_ids";
     const DISK_SPACE_HOLD_SETTING: &'static str = "disk_space_hold_since";
+    const QUEUE_COMPLETE_ACTION_SETTING: &'static str = "queue_complete_action";
 
     /// Create a new queue manager.
     #[allow(clippy::too_many_arguments)]
@@ -1411,6 +1569,7 @@ impl QueueManager {
             history_retries: Mutex::new(HashMap::new()),
             auto_sort_remaining_pct: AtomicBool::new(false),
             postproc_scripts: Mutex::new(PostProcScriptConfig::default()),
+            complete_action: Mutex::new(None),
             postproc_resources: PostProcResourcePool::new(postproc_limits),
             categories: Mutex::new(categories),
             min_free_space: AtomicU64::new(min_free_space),
@@ -1693,6 +1852,39 @@ impl QueueManager {
             timeout: Duration::from_secs(timeout_secs.max(1)),
             max_output_bytes,
         };
+    }
+
+    /// The action `change_complete_action` set, to run once the queue drains.
+    pub fn queue_complete_action(&self) -> Option<String> {
+        self.complete_action.lock().clone()
+    }
+
+    /// Set `change_complete_action`; `None` or an empty value clears it. The
+    /// only action RustNZB runs is `script_<name>`, a script from
+    /// `scripts_dir`, which is checked here so a bad name is refused up front.
+    /// Shutdown, hibernate and standby are refused: RustNZB cannot act on the
+    /// host, and accepting them would silently do nothing.
+    pub fn set_queue_complete_action(&self, action: Option<&str>) -> Result<(), String> {
+        let action = action
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if let Some(action) = action.as_deref() {
+            let Some(script) = action.strip_prefix("script_") else {
+                return Err(format!(
+                    "unsupported complete action '{action}': only script_<name> is supported"
+                ));
+            };
+            let scripts_dir = self.postproc_scripts.lock().scripts_dir.clone();
+            resolve_script_path(scripts_dir.as_deref(), std::path::Path::new(script))
+                .map_err(|error| format!("unable to use script '{script}': {error}"))?;
+        }
+        self.db.lock().set_setting(
+            Self::QUEUE_COMPLETE_ACTION_SETTING,
+            action.as_deref().unwrap_or_default(),
+        );
+        *self.complete_action.lock() = action;
+        Ok(())
     }
 
     /// Stable sort of the queue by remaining work percentage. The original
@@ -3065,7 +3257,7 @@ impl QueueManager {
             })
         };
         let script_stage = match script_status {
-            Some(status) => self.run_postproc_script(job_id, status).await,
+            Some(status) => self.run_postproc_script(job_id, status, &stages).await,
             None => None,
         };
         let mut stages = stages;
@@ -3082,16 +3274,25 @@ impl QueueManager {
             stages.push(stage);
         }
 
-        // Move to history with real stage results
-        {
+        // Move to history with real stage results. The drain check runs under
+        // the same lock, so only the completion that empties the queue sees it.
+        let queue_drained = {
             let mut jobs = self.jobs.lock();
-            if let Some(state) = jobs.get_mut(job_id) {
-                self.move_to_history(state, stages);
+            match jobs.get_mut(job_id) {
+                Some(state) => {
+                    self.move_to_history(state, stages);
+                    queue_drained_by(&jobs, job_id)
+                }
+                None => false,
             }
-        }
+        };
 
         // Persist final state
         self.persist_job_progress_blocking(job_id).await;
+
+        if queue_drained {
+            self.run_queue_complete_action().await;
+        }
 
         // Keep the completed/failed job visible in the queue briefly so the
         // UI has a chance to show the transition.  Fast downloads can go from
@@ -3110,6 +3311,7 @@ impl QueueManager {
         &self,
         job_id: &str,
         final_status: JobStatus,
+        stages: &[StageResult],
     ) -> Option<StageResult> {
         let (job, script_config) = {
             let jobs = self.jobs.lock();
@@ -3117,8 +3319,8 @@ impl QueueManager {
             (state.job.clone(), self.postproc_scripts.lock().clone())
         };
         let configured = match final_status {
-            JobStatus::Completed => script_config.success,
-            JobStatus::Failed => script_config.failure,
+            JobStatus::Completed => script_config.success.clone(),
+            JobStatus::Failed => script_config.failure.clone(),
             _ => None,
         }?;
         let started = Instant::now();
@@ -3134,92 +3336,61 @@ impl QueueManager {
             }
         };
 
-        let files = regular_output_files(&job.output_dir);
-        let file_list = files
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut command = tokio::process::Command::new(&script);
-        command
-            .current_dir(&job.output_dir)
-            .env("SAB_STATUS", final_status.to_string())
-            .env("SAB_JOB", &job.name)
-            .env("SAB_CAT", &job.category)
-            .env("SAB_FILENAME", &job.name)
-            .env("SAB_COMPLETE", &job.output_dir)
-            .env("SAB_BYTES", job.total_bytes.to_string())
-            .env("SAB_BYTES_DOWNLOADED", job.downloaded_bytes.to_string())
-            .env("SAB_FILES", file_list)
-            .env("RUSTNZB_STATUS", final_status.to_string())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = match command.spawn() {
-            Ok(child) => child,
+        let args = postproc_script_args(&job, stages);
+        let env = postproc_script_env(&job, final_status, stages);
+        Some(
+            run_bounded_script(
+                &script,
+                &job.output_dir,
+                &args,
+                env,
+                &script_config,
+                started,
+            )
+            .await,
+        )
+    }
+
+    /// Run the `script_<name>` set by `change_complete_action` once the queue
+    /// has drained. The script runs from the complete directory under the
+    /// post-processing limits. A failure is logged, so it is also listed as a
+    /// warning.
+    async fn run_queue_complete_action(&self) {
+        let Some(action) = self.queue_complete_action() else {
+            return;
+        };
+        let Some(script) = action.strip_prefix("script_") else {
+            return;
+        };
+        let config = self.postproc_scripts.lock().clone();
+        let complete_dir = self.complete_dir.lock().clone();
+        let path = match resolve_script_path(
+            config.scripts_dir.as_deref(),
+            std::path::Path::new(script),
+        ) {
+            Ok(path) => path,
             Err(error) => {
-                return Some(StageResult {
-                    name: "Script".into(),
-                    status: StageStatus::Failed,
-                    message: Some(format!("Unable to start post-processing script: {error}")),
-                    duration_secs: started.elapsed().as_secs_f64(),
-                });
+                warn!(script, %error, "Queue-complete script cannot be resolved");
+                return;
             }
         };
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let max_output_bytes = script_config.max_output_bytes;
-        let result = async {
-            let stdout_reader = async {
-                match stdout {
-                    Some(reader) => read_script_output(reader, max_output_bytes).await,
-                    None => Ok((Vec::new(), false)),
-                }
-            };
-            let stderr_reader = async {
-                match stderr {
-                    Some(reader) => read_script_output(reader, max_output_bytes).await,
-                    None => Ok((Vec::new(), false)),
-                }
-            };
-            let (stdout, stderr) = tokio::join!(stdout_reader, stderr_reader);
-            let stdout = stdout?;
-            let stderr = stderr?;
-            let status = child.wait().await?;
-            Ok::<_, io::Error>((status, stdout, stderr))
-        };
-
-        match tokio::time::timeout(script_config.timeout, result).await {
-            Ok(Ok((status, stdout, stderr))) if status.success() => Some(StageResult {
-                name: "Script".into(),
-                status: StageStatus::Success,
-                message: Some(script_output_message(&stdout, &stderr)),
-                duration_secs: started.elapsed().as_secs_f64(),
-            }),
-            Ok(Ok((status, stdout, stderr))) => Some(StageResult {
-                name: "Script".into(),
-                status: StageStatus::Failed,
-                message: Some(format!(
-                    "Post-processing script exited with {status}: {}",
-                    script_output_message(&stdout, &stderr)
-                )),
-                duration_secs: started.elapsed().as_secs_f64(),
-            }),
-            Ok(Err(error)) => Some(StageResult {
-                name: "Script".into(),
-                status: StageStatus::Failed,
-                message: Some(format!("Post-processing script failed: {error}")),
-                duration_secs: started.elapsed().as_secs_f64(),
-            }),
-            Err(_) => Some(StageResult {
-                name: "Script".into(),
-                status: StageStatus::Failed,
-                message: Some(format!(
-                    "Post-processing script exceeded {} second timeout",
-                    script_config.timeout.as_secs()
-                )),
-                duration_secs: started.elapsed().as_secs_f64(),
-            }),
+        let stage = run_bounded_script(
+            &path,
+            &complete_dir,
+            &[],
+            Vec::new(),
+            &config,
+            Instant::now(),
+        )
+        .await;
+        if stage.status == StageStatus::Failed {
+            warn!(
+                script,
+                message = stage.message.as_deref().unwrap_or_default(),
+                "Queue-complete script failed"
+            );
+        } else {
+            info!(script, "Queue-complete script finished");
         }
     }
 
@@ -5077,6 +5248,13 @@ impl QueueManager {
             );
         }
 
+        let complete_action = self
+            .db
+            .lock()
+            .get_setting(Self::QUEUE_COMPLETE_ACTION_SETTING)
+            .filter(|value| !value.is_empty());
+        *self.complete_action.lock() = complete_action;
+
         // Reclaim partial downloads nothing can reach any more before any
         // job starts writing into the incomplete directory.
         self.sweep_orphaned_work_dirs();
@@ -5961,11 +6139,156 @@ mod global_pause_tests {
         insert_job(&manager, completed);
 
         let stage = manager
-            .run_postproc_script("script-job", JobStatus::Completed)
+            .run_postproc_script("script-job", JobStatus::Completed, &[])
             .await
             .unwrap();
         assert_eq!(stage.status, StageStatus::Success);
         assert!(stage.message.unwrap().contains("output truncated"));
+    }
+
+    /// The script gets SABnzbd's positional arguments and the `NZBPP_*`
+    /// environment next to the `SAB_*` names it always had.
+    #[tokio::test]
+    async fn postproc_script_receives_sab_arguments_and_nzbpp_env() {
+        let (manager, tempdir) = manager();
+        let record = tempdir.path().join("record.txt");
+        let script = tempdir.path().join("record.sh");
+        let body = r#"#!/bin/sh
+{ for a in "$@"; do printf 'arg:%s\n' "$a"; done; env | grep -E '^(NZBPP|SAB)_' | sort; } > RECORD_PATH
+"#
+        .replace("RECORD_PATH", &record.to_string_lossy());
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        manager.set_postproc_scripts(None, Some(script), None, 5, 4096);
+        let mut completed = job("script-job", JobStatus::Completed, tempdir.path());
+        completed.category = "tv".into();
+        completed.output_dir = tempdir.path().join("output");
+        std::fs::create_dir_all(&completed.output_dir).unwrap();
+        insert_job(&manager, completed.clone());
+
+        let stage = manager
+            .run_postproc_script("script-job", JobStatus::Completed, &[])
+            .await
+            .unwrap();
+        assert_eq!(stage.status, StageStatus::Success, "{stage:?}");
+
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        let output = completed.output_dir.to_string_lossy().into_owned();
+        assert_eq!(
+            lines[..8],
+            [
+                format!("arg:{output}"),
+                "arg:script-job".to_string(),
+                "arg:script-job".to_string(),
+                "arg:".to_string(),
+                "arg:tv".to_string(),
+                "arg:".to_string(),
+                "arg:0".to_string(),
+                "arg:".to_string(),
+            ],
+            "{recorded}"
+        );
+        for expected in [
+            "NZBPP_CATEGORY=tv".to_string(),
+            format!("NZBPP_DIRECTORY={output}"),
+            "NZBPP_NZBID=script-job".to_string(),
+            "NZBPP_NZBNAME=script-job".to_string(),
+            "NZBPP_PARSTATUS=0".to_string(),
+            "NZBPP_STATUS=SUCCESS".to_string(),
+            "NZBPP_UNPACKSTATUS=0".to_string(),
+            "SAB_CAT=tv".to_string(),
+            "SAB_STATUS=Completed".to_string(),
+        ] {
+            assert!(
+                lines.contains(&expected.as_str()),
+                "missing {expected}: {recorded}"
+            );
+        }
+    }
+
+    #[test]
+    fn postproc_status_code_matches_sabnzbd_codes() {
+        let stage = |name: &str, status: StageStatus| StageResult {
+            name: name.into(),
+            status,
+            message: None,
+            duration_secs: 0.0,
+        };
+        let ok = [
+            stage("Verify", StageStatus::Success),
+            stage("Extract", StageStatus::Success),
+        ];
+        assert_eq!(postproc_status_code(&ok), 0);
+        let verify_failed = [stage("Repair", StageStatus::Failed)];
+        assert_eq!(postproc_status_code(&verify_failed), 1);
+        let unpack_failed = [stage("Extract", StageStatus::Failed)];
+        assert_eq!(postproc_status_code(&unpack_failed), 2);
+        let both = [
+            stage("Verify", StageStatus::Failed),
+            stage("Extract", StageStatus::Failed),
+        ];
+        assert_eq!(postproc_status_code(&both), 3);
+    }
+
+    /// `change_complete_action` runs its script when the last active job
+    /// finishes, and not while another job is still active.
+    #[tokio::test]
+    async fn queue_complete_action_runs_script_once_queue_drains() {
+        let (manager, tempdir) = manager();
+        let scripts = tempdir.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        // The script runs from the complete directory, which startup creates.
+        std::fs::create_dir_all(tempdir.path().join("complete")).unwrap();
+        let marker = tempdir.path().join("drained.txt");
+        let script = scripts.join("done.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho ran >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        manager.set_postproc_scripts(Some(scripts), None, None, 5, 4096);
+        assert!(
+            manager
+                .set_queue_complete_action(Some("script_missing.sh"))
+                .is_err()
+        );
+        assert!(
+            manager
+                .set_queue_complete_action(Some("shutdown_pc"))
+                .is_err()
+        );
+        manager
+            .set_queue_complete_action(Some("script_done.sh"))
+            .unwrap();
+        assert_eq!(
+            manager.queue_complete_action().as_deref(),
+            Some("script_done.sh")
+        );
+
+        insert_job(&manager, job("first", JobStatus::Completed, tempdir.path()));
+        insert_job(
+            &manager,
+            job("second", JobStatus::Downloading, tempdir.path()),
+        );
+        assert!(!queue_drained_by(&manager.jobs.lock(), "first"));
+        manager.jobs.lock().get_mut("second").unwrap().job.status = JobStatus::Completed;
+        assert!(queue_drained_by(&manager.jobs.lock(), "second"));
+
+        manager.run_queue_complete_action().await;
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\n");
+
+        manager.set_queue_complete_action(None).unwrap();
+        assert_eq!(manager.queue_complete_action(), None);
     }
 
     #[tokio::test]
