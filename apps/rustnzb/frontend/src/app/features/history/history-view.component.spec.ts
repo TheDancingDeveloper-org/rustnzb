@@ -1,7 +1,7 @@
 import '@angular/compiler';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { firstValueFrom, of } from 'rxjs';
+import { firstValueFrom, of, Subject, throwError } from 'rxjs';
 
 import { ApiService } from '../../core/services/api.service';
 import { HistoryEntry } from '../../core/models/queue.model';
@@ -247,5 +247,43 @@ describe('HistoryViewComponent', () => {
     expect(component.detailLoading()).toBe(false);
     component.closeDetails();
     expect(component.selectedId()).toBeNull();
+  });
+
+  it('shows a retryable error instead of the empty state when the fetch fails', () => {
+    const failure = { status: 503, error: { human_readable: 'Database busy' } };
+    api.get.mockImplementation((path: string) =>
+      path === '/status' ? of({ webdav_enabled: true }) : throwError(() => failure),
+    );
+    component.load();
+    expect(component.loading()).toBe(false);
+    expect(component.loadError()).toBe("Couldn't load download history: Database busy");
+    expect(component.entries()).toEqual([]);
+
+    api.get.mockImplementation((path: string) =>
+      path === '/status' ? of({}) : of({ entries: [entry()], total: 1 }),
+    );
+    component.load();
+    expect(component.loadError()).toBeNull();
+    expect(component.entries()).toHaveLength(1);
+  });
+
+  it('ignores a failure from a request superseded by a newer load', () => {
+    const slow = new Subject<unknown>();
+    api.get.mockImplementation((path: string) => (path === '/status' ? of({}) : slow.asObservable()));
+    component.load();
+    api.get.mockImplementation((path: string) =>
+      path === '/status' ? of({}) : of({ entries: [entry()], total: 1 }),
+    );
+    component.load();
+    slow.error({ status: 500 });
+    expect(component.loadError()).toBeNull();
+    expect(component.entries()).toHaveLength(1);
+  });
+
+  it('reports a failed detail fetch as a toast and clears the loading flag', () => {
+    api.get.mockImplementation(() => throwError(() => ({ status: 404 })));
+    component.selectEntry(entry({ id: 'gone' }));
+    expect(component.detailLoading()).toBe(false);
+    expect(snack.open).toHaveBeenCalledWith('Failed to load download details', 'Close', { duration: 5000 });
   });
 });

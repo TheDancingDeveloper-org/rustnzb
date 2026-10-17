@@ -489,4 +489,36 @@ describe('QueueViewComponent', () => {
 
     expect(snackBar.open).not.toHaveBeenCalled();
   });
+
+  it('shows a retryable error instead of the empty queue when the fetch fails', () => {
+    let failQueue = true;
+    const { component } = makeComponent({
+      get: vi.fn((url: string) => {
+        if (url !== '/queue') return of({});
+        return failQueue
+          ? throwError(() => new HttpErrorResponse({ status: 500, error: { human_readable: 'boom' } }))
+          : of({ jobs: [], total: 0, speed_bps: 0, paused: false });
+      }),
+    });
+
+    component.loadQueue();
+    expect(component.loading()).toBe(false);
+    expect(component.loadError()).toBe("Couldn't load the download queue: boom");
+
+    failQueue = false;
+    component.fetchQueue(true);
+    expect(component.loadError()).toBeNull();
+  });
+
+  it('reports a failed category or server load as a toast', () => {
+    const { component, snackBar } = makeComponent({
+      get: vi.fn(() => throwError(() => ({ status: 500 }))),
+    });
+
+    component.loadCategories();
+    component.loadServers();
+
+    expect(snackBar.open).toHaveBeenCalledWith('Failed to load categories', 'Close', { duration: 5000 });
+    expect(snackBar.open).toHaveBeenCalledWith('Failed to load servers', 'Close', { duration: 5000 });
+  });
 });
