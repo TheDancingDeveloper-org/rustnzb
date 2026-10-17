@@ -56,7 +56,8 @@ impl Database {
 
         if version < 1 {
             info!("Applying database migration v1");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 -- Active download queue
                 CREATE TABLE IF NOT EXISTS queue (
@@ -108,46 +109,40 @@ impl Database {
                     id TEXT PRIMARY KEY,
                     config TEXT NOT NULL -- JSON ServerConfig
                 );
-
-                INSERT INTO schema_version (version) VALUES (1);
                 ",
             )?;
+            commit_migration(tx, 1)?;
         }
 
         if version < 2 {
             info!("Applying database migration v2");
-            self.conn.execute_batch(
-                "
-                -- Add NZB data storage and server stats to history
-                ALTER TABLE history ADD COLUMN nzb_data BLOB;
-                ALTER TABLE history ADD COLUMN server_stats TEXT DEFAULT '[]';
+            let tx = self.conn.unchecked_transaction()?;
+            // Add NZB data storage and server stats to history
+            add_column_if_missing(&tx, "history", "nzb_data", "BLOB")?;
+            add_column_if_missing(&tx, "history", "server_stats", "TEXT DEFAULT '[]'")?;
 
-                -- Add server stats to queue
-                ALTER TABLE queue ADD COLUMN server_stats TEXT DEFAULT '[]';
+            // Add server stats to queue
+            add_column_if_missing(&tx, "queue", "server_stats", "TEXT DEFAULT '[]'")?;
 
-                -- Add NZB data to queue for preservation
-                ALTER TABLE queue ADD COLUMN nzb_raw BLOB;
+            // Add NZB data to queue for preservation
+            add_column_if_missing(&tx, "queue", "nzb_raw", "BLOB")?;
 
-                UPDATE schema_version SET version = 2;
-                ",
-            )?;
+            commit_migration(tx, 2)?;
         }
 
         if version < 3 {
             info!("Applying database migration v3");
-            self.conn.execute_batch(
-                "
-                -- Per-job log storage for history
-                ALTER TABLE history ADD COLUMN job_logs TEXT DEFAULT '[]';
+            let tx = self.conn.unchecked_transaction()?;
+            // Per-job log storage for history
+            add_column_if_missing(&tx, "history", "job_logs", "TEXT DEFAULT '[]'")?;
 
-                UPDATE schema_version SET version = 3;
-                ",
-            )?;
+            commit_migration(tx, 3)?;
         }
 
         if version < 4 {
             info!("Applying database migration v4");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 -- RSS feed items (persistent feed cache)
                 CREATE TABLE IF NOT EXISTS rss_items (
@@ -176,24 +171,23 @@ impl Database {
                     match_regex TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1
                 );
-
-                UPDATE schema_version SET version = 4;
                 ",
             )?;
+            commit_migration(tx, 4)?;
         }
 
         if version < 5 {
             info!("Applying database migration v5: settings table");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
-
-                UPDATE schema_version SET version = 5;
                 ",
             )?;
+            commit_migration(tx, 5)?;
         }
 
         // Ensure settings table exists for databases that jumped to v5
@@ -208,7 +202,8 @@ impl Database {
         #[cfg(feature = "groups-db")]
         if version < 6 {
             info!("Applying database migration v6: newsgroup browsing");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS groups (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -253,10 +248,9 @@ impl Database {
                 CREATE TRIGGER IF NOT EXISTS headers_fts_del AFTER DELETE ON headers BEGIN
                     INSERT INTO headers_fts(headers_fts, rowid, subject, author) VALUES ('delete', old.id, old.subject, old.author);
                 END;
-
-                UPDATE schema_version SET version = 6;
                 ",
             )?;
+            commit_migration(tx, 6)?;
         }
 
         if version < 7 {
@@ -1342,6 +1336,43 @@ impl Database {
             .execute("DELETE FROM rss_rules WHERE id=?1", params![id])?;
         Ok(())
     }
+}
+
+/// Commit a single migration step together with its `schema_version` bump.
+///
+/// SQLite DDL is transactional, so running the migration statements and the
+/// version bump inside one transaction means a reader never observes an empty
+/// `schema_version` table, and a crashed step leaves both untouched.
+fn commit_migration(tx: rusqlite::Transaction<'_>, version: u32) -> Result<(), NzbError> {
+    tx.execute("DELETE FROM schema_version", [])?;
+    tx.execute("INSERT INTO schema_version (version) VALUES (?1)", [version])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Add `column` to `table` only when it is not already present.
+///
+/// Databases migrated before migrations became transactional may hold a
+/// committed column without the matching `schema_version` bump; re-running
+/// those steps must not fail on the duplicate column. `table`, `column` and
+/// `definition` are compile-time constants, never user input.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), NzbError> {
+    let present: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |r| r.get(0),
+    )?;
+    if !present {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+        ))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
