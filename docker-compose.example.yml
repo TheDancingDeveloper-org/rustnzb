@@ -1,6 +1,6 @@
 services:
   rustnzb:
-    image: ghcr.io/ausagentsmith-org/rustnzb:latest
+    image: ghcr.io/thedancingdeveloper-org/rustnzbd:latest
     container_name: rustnzb
     restart: unless-stopped
     ports:

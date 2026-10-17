@@ -64,8 +64,22 @@ Open `http://localhost:9090` and add your NNTP servers via the web UI.
 ```bash
 git clone https://github.com/TheDancingDeveloper-org/rustnzb.git
 cd rustnzb
-cp apps/rustnzb/config.example.toml config.toml
+mkdir -p config
+cp apps/rustnzb/config.example.toml config/config.toml
 docker compose up -d
+```
+
+The container reads `/config/config.toml`, which the `./config` mount provides.
+Downloads go to `./downloads` by default. To change that, or the host port,
+timezone, or the UID/GID that owns the files, put the values in a `.env` file
+next to `docker-compose.yml`:
+
+```bash
+DOWNLOADS_DIR=/srv/usenet/downloads
+RUSTNZB_HOST_PORT=9095
+TZ=Australia/Sydney
+PUID=1000
+PGID=1000
 ```
 
 ### Binaries
