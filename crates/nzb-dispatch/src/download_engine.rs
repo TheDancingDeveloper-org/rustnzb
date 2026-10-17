@@ -572,9 +572,9 @@ pub(crate) struct JobContext {
     /// Total bytes across all files (for perf summary throughput).
     pub total_bytes: u64,
     /// The first `size=` seen per file. Only a present size is pinned, and it
-    /// is a cross-check rather than an authority: the NZB-declared size is
-    /// the bound, so one article with a wrong or missing `size=` must not
-    /// make every later article of the file fail.
+    /// cross-checks later articles of the same file against each other. It is
+    /// not compared with the NZB size, which counts encoded segment bytes
+    /// rather than the decoded file `size=` names.
     pinned_file_sizes: Mutex<HashMap<String, u64>>,
     /// Ensures JobFinished/JobAborted is only emitted once.
     finished: AtomicBool,
@@ -3306,8 +3306,12 @@ fn decode_and_assemble(
 
     // Remember the first size= seen for this file, but only a real one: an
     // article that omits size= must not become the pin. The pin is a
-    // cross-check. The NZB-declared size is what bounds the write, so when it
-    // is known a disagreement is logged and the article is still written.
+    // cross-check against later articles of the same file. It is deliberately
+    // not compared with the NZB size: `file.bytes` is the sum of the segment
+    // `bytes` attributes, which count the encoded article rather than the
+    // decoded file `=ybegin size=` names, so the two disagree on every file
+    // (by the yEnc overhead, ~2%) and such a comparison warns on every
+    // article. The NZB size is still what bounds the write.
     let declared = assembler.declared_bytes(&item.job_id, &item.file_id);
     let pinned_size = match (pinned_file_sizes, decoded.file_size) {
         (Some(sizes), Some(size)) => {
@@ -3323,15 +3327,6 @@ fn decode_and_assemble(
         (Some(sizes), None) => sizes.lock().get(&item.file_id).copied(),
         (None, size) => size,
     };
-    if declared.is_some() && decoded.file_size != pinned_size {
-        warn!(
-            file_id = %item.file_id,
-            segment_number = item.segment_number,
-            article_size = ?decoded.file_size,
-            pinned_size = ?pinned_size,
-            "yEnc size= disagrees with the size pinned for this file; the NZB-declared size is the bound"
-        );
-    }
 
     let decoded_len = decoded.data.len() as u64;
     let data_begin = validated_write_offset(
@@ -3726,6 +3721,28 @@ mod tests {
         );
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 2));
+    }
+
+    #[test]
+    fn decode_accepts_yenc_size_below_encoded_nzb_byte_sum() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        // The NZB `bytes` attributes count the encoded article, so their sum
+        // runs a little over the decoded file `=ybegin size=` names. Both
+        // segments must be written in full, not rejected or truncated at the
+        // NZB sum, and the difference must not be treated as corruption.
+        assembler
+            .register_file_with_segment_numbers("j1", "f1", path.clone(), &[1, 2], &[], Some(9))
+            .unwrap();
+
+        let (seg1, _) = yenc_simd::encode_article(b"AAAA", "out.bin", 1, 2, 0, 8);
+        let (seg2, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 4, 8);
+        decode_and_assemble(&decode_test_item("j1", 1), &seg1, &assembler, None).unwrap();
+        decode_and_assemble(&decode_test_item("j1", 2), &seg2, &assembler, None).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"AAAABBBB");
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (2, 2));
     }
 
     #[test]
