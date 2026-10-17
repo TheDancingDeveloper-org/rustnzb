@@ -14,6 +14,9 @@ pub enum NzbError {
     #[error("Idempotency key is already bound to another payload")]
     AdmissionConflict,
 
+    #[error("{0}")]
+    DuplicateNzb(String),
+
     #[error("Server not found: {0}")]
     ServerNotFound(String),
 

@@ -2264,6 +2264,8 @@ pub struct UpdateGeneralBody {
     pub history_retention: Option<Option<usize>>,
     pub rss_history_limit: Option<Option<usize>>,
     pub auto_sort_remaining_pct: Option<bool>,
+    /// `allow`, `warn` or `skip`: what to do with an NZB that duplicates a job.
+    pub duplicate_policy: Option<String>,
     pub rss_downloaded_item_expiry_days: Option<Option<u64>>,
     pub scripts_dir: Option<String>,
     pub script_success: Option<String>,
@@ -2310,6 +2312,16 @@ fn validate_max_active_downloads(value: usize) -> Result<(), ApiError> {
 /// Reject out-of-range values before anything is applied, so a bad request
 /// never half-updates the config or the live queue manager.
 fn validate_general_update(body: &UpdateGeneralBody) -> Result<(), ApiError> {
+    if let Some(policy) = body.duplicate_policy.as_deref()
+        && policy
+            .parse::<nzb_web::nzb_core::config::DuplicatePolicy>()
+            .is_err()
+    {
+        return Err(general_field_error(
+            "duplicate_policy",
+            "must be allow, warn or skip",
+        ));
+    }
     if let Some(max) = body.max_active_downloads {
         validate_max_active_downloads(max)?;
     }
@@ -2416,6 +2428,15 @@ pub async fn h_general_update(
         if let Some(enabled) = body.auto_sort_remaining_pct {
             state.queue_manager.set_auto_sort_remaining_pct(enabled);
             config.general.auto_sort_remaining_pct = enabled;
+        }
+        // Validated by `validate_general_update`, so only a valid value gets here.
+        if let Some(policy) = body.duplicate_policy.as_deref().and_then(|policy| {
+            policy
+                .parse::<nzb_web::nzb_core::config::DuplicatePolicy>()
+                .ok()
+        }) {
+            state.queue_manager.set_duplicate_policy(policy);
+            config.general.duplicate_policy = policy;
         }
         if let Some(days) = body.rss_downloaded_item_expiry_days {
             config.general.rss_downloaded_item_expiry_days = days;

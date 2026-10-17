@@ -2,6 +2,7 @@ use std::path::Path;
 
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::error::NzbError;
@@ -9,6 +10,16 @@ use crate::models::*;
 
 #[allow(dead_code)]
 const SCHEMA_VERSION: u32 = 1;
+
+/// The content digest that recognises a repeated NZB: `sha256:` followed by
+/// the lowercase hex SHA-256 of the payload.
+pub fn nzb_digest(payload: &[u8]) -> String {
+    let hex: String = Sha256::digest(payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("sha256:{hex}")
+}
 
 /// Database handle for queue and history persistence.
 pub struct Database {
@@ -489,6 +500,50 @@ impl Database {
             commit_migration(tx, 16)?;
         }
 
+        if version < 17 {
+            info!("Applying database migration v17: NZB content digests for duplicate detection");
+            // Partial schemas (as built by migration tests) may lack either
+            // table, so only the tables that exist gain the column. Existing
+            // rows are backfilled from their stored NZB so they can be matched.
+            let tx = self.conn.unchecked_transaction()?;
+            for (table, blob_column) in [("queue", "nzb_raw"), ("history", "nzb_data")] {
+                let table_exists: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )?;
+                if table_exists == 0 {
+                    continue;
+                }
+                tx.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN nzb_digest TEXT;
+                     CREATE INDEX IF NOT EXISTS idx_{table}_nzb_digest ON {table}(nzb_digest);"
+                ))?;
+                let has_blob: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                    params![table, blob_column],
+                    |row| row.get(0),
+                )?;
+                if has_blob == 0 {
+                    continue;
+                }
+                let rows: Vec<(String, Vec<u8>)> = {
+                    let mut stmt = tx.prepare(&format!(
+                        "SELECT id, {blob_column} FROM {table} WHERE length({blob_column}) > 0"
+                    ))?;
+                    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<rusqlite::Result<_>>()?
+                };
+                for (id, data) in rows {
+                    tx.execute(
+                        &format!("UPDATE {table} SET nzb_digest = ?2 WHERE id = ?1"),
+                        params![id, nzb_digest(&data)],
+                    )?;
+                }
+            }
+            commit_migration(tx, 17)?;
+        }
+
         Ok(())
     }
 
@@ -554,9 +609,9 @@ impl Database {
             "INSERT INTO queue (id, name, category, status, priority, total_bytes,
              downloaded_bytes, file_count, files_completed, article_count,
              articles_downloaded, articles_failed, added_at, work_dir, output_dir, password,
-             nzb_raw, pp_override, delete_archives)
+             nzb_raw, pp_override, delete_archives, nzb_digest)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-             ?16, ?17, ?18, ?19)",
+             ?16, ?17, ?18, ?19, ?20)",
             params![
                 job.id,
                 job.name,
@@ -577,6 +632,7 @@ impl Database {
                 nzb_data,
                 job.pp_override,
                 job.delete_archives,
+                nzb_digest(nzb_data),
             ],
         )?;
 
@@ -850,6 +906,40 @@ impl Database {
     // History operations
     // -----------------------------------------------------------------------
 
+    /// Find queued and history jobs that an incoming NZB matches by name
+    /// (ignoring ASCII case) or, when `digest` is given, by content digest.
+    pub fn find_duplicate_candidates(
+        &self,
+        name: &str,
+        digest: Option<&str>,
+    ) -> Result<Vec<DuplicateMatch>, NzbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'queue'
+             FROM queue
+             WHERE LOWER(name) = LOWER(?1) OR (?2 IS NOT NULL AND nzb_digest = ?2)
+             UNION ALL
+             SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'history'
+             FROM history
+             WHERE LOWER(name) = LOWER(?1) OR (?2 IS NOT NULL AND nzb_digest = ?2)",
+        )?;
+        let matches = stmt
+            .query_map(params![name, digest], |row| {
+                let location = match row.get::<_, String>(4)?.as_str() {
+                    "queue" => DuplicateLocation::Queue,
+                    _ => DuplicateLocation::History,
+                };
+                Ok(DuplicateMatch {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    by_name: row.get::<_, i64>(2)? != 0,
+                    by_digest: row.get::<_, i64>(3)? != 0,
+                    location,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(matches)
+    }
+
     /// Move a completed/failed job to history.
     pub fn history_insert(&self, entry: &HistoryEntry) -> Result<(), NzbError> {
         self.history_insert_with_carried_bytes(entry, 0)
@@ -879,9 +969,10 @@ impl Database {
         tx.execute(
             "INSERT INTO history (id, name, category, status, total_bytes, downloaded_bytes,
              added_at, completed_at, download_time_secs, output_dir, stages, error_message,
-             nzb_data, server_stats, retry_data, failure_code, post_processing, delete_archives)
+             nzb_data, server_stats, retry_data, failure_code, post_processing, delete_archives,
+             nzb_digest)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-             ?17, ?18)",
+             ?17, ?18, ?19)",
             params![
                 entry.id,
                 entry.name,
@@ -901,6 +992,7 @@ impl Database {
                 entry.failure_code.map(|code| code.to_string()),
                 entry.post_processing,
                 entry.delete_archives,
+                entry.nzb_data.as_deref().map(nzb_digest),
             ],
         )?;
 
@@ -1174,8 +1266,8 @@ impl Database {
     /// Store raw NZB data for a queue job.
     pub fn queue_store_nzb_data(&self, id: &str, nzb_data: &[u8]) -> Result<(), NzbError> {
         self.conn.execute(
-            "UPDATE queue SET nzb_raw = ?2 WHERE id = ?1",
-            params![id, nzb_data],
+            "UPDATE queue SET nzb_raw = ?2, nzb_digest = ?3 WHERE id = ?1",
+            params![id, nzb_data, nzb_digest(nzb_data)],
         )?;
         Ok(())
     }
@@ -1783,6 +1875,60 @@ mod tests {
             nzb_data: None,
             retry_data: None,
         }
+    }
+
+    #[test]
+    fn duplicate_candidates_match_queue_and_history_by_name_or_digest() {
+        let db = Database::open_memory().unwrap();
+        let payload = b"<nzb>queued</nzb>";
+        let digest = nzb_digest(payload);
+
+        let queued = make_job("queued-job", "Show.S01E01");
+        db.queue_insert(&queued).unwrap();
+        db.queue_store_nzb_data(&queued.id, payload).unwrap();
+
+        let mut finished = make_history("done-job", "Other.Release");
+        finished.nzb_data = Some(b"<nzb>finished</nzb>".to_vec());
+        db.history_insert(&finished).unwrap();
+
+        // Name match is case-insensitive and reports the queue row.
+        let by_name = db
+            .find_duplicate_candidates("show.s01e01", Some(&nzb_digest(b"unrelated")))
+            .unwrap();
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].id, "queued-job");
+        assert_eq!(by_name[0].location, DuplicateLocation::Queue);
+        assert!(by_name[0].by_name && !by_name[0].by_digest);
+
+        // Digest match finds a history row under a different name.
+        let by_digest = db
+            .find_duplicate_candidates("Renamed.Upload", Some(&nzb_digest(b"<nzb>finished</nzb>")))
+            .unwrap();
+        assert_eq!(by_digest.len(), 1);
+        assert_eq!(by_digest[0].id, "done-job");
+        assert_eq!(by_digest[0].location, DuplicateLocation::History);
+        assert!(!by_digest[0].by_name && by_digest[0].by_digest);
+
+        // The queued payload's digest also matches the queue row by content.
+        let both = db
+            .find_duplicate_candidates("Show.S01E01", Some(&digest))
+            .unwrap();
+        assert_eq!(both.len(), 1);
+        assert!(both[0].by_name && both[0].by_digest);
+
+        assert!(
+            db.find_duplicate_candidates("Nothing.Here", Some(&nzb_digest(b"new")))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn nzb_digest_is_sha256_hex_with_prefix() {
+        assert_eq!(
+            nzb_digest(b""),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     fn make_rss_item(id: &str, feed: &str, title: &str) -> RssItem {
