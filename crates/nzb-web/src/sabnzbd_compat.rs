@@ -1087,10 +1087,7 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
 
         "rename" => handle_rename(state, req),
 
-        "change_complete_action" => {
-            // No-op stub — Sonarr/Radarr may call this but we don't support custom actions
-            Json(serde_json::json!({ "status": true }))
-        }
+        "change_complete_action" => handle_change_complete_action(state, req),
 
         "switch" => handle_switch(state, req),
 
@@ -1190,7 +1187,7 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
             "dnslookup": false,
             "downloaddir": general.incomplete_dir.to_string_lossy(),
             "downloaddirspeed": 0,
-            "finishaction": serde_json::Value::Null,
+            "finishaction": qm.queue_complete_action(),
             "folders": Vec::<String>::new(),
             "have_quota": false,
             "have_warnings": warnings.len().to_string(),
@@ -1330,7 +1327,7 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         Some("rename") => return handle_queue_rename(state, req),
         Some("purge") => return handle_queue_purge(state),
         Some("sort") => return handle_queue_sort(state, req),
-        Some("change_complete_action") => return Json(serde_json::json!({ "status": true })),
+        Some("change_complete_action") => return handle_change_complete_action(state, req),
         _ => {}
     }
 
@@ -1357,6 +1354,19 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     queue["diskspace2_norm"] = free2_norm.into();
     queue["have_warnings"] = sab_warnings(state).len().to_string().into();
     Json(response)
+}
+
+/// SABnzbd `change_complete_action`: `value` is the action run once the queue
+/// finishes. RustNZB runs `script_<name>` from its scripts directory; other
+/// actions are refused with an error rather than accepted and ignored.
+fn handle_change_complete_action(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    match state
+        .queue_manager
+        .set_queue_complete_action(req.value.as_deref())
+    {
+        Ok(()) => Json(serde_json::json!({ "status": true })),
+        Err(error) => Json(serde_json::json!({ "status": false, "error": error })),
+    }
 }
 
 /// Most warnings `mode=warnings` lists at once.
@@ -5183,6 +5193,58 @@ mod tests {
         };
         let cleared = dispatch_mode(&test_state.state, "warnings", &clear).0;
         assert_eq!(cleared, serde_json::json!({ "status": true }));
+    }
+
+    /// `change_complete_action` takes `script_<name>` from the scripts
+    /// directory, reports it as `finishaction`, refuses power actions, and an
+    /// empty value clears it (both the mode and the `queue` sub-command).
+    #[tokio::test]
+    async fn change_complete_action_sets_and_reports_queue_script() {
+        let test_state = test_state();
+        let scripts = tempfile::tempdir().expect("scripts tempdir");
+        std::fs::write(scripts.path().join("done.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        test_state.state.queue_manager.set_postproc_scripts(
+            Some(scripts.path().to_path_buf()),
+            None,
+            None,
+            5,
+            4096,
+        );
+        let with_value = |value: &str| SabApiRequest {
+            value: Some(value.into()),
+            ..SabApiRequest::default()
+        };
+
+        let refused = dispatch_mode(
+            &test_state.state,
+            "change_complete_action",
+            &with_value("shutdown_pc"),
+        )
+        .0;
+        assert_eq!(refused["status"], false, "resp={refused}");
+        let accepted = dispatch_mode(
+            &test_state.state,
+            "change_complete_action",
+            &with_value("script_done.sh"),
+        )
+        .0;
+        assert_eq!(accepted, serde_json::json!({ "status": true }));
+        let fullstatus =
+            dispatch_mode(&test_state.state, "fullstatus", &SabApiRequest::default()).0;
+        assert_eq!(fullstatus["status"]["finishaction"], "script_done.sh");
+
+        let cleared = SabApiRequest {
+            name: Some("change_complete_action".into()),
+            ..with_value("")
+        };
+        let queue = dispatch_mode(&test_state.state, "queue", &cleared).0;
+        assert_eq!(queue, serde_json::json!({ "status": true }));
+        let fullstatus =
+            dispatch_mode(&test_state.state, "fullstatus", &SabApiRequest::default()).0;
+        assert!(
+            fullstatus["status"]["finishaction"].is_null(),
+            "resp={fullstatus}"
+        );
     }
 
     /// Logged WARN and ERROR events are listed (newest first) with SAB's
