@@ -2470,6 +2470,9 @@ pub async fn h_general_update(
             config.general.script_timeout_secs,
             config.general.script_max_output_bytes,
         );
+        state
+            .queue_manager
+            .set_queue_complete_persist(config.general.queue_complete_pers);
 
         Ok::<_, ApiError>(())
     })?;

@@ -119,6 +119,15 @@ pub struct GeneralConfig {
     /// Remove downloaded RSS records after this many days. None keeps them.
     #[serde(default)]
     pub rss_downloaded_item_expiry_days: Option<u64>,
+    /// Directory that SABnzbd `addlocalfile` may read NZBs from. Unset refuses
+    /// the mode; a file outside this directory (after resolving symlinks and
+    /// `..`) is refused too.
+    #[serde(default)]
+    pub local_import_dir: Option<PathBuf>,
+    /// Keep the SABnzbd `change_complete_action` after it has run once. When
+    /// false (SABnzbd's default) the action is reset after each run.
+    #[serde(default)]
+    pub queue_complete_pers: bool,
     /// Optional directory containing post-processing scripts.
     #[serde(default)]
     pub scripts_dir: Option<PathBuf>,
@@ -238,6 +247,8 @@ impl Default for GeneralConfig {
             article_timeout_secs: default_article_timeout_secs(),
             auto_sort_remaining_pct: false,
             rss_downloaded_item_expiry_days: None,
+            local_import_dir: None,
+            queue_complete_pers: false,
             scripts_dir: None,
             script_success: None,
             script_failure: None,
