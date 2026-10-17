@@ -20,6 +20,7 @@ import { formatBytes, formatSpeed } from './core/format';
 import { AddNzbService } from './core/services/add-nzb.service';
 import { WidthModeService } from './core/services/width-mode.service';
 import { PauseStateService } from './core/services/pause-state.service';
+import { BrowserNotificationsService } from './core/services/browser-notifications.service';
 import { ThemeService } from './core/services/theme.service';
 import { IconComponent } from './shared/icon.component';
 import { MatSnackBar } from '@angular/material/snack-bar';
@@ -466,6 +467,7 @@ export class App implements OnInit, OnDestroy {
     readonly theme: ThemeService,
     pauseState: PauseStateService,
     private snack: MatSnackBar,
+    private notifications: BrowserNotificationsService,
   ) {
     this.paused = pauseState.paused;
     this.authenticated = authService.authenticated;
@@ -498,6 +500,7 @@ export class App implements OnInit, OnDestroy {
         if (s.version) this.version.set(s.version);
         this.loaded.set(true);
         this.offline.set(false);
+        this.notifications.observeStatus(s);
       },
       error: () => this.offline.set(true),
     });

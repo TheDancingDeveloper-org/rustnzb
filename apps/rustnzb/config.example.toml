@@ -135,3 +135,19 @@ auto_send_all = false
 # username = "plex"
 # password = "change-me"
 # api_key = "optional-api-key"
+
+# Notifications for completed, failed and disk-full events. Each target is
+# off until its URL or topic is set. Changes take effect after a restart.
+# Put secrets (URLs with tokens, ntfy_token) in a private config file only.
+[notifications]
+# Generic webhook: POSTs a JSON document per event.
+# webhook_url = "https://example.invalid/rustnzb-hook"
+# Apprise API: notify endpoint of an Apprise API server. Set apprise_urls to
+# send to Apprise URLs directly, or leave it empty when the endpoint carries
+# a configuration key.
+# apprise_api_url = "http://apprise:8000/notify"
+# apprise_urls = "discord://webhook_id/webhook_token"
+# ntfy: publishes to a topic on an ntfy server.
+# ntfy_server = "https://ntfy.sh"
+# ntfy_topic = "rustnzb-alerts"
+# ntfy_token = ""

@@ -1215,6 +1215,19 @@ fn masked_config(
             server.proxy_url = Some(mask_proxy_userinfo(url));
         }
     }
+    // Notification URLs often carry a secret in their path or query, and the
+    // ntfy token is a credential. Mask any that are set.
+    let notifications = &mut config.notifications;
+    for secret in [
+        &mut notifications.webhook_url,
+        &mut notifications.apprise_api_url,
+        &mut notifications.apprise_urls,
+        &mut notifications.ntfy_token,
+    ] {
+        if !secret.is_empty() {
+            *secret = PASSWORD_MASK.to_string();
+        }
+    }
     config
 }
 
