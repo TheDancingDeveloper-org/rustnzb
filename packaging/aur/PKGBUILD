@@ -1,0 +1,33 @@
+# Maintainer: <operator to fill in when the AUR package is registered>
+# AUR package rustnzb-bin: installs the prebuilt release binary from the
+# linux-x86_64 tarball attached to a GitHub release, so no Rust toolchain is
+# needed. pkgver cannot contain a hyphen, so a pre-release tag is written with
+# an underscore: 1.6.0_beta.3 is the tag v1.6.0-beta.3. Refresh pkgver and
+# sha256sums with packaging/aur/update-pkgbuild.sh <tag>; do not edit the
+# checksum by hand.
+pkgname=rustnzb-bin
+pkgver=1.6.0_beta.3
+pkgrel=1
+pkgdesc="A modern Usenet NZB downloader written in Rust (prebuilt binary)"
+arch=('x86_64')
+url="https://rustnzb.dev"
+license=('MIT')
+depends=('p7zip')
+optdepends=('unrar: RAR extraction')
+provides=('rustnzb')
+conflicts=('rustnzb')
+backup=('etc/rustnzb/config.toml')
+options=('!strip')
+
+_ver=${pkgver//_/-}
+source=("rustnzb-${pkgver}.tar.gz::https://github.com/TheDancingDeveloper-org/rustnzb/releases/download/v${_ver}/rustnzb-v${_ver}-linux-x86_64.tar.gz")
+sha256sums=('57c8ee01fff681097777a687d968144d1b314b828068446a63b1e53456f23c0d')
+
+package() {
+    local dir="rustnzb-v${_ver}"
+    install -Dm755 "${srcdir}/${dir}/rustnzb" "${pkgdir}/usr/bin/rustnzb"
+    install -Dm644 "${srcdir}/${dir}/config.example.toml" \
+        "${pkgdir}/etc/rustnzb/config.toml"
+    install -Dm644 "${srcdir}/${dir}/README.md" \
+        "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}
