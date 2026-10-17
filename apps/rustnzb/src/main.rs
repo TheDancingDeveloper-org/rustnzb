@@ -288,8 +288,12 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(run_smoke_tests());
     }
 
+    // The operator's --config / RUSTNZB_CONFIG path is resolved once here, and
+    // only the resolved path is used after this point.
+    let config_path = nzb_web::nzb_core::config_store::resolve_operator_config_path(&args.config)?;
+
     // Load config early to check OTEL settings before initializing tracing
-    let mut config = AppConfig::load(&args.config)?;
+    let mut config = AppConfig::load(&config_path)?;
     // Strip incidental whitespace from user-supplied server fields. Guards
     // against pasted hostnames carrying a trailing newline/space, which
     // surfaces as a misleading "Name does not resolve" from getaddrinfo.
@@ -423,7 +427,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize the engine (config, DB, queue manager, background services)
     let result = nzb_web::startup::initialize(
         StartupConfig {
-            config_path: args.config,
+            config_path,
             listen_addr: args.listen_addr,
             port: args.port,
             data_dir: args.data_dir,
