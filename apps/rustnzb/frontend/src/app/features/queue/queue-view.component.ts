@@ -13,7 +13,7 @@ import { formatBytes, formatBytesParts, formatSpeed } from '../../core/format';
 import { HistoryViewComponent } from '../history/history-view.component';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
-import { isAuthHandledError, showHttpError } from '../../core/http/http-error';
+import { httpErrorMessage, isAuthHandledError, showHttpError } from '../../core/http/http-error';
 
 interface CategoryConfig {
   name: string;
@@ -499,6 +499,13 @@ interface PipelineStep {
             @if (loading()) {
               <tr>
                 <td colspan="11" class="empty-cell">Loading…</td>
+              </tr>
+            } @else if (loadError()) {
+              <tr>
+                <td colspan="11" class="empty-cell error-cell" role="alert">
+                  {{ loadError() }}
+                  <button class="row-action" (click)="fetchQueue(true)">Retry</button>
+                </td>
               </tr>
             } @else if (filteredJobs().length === 0) {
               <tr>
@@ -1100,11 +1107,15 @@ interface PipelineStep {
         color: var(--mute);
         font-size: 13px;
       }
+      .error-cell { color: var(--danger); }
+      .error-cell .row-action { margin-left: 10px; }
     `,
   ],
 })
 export class QueueViewComponent implements OnInit, OnDestroy {
   loading = signal(true);
+  /** Set when the last queue fetch failed; the table shows it with a Retry. */
+  loadError = signal<string | null>(null);
   jobs = signal<NzbJob[]>([]);
   remainingBytes = signal(0);
   categories = signal<CategoryConfig[]>([]);
@@ -1218,7 +1229,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     });
   }
 
-  private fetchQueue(supersedeInFlight: boolean): void {
+  fetchQueue(supersedeInFlight: boolean): void {
     const seq = ++this.queueRequestSeq;
     if (supersedeInFlight) this.queueStaleThrough = seq - 1;
     this.api.get<QueueResponse>('/queue').subscribe({
@@ -1237,23 +1248,28 @@ export class QueueViewComponent implements OnInit, OnDestroy {
         const next = new Set<string>();
         for (const id of cur) if (liveIds.has(id)) next.add(id);
         if (next.size !== cur.size) this.selectedIds.set(next);
+        this.loadError.set(null);
         this.loading.set(false);
       },
-      error: () => this.loading.set(false),
+      error: (err) => {
+        if (seq !== this.queueRequestSeq) return;
+        this.loadError.set(httpErrorMessage(err, "Couldn't load the download queue"));
+        this.loading.set(false);
+      },
     });
   }
 
   loadCategories(): void {
     this.api.get<CategoryConfig[]>('/config/categories').subscribe({
       next: (cats) => this.categories.set(cats),
-      error: () => {},
+      error: (err) => showHttpError(this.snackBar, err, 'Failed to load categories'),
     });
   }
 
   loadServers(): void {
     this.api.get<ServerConfigLite[]>('/config/servers').subscribe({
       next: (srvs) => this.servers.set(srvs),
-      error: () => {},
+      error: (err) => showHttpError(this.snackBar, err, 'Failed to load servers'),
     });
   }
 
