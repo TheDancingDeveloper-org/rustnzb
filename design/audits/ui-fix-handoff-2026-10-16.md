@@ -8,8 +8,8 @@ only and open no PR. Oversight reviews and merges, and the operator deploys.
 
 1. `DESIGN.md` (repo root). This is the spec you implement. Tokens, type
    roles, layout, components, required states, Do's and Don'ts.
-2. `docs/ui-audit-2026-10-16.md` has the findings with severities, screenshots
-   in `docs/ui-audit-2026-10-16/`, the screen-to-source map, and the "Focused
+2. `design/audits/ui-audit-2026-10-16.md` has the findings with severities, screenshots
+   in `design/audits/ui-audit-2026-10-16/`, the screen-to-source map, and the "Focused
    review: Settings typography" section.
 3. `AGENTS.md` has the repo checks and conventions. It now points at
    DESIGN.md.
@@ -91,9 +91,9 @@ These are listed under "Open decisions" in the audit.
 - Take before and after screenshots at 1440×900 and 390×844 of Downloads,
   Settings (General, Paths & disk, API & SABnzbd compat), Statistics and
   Search, in Rust dark and Daylight.
-- For a local build with sample data, follow `demo/README.md`:
+- For a local build with sample data, follow `docs/DEMO.md`:
   1. Build with `--base-href=/demo/` into a scratch directory.
-  2. Copy `demo/mock-api.js` into the build and load it before `main-*.js`.
+  2. Copy `website/demo/mock-api.js` into the build and load it before `main-*.js`.
   3. Serve with an SPA fallback to `/demo/index.html`.
 
   Chromium is at `~/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome`,
@@ -112,7 +112,7 @@ These are listed under "Open decisions" in the audit.
 
 ## Hand-back
 
-Commit the after screenshots to `docs/ui-audit-2026-10-16/` with the prefix
+Commit the after screenshots to `design/audits/ui-audit-2026-10-16/` with the prefix
 `after-`. Tick off the "Planned low-risk fix batch" section in the audit doc.
 Push, then report:
 
