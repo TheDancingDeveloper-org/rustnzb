@@ -35,6 +35,48 @@ export function isBareRoute(url: string): boolean {
   return path === '/login' || path === '/welcome';
 }
 
+const MIB = 1024 * 1024;
+
+// Browser-tab name for each page. The legacy /queue and /history paths keep the
+// tab names they had, so a bookmarked tab still reads the same.
+const PAGE_TITLES: Record<string, string> = {
+  '/downloads': 'Downloads',
+  '/queue': 'Downloads',
+  '/history': 'History',
+  '/groups': 'Search',
+  '/rss': 'RSS',
+  '/media': 'Media',
+  '/logs': 'Logs',
+  '/statistics': 'Statistics',
+  '/settings': 'Settings',
+  '/welcome': 'Welcome',
+  '/login': 'Sign in',
+};
+
+export interface LiveTitleState {
+  paused: boolean;
+  speedBps: number;
+  queueSize: number;
+}
+
+/**
+ * Title for the browser tab: live transfer state first, then the page name.
+ * Pass `null` for live state when it is unknown or stale (offline, not signed in).
+ * The Downloads page is left out of the suffix because it is the home page.
+ */
+export function documentTitle(url: string, live: LiveTitleState | null): string {
+  const path = url.split(/[?#]/)[0];
+  const parts: string[] = [];
+  if (live) {
+    if (live.paused) parts.push('Paused');
+    else if (live.speedBps > 0) parts.push(`↓ ${formatSpeed(live.speedBps)}`);
+    if (live.queueSize > 0) parts.push(`${live.queueSize} left`);
+  }
+  const page = PAGE_TITLES[path];
+  if (page && page !== 'Downloads') parts.push(page);
+  return parts.length ? `${parts.join(' · ')} – rustnzb` : 'rustnzb';
+}
+
 @Component({
   selector: 'app-root',
   standalone: true,
@@ -73,7 +115,46 @@ export function isBareRoute(url: string): boolean {
                   ● {{ paused() ? 'Paused' : 'Live' }}
                 </span>
               }
-              <span class="pill">{{ loaded() ? formatSpeed(speed()) : '—' }}</span>
+              <div class="speed-group" (keydown.escape)="closeSpeedMenu()">
+                <button
+                  type="button"
+                  class="pill pill-btn"
+                  (click)="toggleSpeedMenu()"
+                  title="Set speed limit"
+                  aria-haspopup="true"
+                  [attr.aria-expanded]="speedMenuOpen"
+                >
+                  {{ loaded() ? formatSpeed(speed()) : '—' }}
+                </button>
+                @if (speedMenuOpen) {
+                  <div class="speed-menu" role="menu" (click)="$event.stopPropagation()">
+                    <div class="pm-title">Speed limit</div>
+                    <div class="pm-current">Current: {{ speedLimit() > 0 ? formatSpeed(speedLimit()) : 'off' }}</div>
+                    @for (opt of speedPresets; track opt.bps) {
+                      <button
+                        class="pm-item"
+                        [class.current]="speedLimit() === opt.bps"
+                        role="menuitem"
+                        (click)="setSpeedLimit(opt.bps)"
+                      >
+                        {{ opt.label }}
+                      </button>
+                    }
+                    <div class="pm-custom">
+                      <input
+                        type="number"
+                        min="0.1"
+                        step="any"
+                        placeholder="MB/s"
+                        aria-label="Custom speed limit in MB/s"
+                        [(ngModel)]="customSpeedMb"
+                        (keydown.enter)="setCustomSpeedLimit()"
+                      />
+                      <button class="pm-go" (click)="setCustomSpeedLimit()">Set</button>
+                    </div>
+                  </div>
+                }
+              </div>
               <span class="pill">{{ loaded() ? queueCount() : '—' }} queued</span>
               <span class="pill">{{ loaded() ? formatBytes(diskFree()) : '—' }} free</span>
             </div>
@@ -162,6 +243,15 @@ export function isBareRoute(url: string): boolean {
             <button class="action muted" (click)="onLogout()" title="Sign out">Sign out</button>
           </div>
         </nav>
+
+        @if (noServers()) {
+          <div class="setup-banner" role="status">
+            <div class="wrap">
+              <span>No news servers are set up yet, so downloads will not start.</span>
+              <a routerLink="/welcome">Add a server →</a>
+            </div>
+          </div>
+        }
 
         <main>
           <div class="wrap">
@@ -310,7 +400,57 @@ export function isBareRoute(url: string): boolean {
         font-size: 11px !important;
         margin-left: -6px;
       }
-      .pause-menu {
+      /* Speed-limit pill: a button that opens a popover under the status pills. */
+      .speed-group {
+        position: relative;
+        display: flex;
+        align-items: center;
+      }
+      .pill-btn {
+        font: inherit;
+        color: inherit;
+        cursor: pointer;
+      }
+      .pill-btn:hover {
+        border-color: var(--accent);
+      }
+      .pm-current {
+        font-size: 12px;
+        color: var(--mute);
+        padding: 0 8px 6px;
+      }
+      .pm-item.current {
+        color: var(--accent);
+        font-weight: 600;
+      }
+
+      /* First-run banner: shown under the header until a server is configured. */
+      .setup-banner {
+        flex-shrink: 0;
+        background: var(--panel2);
+        border-bottom: 1px solid var(--line);
+        border-left: 3px solid var(--warn);
+        font-size: 13px;
+      }
+      .setup-banner .wrap {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px 16px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+      }
+      .setup-banner a {
+        color: var(--accent);
+        font-weight: 600;
+        text-decoration: none;
+      }
+      .setup-banner a:hover {
+        text-decoration: underline;
+      }
+
+      .pause-menu,
+      .speed-menu {
         position: absolute;
         top: 100%;
         right: 0;
@@ -322,6 +462,11 @@ export function isBareRoute(url: string): boolean {
         padding: 6px;
         min-width: 160px;
         z-index: 40;
+      }
+      /* The speed popover hangs off the left edge of its pill; pause hangs off the right. */
+      .speed-menu {
+        left: 0;
+        right: auto;
       }
       .pm-title {
         font-size: 11px;
@@ -450,11 +595,26 @@ export class App implements OnInit, OnDestroy {
     { label: '1 hour', secs: 60 * 60 },
     { label: '2 hours', secs: 2 * 60 * 60 },
   ];
+  // Global speed limit, from the status poll. 0 means unlimited.
+  speedLimit = signal(0);
+  speedMenuOpen = false;
+  customSpeedMb: number | null = null;
+  readonly speedPresets = [
+    { label: 'Unlimited', bps: 0 },
+    { label: '1 MB/s', bps: 1 * MIB },
+    { label: '5 MB/s', bps: 5 * MIB },
+    { label: '10 MB/s', bps: 10 * MIB },
+    { label: '25 MB/s', bps: 25 * MIB },
+    { label: '50 MB/s', bps: 50 * MIB },
+  ];
+  // Null until the server list has loaded, so the banner never shows on a guess.
+  readonly serverCount = signal<number | null>(null);
+  readonly noServers = computed(() => this.serverCount() === 0);
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private docClickHandler = (e: MouseEvent) => {
-    if (!this.pauseMenuOpen) return;
-    const el = (e.target as HTMLElement).closest('.pause-group');
-    if (!el) this.pauseMenuOpen = false;
+    const target = e.target as HTMLElement;
+    if (this.pauseMenuOpen && !target.closest('.pause-group')) this.pauseMenuOpen = false;
+    if (this.speedMenuOpen && !target.closest('.speed-group')) this.speedMenuOpen = false;
   };
 
   constructor(
@@ -472,11 +632,17 @@ export class App implements OnInit, OnDestroy {
     this.currentUrl.set(router.url);
     router.events
       .pipe(filter((e): e is NavigationEnd => e instanceof NavigationEnd))
-      .subscribe((e) => this.currentUrl.set(e.urlAfterRedirects));
+      .subscribe((e) => {
+        this.currentUrl.set(e.urlAfterRedirects);
+        this.updateTitle();
+        // Re-check after each navigation so the banner clears once a server is added.
+        this.loadServerCount();
+      });
   }
 
   ngOnInit(): void {
     this.pollStatus();
+    this.loadServerCount();
     this.pollTimer = setInterval(() => this.pollStatus(), 2000);
     document.addEventListener('click', this.docClickHandler);
   }
@@ -491,6 +657,7 @@ export class App implements OnInit, OnDestroy {
     this.api.get<StatusResponse>('/status').subscribe({
       next: (s) => {
         this.speed.set(s.speed_bps);
+        this.speedLimit.set(s.speed_limit_bps ?? 0);
         this.paused.set(s.paused);
         this.queueCount.set(s.queue_size);
         this.diskFree.set(s.disk_space_free);
@@ -498,9 +665,60 @@ export class App implements OnInit, OnDestroy {
         if (s.version) this.version.set(s.version);
         this.loaded.set(true);
         this.offline.set(false);
+        this.updateTitle();
       },
-      error: () => this.offline.set(true),
+      error: () => {
+        this.offline.set(true);
+        this.updateTitle();
+      },
     });
+  }
+
+  loadServerCount(): void {
+    if (!this.authenticated()) return;
+    this.api.get<unknown[]>('/config/servers').subscribe({
+      next: (servers) => this.serverCount.set(Array.isArray(servers) ? servers.length : null),
+      // A failed check leaves the count unknown, so no banner is shown on a guess.
+      error: () => this.serverCount.set(null),
+    });
+  }
+
+  private updateTitle(): void {
+    const live =
+      this.loaded() && !this.offline()
+        ? { paused: this.paused(), speedBps: this.speed(), queueSize: this.queueCount() }
+        : null;
+    document.title = documentTitle(this.currentUrl(), live);
+  }
+
+  toggleSpeedMenu(): void {
+    this.speedMenuOpen = !this.speedMenuOpen;
+    this.pauseMenuOpen = false;
+  }
+
+  closeSpeedMenu(): void {
+    this.speedMenuOpen = false;
+  }
+
+  setSpeedLimit(bps: number): void {
+    this.api.put('/config/speed-limit', { speed_limit_bps: bps }).subscribe({
+      next: () => {
+        this.speedLimit.set(bps);
+        this.speedMenuOpen = false;
+        this.snack.open(bps > 0 ? `Speed limit set to ${formatSpeed(bps)}` : 'Speed limit off', 'Close', {
+          duration: 2000,
+        });
+        this.pollStatus();
+      },
+      error: (err) => showHttpError(this.snack, err, 'Failed to set speed limit'),
+    });
+  }
+
+  setCustomSpeedLimit(): void {
+    const mb = this.customSpeedMb;
+    if (!mb || mb <= 0) return;
+    this.setSpeedLimit(Math.round(mb * MIB));
+    this.customSpeedMb = null;
   }
 
   onLogout(): void {

@@ -24,5 +24,23 @@ describe('StatisticsViewComponent', () => {
     const component = new StatisticsViewComponent(api as unknown as ApiService);
     component.ngOnInit();
     expect(component.selectedTotals().downloads).toBe(0);
+    expect(component.statistics()).toBeNull();
+    expect(component.loading()).toBe(false);
+  });
+
+  it('retries the request after a failed load and shows the result', () => {
+    const period = { downloads: 2, completed: 2, failed: 0, bytes_downloaded: 0, total_duration_secs: 0, average_speed_bps: 0, fastest_download_bps: 0, news_server_hits: 0, articles_served: 0, articles_missing: 0 };
+    const api = { get: vi.fn()
+      .mockReturnValueOnce(throwError(() => new Error('offline')))
+      .mockReturnValueOnce(of({ generated_at: new Date().toISOString(), today: period, week: period, month: period, lifetime: period, servers: [], daily: [] })) };
+    const component = new StatisticsViewComponent(api as unknown as ApiService);
+    component.ngOnInit();
+    expect(component.statistics()).toBeNull();
+
+    component.load();
+
+    expect(api.get).toHaveBeenCalledTimes(2);
+    expect(component.statistics()).not.toBeNull();
+    expect(component.selectedTotals().downloads).toBe(2);
   });
 });
