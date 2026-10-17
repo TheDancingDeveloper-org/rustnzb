@@ -24,6 +24,9 @@ pub struct AppState {
     pub log_buffer: LogBuffer,
     pub token_store: Arc<TokenStore>,
     pub credential_store: Arc<CredentialStore>,
+    /// Set once shutdown begins, so `/api/ready` stops reporting ready while
+    /// the process drains and a load balancer can stop routing to it.
+    pub shutting_down: std::sync::atomic::AtomicBool,
     /// When the application state was created at startup; the basis for the
     /// SABnzbd-compatible `uptime`.
     pub started_at: std::time::Instant,
@@ -56,6 +59,7 @@ impl AppState {
             log_buffer,
             token_store,
             credential_store,
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
             started_at: std::time::Instant::now(),
             file: Mutex::new(file),
             overrides: OverrideSet::default(),

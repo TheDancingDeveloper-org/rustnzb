@@ -1,4 +1,6 @@
+use std::future::IntoFuture;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
@@ -11,7 +13,7 @@ use http::{HeaderMap, HeaderValue, StatusCode, header};
 use rust_embed::Embed;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -505,6 +507,8 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/", get(h_root))
         // Health check — no auth (Docker HEALTHCHECK)
         .route("/api/health", get(handlers::h_health))
+        // Readiness probe — no auth; reports 503 once shutdown has begun
+        .route("/api/ready", get(handlers::h_ready))
         // Auth endpoints — no auth middleware
         .nest("/api", auth_routes)
         // Protected API routes
@@ -537,15 +541,66 @@ pub async fn serve(state: Arc<AppState>, router: Router) -> anyhow::Result<()> {
     info!("Web GUI: http://{addr}/");
     info!("Arr API: http://{addr}/sabnzbd/api?mode=version");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let timeout = shutdown_limit(config.general.shutdown_timeout_secs);
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = signal_tx.send(());
+        })
+        .into_future();
+    tokio::pin!(server);
 
+    // Once a signal arrives, give open connections the shutdown timeout to
+    // finish, then drop them. Without a timeout this branch never completes.
+    let drain_limit = async {
+        let _ = signal_rx.await;
+        state
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        match timeout {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(drain_limit);
+
+    tokio::select! {
+        result = &mut server => result?,
+        () = &mut drain_limit => {
+            warn!(
+                timeout_secs = config.general.shutdown_timeout_secs,
+                "HTTP connections still open after the shutdown timeout; closing them"
+            );
+        }
+    }
+
+    state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     info!("HTTP server stopped, shutting down queue manager...");
-    state.queue_manager.shutdown().await;
+    match timeout {
+        Some(limit) => {
+            if tokio::time::timeout(limit, state.queue_manager.shutdown())
+                .await
+                .is_err()
+            {
+                warn!(
+                    timeout_secs = config.general.shutdown_timeout_secs,
+                    "Queue manager did not finish shutting down within the timeout; exiting"
+                );
+            }
+        }
+        None => state.queue_manager.shutdown().await,
+    }
     info!("Graceful shutdown complete");
 
     Ok(())
+}
+
+/// The shutdown time limit for `secs`, where 0 means no limit.
+fn shutdown_limit(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 async fn shutdown_signal() {
