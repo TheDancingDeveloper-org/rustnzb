@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::nzb_core::config::{
-    CategoryConfig, DuplicatePolicy, ServerConfig, normalize_history_retention,
+    CategoryConfig, DuplicatePolicy, NotificationConfig, ServerConfig, normalize_history_retention,
 };
 use crate::nzb_core::db::{Database, HistoryFilter, HistorySummary, nzb_digest};
 use crate::nzb_core::models::*;
@@ -30,6 +30,7 @@ use nzb_postproc::{
 
 use crate::direct_unpack::DirectUnpacker;
 use crate::log_buffer::LogBuffer;
+use crate::notifications::{NotificationEvent, NotificationKind, Notifier};
 use nzb_dispatch::{
     BandwidthConfig, BandwidthLimiter, DispatchEngine, DispatchHandle, ProgressUpdate,
 };
@@ -1234,6 +1235,39 @@ pub enum HistoryRetryOutcome {
 /// Thread-safe queue manager that coordinates all downloads.
 ///
 /// Wrapped in `Arc` for sharing between the background task and HTTP handlers.
+/// The notification for a job reaching a terminal status, or `None` when
+/// the outcome is not reported. A post-processing stop for lack of disk
+/// space is reported as a disk event, not as a generic failure.
+fn terminal_notification(job: &NzbJob, final_status: JobStatus) -> Option<NotificationEvent> {
+    let event = match final_status {
+        JobStatus::Completed => NotificationEvent::new(
+            NotificationKind::Complete,
+            "Download complete",
+            job.name.clone(),
+        ),
+        JobStatus::Failed if job.error_message.as_deref() == Some(POSTPROC_DISK_FULL_MESSAGE) => {
+            NotificationEvent::new(
+                NotificationKind::DiskFull,
+                "Disk space low",
+                "Post-processing stopped: free space on a storage volume is below the minimum.",
+            )
+        }
+        JobStatus::Failed => NotificationEvent::new(
+            NotificationKind::Failed,
+            "Download failed",
+            job.error_message
+                .clone()
+                .unwrap_or_else(|| format!("{} failed", job.name)),
+        ),
+        _ => return None,
+    };
+    Some(event.for_job(&job.name, &job.category))
+}
+
+/// Error message the post-processing disk check records. Matched when
+/// notifying, so a disk stop is reported once, as a disk event.
+const POSTPROC_DISK_FULL_MESSAGE: &str = "Insufficient free disk space for post-processing";
+
 pub struct QueueManager {
     /// Active jobs keyed by job ID.
     jobs: Mutex<HashMap<String, JobState>>,
@@ -1288,6 +1322,8 @@ pub struct QueueManager {
     duplicate_policy: Mutex<DuplicatePolicy>,
     /// Optional bounded post-processing hooks.
     postproc_scripts: Mutex<PostProcScriptConfig>,
+    /// Outbound notification targets for job outcomes and disk pressure.
+    notifier: Mutex<Arc<Notifier>>,
     /// Stage-specific resource gates shared by all post-processing jobs.
     postproc_resources: Arc<PostProcResourcePool>,
     /// Category configs for post-processing decisions.
@@ -1416,6 +1452,7 @@ impl QueueManager {
             auto_sort_remaining_pct: AtomicBool::new(false),
             duplicate_policy: Mutex::new(DuplicatePolicy::default()),
             postproc_scripts: Mutex::new(PostProcScriptConfig::default()),
+            notifier: Mutex::new(Arc::new(Notifier::disabled())),
             postproc_resources: PostProcResourcePool::new(postproc_limits),
             categories: Mutex::new(categories),
             min_free_space: AtomicU64::new(min_free_space),
@@ -1708,6 +1745,18 @@ impl QueueManager {
             timeout: Duration::from_secs(timeout_secs.max(1)),
             max_output_bytes,
         };
+    }
+
+    /// Replace the notification targets. Takes effect for events raised after
+    /// the call; in-flight deliveries finish with the previous targets.
+    pub fn set_notifications(&self, config: &NotificationConfig) {
+        *self.notifier.lock() = Arc::new(Notifier::from_config(config));
+    }
+
+    /// Send a notification about a job or the disk guard, if any target is set.
+    fn notify(&self, event: NotificationEvent) {
+        let notifier = Arc::clone(&self.notifier.lock());
+        notifier.notify(event);
     }
 
     /// Stable sort of the queue by remaining work percentage. The original
@@ -2295,10 +2344,26 @@ impl QueueManager {
                 "Paused job due to low disk space on a job storage volume"
             );
             let mut jobs = self.jobs.lock();
+            let mut alert = None;
             if let Some(state) = jobs.get_mut(job_id) {
+                // Notify once per hold, not on every re-check of a held job.
+                if state.failure_code != Some(JobFailureCode::StorageUnavailable) {
+                    alert = Some(
+                        NotificationEvent::new(
+                            NotificationKind::DiskFull,
+                            "Disk space low",
+                            "Downloads paused: free space on a storage volume is below the minimum.",
+                        )
+                        .for_job(&state.job.name, &state.job.category),
+                    );
+                }
                 state.job.status = JobStatus::Paused;
                 state.job.error_message = Some("Paused: low disk space".to_string());
                 state.failure_code = Some(JobFailureCode::StorageUnavailable);
+            }
+            drop(jobs);
+            if let Some(alert) = alert {
+                self.notify(alert);
             }
             return;
         }
@@ -2989,7 +3054,7 @@ impl QueueManager {
             [work_dir.as_path(), output_dir.as_path()].as_slice(),
         ) {
             if let Some(state) = self.jobs.lock().get_mut(job_id) {
-                let message = "Insufficient free disk space for post-processing".to_string();
+                let message = POSTPROC_DISK_FULL_MESSAGE.to_string();
                 state.job.status = JobStatus::Failed;
                 state.job.error_message = Some(message.clone());
                 self.move_to_history(
@@ -3494,6 +3559,7 @@ impl QueueManager {
         drop(db);
 
         if history_persisted {
+            self.notify_terminal(state, final_status);
             let retain_for_retry = final_status == JobStatus::Failed
                 && state.nzb_data.is_some()
                 && state
@@ -3513,6 +3579,13 @@ impl QueueManager {
                 work_dir = %state.job.work_dir.display(),
                 "Retaining terminal work directory because history persistence failed"
             );
+        }
+    }
+
+    /// Notify about a job that has just reached history.
+    fn notify_terminal(&self, state: &JobState, final_status: JobStatus) {
+        if let Some(event) = terminal_notification(&state.job, final_status) {
+            self.notify(event);
         }
     }
 
@@ -4411,6 +4484,11 @@ impl QueueManager {
                     "Low disk space on a configured storage volume, auto-pausing downloads"
                 );
                 self.pause_all_with_hold(Some(Utc::now()));
+                self.notify(NotificationEvent::new(
+                    NotificationKind::DiskFull,
+                    "Disk space low",
+                    "Downloads paused: free space on a storage volume is below the minimum.",
+                ));
             }
             return;
         }
@@ -5618,6 +5696,32 @@ impl QueueManager {
 #[cfg(test)]
 mod global_pause_tests {
     use super::*;
+
+    #[test]
+    fn terminal_notification_maps_outcomes() {
+        let root = std::path::Path::new("/unused");
+        let mut done = job("done", JobStatus::Completed, root);
+        done.category = "tv".into();
+
+        let complete = terminal_notification(&done, JobStatus::Completed).unwrap();
+        assert_eq!(complete.kind, NotificationKind::Complete);
+        assert_eq!(complete.job_name.as_deref(), Some("done"));
+        assert_eq!(complete.category.as_deref(), Some("tv"));
+
+        let mut broken = job("broken", JobStatus::Failed, root);
+        broken.error_message = Some("archive is corrupt".into());
+        let failed = terminal_notification(&broken, JobStatus::Failed).unwrap();
+        assert_eq!(failed.kind, NotificationKind::Failed);
+        assert_eq!(failed.message, "archive is corrupt");
+
+        let mut full = job("full", JobStatus::Failed, root);
+        full.error_message = Some(POSTPROC_DISK_FULL_MESSAGE.into());
+        let disk = terminal_notification(&full, JobStatus::Failed).unwrap();
+        assert_eq!(disk.kind, NotificationKind::DiskFull);
+
+        let paused = job("paused", JobStatus::Paused, root);
+        assert!(terminal_notification(&paused, JobStatus::Paused).is_none());
+    }
 
     fn job(id: &str, status: JobStatus, root: &std::path::Path) -> NzbJob {
         NzbJob {

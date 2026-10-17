@@ -23,6 +23,8 @@ pub struct AppConfig {
     pub rss_feeds: Vec<RssFeedConfig>,
     #[serde(default)]
     pub dav: DavConfig,
+    #[serde(default)]
+    pub notifications: NotificationConfig,
 }
 
 impl Default for AppConfig {
@@ -35,6 +37,7 @@ impl Default for AppConfig {
             otel: OtelConfig::default(),
             rss_feeds: Vec::new(),
             dav: DavConfig::default(),
+            notifications: NotificationConfig::default(),
         }
     }
 }
@@ -458,6 +461,42 @@ fn default_poll_interval() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+/// Outbound notifications for completed, failed and disk-full events.
+///
+/// Each target is off until its URL or topic is set. Targets are read at
+/// startup, so a change takes effect after a restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NotificationConfig {
+    /// Generic webhook: each event is POSTed as a JSON document.
+    pub webhook_url: String,
+    /// Apprise API notify endpoint, for example `http://apprise:8000/notify`
+    /// or `http://apprise:8000/notify/<key>`. Empty disables Apprise.
+    pub apprise_api_url: String,
+    /// Apprise notification URLs (comma-separated) sent with each message.
+    /// Leave empty when the endpoint already carries a configuration key.
+    pub apprise_urls: String,
+    /// ntfy server base URL.
+    pub ntfy_server: String,
+    /// ntfy topic to publish to. Empty disables ntfy.
+    pub ntfy_topic: String,
+    /// Optional ntfy access token, sent as a bearer token.
+    pub ntfy_token: String,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            webhook_url: String::new(),
+            apprise_api_url: String::new(),
+            apprise_urls: String::new(),
+            ntfy_server: "https://ntfy.sh".to_string(),
+            ntfy_topic: String::new(),
+            ntfy_token: String::new(),
+        }
+    }
 }
 
 /// DAV pipeline auto-send configuration.
