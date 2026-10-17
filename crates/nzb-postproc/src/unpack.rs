@@ -1053,17 +1053,43 @@ mod tests {
     /// stored owner-only modes on what it extracts.
     #[cfg(unix)]
     fn owner_only_fake_unrar(dir: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-unrar");
-        fs::write(
+        write_script(
             &path,
             "#!/bin/sh\nfor a; do out=$a; done\nmkdir -p \"$out/Season 1\"\n\
              printf x > \"$out/Season 1/episode.mkv\"\nprintf y > \"$out/movie.mkv\"\n\
              chmod 700 \"$out/Season 1/episode.mkv\" \"$out/movie.mkv\" \"$out/Season 1\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         path
+    }
+
+    /// Writes an executable script from a child `sh`, so the open write
+    /// handle never lives in this process. Otherwise another test thread can
+    /// fork while it is open, the child inherits it, and running the script
+    /// fails with "Text file busy" (ETXTBSY).
+    #[cfg(unix)]
+    fn write_script(path: &Path, contents: &str) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("cat > \"$1\" && chmod 755 \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+        assert!(
+            child.wait().unwrap().success(),
+            "writing {}",
+            path.display()
+        );
     }
 
     #[cfg(unix)]
@@ -1160,18 +1186,15 @@ mod tests {
     /// `yes` when any argument contains the test password.
     #[cfg(unix)]
     fn fake_extractor(dir: &Path, name: &str, banner: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        fs::write(
+        write_script(
             &path,
-            format!(
+            &format!(
                 "#!/bin/sh\nif [ $# -eq 0 ]; then printf '%s\\n' '{banner}'; exit 0; fi\n\
                  secret_in_argv=no\nfor a; do case \"$a\" in *s3cr3t*) secret_in_argv=yes;; esac; out=$a; done\n\
                  {body}\n"
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         path
     }
 
