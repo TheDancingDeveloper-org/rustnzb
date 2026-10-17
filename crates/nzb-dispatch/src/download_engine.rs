@@ -1963,6 +1963,7 @@ async fn run_worker_serial(
                 &item,
                 &ctx.assembler,
                 &ctx.cancelled,
+                Some(&ctx.pinned_file_sizes),
                 primary_server,
                 worker_id,
             );
@@ -3128,6 +3129,7 @@ async fn fetch_article_with_retry(
     item: &WorkItem,
     assembler: &FileAssembler,
     cancelled: &AtomicBool,
+    pinned_file_sizes: Option<&Mutex<HashMap<String, YencSizeRange>>>,
     _server: &ServerConfig,
     worker_id: &str,
 ) -> Result<ProcessResult, ArticleError> {
@@ -3153,7 +3155,7 @@ async fn fetch_article_with_retry(
                 conn.release_body_buffer(raw_data);
                 return Err(ArticleError::Cancelled);
             }
-            let result = decode_and_assemble(item, &raw_data, assembler, None);
+            let result = decode_and_assemble(item, &raw_data, assembler, pinned_file_sizes);
             // Return the buffer to the connection's pool so the next
             // article's fetch reuses it instead of allocating fresh.
             conn.release_body_buffer(raw_data);
@@ -4075,8 +4077,10 @@ mod tests {
 
         // abort_job() flips the flag while the fetch is in flight.
         let cancelled = AtomicBool::new(true);
-        let result =
-            fetch_article_with_retry(&mut conn, &item, &assembler, &cancelled, &config, "w0").await;
+        let result = fetch_article_with_retry(
+            &mut conn, &item, &assembler, &cancelled, None, &config, "w0",
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ArticleError::Cancelled)),
@@ -4087,12 +4091,81 @@ mod tests {
 
         // Sanity: the same fetch succeeds and writes when not cancelled.
         let not_cancelled = AtomicBool::new(false);
-        let result =
-            fetch_article_with_retry(&mut conn, &item, &assembler, &not_cancelled, &config, "w0")
-                .await
-                .unwrap();
+        let result = fetch_article_with_retry(
+            &mut conn,
+            &item,
+            &assembler,
+            &not_cancelled,
+            None,
+            &config,
+            "w0",
+        )
+        .await
+        .unwrap();
         assert!(result.file_complete);
         assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn serial_fetch_bounds_undeclared_file_by_the_first_yenc_size() {
+        use nzb_nntp::testutil::{MockConfig, MockNntpServer, test_config};
+
+        // Segment 2 claims an offset past the first segment's `size=`. The
+        // pipelined path rejects it; the serial path must too.
+        let (seg1, _) = yenc_simd::encode_article(b"AAAA", "out.bin", 1, 2, 0, 8);
+        let (seg2, _) = yenc_simd::encode_article(b"BBBB", "out.bin", 2, 2, 8, 12);
+        let mut articles = HashMap::new();
+        articles.insert("seg1@test".to_string(), seg1);
+        articles.insert("seg2@test".to_string(), seg2);
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new(config.id.clone());
+        conn.connect(&config).await.unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file("j1", "f1", path.clone(), 2)
+            .unwrap();
+        let pinned = Mutex::new(HashMap::new());
+        let not_cancelled = AtomicBool::new(false);
+
+        let item1 = make_item("j1", "seg1@test", "out.bin");
+        fetch_article_with_retry(
+            &mut conn,
+            &item1,
+            &assembler,
+            &not_cancelled,
+            Some(&pinned),
+            &config,
+            "w0",
+        )
+        .await
+        .unwrap();
+
+        let item2 = make_item("j1", "seg2@test", "out.bin");
+        let result = fetch_article_with_retry(
+            &mut conn,
+            &item2,
+            &assembler,
+            &not_cancelled,
+            Some(&pinned),
+            &config,
+            "w0",
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ArticleError::DecodeError(_))),
+            "a serial segment past the first size= must be rejected, got {result:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"AAAA");
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (1, 2));
     }
 
     #[cfg(target_os = "linux")]
