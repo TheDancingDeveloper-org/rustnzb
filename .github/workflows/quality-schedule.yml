@@ -34,7 +34,9 @@ jobs:
         with:
           toolchain: nightly
       - name: Install fuzzing tooling
-        run: cargo install cargo-fuzz --locked
+        # rust-toolchain.toml pins the MSRV here; cargo-fuzz's locked deps
+        # need a newer rustc, so install with the nightly the job uses.
+        run: cargo +nightly install cargo-fuzz --locked
       - name: Run bounded fuzz targets
         working-directory: fuzz
         run: |
@@ -58,7 +60,10 @@ jobs:
       - name: Install mutation tooling
         run: cargo install cargo-mutants --locked
       - name: Mutation-test parser and decoder crates
-        run: cargo mutants --package nzb-core --package nzb-decode --timeout 60 --output .ci-artifacts/mutants
+        # cargo-mutants creates --output itself but not its parents.
+        run: |
+          mkdir -p .ci-artifacts
+          cargo mutants --package nzb-core --package nzb-decode --timeout 60 --output .ci-artifacts/mutants
       - uses: actions/upload-artifact@v4
         with:
           name: mutation-report
