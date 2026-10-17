@@ -151,6 +151,21 @@ pub async fn h_sabnzbd_api_get(
         .await;
     }
 
+    // `addlocalfile` reads an NZB from the server's disk; the read is async
+    // and then reuses the `addfile` path, so it cannot run on the blocking pool.
+    if mode == "addlocalfile" {
+        return handle_addlocalfile(
+            &state,
+            req.name.clone(),
+            req.nzbname.clone(),
+            req.cat.clone(),
+            req.priority.clone(),
+            req.password.clone(),
+            req.pp.clone(),
+        )
+        .await;
+    }
+
     // Modes read the database and the job list under their mutexes; run them
     // on a blocking thread so a slow query never stalls an async worker.
     let result = tokio::task::spawn_blocking(move || {
@@ -844,6 +859,19 @@ async fn dispatch_post(
             }
         }
 
+        "addlocalfile" => {
+            handle_addlocalfile(
+                state,
+                name,
+                query_req.nzbname,
+                cat,
+                priority,
+                password,
+                query_req.pp,
+            )
+            .await
+        }
+
         "addurl" => {
             // `value`/`url` (or `name`) is the URL to fetch, not a job name.
             let url = nzb_url.or_else(|| name.clone());
@@ -896,6 +924,98 @@ async fn dispatch_post(
             ))
         }
     }
+}
+
+fn addlocalfile_refused(error: &str) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": false, "error": error }))
+}
+
+/// `mode=addlocalfile`: enqueue an NZB already on the server's disk. `path`
+/// (SAB's `name`) must be an absolute path to a regular file. The file is
+/// read under the `addurl` size bound and then takes the `addfile` path, so
+/// category, priority, password and `nzbname` behave exactly as for uploads.
+async fn handle_addlocalfile(
+    state: &AppState,
+    path: Option<String>,
+    nzbname: Option<String>,
+    cat: Option<String>,
+    priority: Option<String>,
+    password: Option<String>,
+    pp: Option<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Reading the server's disk is only offered to clients that present the
+    // configured API key, and only for files under the directory the operator
+    // named in `local_import_dir`.
+    let config = state.config();
+    if config.general.api_key.as_deref().is_none_or(str::is_empty) {
+        return Ok(addlocalfile_refused(
+            "addlocalfile needs an API key to be configured",
+        ));
+    }
+    let Some(import_dir) = config.general.local_import_dir.as_deref() else {
+        return Ok(addlocalfile_refused(
+            "addlocalfile is disabled: local_import_dir is not configured",
+        ));
+    };
+    let Ok(import_dir) = tokio::fs::canonicalize(import_dir).await else {
+        return Ok(addlocalfile_refused("local_import_dir is not accessible"));
+    };
+
+    let path = path.unwrap_or_default();
+    let path = std::path::Path::new(path.trim());
+    if !path.is_absolute() {
+        return Ok(addlocalfile_refused(
+            "addlocalfile needs an absolute path to an NZB file",
+        ));
+    }
+    // Canonicalising resolves `..` and symlinks first, so a path that leaves
+    // the directory by either route fails the prefix check below.
+    let Ok(path) = tokio::fs::canonicalize(path).await else {
+        return Ok(addlocalfile_refused("No NZB file at the given path"));
+    };
+    if !path.starts_with(&import_dir) {
+        return Ok(addlocalfile_refused("NZB file is outside local_import_dir"));
+    }
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return Ok(addlocalfile_refused("No NZB file at the given path")),
+    };
+    if metadata.len() > MAX_ADDURL_BODY_BYTES as u64 {
+        return Ok(Json(serde_json::json!({
+            "status": false,
+            "error": format!("NZB file exceeds the {MAX_ADDURL_BODY_BYTES} byte limit")
+        })));
+    }
+    let data = match tokio::fs::read(&path).await {
+        Ok(data) => data,
+        Err(error) => {
+            return Ok(Json(serde_json::json!({
+                "status": false,
+                "error": format!("Unable to read NZB file: {error}")
+            })));
+        }
+    };
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Boxed because `dispatch_post` dispatches `addlocalfile` back here.
+    Box::pin(dispatch_post(
+        state,
+        "addfile".into(),
+        None,
+        cat,
+        priority,
+        Some((file_name, data)),
+        None,
+        password,
+        SabApiRequest {
+            nzbname,
+            pp,
+            ..SabApiRequest::default()
+        },
+    ))
+    .await
 }
 
 /// Zip entries may sit in folders; a job is named after the file alone.
@@ -991,10 +1111,7 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
 
         "rename" => handle_rename(state, req),
 
-        "change_complete_action" => {
-            // No-op stub — Sonarr/Radarr may call this but we don't support custom actions
-            Json(serde_json::json!({ "status": true }))
-        }
+        "change_complete_action" => handle_change_complete_action(state, req),
 
         "switch" => handle_switch(state, req),
 
@@ -1014,12 +1131,14 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
 
         "retry_all" => handle_retry_all(state),
 
-        // SABnzbd `_api_warnings`. RustNZB does not keep a SABnzbd-style
-        // warnings log; the only warning reported is the live disk-space
-        // hold (see `sab_warnings`). `name=clear` is accepted.
+        // SABnzbd `_api_warnings`: `name=clear` dismisses the logged
+        // warnings, anything else lists them (see `sab_warnings`).
         "warnings" => match req.name.as_deref() {
-            Some("clear") => Json(serde_json::json!({ "status": true })),
-            _ => Json(serde_json::json!({ "warnings": sab_warnings(&state.queue_manager) })),
+            Some("clear") => {
+                state.log_buffer.clear_warnings();
+                Json(serde_json::json!({ "status": true }))
+            }
+            _ => Json(serde_json::json!({ "warnings": sab_warnings(state) })),
         },
 
         _ => Json(serde_json::json!({
@@ -1068,7 +1187,7 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
     let pause_int = qm.pause_remaining_secs().unwrap_or(0).max(0).to_string();
     let (free1, total1, free1_norm) = sab_disk_space(&qm.incomplete_dir());
     let (free2, total2, free2_norm) = sab_disk_space(&qm.complete_dir());
-    let warnings = sab_warnings(qm);
+    let warnings = sab_warnings(state);
 
     Json(serde_json::json!({
         "status": {
@@ -1092,7 +1211,7 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
             "dnslookup": false,
             "downloaddir": general.incomplete_dir.to_string_lossy(),
             "downloaddirspeed": 0,
-            "finishaction": serde_json::Value::Null,
+            "finishaction": qm.queue_complete_action(),
             "folders": Vec::<String>::new(),
             "have_quota": false,
             "have_warnings": warnings.len().to_string(),
@@ -1232,7 +1351,7 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         Some("rename") => return handle_queue_rename(state, req),
         Some("purge") => return handle_queue_purge(state),
         Some("sort") => return handle_queue_sort(state, req),
-        Some("change_complete_action") => return Json(serde_json::json!({ "status": true })),
+        Some("change_complete_action") => return handle_change_complete_action(state, req),
         _ => {}
     }
 
@@ -1257,17 +1376,37 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     queue["diskspace2"] = free2.into();
     queue["diskspacetotal2"] = total2.into();
     queue["diskspace2_norm"] = free2_norm.into();
-    queue["have_warnings"] = sab_warnings(qm).len().to_string().into();
+    queue["have_warnings"] = sab_warnings(state).len().to_string().into();
     Json(response)
 }
 
+/// SABnzbd `change_complete_action`: `value` is the action run once the queue
+/// finishes. RustNZB runs `script_<name>` from its scripts directory; other
+/// actions are refused with an error rather than accepted and ignored.
+fn handle_change_complete_action(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    match state
+        .queue_manager
+        .set_queue_complete_action(req.value.as_deref())
+    {
+        Ok(()) => Json(serde_json::json!({ "status": true })),
+        Err(error) => Json(serde_json::json!({ "status": false, "error": error })),
+    }
+}
+
+/// Most warnings `mode=warnings` lists at once.
+const SAB_WARNINGS_LIMIT: usize = 100;
+
 /// SABnzbd-shaped warnings (`GUIHandler` entries: `type`, `text`, `time`).
 ///
-/// SABnzbd logs "Too little diskspace forcing PAUSE" when its free-space
-/// check pauses the downloader; RustNZB reports the equivalent warning for
-/// as long as its disk-space guard is holding downloads.
-fn sab_warnings(qm: &crate::queue_manager::QueueManager) -> Vec<serde_json::Value> {
-    qm.disk_space_hold_since()
+/// The live disk-space hold comes first: SABnzbd logs "Too little diskspace
+/// forcing PAUSE" when its free-space check pauses the downloader, and
+/// RustNZB reports the same warning for as long as its guard holds downloads.
+/// Then follow the WARN and ERROR log entries that `clear` has not dismissed,
+/// newest first.
+fn sab_warnings(state: &AppState) -> Vec<serde_json::Value> {
+    let qm = &state.queue_manager;
+    let hold = qm
+        .disk_space_hold_since()
         .filter(|_| qm.is_paused())
         .map(|since| {
             serde_json::json!({
@@ -1275,8 +1414,26 @@ fn sab_warnings(qm: &crate::queue_manager::QueueManager) -> Vec<serde_json::Valu
                 "text": "Too little diskspace forcing PAUSE",
                 "time": since.timestamp(),
             })
-        })
+        });
+    let logged = state
+        .log_buffer
+        .warnings(SAB_WARNINGS_LIMIT)
         .into_iter()
+        .map(|entry| {
+            let kind = if entry.level.eq_ignore_ascii_case("ERROR") {
+                "ERROR"
+            } else {
+                "WARNING"
+            };
+            serde_json::json!({
+                "type": kind,
+                "text": entry.message,
+                "time": entry.timestamp.timestamp(),
+            })
+        });
+    hold.into_iter()
+        .chain(logged)
+        .take(SAB_WARNINGS_LIMIT)
         .collect()
 }
 
@@ -3022,8 +3179,10 @@ mod tests {
     use arc_swap::ArcSwap;
     use chrono::TimeZone;
 
+    use tracing_subscriber::layer::SubscriberExt;
+
     use crate::auth::{CredentialStore, TokenStore};
-    use crate::log_buffer::LogBuffer;
+    use crate::log_buffer::{LogBuffer, LogBufferLayer};
     use crate::nzb_core::config::{AppConfig, CategoryConfig};
     use crate::nzb_core::db::Database;
     use crate::queue_manager::QueueManager;
@@ -4418,6 +4577,167 @@ mod tests {
         assert!(malformed["error"].is_string());
     }
 
+    /// Point `local_import_dir` at `dir` in the live config.
+    fn set_local_import_dir(test_state: &TestState, dir: Option<&Path>) {
+        let mut config = (*test_state.state.config()).clone();
+        config.general.local_import_dir = dir.map(Path::to_path_buf);
+        test_state.state.config.store(Arc::new(config));
+    }
+
+    async fn addlocalfile_value(test_state: &TestState, path: &str) -> serde_json::Value {
+        handle_addlocalfile(
+            &test_state.state,
+            Some(path.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("addlocalfile response")
+        .0
+    }
+
+    /// `addlocalfile` enqueues an absolute-path NZB from `local_import_dir`
+    /// the same way an upload is, and refuses relative paths, missing files
+    /// and the directory itself.
+    #[tokio::test]
+    async fn addlocalfile_enqueues_an_nzb_from_the_import_dir() {
+        let test_state = test_state();
+        let dir = tempfile::tempdir().expect("local NZB tempdir");
+        let path = dir.path().join("local-release.nzb");
+        std::fs::write(&path, SAMPLE_NZB).expect("write local NZB");
+        set_local_import_dir(&test_state, Some(dir.path()));
+
+        let response = addlocalfile_value(&test_state, &path.to_string_lossy()).await;
+        assert_eq!(
+            response["status"],
+            serde_json::json!(true),
+            "resp={response}"
+        );
+        assert!(
+            response["nzo_ids"][0]
+                .as_str()
+                .is_some_and(|id| id.starts_with("SABnzbd_nzo_")),
+            "resp={response}"
+        );
+        assert_eq!(queued_names(&test_state), vec!["local-release".to_string()]);
+
+        for name in [
+            "local-release.nzb".to_string(),
+            dir.path()
+                .join("missing.nzb")
+                .to_string_lossy()
+                .into_owned(),
+            dir.path().to_string_lossy().into_owned(),
+        ] {
+            let refused = addlocalfile_value(&test_state, &name).await;
+            assert_eq!(
+                refused["status"],
+                serde_json::json!(false),
+                "resp={refused}"
+            );
+            assert!(refused["error"].is_string(), "resp={refused}");
+        }
+        assert_eq!(queued_names(&test_state).len(), 1);
+    }
+
+    /// Files outside the import directory are refused, whether named directly
+    /// or reached through `..` in the path.
+    #[tokio::test]
+    async fn addlocalfile_refuses_paths_outside_the_import_dir() {
+        let test_state = test_state();
+        let root = tempfile::tempdir().expect("root tempdir");
+        let import = root.path().join("import");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&import).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.nzb"), SAMPLE_NZB).unwrap();
+        set_local_import_dir(&test_state, Some(&import));
+
+        let direct =
+            addlocalfile_value(&test_state, &outside.join("secret.nzb").to_string_lossy()).await;
+        assert_eq!(direct["status"], serde_json::json!(false), "resp={direct}");
+        assert!(
+            direct["error"]
+                .as_str()
+                .unwrap()
+                .contains("outside local_import_dir"),
+            "resp={direct}"
+        );
+
+        let traversal = addlocalfile_value(
+            &test_state,
+            &import.join("../outside/secret.nzb").to_string_lossy(),
+        )
+        .await;
+        assert_eq!(
+            traversal["status"],
+            serde_json::json!(false),
+            "resp={traversal}"
+        );
+        assert!(queued_names(&test_state).is_empty());
+    }
+
+    /// A symlink inside the import directory that points outside it is
+    /// refused: the canonical target is what gets checked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn addlocalfile_refuses_symlinks_that_leave_the_import_dir() {
+        let test_state = test_state();
+        let root = tempfile::tempdir().expect("root tempdir");
+        let import = root.path().join("import");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&import).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.nzb"), SAMPLE_NZB).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.nzb"), import.join("link.nzb")).unwrap();
+        set_local_import_dir(&test_state, Some(&import));
+
+        let linked =
+            addlocalfile_value(&test_state, &import.join("link.nzb").to_string_lossy()).await;
+        assert_eq!(linked["status"], serde_json::json!(false), "resp={linked}");
+        assert!(queued_names(&test_state).is_empty());
+    }
+
+    /// `addlocalfile` is refused when no import directory is configured, and
+    /// when no API key is configured, even with an import directory set.
+    #[tokio::test]
+    async fn addlocalfile_is_refused_without_import_dir_or_api_key() {
+        let test_state = test_state();
+        let dir = tempfile::tempdir().expect("local NZB tempdir");
+        let path = dir.path().join("local-release.nzb");
+        std::fs::write(&path, SAMPLE_NZB).unwrap();
+        let path = path.to_string_lossy().into_owned();
+
+        let unset = addlocalfile_value(&test_state, &path).await;
+        assert_eq!(unset["status"], serde_json::json!(false), "resp={unset}");
+        assert!(
+            unset["error"]
+                .as_str()
+                .unwrap()
+                .contains("local_import_dir"),
+            "resp={unset}"
+        );
+
+        set_local_import_dir(&test_state, Some(dir.path()));
+        let mut config = (*test_state.state.config()).clone();
+        config.general.api_key = None;
+        test_state.state.config.store(Arc::new(config));
+        let keyless = addlocalfile_value(&test_state, &path).await;
+        assert_eq!(
+            keyless["status"],
+            serde_json::json!(false),
+            "resp={keyless}"
+        );
+        assert!(
+            keyless["error"].as_str().unwrap().contains("API key"),
+            "resp={keyless}"
+        );
+        assert!(queued_names(&test_state).is_empty());
+    }
+
     /// SABnzbd's PAUSED_PRIORITY (-2) adds the job paused rather than at a
     /// queue priority; the slot keeps reporting a normal priority.
     #[tokio::test]
@@ -5001,6 +5321,101 @@ mod tests {
         };
         let cleared = dispatch_mode(&test_state.state, "warnings", &clear).0;
         assert_eq!(cleared, serde_json::json!({ "status": true }));
+    }
+
+    /// `change_complete_action` takes `script_<name>` from the scripts
+    /// directory, reports it as `finishaction`, refuses power actions, and an
+    /// empty value clears it (both the mode and the `queue` sub-command).
+    #[tokio::test]
+    async fn change_complete_action_sets_and_reports_queue_script() {
+        let test_state = test_state();
+        let scripts = tempfile::tempdir().expect("scripts tempdir");
+        std::fs::write(scripts.path().join("done.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        test_state.state.queue_manager.set_postproc_scripts(
+            Some(scripts.path().to_path_buf()),
+            None,
+            None,
+            5,
+            4096,
+        );
+        let with_value = |value: &str| SabApiRequest {
+            value: Some(value.into()),
+            ..SabApiRequest::default()
+        };
+
+        let refused = dispatch_mode(
+            &test_state.state,
+            "change_complete_action",
+            &with_value("shutdown_pc"),
+        )
+        .0;
+        assert_eq!(refused["status"], false, "resp={refused}");
+        let accepted = dispatch_mode(
+            &test_state.state,
+            "change_complete_action",
+            &with_value("script_done.sh"),
+        )
+        .0;
+        assert_eq!(accepted, serde_json::json!({ "status": true }));
+        let fullstatus =
+            dispatch_mode(&test_state.state, "fullstatus", &SabApiRequest::default()).0;
+        assert_eq!(fullstatus["status"]["finishaction"], "script_done.sh");
+
+        let cleared = SabApiRequest {
+            name: Some("change_complete_action".into()),
+            ..with_value("")
+        };
+        let queue = dispatch_mode(&test_state.state, "queue", &cleared).0;
+        assert_eq!(queue, serde_json::json!({ "status": true }));
+        let fullstatus =
+            dispatch_mode(&test_state.state, "fullstatus", &SabApiRequest::default()).0;
+        assert!(
+            fullstatus["status"]["finishaction"].is_null(),
+            "resp={fullstatus}"
+        );
+    }
+
+    /// Logged WARN and ERROR events are listed (newest first) with SAB's
+    /// `type`/`text`/`time` shape, INFO is not, and `name=clear` dismisses
+    /// what was logged so far while later warnings are reported again.
+    #[tokio::test]
+    async fn warnings_mode_lists_logged_warnings_until_cleared() {
+        let test_state = test_state();
+        let subscriber = tracing_subscriber::registry()
+            .with(LogBufferLayer::new(test_state.state.log_buffer.clone()));
+        let dispatch = tracing::Dispatch::new(subscriber);
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::info!("routine progress");
+            tracing::warn!("first problem");
+            tracing::error!("second problem");
+        });
+
+        let list = dispatch_mode(&test_state.state, "warnings", &SabApiRequest::default()).0;
+        let warnings = list["warnings"].as_array().expect("warnings list");
+        assert_eq!(warnings.len(), 2, "resp={list}");
+        assert_eq!(warnings[0]["type"], "ERROR");
+        assert_eq!(warnings[0]["text"], "second problem");
+        assert_eq!(warnings[1]["type"], "WARNING");
+        assert_eq!(warnings[1]["text"], "first problem");
+        assert!(warnings[1]["time"].as_i64().is_some(), "resp={list}");
+
+        let clear = SabApiRequest {
+            name: Some("clear".into()),
+            ..SabApiRequest::default()
+        };
+        let cleared = dispatch_mode(&test_state.state, "warnings", &clear).0;
+        assert_eq!(cleared, serde_json::json!({ "status": true }));
+        let after_clear = dispatch_mode(&test_state.state, "warnings", &SabApiRequest::default()).0;
+        assert_eq!(after_clear["warnings"], serde_json::json!([]));
+        let queue = dispatch_mode(&test_state.state, "queue", &SabApiRequest::default()).0;
+        assert_eq!(queue["queue"]["have_warnings"], "0");
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::warn!("third problem");
+        });
+        let relisted = dispatch_mode(&test_state.state, "warnings", &SabApiRequest::default()).0;
+        assert_eq!(relisted["warnings"][0]["text"], "third problem");
+        assert_eq!(relisted["warnings"].as_array().unwrap().len(), 1);
     }
 
     /// SABnzbd's real `_api_queue_delete` accepts a comma-separated `value`
