@@ -7,7 +7,7 @@ import { ApiService } from '../../core/services/api.service';
 import { HistoryEntry, StatusResponse } from '../../core/models/queue.model';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
-import { showHttpError } from '../../core/http/http-error';
+import { httpErrorMessage, showHttpError } from '../../core/http/http-error';
 
 type StatusFilter = 'all' | 'completed' | 'failed';
 type TimeFilter = '7d' | '30d' | 'all';
@@ -229,6 +229,13 @@ const EXPORT_PAGE_SIZE = 200;
               <tr>
                 <td colspan="8" class="empty-cell">Loading…</td>
               </tr>
+            } @else if (loadError()) {
+              <tr>
+                <td colspan="8" class="empty-cell error-cell" role="alert">
+                  {{ loadError() }}
+                  <button class="row-action" (click)="load()">Retry</button>
+                </td>
+              </tr>
             } @else if (filteredEntries().length === 0) {
               <tr>
                 <td colspan="8" class="empty-cell">
@@ -270,6 +277,8 @@ const EXPORT_PAGE_SIZE = 200;
       text-align: center; padding: 36px 20px !important;
       color: var(--mute); font-size: 13px;
     }
+    .error-cell { color: var(--danger); }
+    .error-cell .row-action { margin-left: 10px; }
     .row-action.media { color: var(--accent, #7c6af7); border-color: var(--accent, #7c6af7); }
     .actions-cell {
       white-space: nowrap;
@@ -313,6 +322,8 @@ const EXPORT_PAGE_SIZE = 200;
 })
 export class HistoryViewComponent implements OnInit, OnDestroy {
   loading = signal(true);
+  /** Set when the last history fetch failed; the table shows it with a Retry. */
+  loadError = signal<string | null>(null);
   /** The current page of entries, already filtered by the server. */
   entries = signal<HistoryEntry[]>([]);
   /** Entries matching the filters across all pages. */
@@ -385,9 +396,14 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
         this.total.set(total);
         this.categories.set(r.categories ?? null);
         this.stats.set(r.stats ?? null);
+        this.loadError.set(null);
         this.loading.set(false);
       },
-      error: () => this.loading.set(false),
+      error: err => {
+        if (seq !== this.loadSeq) return;
+        this.loadError.set(httpErrorMessage(err, "Couldn't load download history"));
+        this.loading.set(false);
+      },
     });
   }
 
@@ -448,7 +464,10 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
         this.selectedEntry.set(detail);
         this.detailLoading.set(false);
       },
-      error: () => this.detailLoading.set(false),
+      error: err => {
+        this.detailLoading.set(false);
+        showHttpError(this.snack, err, 'Failed to load download details');
+      },
     });
   }
 
