@@ -926,6 +926,10 @@ async fn dispatch_post(
     }
 }
 
+fn addlocalfile_refused(error: &str) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": false, "error": error }))
+}
+
 /// `mode=addlocalfile`: enqueue an NZB already on the server's disk. `path`
 /// (SAB's `name`) must be an absolute path to a regular file. The file is
 /// read under the `addurl` size bound and then takes the `addfile` path, so
@@ -939,22 +943,42 @@ async fn handle_addlocalfile(
     password: Option<String>,
     pp: Option<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Reading the server's disk is only offered to clients that present the
+    // configured API key, and only for files under the directory the operator
+    // named in `local_import_dir`.
+    let config = state.config();
+    if config.general.api_key.as_deref().is_none_or(str::is_empty) {
+        return Ok(addlocalfile_refused(
+            "addlocalfile needs an API key to be configured",
+        ));
+    }
+    let Some(import_dir) = config.general.local_import_dir.as_deref() else {
+        return Ok(addlocalfile_refused(
+            "addlocalfile is disabled: local_import_dir is not configured",
+        ));
+    };
+    let Ok(import_dir) = tokio::fs::canonicalize(import_dir).await else {
+        return Ok(addlocalfile_refused("local_import_dir is not accessible"));
+    };
+
     let path = path.unwrap_or_default();
     let path = std::path::Path::new(path.trim());
     if !path.is_absolute() {
-        return Ok(Json(serde_json::json!({
-            "status": false,
-            "error": "addlocalfile needs an absolute path to an NZB file"
-        })));
+        return Ok(addlocalfile_refused(
+            "addlocalfile needs an absolute path to an NZB file",
+        ));
     }
-    let metadata = match tokio::fs::metadata(path).await {
+    // Canonicalising resolves `..` and symlinks first, so a path that leaves
+    // the directory by either route fails the prefix check below.
+    let Ok(path) = tokio::fs::canonicalize(path).await else {
+        return Ok(addlocalfile_refused("No NZB file at the given path"));
+    };
+    if !path.starts_with(&import_dir) {
+        return Ok(addlocalfile_refused("NZB file is outside local_import_dir"));
+    }
+    let metadata = match tokio::fs::metadata(&path).await {
         Ok(metadata) if metadata.is_file() => metadata,
-        _ => {
-            return Ok(Json(serde_json::json!({
-                "status": false,
-                "error": "No NZB file at the given path"
-            })));
-        }
+        _ => return Ok(addlocalfile_refused("No NZB file at the given path")),
     };
     if metadata.len() > MAX_ADDURL_BODY_BYTES as u64 {
         return Ok(Json(serde_json::json!({
@@ -962,7 +986,7 @@ async fn handle_addlocalfile(
             "error": format!("NZB file exceeds the {MAX_ADDURL_BODY_BYTES} byte limit")
         })));
     }
-    let data = match tokio::fs::read(path).await {
+    let data = match tokio::fs::read(&path).await {
         Ok(data) => data,
         Err(error) => {
             return Ok(Json(serde_json::json!({
@@ -4553,18 +4577,17 @@ mod tests {
         assert!(malformed["error"].is_string());
     }
 
-    /// `addlocalfile` enqueues an absolute-path NZB the same way an upload
-    /// is, and refuses relative paths and paths that are not regular files.
-    #[tokio::test]
-    async fn addlocalfile_enqueues_an_nzb_from_disk() {
-        let test_state = test_state();
-        let dir = tempfile::tempdir().expect("local NZB tempdir");
-        let path = dir.path().join("local-release.nzb");
-        std::fs::write(&path, SAMPLE_NZB).expect("write local NZB");
+    /// Point `local_import_dir` at `dir` in the live config.
+    fn set_local_import_dir(test_state: &TestState, dir: Option<&Path>) {
+        let mut config = (*test_state.state.config()).clone();
+        config.general.local_import_dir = dir.map(Path::to_path_buf);
+        test_state.state.config.store(Arc::new(config));
+    }
 
-        let response = handle_addlocalfile(
+    async fn addlocalfile_value(test_state: &TestState, path: &str) -> serde_json::Value {
+        handle_addlocalfile(
             &test_state.state,
-            Some(path.to_string_lossy().into_owned()),
+            Some(path.to_string()),
             None,
             None,
             None,
@@ -4573,7 +4596,21 @@ mod tests {
         )
         .await
         .expect("addlocalfile response")
-        .0;
+        .0
+    }
+
+    /// `addlocalfile` enqueues an absolute-path NZB from `local_import_dir`
+    /// the same way an upload is, and refuses relative paths, missing files
+    /// and the directory itself.
+    #[tokio::test]
+    async fn addlocalfile_enqueues_an_nzb_from_the_import_dir() {
+        let test_state = test_state();
+        let dir = tempfile::tempdir().expect("local NZB tempdir");
+        let path = dir.path().join("local-release.nzb");
+        std::fs::write(&path, SAMPLE_NZB).expect("write local NZB");
+        set_local_import_dir(&test_state, Some(dir.path()));
+
+        let response = addlocalfile_value(&test_state, &path.to_string_lossy()).await;
         assert_eq!(
             response["status"],
             serde_json::json!(true),
@@ -4595,11 +4632,7 @@ mod tests {
                 .into_owned(),
             dir.path().to_string_lossy().into_owned(),
         ] {
-            let refused =
-                handle_addlocalfile(&test_state.state, Some(name), None, None, None, None, None)
-                    .await
-                    .expect("addlocalfile response")
-                    .0;
+            let refused = addlocalfile_value(&test_state, &name).await;
             assert_eq!(
                 refused["status"],
                 serde_json::json!(false),
@@ -4608,6 +4641,101 @@ mod tests {
             assert!(refused["error"].is_string(), "resp={refused}");
         }
         assert_eq!(queued_names(&test_state).len(), 1);
+    }
+
+    /// Files outside the import directory are refused, whether named directly
+    /// or reached through `..` in the path.
+    #[tokio::test]
+    async fn addlocalfile_refuses_paths_outside_the_import_dir() {
+        let test_state = test_state();
+        let root = tempfile::tempdir().expect("root tempdir");
+        let import = root.path().join("import");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&import).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.nzb"), SAMPLE_NZB).unwrap();
+        set_local_import_dir(&test_state, Some(&import));
+
+        let direct =
+            addlocalfile_value(&test_state, &outside.join("secret.nzb").to_string_lossy()).await;
+        assert_eq!(direct["status"], serde_json::json!(false), "resp={direct}");
+        assert!(
+            direct["error"]
+                .as_str()
+                .unwrap()
+                .contains("outside local_import_dir"),
+            "resp={direct}"
+        );
+
+        let traversal = addlocalfile_value(
+            &test_state,
+            &import.join("../outside/secret.nzb").to_string_lossy(),
+        )
+        .await;
+        assert_eq!(
+            traversal["status"],
+            serde_json::json!(false),
+            "resp={traversal}"
+        );
+        assert!(queued_names(&test_state).is_empty());
+    }
+
+    /// A symlink inside the import directory that points outside it is
+    /// refused: the canonical target is what gets checked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn addlocalfile_refuses_symlinks_that_leave_the_import_dir() {
+        let test_state = test_state();
+        let root = tempfile::tempdir().expect("root tempdir");
+        let import = root.path().join("import");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&import).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.nzb"), SAMPLE_NZB).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.nzb"), import.join("link.nzb")).unwrap();
+        set_local_import_dir(&test_state, Some(&import));
+
+        let linked =
+            addlocalfile_value(&test_state, &import.join("link.nzb").to_string_lossy()).await;
+        assert_eq!(linked["status"], serde_json::json!(false), "resp={linked}");
+        assert!(queued_names(&test_state).is_empty());
+    }
+
+    /// `addlocalfile` is refused when no import directory is configured, and
+    /// when no API key is configured, even with an import directory set.
+    #[tokio::test]
+    async fn addlocalfile_is_refused_without_import_dir_or_api_key() {
+        let test_state = test_state();
+        let dir = tempfile::tempdir().expect("local NZB tempdir");
+        let path = dir.path().join("local-release.nzb");
+        std::fs::write(&path, SAMPLE_NZB).unwrap();
+        let path = path.to_string_lossy().into_owned();
+
+        let unset = addlocalfile_value(&test_state, &path).await;
+        assert_eq!(unset["status"], serde_json::json!(false), "resp={unset}");
+        assert!(
+            unset["error"]
+                .as_str()
+                .unwrap()
+                .contains("local_import_dir"),
+            "resp={unset}"
+        );
+
+        set_local_import_dir(&test_state, Some(dir.path()));
+        let mut config = (*test_state.state.config()).clone();
+        config.general.api_key = None;
+        test_state.state.config.store(Arc::new(config));
+        let keyless = addlocalfile_value(&test_state, &path).await;
+        assert_eq!(
+            keyless["status"],
+            serde_json::json!(false),
+            "resp={keyless}"
+        );
+        assert!(
+            keyless["error"].as_str().unwrap().contains("API key"),
+            "resp={keyless}"
+        );
+        assert!(queued_names(&test_state).is_empty());
     }
 
     /// SABnzbd's PAUSED_PRIORITY (-2) adds the job paused rather than at a

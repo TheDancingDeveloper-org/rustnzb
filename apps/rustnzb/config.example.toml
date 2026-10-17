@@ -42,6 +42,9 @@ max_nested_archive_depth = 5  # 0=outer archive only; protects against unbounded
 # category, group, status code 0-3, URL) plus SAB_* and NZBPP_* environment variables.
 # SABnzbd's change_complete_action can name a script_<name> from scripts_dir to run
 # once the queue drains; power actions are refused.
+# queue_complete_pers = false    # keep change_complete_action after it runs once (SABnzbd default: reset)
+# SABnzbd addlocalfile reads NZBs only from this directory, and only with an API key set.
+# local_import_dir = "/data/nzb-import"
 # scripts_dir = "/data/scripts"
 # script_success = "on-success.sh"
 # script_failure = "on-failure.sh"

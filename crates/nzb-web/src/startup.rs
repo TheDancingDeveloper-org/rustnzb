@@ -363,6 +363,7 @@ pub async fn initialize(
         config.general.script_max_output_bytes,
     );
     queue_manager.set_notifications(&config.notifications);
+    queue_manager.set_queue_complete_persist(config.general.queue_complete_pers);
 
     // Restore any in-progress jobs from the database
     if let Err(e) = queue_manager.restore_from_db() {
