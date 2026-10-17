@@ -38,6 +38,11 @@ export function isBareRoute(url: string): boolean {
 
 const MIB = 1024 * 1024;
 
+// Width of the header menus. The CSS sets the same width (border-box), so the
+// viewport clamp in anchorMenu() matches what is actually rendered.
+export const MENU_WIDTH = 240;
+const VIEWPORT_GUTTER = 8;
+
 // Browser-tab name for each page. The legacy /queue and /history paths keep the
 // tab names they had, so a bookmarked tab still reads the same.
 const PAGE_TITLES: Record<string, string> = {
@@ -469,6 +474,9 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
       .pause-menu,
       .speed-menu {
         position: fixed;
+        box-sizing: border-box;
+        width: 240px; /* MENU_WIDTH in TS: keep in step */
+        max-width: calc(100vw - 16px);
         background: var(--panel);
         border: 1px solid var(--line);
         border-radius: 6px;
@@ -706,11 +714,11 @@ export class App implements OnInit, OnDestroy {
   /** Place a fixed menu just below its trigger, kept inside the viewport. */
   private anchorMenu(trigger: HTMLElement): void {
     const r = trigger.getBoundingClientRect();
-    const maxLeft = Math.max(8, window.innerWidth - 220);
+    const maxLeft = Math.max(VIEWPORT_GUTTER, window.innerWidth - MENU_WIDTH - VIEWPORT_GUTTER);
     this.menuAnchor = {
       top: r.bottom + 4,
-      left: Math.min(Math.max(8, r.left), maxLeft),
-      right: Math.max(8, window.innerWidth - r.right),
+      left: Math.min(Math.max(VIEWPORT_GUTTER, r.left), maxLeft),
+      right: Math.max(VIEWPORT_GUTTER, window.innerWidth - r.right),
     };
   }
 
