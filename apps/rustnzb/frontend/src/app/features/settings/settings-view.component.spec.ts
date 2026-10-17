@@ -32,8 +32,9 @@ function makeComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {})
   const snack = { open: vi.fn() };
   const confirm = { confirm: vi.fn(() => of(true)) };
   const theme = { set: vi.fn() };
+  const notifications = { enabled: vi.fn(() => false), supported: true, permission: vi.fn(() => 'default'), setEnabled: vi.fn() };
   return {
-    component: new SettingsViewComponent(api as unknown as ApiService, snack as never, confirm as never, theme as never),
+    component: new SettingsViewComponent(api as unknown as ApiService, snack as never, confirm as never, theme as never, notifications as never),
     api,
     snack,
     confirm,

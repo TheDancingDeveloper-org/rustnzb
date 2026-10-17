@@ -9,6 +9,7 @@ import { StatusResponse } from '../../core/models/queue.model';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
 import { AppTheme, ThemeService } from '../../core/services/theme.service';
+import { BrowserNotificationsService } from '../../core/services/browser-notifications.service';
 import { httpErrorMessage, showHttpError } from '../../core/http/http-error';
 
 interface ServerConfig {
@@ -954,6 +955,34 @@ function emptyCategory(): CategoryConfig {
           </div>
 
           <div class="panel">
+            <h3>Browser notifications</h3>
+            <div class="body">
+              <div class="form">
+                <label>Desktop alerts</label>
+                <div class="inline">
+                  <label class="toggle">
+                    <input
+                      type="checkbox"
+                      [checked]="notifications.enabled()"
+                      [disabled]="!notifications.supported"
+                      (change)="toggleNotifications($event)"
+                    />
+                    <span>Alert when a download completes or fails, or downloads pause for low disk space</span>
+                  </label>
+                </div>
+                <div class="dim">
+                  Stored in this browser only. Alerts appear while this tab is in the background.
+                  @if (!notifications.supported) {
+                    This browser does not support notifications.
+                  } @else if (notifications.permission() === 'denied') {
+                    The browser is blocking notifications for this site.
+                  }
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
             <h3>Speed &amp; concurrency</h3>
             <div class="body">
               <div class="form">
@@ -1555,6 +1584,7 @@ export class SettingsViewComponent implements OnInit {
     private snack: MatSnackBar,
     private confirmSvc: ConfirmService,
     public readonly theme: ThemeService,
+    public readonly notifications: BrowserNotificationsService,
   ) {}
 
   ngOnInit(): void {
@@ -1852,6 +1882,21 @@ export class SettingsViewComponent implements OnInit {
   }
 
   // ======================== GENERAL ========================
+
+  async toggleNotifications(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const on = await this.notifications.setEnabled(input.checked);
+    if (input.checked && !on) {
+      input.checked = false;
+      this.snack.open(
+        this.notifications.supported
+          ? 'Notifications are blocked. Allow them for this site in the browser settings.'
+          : 'This browser does not support notifications.',
+        'OK',
+        { duration: 6000 },
+      );
+    }
+  }
 
   setTheme(theme: AppTheme): void {
     this.theme.set(theme);
