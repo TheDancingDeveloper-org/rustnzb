@@ -2622,6 +2622,23 @@ pub async fn h_health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
 }
 
+/// GET /api/ready -- Readiness probe. The engine is initialised before the
+/// listener binds, so this is 200 whenever the process is serving, and 503
+/// once shutdown has begun, so a load balancer stops routing new requests.
+pub async fn h_ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    if state
+        .shutting_down
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "shutting_down"})),
+        )
+    } else {
+        (StatusCode::OK, Json(serde_json::json!({"status": "ready"})))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Directory browser
 // ---------------------------------------------------------------------------
