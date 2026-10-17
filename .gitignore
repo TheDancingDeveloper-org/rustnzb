@@ -27,3 +27,6 @@ e2e/mock-auth-state.json
 
 # Codesight
 .codesight/
+
+# Operator-specific compose (host paths, logging sidecar). Not tracked.
+docker-compose.local.yml
