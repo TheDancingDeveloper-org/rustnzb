@@ -25,6 +25,7 @@ anyhow = "1"
 tracing = "0.1"
 parking_lot = "0.12"
 quick-xml = "0.41"
+regex = { workspace = true }
 unicode-normalization = "0.1"
 
 [dev-dependencies]
