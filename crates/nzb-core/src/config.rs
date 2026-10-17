@@ -173,6 +173,15 @@ pub struct GeneralConfig {
     /// name or content digest: `allow`, `warn` (default) or `skip`.
     #[serde(default)]
     pub duplicate_policy: DuplicatePolicy,
+    /// Directory that SABnzbd `addlocalfile` may read NZBs from. Unset refuses
+    /// the mode; a file outside this directory (after resolving symlinks and
+    /// `..`) is refused too.
+    #[serde(default)]
+    pub local_import_dir: Option<PathBuf>,
+    /// Keep the SABnzbd `change_complete_action` after it has run once. When
+    /// false (SABnzbd's default) the action is reset after each run.
+    #[serde(default)]
+    pub queue_complete_pers: bool,
     /// Optional directory containing post-processing scripts.
     #[serde(default)]
     pub scripts_dir: Option<PathBuf>,
@@ -302,6 +311,8 @@ impl Default for GeneralConfig {
             auto_sort_remaining_pct: false,
             duplicate_policy: DuplicatePolicy::Warn,
             rss_downloaded_item_expiry_days: None,
+            local_import_dir: None,
+            queue_complete_pers: false,
             scripts_dir: None,
             script_success: None,
             script_failure: None,
