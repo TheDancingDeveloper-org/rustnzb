@@ -151,6 +151,21 @@ pub async fn h_sabnzbd_api_get(
         .await;
     }
 
+    // `addlocalfile` reads an NZB from the server's disk; the read is async
+    // and then reuses the `addfile` path, so it cannot run on the blocking pool.
+    if mode == "addlocalfile" {
+        return handle_addlocalfile(
+            &state,
+            req.name.clone(),
+            req.nzbname.clone(),
+            req.cat.clone(),
+            req.priority.clone(),
+            req.password.clone(),
+            req.pp.clone(),
+        )
+        .await;
+    }
+
     // Modes read the database and the job list under their mutexes; run them
     // on a blocking thread so a slow query never stalls an async worker.
     let result = tokio::task::spawn_blocking(move || {
@@ -844,6 +859,19 @@ async fn dispatch_post(
             }
         }
 
+        "addlocalfile" => {
+            handle_addlocalfile(
+                state,
+                name,
+                query_req.nzbname,
+                cat,
+                priority,
+                password,
+                query_req.pp,
+            )
+            .await
+        }
+
         "addurl" => {
             // `value`/`url` (or `name`) is the URL to fetch, not a job name.
             let url = nzb_url.or_else(|| name.clone());
@@ -896,6 +924,74 @@ async fn dispatch_post(
             ))
         }
     }
+}
+
+/// `mode=addlocalfile`: enqueue an NZB already on the server's disk. `path`
+/// (SAB's `name`) must be an absolute path to a regular file. The file is
+/// read under the `addurl` size bound and then takes the `addfile` path, so
+/// category, priority, password and `nzbname` behave exactly as for uploads.
+async fn handle_addlocalfile(
+    state: &AppState,
+    path: Option<String>,
+    nzbname: Option<String>,
+    cat: Option<String>,
+    priority: Option<String>,
+    password: Option<String>,
+    pp: Option<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let path = path.unwrap_or_default();
+    let path = std::path::Path::new(path.trim());
+    if !path.is_absolute() {
+        return Ok(Json(serde_json::json!({
+            "status": false,
+            "error": "addlocalfile needs an absolute path to an NZB file"
+        })));
+    }
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => {
+            return Ok(Json(serde_json::json!({
+                "status": false,
+                "error": "No NZB file at the given path"
+            })));
+        }
+    };
+    if metadata.len() > MAX_ADDURL_BODY_BYTES as u64 {
+        return Ok(Json(serde_json::json!({
+            "status": false,
+            "error": format!("NZB file exceeds the {MAX_ADDURL_BODY_BYTES} byte limit")
+        })));
+    }
+    let data = match tokio::fs::read(path).await {
+        Ok(data) => data,
+        Err(error) => {
+            return Ok(Json(serde_json::json!({
+                "status": false,
+                "error": format!("Unable to read NZB file: {error}")
+            })));
+        }
+    };
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Boxed because `dispatch_post` dispatches `addlocalfile` back here.
+    Box::pin(dispatch_post(
+        state,
+        "addfile".into(),
+        None,
+        cat,
+        priority,
+        Some((file_name, data)),
+        None,
+        password,
+        SabApiRequest {
+            nzbname,
+            pp,
+            ..SabApiRequest::default()
+        },
+    ))
+    .await
 }
 
 /// Zip entries may sit in folders; a job is named after the file alone.
@@ -1014,12 +1110,14 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
 
         "retry_all" => handle_retry_all(state),
 
-        // SABnzbd `_api_warnings`. RustNZB does not keep a SABnzbd-style
-        // warnings log; the only warning reported is the live disk-space
-        // hold (see `sab_warnings`). `name=clear` is accepted.
+        // SABnzbd `_api_warnings`: `name=clear` dismisses the logged
+        // warnings, anything else lists them (see `sab_warnings`).
         "warnings" => match req.name.as_deref() {
-            Some("clear") => Json(serde_json::json!({ "status": true })),
-            _ => Json(serde_json::json!({ "warnings": sab_warnings(&state.queue_manager) })),
+            Some("clear") => {
+                state.log_buffer.clear_warnings();
+                Json(serde_json::json!({ "status": true }))
+            }
+            _ => Json(serde_json::json!({ "warnings": sab_warnings(state) })),
         },
 
         _ => Json(serde_json::json!({
@@ -1068,7 +1166,7 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
     let pause_int = qm.pause_remaining_secs().unwrap_or(0).max(0).to_string();
     let (free1, total1, free1_norm) = sab_disk_space(&qm.incomplete_dir());
     let (free2, total2, free2_norm) = sab_disk_space(&qm.complete_dir());
-    let warnings = sab_warnings(qm);
+    let warnings = sab_warnings(state);
 
     Json(serde_json::json!({
         "status": {
@@ -1257,17 +1355,24 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     queue["diskspace2"] = free2.into();
     queue["diskspacetotal2"] = total2.into();
     queue["diskspace2_norm"] = free2_norm.into();
-    queue["have_warnings"] = sab_warnings(qm).len().to_string().into();
+    queue["have_warnings"] = sab_warnings(state).len().to_string().into();
     Json(response)
 }
 
+/// Most warnings `mode=warnings` lists at once.
+const SAB_WARNINGS_LIMIT: usize = 100;
+
 /// SABnzbd-shaped warnings (`GUIHandler` entries: `type`, `text`, `time`).
 ///
-/// SABnzbd logs "Too little diskspace forcing PAUSE" when its free-space
-/// check pauses the downloader; RustNZB reports the equivalent warning for
-/// as long as its disk-space guard is holding downloads.
-fn sab_warnings(qm: &crate::queue_manager::QueueManager) -> Vec<serde_json::Value> {
-    qm.disk_space_hold_since()
+/// The live disk-space hold comes first: SABnzbd logs "Too little diskspace
+/// forcing PAUSE" when its free-space check pauses the downloader, and
+/// RustNZB reports the same warning for as long as its guard holds downloads.
+/// Then follow the WARN and ERROR log entries that `clear` has not dismissed,
+/// newest first.
+fn sab_warnings(state: &AppState) -> Vec<serde_json::Value> {
+    let qm = &state.queue_manager;
+    let hold = qm
+        .disk_space_hold_since()
         .filter(|_| qm.is_paused())
         .map(|since| {
             serde_json::json!({
@@ -1275,8 +1380,26 @@ fn sab_warnings(qm: &crate::queue_manager::QueueManager) -> Vec<serde_json::Valu
                 "text": "Too little diskspace forcing PAUSE",
                 "time": since.timestamp(),
             })
-        })
+        });
+    let logged = state
+        .log_buffer
+        .warnings(SAB_WARNINGS_LIMIT)
         .into_iter()
+        .map(|entry| {
+            let kind = if entry.level.eq_ignore_ascii_case("ERROR") {
+                "ERROR"
+            } else {
+                "WARNING"
+            };
+            serde_json::json!({
+                "type": kind,
+                "text": entry.message,
+                "time": entry.timestamp.timestamp(),
+            })
+        });
+    hold.into_iter()
+        .chain(logged)
+        .take(SAB_WARNINGS_LIMIT)
         .collect()
 }
 
@@ -3022,8 +3145,10 @@ mod tests {
     use arc_swap::ArcSwap;
     use chrono::TimeZone;
 
+    use tracing_subscriber::layer::SubscriberExt;
+
     use crate::auth::{CredentialStore, TokenStore};
-    use crate::log_buffer::LogBuffer;
+    use crate::log_buffer::{LogBuffer, LogBufferLayer};
     use crate::nzb_core::config::{AppConfig, CategoryConfig};
     use crate::nzb_core::db::Database;
     use crate::queue_manager::QueueManager;
@@ -4418,6 +4543,63 @@ mod tests {
         assert!(malformed["error"].is_string());
     }
 
+    /// `addlocalfile` enqueues an absolute-path NZB the same way an upload
+    /// is, and refuses relative paths and paths that are not regular files.
+    #[tokio::test]
+    async fn addlocalfile_enqueues_an_nzb_from_disk() {
+        let test_state = test_state();
+        let dir = tempfile::tempdir().expect("local NZB tempdir");
+        let path = dir.path().join("local-release.nzb");
+        std::fs::write(&path, SAMPLE_NZB).expect("write local NZB");
+
+        let response = handle_addlocalfile(
+            &test_state.state,
+            Some(path.to_string_lossy().into_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("addlocalfile response")
+        .0;
+        assert_eq!(
+            response["status"],
+            serde_json::json!(true),
+            "resp={response}"
+        );
+        assert!(
+            response["nzo_ids"][0]
+                .as_str()
+                .is_some_and(|id| id.starts_with("SABnzbd_nzo_")),
+            "resp={response}"
+        );
+        assert_eq!(queued_names(&test_state), vec!["local-release".to_string()]);
+
+        for name in [
+            "local-release.nzb".to_string(),
+            dir.path()
+                .join("missing.nzb")
+                .to_string_lossy()
+                .into_owned(),
+            dir.path().to_string_lossy().into_owned(),
+        ] {
+            let refused =
+                handle_addlocalfile(&test_state.state, Some(name), None, None, None, None, None)
+                    .await
+                    .expect("addlocalfile response")
+                    .0;
+            assert_eq!(
+                refused["status"],
+                serde_json::json!(false),
+                "resp={refused}"
+            );
+            assert!(refused["error"].is_string(), "resp={refused}");
+        }
+        assert_eq!(queued_names(&test_state).len(), 1);
+    }
+
     /// SABnzbd's PAUSED_PRIORITY (-2) adds the job paused rather than at a
     /// queue priority; the slot keeps reporting a normal priority.
     #[tokio::test]
@@ -5001,6 +5183,49 @@ mod tests {
         };
         let cleared = dispatch_mode(&test_state.state, "warnings", &clear).0;
         assert_eq!(cleared, serde_json::json!({ "status": true }));
+    }
+
+    /// Logged WARN and ERROR events are listed (newest first) with SAB's
+    /// `type`/`text`/`time` shape, INFO is not, and `name=clear` dismisses
+    /// what was logged so far while later warnings are reported again.
+    #[tokio::test]
+    async fn warnings_mode_lists_logged_warnings_until_cleared() {
+        let test_state = test_state();
+        let subscriber = tracing_subscriber::registry()
+            .with(LogBufferLayer::new(test_state.state.log_buffer.clone()));
+        let dispatch = tracing::Dispatch::new(subscriber);
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::info!("routine progress");
+            tracing::warn!("first problem");
+            tracing::error!("second problem");
+        });
+
+        let list = dispatch_mode(&test_state.state, "warnings", &SabApiRequest::default()).0;
+        let warnings = list["warnings"].as_array().expect("warnings list");
+        assert_eq!(warnings.len(), 2, "resp={list}");
+        assert_eq!(warnings[0]["type"], "ERROR");
+        assert_eq!(warnings[0]["text"], "second problem");
+        assert_eq!(warnings[1]["type"], "WARNING");
+        assert_eq!(warnings[1]["text"], "first problem");
+        assert!(warnings[1]["time"].as_i64().is_some(), "resp={list}");
+
+        let clear = SabApiRequest {
+            name: Some("clear".into()),
+            ..SabApiRequest::default()
+        };
+        let cleared = dispatch_mode(&test_state.state, "warnings", &clear).0;
+        assert_eq!(cleared, serde_json::json!({ "status": true }));
+        let after_clear = dispatch_mode(&test_state.state, "warnings", &SabApiRequest::default()).0;
+        assert_eq!(after_clear["warnings"], serde_json::json!([]));
+        let queue = dispatch_mode(&test_state.state, "queue", &SabApiRequest::default()).0;
+        assert_eq!(queue["queue"]["have_warnings"], "0");
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::warn!("third problem");
+        });
+        let relisted = dispatch_mode(&test_state.state, "warnings", &SabApiRequest::default()).0;
+        assert_eq!(relisted["warnings"][0]["text"], "third problem");
+        assert_eq!(relisted["warnings"].as_array().unwrap().len(), 1);
     }
 
     /// SABnzbd's real `_api_queue_delete` accepts a comma-separated `value`
