@@ -42,14 +42,30 @@ takes the rebuild path below.
 
 ## Release checklist
 
-1. Update the workspace version in `Cargo.toml` and any user-visible version
-   metadata.
+1. Update `[workspace.package] version` in `Cargo.toml`. That is the single
+   source for the version. `desktop/package.json`, `desktop/package-lock.json`,
+   `desktop/src-tauri/Cargo.toml` and `desktop/src-tauri/Cargo.lock` must carry
+   the same number, and `ci/check-version.sh` fails the release if they do not.
+   The installer takes its version from the release tag at build time.
 2. Run the checks in [DEVELOPMENT.md](DEVELOPMENT.md).
 3. Merge the release change to `main` through a reviewed pull request.
 4. Create and push an annotated `vX.Y.Z` tag on that `main` commit.
 5. Monitor the GitHub Actions release workflow.
-6. Verify the GitHub release assets, checksums, and multi-architecture GHCR
-   image:
+6. Verify the GitHub release assets, checksums, signatures, and
+   multi-architecture GHCR image. The image is signed keyless with the release
+   workflow's OIDC identity, and the image index carries build provenance and
+   an SBOM as attestations. `SHA256SUMS-<tag>.txt` has a `.sig` and `.pem`
+   alongside it:
+
+   ```text
+   cosign verify-blob --signature SHA256SUMS-vX.Y.Z.sig \
+     --certificate SHA256SUMS-vX.Y.Z.pem SHA256SUMS-vX.Y.Z.txt
+   cosign verify ghcr.io/thedancingdeveloper-org/rustnzbd:vX.Y.Z \
+     --certificate-identity-regexp '^https://github.com/TheDancingDeveloper-org/rustnzb/' \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+   ```
+
+   The image is published under these tags:
 
    ```text
    ghcr.io/thedancingdeveloper-org/rustnzbd:vX.Y.Z
