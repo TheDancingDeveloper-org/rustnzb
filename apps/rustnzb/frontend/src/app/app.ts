@@ -1,6 +1,7 @@
 import {
   Component,
   ElementRef,
+  HostListener,
   OnInit,
   OnDestroy,
   Signal,
@@ -117,9 +118,10 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
               }
               <div class="speed-group" (keydown.escape)="closeSpeedMenu()">
                 <button
+                  #speedBtn
                   type="button"
                   class="pill pill-btn"
-                  (click)="toggleSpeedMenu()"
+                  (click)="toggleSpeedMenu(speedBtn)"
                   title="Set speed limit"
                   aria-haspopup="true"
                   [attr.aria-expanded]="speedMenuOpen"
@@ -127,7 +129,13 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
                   {{ loaded() ? formatSpeed(speed()) : '—' }}
                 </button>
                 @if (speedMenuOpen) {
-                  <div class="speed-menu" role="menu" (click)="$event.stopPropagation()">
+                  <div
+                    class="speed-menu"
+                    role="menu"
+                    [style.top.px]="menuAnchor.top"
+                    [style.left.px]="menuAnchor.left"
+                    (click)="$event.stopPropagation()"
+                  >
                     <div class="pm-title">Speed limit</div>
                     <div class="pm-current">Current: {{ speedLimit() > 0 ? formatSpeed(speedLimit()) : 'off' }}</div>
                     @for (opt of speedPresets; track opt.bps) {
@@ -209,7 +217,7 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
                 <button
                   #pauseCaretBtn
                   class="action pause-caret"
-                  (click)="pauseMenuOpen = !pauseMenuOpen"
+                  (click)="togglePauseMenu(pauseCaretBtn)"
                   title="Pause for…"
                   aria-label="Pause for…"
                   aria-haspopup="true"
@@ -218,7 +226,13 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
                   <app-icon name="chevron-down" [size]="11" />
                 </button>
                 @if (pauseMenuOpen) {
-                  <div class="pause-menu" role="menu" (click)="$event.stopPropagation()">
+                  <div
+                    class="pause-menu"
+                    role="menu"
+                    [style.top.px]="menuAnchor.top"
+                    [style.right.px]="menuAnchor.right"
+                    (click)="$event.stopPropagation()"
+                  >
                     <div class="pm-title">Pause for…</div>
                     @for (opt of pauseTimerOptions; track opt.secs) {
                       <button class="pm-item" role="menuitem" (click)="pauseFor(opt.secs)">
@@ -449,12 +463,12 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
         text-decoration: underline;
       }
 
+      /* Menus are fixed to the viewport, positioned from the trigger's rect on open
+         (see anchorMenu). The nav scrolls horizontally, so an absolutely positioned
+         menu inside it would be clipped to the nav's height. */
       .pause-menu,
       .speed-menu {
-        position: absolute;
-        top: 100%;
-        right: 0;
-        margin-top: 4px;
+        position: fixed;
         background: var(--panel);
         border: 1px solid var(--line);
         border-radius: 6px;
@@ -462,11 +476,6 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
         padding: 6px;
         min-width: 160px;
         z-index: 40;
-      }
-      /* The speed popover hangs off the left edge of its pill; pause hangs off the right. */
-      .speed-menu {
-        left: 0;
-        right: auto;
       }
       .pm-title {
         font-size: 11px;
@@ -691,9 +700,37 @@ export class App implements OnInit, OnDestroy {
     document.title = documentTitle(this.currentUrl(), live);
   }
 
-  toggleSpeedMenu(): void {
+  // Viewport position for whichever menu is open. Only one menu is open at a time.
+  menuAnchor = { top: 0, left: 0, right: 0 };
+
+  /** Place a fixed menu just below its trigger, kept inside the viewport. */
+  private anchorMenu(trigger: HTMLElement): void {
+    const r = trigger.getBoundingClientRect();
+    const maxLeft = Math.max(8, window.innerWidth - 220);
+    this.menuAnchor = {
+      top: r.bottom + 4,
+      left: Math.min(Math.max(8, r.left), maxLeft),
+      right: Math.max(8, window.innerWidth - r.right),
+    };
+  }
+
+  togglePauseMenu(trigger: HTMLElement): void {
+    this.pauseMenuOpen = !this.pauseMenuOpen;
+    if (this.pauseMenuOpen) this.anchorMenu(trigger);
+    this.speedMenuOpen = false;
+  }
+
+  toggleSpeedMenu(trigger: HTMLElement): void {
     this.speedMenuOpen = !this.speedMenuOpen;
+    if (this.speedMenuOpen) this.anchorMenu(trigger);
     this.pauseMenuOpen = false;
+  }
+
+  @HostListener('window:resize')
+  onWindowResize(): void {
+    // A menu anchored to the old layout would sit in the wrong place, so close it.
+    this.pauseMenuOpen = false;
+    this.speedMenuOpen = false;
   }
 
   closeSpeedMenu(): void {

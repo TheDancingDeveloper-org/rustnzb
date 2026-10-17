@@ -236,6 +236,54 @@ describe('first-run server banner', () => {
   });
 });
 
+describe('header menus', () => {
+  const trigger = (rect: { left: number; right: number; bottom: number }) =>
+    ({ getBoundingClientRect: () => ({ ...rect, top: 0, width: 0, height: 0, x: 0, y: 0, toJSON: () => ({}) }) }) as unknown as HTMLElement;
+
+  it('anchors the speed menu just below its trigger and opens it', () => {
+    const { app } = makeApp();
+
+    app.toggleSpeedMenu(trigger({ left: 300, right: 360, bottom: 40 }));
+
+    expect(app.speedMenuOpen).toBe(true);
+    expect(app.menuAnchor.top).toBe(44);
+    expect(app.menuAnchor.left).toBe(300);
+  });
+
+  it('keeps the speed menu inside the viewport on narrow screens', () => {
+    const { app } = makeApp();
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+
+    try {
+      app.toggleSpeedMenu(trigger({ left: 380, right: 420, bottom: 40 }));
+      expect(app.menuAnchor.left).toBe(390 - 220);
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
+    }
+  });
+
+  it('anchors the pause menu from the right edge and closes the other menu', () => {
+    const { app } = makeApp();
+    app.speedMenuOpen = true;
+
+    app.togglePauseMenu(trigger({ left: 900, right: 940, bottom: 40 }));
+
+    expect(app.pauseMenuOpen).toBe(true);
+    expect(app.speedMenuOpen).toBe(false);
+    expect(app.menuAnchor.right).toBe(window.innerWidth - 940);
+  });
+
+  it('closes both menus on window resize', () => {
+    const { app } = makeApp();
+    app.togglePauseMenu(trigger({ left: 900, right: 940, bottom: 40 }));
+
+    app.onWindowResize();
+
+    expect(app.pauseMenuOpen).toBe(false);
+    expect(app.speedMenuOpen).toBe(false);
+  });
+});
+
 describe('bare route detection', () => {
   it('keeps login and welcome full-screen', () => {
     expect(isBareRoute('/login')).toBe(true);
