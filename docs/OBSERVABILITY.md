@@ -20,6 +20,22 @@ Traces follow the logs switch and use the logs endpoint, so a download's spans
 and its log lines go to the same place. The resource carries `service.name`
 only. There is no environment-variable override for these settings.
 
+## Log file
+
+`--log-file <path>` (or `RUSTNZB_LOG_FILE`, or `general.log_file` in
+`config.toml`) writes logs to a file as well as stdout. The flag or variable
+wins over the config value. Nothing is removed from stdout.
+
+- The file rotates daily. The name is the path's file name with the date
+  appended: `--log-file data/rustnzb.log` writes `data/rustnzb.log.2026-10-17`.
+  The newest 7 daily files are kept and older ones are deleted when a new day
+  starts.
+- A relative path is resolved against the working directory. The parent
+  directory is created if it is missing.
+- Lines in the file have no ANSI colour codes.
+- A path with no file name (such as `/`) or a directory that cannot be opened
+  stops startup with an error.
+
 ## Debug logging toggle
 
 Settings → General → **Debug logging**. It takes effect at once (the tracing
