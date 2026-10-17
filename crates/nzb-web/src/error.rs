@@ -167,6 +167,7 @@ impl Serialize for ApiError {
                     "admission_conflict"
                 }
                 ApiErrorKind::UrlRejected(_) => "url_rejected",
+                ApiErrorKind::Core(crate::nzb_core::NzbError::DuplicateNzb(_)) => "duplicate_nzb",
                 // Otherwise classify by status so clients can tell a bad
                 // request or missing resource from a server fault.
                 _ => match self.status() {
@@ -215,7 +216,7 @@ impl From<crate::nzb_core::NzbError> for ApiError {
             | NzbError::ServerNotFound(_)
             | NzbError::CategoryNotFound(_) => StatusCode::NOT_FOUND,
             NzbError::ParseError(_) | NzbError::InvalidNzb(_) => StatusCode::BAD_REQUEST,
-            NzbError::AdmissionConflict => StatusCode::CONFLICT,
+            NzbError::AdmissionConflict | NzbError::DuplicateNzb(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {

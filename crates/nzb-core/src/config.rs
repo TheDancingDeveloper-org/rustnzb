@@ -39,6 +39,45 @@ impl Default for AppConfig {
     }
 }
 
+/// What admission does when an incoming NZB matches a queued or history job
+/// by name or by content digest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DuplicatePolicy {
+    /// Admit the NZB without checking for a match.
+    Allow,
+    /// Admit the NZB and record the match in the log (default).
+    #[default]
+    Warn,
+    /// Refuse the NZB; the existing job is left as it is.
+    Skip,
+}
+
+impl std::fmt::Display for DuplicatePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Allow => "allow",
+            Self::Warn => "warn",
+            Self::Skip => "skip",
+        })
+    }
+}
+
+impl std::str::FromStr for DuplicatePolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "allow" => Ok(Self::Allow),
+            "warn" => Ok(Self::Warn),
+            "skip" => Ok(Self::Skip),
+            other => Err(format!(
+                "duplicate_policy must be allow, warn or skip, not `{other}`"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GeneralConfig {
@@ -127,6 +166,10 @@ pub struct GeneralConfig {
     /// Remove downloaded RSS records after this many days. None keeps them.
     #[serde(default)]
     pub rss_downloaded_item_expiry_days: Option<u64>,
+    /// What to do when an incoming NZB matches a queued or history job by
+    /// name or content digest: `allow`, `warn` (default) or `skip`.
+    #[serde(default)]
+    pub duplicate_policy: DuplicatePolicy,
     /// Optional directory containing post-processing scripts.
     #[serde(default)]
     pub scripts_dir: Option<PathBuf>,
@@ -254,6 +297,7 @@ impl Default for GeneralConfig {
             required_completion_pct: default_required_completion_pct(),
             article_timeout_secs: default_article_timeout_secs(),
             auto_sort_remaining_pct: false,
+            duplicate_policy: DuplicatePolicy::Warn,
             rss_downloaded_item_expiry_days: None,
             scripts_dir: None,
             script_success: None,
@@ -665,6 +709,25 @@ ssl = false
         assert_eq!(cfg.rss_history_limit, Some(500));
         assert!(cfg.direct_unpack);
         assert_eq!(cfg.max_nested_archive_depth, 5);
+    }
+
+    #[test]
+    fn duplicate_policy_defaults_to_warn_and_parses_known_values() {
+        assert_eq!(
+            GeneralConfig::default().duplicate_policy,
+            DuplicatePolicy::Warn
+        );
+        assert_eq!("Skip".parse::<DuplicatePolicy>(), Ok(DuplicatePolicy::Skip));
+        assert_eq!(
+            " allow ".parse::<DuplicatePolicy>(),
+            Ok(DuplicatePolicy::Allow)
+        );
+        assert!("ignore".parse::<DuplicatePolicy>().is_err());
+
+        let general: GeneralConfig = toml::from_str("duplicate_policy = \"skip\"").unwrap();
+        assert_eq!(general.duplicate_policy, DuplicatePolicy::Skip);
+        let omitted: GeneralConfig = toml::from_str("").unwrap();
+        assert_eq!(omitted.duplicate_policy, DuplicatePolicy::Warn);
     }
 
     #[test]
