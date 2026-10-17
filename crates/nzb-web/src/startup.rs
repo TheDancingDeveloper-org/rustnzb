@@ -287,6 +287,14 @@ pub async fn initialize(
     let config_path = startup.config_path;
     let mut file = AppConfig::load(&config_path)?;
     sanitize_loaded_config(&mut file);
+    let problems = file.validate();
+    if !problems.is_empty() {
+        anyhow::bail!(
+            "invalid config {}:\n  - {}",
+            config_path.display(),
+            problems.join("\n  - ")
+        );
+    }
 
     // The file layer is what gets saved. Overrides from the command line,
     // the environment and the desktop shell apply on top of it, for this
