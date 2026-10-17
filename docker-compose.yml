@@ -1,36 +1,34 @@
+# Generic rustnzb stack for a single host. Every host-specific value has a
+# default and can be overridden with an environment variable, either exported
+# in the shell or set in a .env file next to this file:
+#
+#   RUSTNZB_IMAGE       image to run (default: the GHCR release image)
+#   RUSTNZB_HOST_PORT   host port for the web UI and API (default: 9090)
+#   DOWNLOADS_DIR       host directory for downloads (default: ./downloads)
+#   PUID / PGID         user and group that own the mounted directories
+#   TZ                  timezone for logs and schedules (default: UTC)
+#
+# The container always listens on 9090. Change RUSTNZB_HOST_PORT, not the
+# container side, unless you also change the server port in config.toml.
 services:
   rustnzb:
-    image: ${DOCKERHUB_USERNAME:-ausagentsmith}/rustnzb:latest
+    image: ${RUSTNZB_IMAGE:-ghcr.io/thedancingdeveloper-org/rustnzbd:latest}
     container_name: rustnzb
     restart: unless-stopped
     ports:
-      - "9095:9090"
+      - "${RUSTNZB_HOST_PORT:-9090}:9090"
     volumes:
       - ./config:/config
       - ./data:/data
-      - /mnt/data3/downloads:/downloads
+      - ${DOWNLOADS_DIR:-./downloads}:/downloads
     environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=Australia/Sydney
-      - RUST_LOG=info
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-UTC}
+      - RUST_LOG=${RUST_LOG:-info}
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9090/api/status"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9090/api/health"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
-
-  promtail:
-    image: grafana/promtail:3.6.10
-    profiles: [logging]
-    network_mode: host
-    volumes:
-      - ./promtail.yml:/etc/promtail/config.yml:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /var/lib/docker/containers:/var/lib/docker/containers:ro
-    environment:
-      LOKI_URL: ${LOKI_URL}
-      HOSTNAME: ${HOSTNAME:-rustnzb}
-    command: -config.file=/etc/promtail/config.yml -config.expand-env=true
-    restart: unless-stopped
+      start_period: 20s
