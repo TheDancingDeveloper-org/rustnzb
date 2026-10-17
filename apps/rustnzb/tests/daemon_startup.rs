@@ -96,9 +96,9 @@ fn malformed_config_exits_1_with_the_parse_error() {
 fn unwritable_config_directory_exits_1_and_names_the_directory() {
     let root = tempfile::tempdir().unwrap();
     let blocker = blocker_file(root.path());
-    let config = blocker.join("config.toml");
 
-    let out = rustnzb().arg("--config").arg(&config).output().unwrap();
+    // Only the default path is auto-created, so point it under the blocker.
+    let out = rustnzb().env("XDG_CONFIG_HOME", &blocker).output().unwrap();
 
     assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
     let err = stderr_of(&out);
@@ -182,16 +182,16 @@ fn port_already_in_use_exits_1_and_names_the_bind_address() {
 }
 
 #[test]
-fn missing_config_is_created_with_owner_only_permissions() {
+fn missing_default_config_is_created_with_owner_only_permissions() {
     let root = tempfile::tempdir().unwrap();
-    let config = root.path().join("fresh").join("config.toml");
+    let xdg = root.path().join("fresh");
+    let config = xdg.join("rustnzb").join("config.toml");
     // A bad data dir stops startup right after the default config is written,
     // so the test never reaches the server or the default download paths.
     let blocker = blocker_file(root.path());
 
     let out = rustnzb()
-        .arg("--config")
-        .arg(&config)
+        .env("XDG_CONFIG_HOME", &xdg)
         .arg("--data-dir")
         .arg(blocker.join("data"))
         .output()
@@ -201,6 +201,19 @@ fn missing_config_is_created_with_owner_only_permissions() {
     assert!(config.exists(), "default config should be written");
     let mode = fs::metadata(&config).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "config must be owner-only");
+}
+
+#[test]
+fn missing_explicit_config_exits_1_and_is_not_created() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("fresh").join("config.toml");
+
+    let out = rustnzb().arg("--config").arg(&config).output().unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    let err = stderr_of(&out);
+    assert!(err.contains("does not exist"), "got: {err}");
+    assert!(!config.exists(), "an explicit --config must not be created");
 }
 
 /// The config path is resolved once, at startup, against the launch CWD. A
@@ -234,11 +247,13 @@ fn config_path_resolves_once_when_cwd_changes() {
     assert_eq!(again, anchored, "an already-resolved path must not move");
 }
 
-/// End to end: a relative `--config` from one CWD creates the file there, even
-/// when the directory is created during startup.
+/// End to end: a relative `--config` is read from the launch directory.
 #[test]
 fn relative_config_path_is_resolved_against_the_launch_directory() {
     let launch_dir = tempfile::tempdir().unwrap();
+    let nested = launch_dir.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    write_config(&nested, free_port());
     let blocker = blocker_file(launch_dir.path());
 
     let out = rustnzb()
@@ -249,11 +264,14 @@ fn relative_config_path_is_resolved_against_the_launch_directory() {
         .output()
         .unwrap();
 
+    // Getting as far as the data dir means the relative config was found.
     assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    let err = stderr_of(&out);
     assert!(
-        launch_dir.path().join("nested/config.toml").exists(),
-        "config should be created under the launch directory"
+        !err.contains("does not exist"),
+        "config should be found under the launch directory, got: {err}"
     );
+    assert!(err.contains(&blocker.display().to_string()), "got: {err}");
 }
 
 /// A save replaces the file atomically with owner-only permissions, keeps the
