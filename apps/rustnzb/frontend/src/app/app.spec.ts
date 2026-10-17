@@ -33,6 +33,7 @@ function makeApp(postResult = new Subject<unknown>()) {
     {} as never,
     pauseState,
     snack as never,
+    { observeStatus: vi.fn() } as never,
   );
   return { app, api, auth, pauseState, postResult, snack };
 }
