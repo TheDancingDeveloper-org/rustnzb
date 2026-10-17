@@ -1,0 +1,71 @@
+name: Bug report
+description: Report something rustnzb does wrong.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security-sensitive reports (credentials, authentication, network exposure,
+        arbitrary file access, data loss) must not be filed here. Follow
+        the SECURITY.md file in the repository root instead.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched the existing issues and found no duplicate.
+          required: true
+        - label: I removed provider credentials, API keys, NZB URLs, private hostnames and personal paths from this report.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: rustnzb version
+      description: The output of `rustnzb --version`, or the container image tag.
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation method
+      options:
+        - Container image
+        - Static binary
+        - Built from source
+        - Desktop app
+        - Other (describe below)
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and architecture
+      placeholder: "e.g. Debian 13 on x86_64"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Add an NZB with ...
+        2. Open ...
+        3. ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Non-secret log excerpts only. Redact anything that identifies a provider, account or host.
+      render: text
