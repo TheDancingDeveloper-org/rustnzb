@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<!--
+  Unraid Community Applications template for rustnzb.
+  Draft: submit to the Community Apps repository by the operator. Keep the
+  Repository tag and the WebUI port in step with the release image.
+-->
+<Container version="2">
+  <Name>rustnzb</Name>
+  <Repository>ghcr.io/thedancingdeveloper-org/rustnzbd:latest</Repository>
+  <Registry>https://github.com/thedancingdeveloper-org/rustnzbd/pkgs/container/rustnzbd</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/TheDancingDeveloper-org/rustnzb/issues</Support>
+  <Project>https://github.com/TheDancingDeveloper-org/rustnzb</Project>
+  <Overview>rustnzb is a Usenet NZB downloader written in Rust. It runs the whole pipeline (pipelined NNTP over TLS, yEnc decoding, PAR2 verify and repair, archive extraction) behind a web UI and a SABnzbd-compatible API, so Sonarr, Radarr, Lidarr and mobile SAB clients can drive it.</Overview>
+  <Category>Downloaders:</Category>
+  <WebUI>http://[IP]:[PORT:9090]/</WebUI>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/TheDancingDeveloper-org/rustnzb/main/LOGOS/688oi.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="WebUI port" Target="9090" Default="9090" Mode="tcp" Description="Port for the web UI and SABnzbd-compatible API" Type="Port" Display="always" Required="true" Mask="false">9090</Config>
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/rustnzb/config" Mode="rw" Description="Configuration and the SQLite database" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/rustnzb/config</Config>
+  <Config Name="Data" Target="/data" Default="/mnt/user/appdata/rustnzb/data" Mode="rw" Description="Application state" Type="Path" Display="advanced" Required="true" Mask="false">/mnt/user/appdata/rustnzb/data</Config>
+  <Config Name="Downloads" Target="/downloads" Default="/mnt/user/downloads" Mode="rw" Description="Where finished downloads are written" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/downloads</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID the process runs as (99 is nobody on Unraid)" Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID the process runs as (100 is users on Unraid)" Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
+  <Config Name="Timezone" Target="TZ" Default="" Mode="" Description="Timezone, for example Australia/Sydney" Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+</Container>
