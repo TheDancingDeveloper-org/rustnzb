@@ -192,7 +192,7 @@ interface PipelineStep {
           </button>
         </h3>
         <div class="body">
-          @if (servers().length === 0) {
+          @if (serversLoaded() && servers().length === 0) {
             <div class="upload-warn" role="alert">
               No news servers are set up, so uploads will queue but not download.
               <a routerLink="/welcome">Add a server</a> first.
@@ -1135,6 +1135,8 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   remainingBytes = signal(0);
   categories = signal<CategoryConfig[]>([]);
   servers = signal<ServerConfigLite[]>([]);
+  // False until the first successful load, so the upload warning never flashes on a guess.
+  serversLoaded = signal(false);
   status = signal<StatusResponse | null>(null);
   selectedIds = signal<Set<string>>(new Set());
   paused: WritableSignal<boolean>;
@@ -1283,7 +1285,10 @@ export class QueueViewComponent implements OnInit, OnDestroy {
 
   loadServers(): void {
     this.api.get<ServerConfigLite[]>('/config/servers').subscribe({
-      next: (srvs) => this.servers.set(srvs),
+      next: (srvs) => {
+        this.servers.set(srvs);
+        this.serversLoaded.set(true);
+      },
       error: (err) => showHttpError(this.snackBar, err, 'Failed to load servers'),
     });
   }
