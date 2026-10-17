@@ -1,0 +1,29 @@
+# Maintainer: <operator to fill in when the AUR package is registered>
+# Draft for the rustnzb-bin AUR package. It installs the release binary from
+# the linux-x86_64 tarball attached to a GitHub release, so it needs no Rust
+# toolchain. Update pkgver per release and replace the sha256sums entry with
+# the value from that release's SHA256SUMS file before publishing.
+pkgname=rustnzb-bin
+pkgver=1.6.0
+pkgrel=1
+pkgdesc="A modern Usenet NZB downloader written in Rust (prebuilt binary)"
+arch=('x86_64')
+url="https://rustnzb.dev"
+license=('MIT')
+depends=('p7zip')
+optdepends=('unrar: RAR extraction')
+provides=('rustnzb')
+conflicts=('rustnzb')
+options=('!strip')
+backup=('etc/rustnzb/config.toml')
+source=("rustnzb-v${pkgver}-linux-x86_64.tar.gz::https://github.com/TheDancingDeveloper-org/rustnzb/releases/download/v${pkgver}/rustnzb-v${pkgver}-linux-x86_64.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    local dir="rustnzb-v${pkgver}"
+    install -Dm755 "${srcdir}/${dir}/rustnzb" "${pkgdir}/usr/bin/rustnzb"
+    install -Dm644 "${srcdir}/${dir}/config.example.toml" \
+        "${pkgdir}/etc/rustnzb/config.toml"
+    install -Dm644 "${srcdir}/${dir}/README.md" \
+        "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}
