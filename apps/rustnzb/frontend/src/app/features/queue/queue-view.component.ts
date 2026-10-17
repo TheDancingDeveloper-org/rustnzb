@@ -192,6 +192,12 @@ interface PipelineStep {
           </button>
         </h3>
         <div class="body">
+          @if (servers().length === 0) {
+            <div class="upload-warn" role="alert">
+              No news servers are set up, so uploads will queue but not download.
+              <a routerLink="/welcome">Add a server</a> first.
+            </div>
+          }
           <div class="add-tabs">
             <button class="btn sm" [class.primary]="addMode === 'file'" (click)="addMode = 'file'">
               Upload files
@@ -852,6 +858,15 @@ interface PipelineStep {
         display: flex;
         gap: 8px;
         margin-bottom: 12px;
+      }
+      .upload-warn {
+        color: var(--warn);
+        font-size: 12px;
+        margin-bottom: 12px;
+      }
+      .upload-warn a {
+        color: inherit;
+        font-weight: 600;
       }
       .dropzone {
         border: 2px dashed var(--line);

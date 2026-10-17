@@ -24,4 +24,6 @@ export const routes: Routes = [
   { path: 'statistics', loadComponent: () => import('./features/statistics/statistics-view.component').then(m => m.StatisticsViewComponent), canActivate: [authGuard] },
   { path: 'logs', loadComponent: () => import('./features/logs/logs-view.component').then(m => m.LogsViewComponent), canActivate: [authGuard] },
   { path: 'media', loadComponent: () => import('./features/media/media-view.component').then(m => m.MediaViewComponent), canActivate: [authGuard] },
+  // Unknown paths go to the home page instead of rendering an empty shell.
+  { path: '**', redirectTo: '/downloads' },
 ];
