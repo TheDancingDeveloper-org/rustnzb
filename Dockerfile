@@ -66,6 +66,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 FROM lscr.io/linuxserver/baseimage-alpine:3.23@sha256:46d690858431e262d574274bb2863e1fbaf8de61c6f7677150dd79c2cc65cdcf AS runtime
 
 ARG RUSTNZB_BUILD_REF
+ARG RUSTNZB_BUILD_CREATED=unknown
 
 RUN apk add --no-cache \
         7zip \
@@ -79,8 +80,14 @@ COPY --from=unrar-builder /out/unrar /usr/local/bin/unrar
 COPY apps/rustnzb/root/ /
 
 LABEL org.opencontainers.image.title="rustnzb" \
+      org.opencontainers.image.description="A modern Usenet NZB downloader written in Rust" \
       org.opencontainers.image.source="https://github.com/TheDancingDeveloper-org/rustnzb" \
-      org.opencontainers.image.revision="$RUSTNZB_BUILD_REF"
+      org.opencontainers.image.url="https://rustnzb.dev" \
+      org.opencontainers.image.documentation="https://github.com/TheDancingDeveloper-org/rustnzb#readme" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="$RUSTNZB_BUILD_REF" \
+      org.opencontainers.image.revision="$RUSTNZB_BUILD_REF" \
+      org.opencontainers.image.created="$RUSTNZB_BUILD_CREATED"
 
 EXPOSE 9090
 VOLUME ["/config", "/data", "/downloads"]

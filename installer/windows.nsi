@@ -1,5 +1,8 @@
+; VERSION is never hard-coded here. ci/tasks/package-release passes the release
+; tag (-DVERSION=vX.Y.Z), which ci/check-version.sh has already matched to the
+; workspace version. A local build must pass it too.
 !ifndef VERSION
-  !define VERSION "dev"
+  !error "pass -DVERSION=<version>, e.g. makensis -DVERSION=v1.6.0 windows.nsi"
 !endif
 
 !define PRODUCT_NAME "rustnzb"
