@@ -4,8 +4,8 @@ import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router, RouterModule } from '@angular/router';
 import { HttpClient } from '@angular/common/http';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
-import { Observable, Subscription, catchError, finalize, forkJoin, map, of } from 'rxjs';
-import { ApiService } from '../../core/services/api.service';
+import { Observable, Subscription, catchError, finalize, forkJoin, map, of, timeout } from 'rxjs';
+import { ApiService, POLL_TIMEOUT_MS, pageHidden } from '../../core/services/api.service';
 import { AddNzbService } from '../../core/services/add-nzb.service';
 import { PauseStateService } from '../../core/services/pause-state.service';
 import { NzbJob, PauseReason, QueueResponse, StatusResponse } from '../../core/models/queue.model';
@@ -1174,6 +1174,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private queueRequestSeq = 0;
+  private queuePollInFlight = false;
   // Polls started before this sequence finished must not apply their response:
   // a snapshot taken mid-reorder/delete would resurrect rows (BUG-126).
   private queueStaleThrough = 0;
@@ -1221,7 +1222,9 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       }
     });
     this.loadAll();
-    this.pollTimer = setInterval(() => this.fetchQueue(false), 2000);
+    this.pollTimer = setInterval(() => {
+      if (!pageHidden() && !this.queuePollInFlight) this.fetchQueue(false);
+    }, 2000);
     this.toggleSub = this.addNzbService.panelToggle$.subscribe(() => {
       this.showAddPanel = !this.showAddPanel;
     });
@@ -1258,8 +1261,10 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   fetchQueue(supersedeInFlight: boolean): void {
     const seq = ++this.queueRequestSeq;
     if (supersedeInFlight) this.queueStaleThrough = seq - 1;
-    this.api.get<QueueResponse>('/queue').subscribe({
+    this.queuePollInFlight = true;
+    this.api.get<QueueResponse>('/queue').pipe(timeout(POLL_TIMEOUT_MS)).subscribe({
       next: (r) => {
+        if (seq === this.queueRequestSeq) this.queuePollInFlight = false;
         if (seq <= this.queueStaleThrough || this.reorderPending()) return;
         this.queueStaleThrough = seq;
         this.jobs.set(r.jobs);
@@ -1279,6 +1284,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       },
       error: (err) => {
         if (seq !== this.queueRequestSeq) return;
+        this.queuePollInFlight = false;
         this.loadError.set(httpErrorMessage(err, "Couldn't load the download queue"));
         this.loading.set(false);
       },
