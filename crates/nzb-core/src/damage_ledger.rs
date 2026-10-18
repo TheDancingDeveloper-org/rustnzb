@@ -319,6 +319,24 @@ impl Database {
         Ok(confirm)
     }
 
+    /// Record many fetch outcomes in one transaction, so a batch costs one
+    /// commit rather than one per article. Each note carries the time its
+    /// outcome was observed. Returns each outcome's [`ConfirmNeeded`], in
+    /// order. Outcomes for the same article apply in the order given.
+    pub fn ledger_note_batch(
+        &self,
+        notes: &[(ArticleKey, String, Outcome, DateTime<Utc>)],
+        enabled_servers: &[String],
+    ) -> Result<Vec<ConfirmNeeded>, NzbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut confirms = Vec::with_capacity(notes.len());
+        for (key, message_id, outcome, at) in notes {
+            confirms.push(self.ledger_note(key, message_id, outcome, enabled_servers, *at)?);
+        }
+        tx.commit()?;
+        Ok(confirms)
+    }
+
     /// Guidance before fetching an article: skip a live hole, re-probe an
     /// expired one, otherwise fetch normally.
     pub fn ledger_consult(
@@ -723,5 +741,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(db.ledger_file_gone_ratio("job-2", 0).unwrap(), 0.5);
+    }
+
+    #[test]
+    fn note_batch_applies_in_order_with_each_notes_time() {
+        let db = Database::open_memory().unwrap();
+        let srv = servers(&["a", "b"]);
+        let key = ArticleKey::new("job-3", 0, 1);
+        let refused = |server: &str| Outcome::Refused {
+            server: server.into(),
+        };
+        // Two fast refusals, then a confirming one past the guard: one batch.
+        let notes = vec![
+            (key.clone(), "<m>".to_string(), refused("a"), t(0)),
+            (key.clone(), "<m>".to_string(), refused("b"), t(0)),
+            (key.clone(), "<m>".to_string(), refused("a"), t(2)),
+        ];
+        let confirms = db.ledger_note_batch(&notes, &srv).unwrap();
+        assert_eq!(
+            confirms,
+            vec![
+                ConfirmNeeded(true),
+                ConfirmNeeded(true),
+                ConfirmNeeded(false)
+            ]
+        );
+        let records = db.ledger_load_file("job-3", 0).unwrap();
+        assert_eq!(records[0].state, LedgerState::ConfirmedMissing);
     }
 }
