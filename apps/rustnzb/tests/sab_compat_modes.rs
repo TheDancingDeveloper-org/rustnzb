@@ -113,13 +113,12 @@ async fn change_complete_action_refuses_power_actions_and_accepts_a_clear() {
     // RustNZB cannot act on the host, so power actions are refused rather
     // than silently ignored.
     let body = sab_call(&server, "mode=change_complete_action&value=shutdown").await;
-    assert_eq!(body["status"], serde_json::json!(false));
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("shutdown"),
-        "error should name the refused action: {body}"
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "status": false,
+            "error": "unsupported complete action 'shutdown': only script_<name> is supported",
+        })
     );
 
     // An empty value clears the action.
