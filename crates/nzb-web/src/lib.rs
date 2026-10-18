@@ -5,6 +5,7 @@ pub use nzb_postproc;
 pub use nzb_postproc::nzb_core;
 
 pub mod auth;
+mod damage_recorder;
 pub mod dir_watcher;
 pub mod direct_unpack;
 pub mod error;
