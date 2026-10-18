@@ -13,8 +13,8 @@ import {
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { NavigationEnd, Router, RouterModule } from '@angular/router';
-import { filter } from 'rxjs';
-import { ApiService } from './core/services/api.service';
+import { filter, timeout } from 'rxjs';
+import { ApiService, POLL_TIMEOUT_MS, pageHidden } from './core/services/api.service';
 import { AuthService } from './core/services/auth.service';
 import { StatusResponse } from './core/models/queue.model';
 import { formatBytes, formatSpeed } from './core/format';
@@ -629,6 +629,7 @@ export class App implements OnInit, OnDestroy {
   readonly serverCount = signal<number | null>(null);
   readonly noServers = computed(() => this.serverCount() === 0);
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private statusInFlight = false;
   private docClickHandler = (e: MouseEvent) => {
     const target = e.target as HTMLElement;
     if (this.pauseMenuOpen && !target.closest('.pause-group')) this.pauseMenuOpen = false;
@@ -662,7 +663,9 @@ export class App implements OnInit, OnDestroy {
   ngOnInit(): void {
     this.pollStatus();
     this.loadServerCount();
-    this.pollTimer = setInterval(() => this.pollStatus(), 2000);
+    this.pollTimer = setInterval(() => {
+      if (!pageHidden() && !this.statusInFlight) this.pollStatus();
+    }, 2000);
     document.addEventListener('click', this.docClickHandler);
   }
 
@@ -673,8 +676,10 @@ export class App implements OnInit, OnDestroy {
 
   pollStatus(): void {
     if (!this.authenticated()) return;
-    this.api.get<StatusResponse>('/status').subscribe({
+    this.statusInFlight = true;
+    this.api.get<StatusResponse>('/status').pipe(timeout(POLL_TIMEOUT_MS)).subscribe({
       next: (s) => {
+        this.statusInFlight = false;
         this.speed.set(s.speed_bps);
         this.speedLimit.set(s.speed_limit_bps ?? 0);
         this.paused.set(s.paused);
@@ -688,6 +693,7 @@ export class App implements OnInit, OnDestroy {
         this.updateTitle();
       },
       error: () => {
+        this.statusInFlight = false;
         this.offline.set(true);
         this.updateTitle();
       },

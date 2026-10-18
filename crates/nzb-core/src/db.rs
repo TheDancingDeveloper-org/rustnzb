@@ -544,6 +544,64 @@ impl Database {
             commit_migration(tx, 17)?;
         }
 
+        if version < 18 {
+            info!("Applying database migration v18: history list columns ahead of the NZB blob");
+            // Columns added to history by ALTER TABLE are stored after
+            // nzb_data, so reading them walks the blob's overflow chain (about
+            // 1.3 s for a 50-row page on a production database). List queries
+            // read them from this narrow copy instead; triggers keep it in step.
+            let has_history: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'history'",
+                [],
+                |row| row.get(0),
+            )?;
+            // Partial schemas (as built by migration tests) may lack the
+            // source columns: they still get the table, so list queries work.
+            let source_columns: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('history') WHERE name IN
+                 ('download_time_secs', 'server_stats', 'failure_code',
+                  'post_processing', 'delete_archives')",
+                [],
+                |row| row.get(0),
+            )?;
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS history_list_meta (
+                    id TEXT PRIMARY KEY,
+                    download_time_secs REAL,
+                    server_stats TEXT,
+                    failure_code TEXT,
+                    post_processing INTEGER,
+                    delete_archives INTEGER
+                );",
+            )?;
+            if has_history > 0 && source_columns == 5 {
+                tx.execute_batch(
+                    "INSERT INTO history_list_meta
+                        SELECT id, download_time_secs, server_stats, failure_code,
+                               post_processing, delete_archives FROM history;
+                    CREATE TRIGGER history_list_meta_insert AFTER INSERT ON history BEGIN
+                        INSERT OR REPLACE INTO history_list_meta VALUES (
+                            NEW.id, NEW.download_time_secs, NEW.server_stats,
+                            NEW.failure_code, NEW.post_processing, NEW.delete_archives);
+                    END;
+                    CREATE TRIGGER history_list_meta_update AFTER UPDATE OF
+                        id, download_time_secs, server_stats, failure_code,
+                        post_processing, delete_archives ON history BEGIN
+                        DELETE FROM history_list_meta WHERE id = OLD.id;
+                        INSERT OR REPLACE INTO history_list_meta VALUES (
+                            NEW.id, NEW.download_time_secs, NEW.server_stats,
+                            NEW.failure_code, NEW.post_processing, NEW.delete_archives);
+                    END;
+                    CREATE TRIGGER history_list_meta_delete AFTER DELETE ON history BEGIN
+                        DELETE FROM history_list_meta WHERE id = OLD.id;
+                    END;
+                    CREATE INDEX IF NOT EXISTS idx_history_category ON history(category);",
+                )?;
+            }
+            commit_migration(tx, 18)?;
+        }
+
         Ok(())
     }
 
@@ -1057,7 +1115,7 @@ impl Database {
     /// List history entries, most recent first.
     pub fn history_list(&self, limit: usize) -> Result<Vec<HistoryEntry>, NzbError> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {HISTORY_LIST_COLUMNS} FROM history ORDER BY completed_at DESC LIMIT ?1"
+            "SELECT {HISTORY_LIST_COLUMNS} FROM {HISTORY_LIST_FROM} ORDER BY h.completed_at DESC LIMIT ?1"
         ))?;
         let entries = stmt
             .query_map(params![limit as i64], history_list_row)?
@@ -1142,7 +1200,7 @@ impl Database {
     /// are skipped. Like [`Database::history_list`], blobs are not loaded.
     pub fn history_get_listed(&self, ids: &[String]) -> Result<Vec<HistoryEntry>, NzbError> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {HISTORY_LIST_COLUMNS} FROM history WHERE id = ?1"
+            "SELECT {HISTORY_LIST_COLUMNS} FROM {HISTORY_LIST_FROM} WHERE h.id = ?1"
         ))?;
         let mut entries = Vec::with_capacity(ids.len());
         for id in ids {
@@ -1203,10 +1261,10 @@ impl Database {
     /// Get a single history entry by ID.
     pub fn history_get(&self, id: &str) -> Result<Option<HistoryEntry>, NzbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, category, status, total_bytes, downloaded_bytes,
-             added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
-             failure_code, post_processing, delete_archives
-             FROM history WHERE id = ?1",
+            "SELECT h.id, h.name, h.category, h.status, h.total_bytes, h.downloaded_bytes,
+             h.added_at, h.completed_at, m.download_time_secs, h.output_dir, h.stages,
+             h.error_message, m.server_stats, m.failure_code, m.post_processing, m.delete_archives
+             FROM history h LEFT JOIN history_list_meta m ON m.id = h.id WHERE h.id = ?1",
         )?;
 
         let result = stmt.query_row(params![id], |row| {
@@ -1585,17 +1643,23 @@ impl Database {
 // Parse helpers
 // ---------------------------------------------------------------------------
 
-/// Columns of a history list row. `has_nzb` uses `typeof()`, which SQLite
-/// answers from the record header without loading the blob itself; neither
-/// `nzb_data` nor `retry_data` content is ever read for a list row.
-const HISTORY_LIST_COLUMNS: &str = "id, name, category, status, total_bytes, downloaded_bytes,
-     added_at, completed_at, download_time_secs, output_dir, stages, error_message, server_stats,
-     typeof(nzb_data) <> 'null' AS has_nzb, failure_code, post_processing, delete_archives";
+/// Columns of a history list row, selected `FROM` [`HISTORY_LIST_FROM`].
+/// `has_nzb` uses `typeof()`, which SQLite answers from the record header
+/// without loading the blob itself. Columns stored after `nzb_data` in
+/// `history` come from `history_list_meta`, so no blob overflow chain is
+/// walked for a list row.
+const HISTORY_LIST_COLUMNS: &str = "h.id, h.name, h.category, h.status, h.total_bytes,
+     h.downloaded_bytes, h.added_at, h.completed_at, m.download_time_secs, h.output_dir, h.stages,
+     h.error_message, m.server_stats, typeof(h.nzb_data) <> 'null' AS has_nzb, m.failure_code,
+     m.post_processing, m.delete_archives";
+
+/// Source of [`HISTORY_LIST_COLUMNS`].
+const HISTORY_LIST_FROM: &str = "history h LEFT JOIN history_list_meta m ON m.id = h.id";
 
 fn history_page_sql(where_sql: &str, arg_count: usize) -> String {
     format!(
-        "SELECT {HISTORY_LIST_COLUMNS} FROM history{where_sql}
-         ORDER BY completed_at DESC LIMIT ?{} OFFSET ?{}",
+        "SELECT {HISTORY_LIST_COLUMNS} FROM {HISTORY_LIST_FROM}{where_sql}
+         ORDER BY h.completed_at DESC LIMIT ?{} OFFSET ?{}",
         arg_count + 1,
         arg_count + 2
     )
@@ -2880,6 +2944,10 @@ mod tests {
                     continue;
                 }
                 assert_ne!(*p2, retry_col, "list page reads retry_data");
+                assert!(
+                    *p2 <= nzb_col,
+                    "list page reads history column {p2}, stored after nzb_data"
+                );
                 if *p2 == nzb_col {
                     assert_ne!(p5 & OPFLAG_TYPEOFARG, 0, "list page loads nzb_data");
                     probed_nzb = true;
@@ -2887,5 +2955,35 @@ mod tests {
             }
             assert!(probed_nzb, "has_nzb probe missing from the plan");
         }
+    }
+
+    #[test]
+    fn history_list_meta_follows_inserts_deletes_and_retention() {
+        let (db, _) = seeded_history_db();
+        let meta_count = |db: &Database| -> i64 {
+            db.conn
+                .query_row("SELECT COUNT(*) FROM history_list_meta", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let history_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(meta_count(&db), history_count);
+
+        let listed = db.history_list(1).unwrap();
+        let first = listed[0].clone();
+        let full = db.history_get(&first.id).unwrap().unwrap();
+        assert_eq!(full.failure_code, first.failure_code);
+        assert_eq!(full.download_time_secs, first.download_time_secs);
+
+        db.history_remove(&first.id).unwrap();
+        assert_eq!(meta_count(&db), history_count - 1);
+        db.history_enforce_retention(2).unwrap();
+        assert_eq!(meta_count(&db), 2);
+        db.history_clear().unwrap();
+        assert_eq!(meta_count(&db), 0);
     }
 }
