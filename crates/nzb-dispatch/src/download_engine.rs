@@ -126,6 +126,33 @@ fn try_send_progress(tx: &mpsc::Sender<ProgressUpdate>, job_id: &str, update: Pr
     }
 }
 
+/// Report one server attempt's outcome for `item` to the queue layer.
+fn send_outcome(ctx: &JobContext, item: &WorkItem, outcome: nzb_core::Outcome) {
+    try_send_progress(
+        &ctx.progress_tx,
+        &item.job_id,
+        ProgressUpdate::ArticleOutcome {
+            job_id: item.job_id.clone(),
+            file_id: item.file_id.clone(),
+            segment_number: item.segment_number,
+            message_id: item.message_id.clone(),
+            outcome,
+        },
+    );
+}
+
+fn transport(server: &ServerConfig) -> nzb_core::Outcome {
+    nzb_core::Outcome::Transport {
+        server: server.id.clone(),
+    }
+}
+
+fn refused(server: &ServerConfig) -> nzb_core::Outcome {
+    nzb_core::Outcome::Refused {
+        server: server.id.clone(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Global connection tracking — semaphore-backed permit pools
 // ---------------------------------------------------------------------------
@@ -499,6 +526,19 @@ pub enum ProgressUpdate {
         file_id: String,
         segment_number: u32,
         failure: crate::article_failure::ArticleFailure,
+    },
+    /// What one server said about one article on one attempt, in the damage
+    /// ledger's vocabulary. Emitted once per server attempt, before the
+    /// article's terminal `ArticleComplete`/`ArticleFailed`, so the queue
+    /// layer can record per-server evidence. Only a "not here" answer (430
+    /// and 411/412/420/423) is `Refused`; timeouts, connection loss and
+    /// decode errors are `Transport`.
+    ArticleOutcome {
+        job_id: String,
+        file_id: String,
+        segment_number: u32,
+        message_id: String,
+        outcome: nzb_core::Outcome,
     },
     JobFinished {
         job_id: String,
@@ -1978,6 +2018,7 @@ async fn run_worker_serial(
                             "Connection stalled — no response within {}s, reconnecting",
                             timeout.as_secs()
                         );
+                        send_outcome(&ctx, &item, transport(primary_server));
                         if retry_or_fail_over(
                             item,
                             primary_server,
@@ -2014,6 +2055,7 @@ async fn run_worker_serial(
                 if let Some(n) = std::num::NonZeroU32::new(process_result.decoded_bytes as u32) {
                     let _ = pool.bandwidth.acquire_download(n).await;
                 }
+                send_outcome(&ctx, &item, nzb_core::Outcome::Present);
                 try_send_progress(
                     &ctx.progress_tx,
                     &item.job_id,
@@ -2032,6 +2074,7 @@ async fn run_worker_serial(
                 last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
             }
             Err(ArticleError::ArticleNotFound) => {
+                send_outcome(&ctx, &item, refused(primary_server));
                 if handle_article_not_available(
                     &mut item,
                     primary_server,
@@ -2047,6 +2090,7 @@ async fn run_worker_serial(
                 }
             }
             Err(ArticleError::ConnectionLost(msg)) => {
+                send_outcome(&ctx, &item, transport(primary_server));
                 increment_counter("nntp.transient_reconnects");
                 consecutive_errors += 1;
                 warn!(
@@ -2072,6 +2116,7 @@ async fn run_worker_serial(
                 return WorkerExit::Reconnect;
             }
             Err(ArticleError::ProviderUnavailable { kind, message }) => {
+                send_outcome(&ctx, &item, transport(primary_server));
                 increment_counter("nntp.transient_reconnects");
                 let is_auth = matches!(
                     kind,
@@ -2098,6 +2143,7 @@ async fn run_worker_serial(
                 return WorkerExit::Reconnect;
             }
             Err(ArticleError::ServerError { kind, message }) => {
+                send_outcome(&ctx, &item, transport(primary_server));
                 if retry_or_fail_over(item, primary_server, pool, &ctx, worker_id, kind, &message) {
                     last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
                 }
@@ -2106,6 +2152,9 @@ async fn run_worker_serial(
                 }
             }
             Err(ArticleError::DecodeError(msg)) => {
+                // A body that fails to decode is not evidence the article is
+                // missing (WI-145): it is inconclusive, never a refusal.
+                send_outcome(&ctx, &item, transport(primary_server));
                 if handle_article_not_available(
                     &mut item,
                     primary_server,
@@ -2126,6 +2175,8 @@ async fn run_worker_serial(
                 ctx.resolve_one();
             }
             Err(ArticleError::AssemblyError(msg)) => {
+                // The server served a decodable body; only the local write failed.
+                send_outcome(&ctx, &item, nzb_core::Outcome::Present);
                 error!(job_id = %item.job_id, file_id = %item.file_id, segment_number = item.segment_number, message_id = %item.message_id, server_id = %primary_server.id, worker_id = %worker_id, original_failure_kind = "decode_error", terminal_failure_kind = "decode_error", "Assembly error: {msg}");
                 try_send_progress(
                     &ctx.progress_tx,
@@ -2318,6 +2369,13 @@ async fn run_worker_pipelined(
                         "Connection stalled — no response within {}s, reconnecting",
                         timeout.as_secs()
                     );
+                    // Every request still in flight went unanswered.
+                    for item in in_flight_items.values() {
+                        let ctx = pool.job_contexts.lock().get(&item.job_id).cloned();
+                        if let Some(ctx) = ctx {
+                            send_outcome(&ctx, item, transport(primary_server));
+                        }
+                    }
                     requeue_all(&mut in_flight_items, &pool.work_queue);
                     return WorkerExit::Reconnect;
                 }
@@ -2383,6 +2441,7 @@ async fn run_worker_pipelined(
                                     let _ = pool.bandwidth.acquire_download(n).await;
                                 }
                                 perf_bandwidth_us += bw_t.elapsed().as_micros() as u64;
+                                send_outcome(&ctx, &item, nzb_core::Outcome::Present);
                                 try_send_progress(
                                     &ctx.progress_tx,
                                     &item.job_id,
@@ -2435,6 +2494,8 @@ async fn run_worker_pipelined(
                                 }
                             }
                             Err(ArticleError::DecodeError(msg)) => {
+                                // Inconclusive, never a refusal (WI-145).
+                                send_outcome(&ctx, &item, transport(primary_server));
                                 if handle_article_not_available(
                                     &mut item,
                                     primary_server,
@@ -2450,6 +2511,7 @@ async fn run_worker_pipelined(
                                 }
                             }
                             Err(ArticleError::AssemblyError(msg)) => {
+                                send_outcome(&ctx, &item, nzb_core::Outcome::Present);
                                 error!(job_id = %item.job_id, file_id = %item.file_id, segment_number = item.segment_number, message_id = %item.message_id, server_id = %primary_server.id, worker_id = %worker_id, original_failure_kind = "decode_error", terminal_failure_kind = "decode_error", "Assembly error: {msg}");
                                 try_send_progress(
                                     &ctx.progress_tx,
@@ -2479,6 +2541,7 @@ async fn run_worker_pipelined(
                     ) => {
                         // 430 and 411/412/420/423 are article-level "not
                         // here" answers; the pipelined connection stays usable.
+                        send_outcome(&ctx, &item, refused(primary_server));
                         if handle_article_not_available(
                             &mut item,
                             primary_server,
@@ -2494,6 +2557,7 @@ async fn run_worker_pipelined(
                         }
                     }
                     Err(NntpError::Connection(_) | NntpError::Io(_)) => {
+                        send_outcome(&ctx, &item, transport(primary_server));
                         increment_counter("nntp.transient_reconnects");
                         warn!(
                             job_id = %item.job_id,
@@ -2517,6 +2581,7 @@ async fn run_worker_pipelined(
                         return WorkerExit::Reconnect;
                     }
                     Err(e) => {
+                        send_outcome(&ctx, &item, transport(primary_server));
                         increment_counter("nntp.transient_reconnects");
                         let failure = crate::article_failure::ArticleFailure::from_nntp(
                             &e,

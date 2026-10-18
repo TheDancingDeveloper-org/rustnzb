@@ -1927,6 +1927,7 @@ dependencies = [
  "hex",
  "http",
  "libc",
+ "mock-nntp-server",
  "notify",
  "nzb-decode",
  "nzb-dispatch",
