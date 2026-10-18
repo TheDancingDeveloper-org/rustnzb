@@ -8,6 +8,7 @@ pub mod groups_db;
 pub mod models;
 pub mod nzb_parser;
 pub mod overrides;
+pub mod par2_match;
 pub mod path;
 pub mod sabnzbd_import;
 
@@ -20,3 +21,4 @@ pub use error::{NzbError, Result};
 pub use models::*;
 pub use nzb_nntp;
 pub use overrides::{OverrideSet, OverrideSource, OverrideValue};
+pub use par2_match::{CandidateFile, PAR2_HASH_16K_LEN, Par2FileRef, match_files_by_hash16k};
