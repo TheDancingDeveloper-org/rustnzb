@@ -2,6 +2,14 @@ import { Injectable } from '@angular/core';
 import { HttpClient, HttpHeaders } from '@angular/common/http';
 import { Observable } from 'rxjs';
 
+/** A background poll that has not answered by now errors out, so the next poll can run. */
+export const POLL_TIMEOUT_MS = 15_000;
+
+/** True while the page is in a background tab, where polls are skipped. */
+export function pageHidden(): boolean {
+  return typeof document !== 'undefined' && document.hidden;
+}
+
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private baseUrl = '/api';

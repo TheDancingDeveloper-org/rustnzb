@@ -1,9 +1,9 @@
 import { Component, OnInit, OnDestroy, signal, computed } from '@angular/core';
-import { EMPTY, Observable, expand, map, reduce } from 'rxjs';
+import { EMPTY, Observable, expand, map, reduce, timeout } from 'rxjs';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
-import { ApiService } from '../../core/services/api.service';
+import { ApiService, POLL_TIMEOUT_MS, pageHidden } from '../../core/services/api.service';
 import { HistoryEntry, StatusResponse } from '../../core/models/queue.model';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
@@ -364,7 +364,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
 
   /** Background refresh: skipped while the tab is hidden or a load is still running. */
   poll(): void {
-    if (document.hidden || this.loadInFlight) return;
+    if (pageHidden() || this.loadInFlight) return;
     this.load();
   }
 
@@ -388,7 +388,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
     const seq = ++this.loadSeq;
     this.loadInFlight = true;
     const params = { offset: String(this.offset()), limit: String(PAGE_SIZE), ...this.filterParams() };
-    this.api.get<HistoryPage>('/history', params).subscribe({
+    this.api.get<HistoryPage>('/history', params).pipe(timeout(POLL_TIMEOUT_MS)).subscribe({
       next: r => {
         // A slower response for superseded filters/page must not win.
         if (seq !== this.loadSeq) return;
