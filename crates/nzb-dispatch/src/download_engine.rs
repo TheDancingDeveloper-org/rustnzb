@@ -126,6 +126,19 @@ fn try_send_progress(tx: &mpsc::Sender<ProgressUpdate>, job_id: &str, update: Pr
     }
 }
 
+/// Extra rounds an article refused by every server gets before it fails, so
+/// each server is asked `1 + CONFIRM_ASKS_PER_SERVER` times. A provider is
+/// known to answer `430` for an article it holds while busy, and the damage
+/// ledger only confirms a hole from refusals spread past
+/// [`nzb_core::damage_ledger::HOLE_CONFIRM_DELAY_SECS`]. One fast round
+/// across all servers never is.
+pub const CONFIRM_ASKS_PER_SERVER: u32 = 2;
+
+/// Wait before each confirm round. Longer than the ledger's busy-provider
+/// guard, so the confirming refusal counts.
+const CONFIRM_ROUND_DELAY: Duration =
+    Duration::from_millis(nzb_core::damage_ledger::HOLE_CONFIRM_DELAY_SECS as u64 * 1000 + 250);
+
 /// Report one server attempt's outcome for `item` to the queue layer.
 fn send_outcome(ctx: &JobContext, item: &WorkItem, outcome: nzb_core::Outcome) {
     try_send_progress(
@@ -575,6 +588,9 @@ pub(crate) struct WorkItem {
     /// Timeouts and dropped connections seen for this article while the
     /// server was otherwise healthy. Reset when the article moves server.
     pub(crate) outage_tries: u32,
+    /// Confirm rounds already spent on this article; see
+    /// [`CONFIRM_ASKS_PER_SERVER`].
+    pub(crate) confirm_rounds: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -2851,6 +2867,27 @@ fn handle_article_not_available(
         "Article returned error on this server"
     );
 
+    let all_refused = item
+        .provider_outcomes
+        .values()
+        .all(|k| *k == crate::article_failure::ArticleFailureKind::NotFound);
+    if all_definitive && all_refused && item.confirm_rounds < CONFIRM_ASKS_PER_SERVER {
+        // Every server refused within one fast round. Ask them all again
+        // after the busy-provider guard, through the normal queue, so the
+        // article stays unresolved and the re-ask uses the pool's own
+        // connections and permits.
+        item.confirm_rounds += 1;
+        item.provider_outcomes.clear();
+        item.tried_servers.clear();
+        let item = item.clone();
+        let work_queue = Arc::clone(work_queue);
+        tokio::spawn(async move {
+            tokio::time::sleep(CONFIRM_ROUND_DELAY).await;
+            work_queue.push_front(item);
+        });
+        return false;
+    }
+
     // (debug log immediately below was added for observability)
     if all_definitive {
         fail_article_everywhere(item, &primary_server.id, ctx, worker_id, kind, error_msg);
@@ -3169,6 +3206,7 @@ pub(crate) fn build_job_submission(
                     provider_outcomes: HashMap::new(),
                     tries_on_current: 0,
                     outage_tries: 0,
+                    confirm_rounds: 0,
                 })
         })
         .collect();
@@ -4309,6 +4347,7 @@ mod tests {
             provider_outcomes: HashMap::new(),
             tries_on_current: 0,
             outage_tries: 0,
+            confirm_rounds: 0,
         }
     }
 

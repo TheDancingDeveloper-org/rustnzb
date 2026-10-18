@@ -28,7 +28,7 @@ use nzb_postproc::{
     has_usable_output, parse_rar_volume, run_pipeline_with_cleanup, run_repair_pipeline,
 };
 
-use crate::damage_recorder::{self, LedgerRecorder};
+use crate::damage_recorder::LedgerRecorder;
 use crate::direct_unpack::DirectUnpacker;
 use crate::log_buffer::LogBuffer;
 use crate::notifications::{NotificationEvent, NotificationKind, Notifier};
@@ -1508,8 +1508,6 @@ pub struct QueueManager {
     dispatch: Arc<dyn DispatchEngine>,
     /// Minimum effective completion percentage, including usable PAR2 capacity.
     required_completion_pct: f64,
-    /// Bounds the damage ledger's confirm re-asks across all jobs.
-    ledger_probes: Arc<tokio::sync::Semaphore>,
 }
 
 impl QueueManager {
@@ -1632,9 +1630,6 @@ impl QueueManager {
             // article doesn't accidentally abort a real download; short
             // enough that an obvious zombie is killed within minutes.
             no_progress_timeout: Mutex::new(Duration::from_secs(300)),
-            ledger_probes: Arc::new(tokio::sync::Semaphore::new(
-                damage_recorder::MAX_CONCURRENT_PROBES,
-            )),
         })
     }
 
@@ -2691,9 +2686,15 @@ impl QueueManager {
                     continue;
                 }
             };
-            // Write buffered ledger evidence before acting on anything else,
-            // so a terminal article event sees every outcome that led to it.
-            if !matches!(update, ProgressUpdate::ArticleOutcome { .. }) {
+            // Write buffered ledger evidence before a terminal article or job
+            // event, so it sees every outcome that led to it. Other events
+            // leave the batch to fill.
+            if matches!(
+                update,
+                ProgressUpdate::ArticleFailed { .. }
+                    | ProgressUpdate::JobFinished { .. }
+                    | ProgressUpdate::JobAborted { .. }
+            ) {
                 self.flush_ledger(&job_id, &mut ledger);
             }
             match update {
@@ -2942,7 +2943,6 @@ impl QueueManager {
                     failure,
                     ..
                 } => {
-                    self.schedule_ledger_confirm(&job_id, &mut ledger, &file_id, segment_number);
                     let _ = &failure.message; // forwarded into logs below
                     let should_abort = {
                         let mut jobs = self.jobs.lock();
@@ -3251,60 +3251,6 @@ impl QueueManager {
         }
         let enabled = self.enabled_server_ids();
         ledger.flush(job_id, &self.db.lock(), &enabled);
-    }
-
-    /// An article failed on every server. If the ledger holds it only on a
-    /// provisional refusal, re-ask each server once after the busy-provider
-    /// guard so a real hole can be confirmed (or cleared).
-    fn schedule_ledger_confirm(
-        self: &Arc<Self>,
-        job_id: &str,
-        ledger: &mut LedgerRecorder,
-        file_id: &str,
-        segment_number: u32,
-    ) {
-        let Some(file_index) = ledger.file_index(file_id) else {
-            return;
-        };
-        let Some(message_id) = ledger.take_confirm(file_index, segment_number) else {
-            return;
-        };
-        let key = crate::nzb_core::ArticleKey::new(job_id, file_index, segment_number);
-        let qm = Arc::clone(self);
-        tokio::spawn(async move {
-            let Ok(_permit) = Arc::clone(&qm.ledger_probes).acquire_owned().await else {
-                return;
-            };
-            tokio::time::sleep(damage_recorder::CONFIRM_BACKOFF).await;
-            let mut servers: Vec<ServerConfig> = qm
-                .servers
-                .lock()
-                .iter()
-                .filter(|s| s.enabled)
-                .cloned()
-                .collect();
-            servers.sort_by_key(|s| s.priority);
-            let enabled: Vec<String> = servers.iter().map(|s| s.id.clone()).collect();
-            for server in &servers {
-                if !qm
-                    .db
-                    .lock()
-                    .ledger_held_provisionally(&key)
-                    .unwrap_or(false)
-                {
-                    break;
-                }
-                let outcome = damage_recorder::probe_server(server, &message_id).await;
-                if let Err(e) =
-                    qm.db
-                        .lock()
-                        .ledger_note(&key, &message_id, &outcome, &enabled, Utc::now())
-                {
-                    warn!(job_id = %key.scope_id, "Damage ledger confirm write failed: {e}");
-                    break;
-                }
-            }
-        });
     }
 
     /// Called when a job's download phase completes.
