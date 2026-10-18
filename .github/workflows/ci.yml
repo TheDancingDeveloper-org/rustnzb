@@ -17,9 +17,13 @@ jobs:
     # self-hosted runner for every automated update. Skipped jobs report a
     # successful check, so required checks do not remain pending.
     if: github.event_name != 'pull_request' || github.event.pull_request.user.type != 'Bot'
-    runs-on: [self-hosted]
+    # Heavy Rust: an on-demand GCP Spot VM (c3d-highcpu-8, 16 GB; spot-github-runners
+    # deploy/tdd-org-gcp). Only those VMs carry `gcp-rust`, so an idle Node B runner
+    # cannot claim the job first.
+    runs-on: [self-hosted, gcp-rust]
     env:
-      CARGO_BUILD_JOBS: 1
+      # 8 vCPU / 16 GB: 4 jobs leaves headroom for the WebDAV and benchnzb links.
+      CARGO_BUILD_JOBS: 4
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
