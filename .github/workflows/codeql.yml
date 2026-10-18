@@ -78,6 +78,14 @@ jobs:
             echo "No $LANGUAGE changes; analysis skipped (the queue analyses everything)."
           fi
 
+      # TypeScript extraction needs `node` on PATH; not every self-hosted
+      # runner has it, so install it rather than depend on runner placement.
+      - name: Set up Node.js
+        if: steps.scope.outputs.run == 'true' && matrix.language == 'javascript-typescript'
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
       - name: Initialize CodeQL
         if: steps.scope.outputs.run == 'true'
         uses: github/codeql-action/init@v4
