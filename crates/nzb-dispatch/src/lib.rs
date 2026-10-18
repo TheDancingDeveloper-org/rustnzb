@@ -18,6 +18,7 @@ pub mod article_failure;
 pub mod bandwidth;
 pub mod dispatch_engine;
 pub mod download_engine;
+pub mod slice_layout;
 pub mod telemetry;
 pub mod util;
 
@@ -29,3 +30,4 @@ pub use download_engine::{
     ConnectionSlot, ConnectionTracker, ProgressUpdate, ServerHealth, SlotStatus, WorkerPool,
     has_known_extension,
 };
+pub use slice_layout::slice_layout_from_par2;
