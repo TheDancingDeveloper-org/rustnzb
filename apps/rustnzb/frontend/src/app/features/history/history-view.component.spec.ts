@@ -64,6 +64,32 @@ describe('HistoryViewComponent', () => {
     component.ngOnDestroy();
   });
 
+  it('skips background polls while the tab is hidden', () => {
+    component.ngOnInit();
+    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+    vi.advanceTimersByTime(15000);
+    expect(historyCalls()).toHaveLength(1);
+    hidden.mockReturnValue(false);
+    vi.advanceTimersByTime(5000);
+    expect(historyCalls()).toHaveLength(2);
+    hidden.mockRestore();
+    component.ngOnDestroy();
+  });
+
+  it('does not stack polls behind a load that is still running', () => {
+    const pending = new Subject<unknown>();
+    api.get.mockImplementation((path: string) =>
+      path === '/status' ? of({}) : pending,
+    );
+    component.ngOnInit();
+    vi.advanceTimersByTime(15000);
+    expect(historyCalls()).toHaveLength(1);
+    pending.next({ entries: [] });
+    vi.advanceTimersByTime(5000);
+    expect(historyCalls()).toHaveLength(2);
+    component.ngOnDestroy();
+  });
+
   function historyCalls() {
     return api.get.mock.calls.filter(([path]) => path === '/history');
   }
