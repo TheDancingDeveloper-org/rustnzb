@@ -8,6 +8,7 @@ name: Runner policy
 
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
   # Lets the gate be re-run without a push. Needed because a run that fails to
@@ -15,6 +16,10 @@ on:
   # a jobless run -- which is exactly the state every public repo's gate was in
   # while github-policy was private.
   workflow_dispatch:
+
+concurrency:
+  group: runner-policy-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   runner-policy:

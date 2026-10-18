@@ -1,22 +1,70 @@
 name: CI
 
+# Pull requests run only the areas their diff touches (see `changes`). The
+# merge queue (merge_group), pushes to main and manual runs run everything.
+# Required checks are skipped, never absent, so a skipped area still reports
+# success. See docs/ci.md.
 on:
   push:
     branches: [main]
-    paths-ignore: ["*.md", "docs/**", "design/**", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"]
   pull_request:
-    paths-ignore: ["*.md", "docs/**", "design/**", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"]
+  merge_group:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  # Per ref: a force-push cancels the superseded PR run. Each queue entry has
+  # its own gh-readonly-queue/... ref, so entries never cancel each other.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  changes:
+    name: classify changes
+    if: github.event_name != 'pull_request' || github.event.pull_request.user.type != 'Bot'
+    runs-on: [self-hosted]
+    outputs:
+      rust: ${{ steps.classify.outputs.rust }}
+      frontend: ${{ steps.classify.outputs.frontend }}
+      desktop: ${{ steps.classify.outputs.desktop }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: classify
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" != pull_request ]]; then
+            printf 'rust=true\nfrontend=true\ndesktop=true\n' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files="$(git diff --name-only "$(git merge-base "$BASE_SHA" HEAD)" HEAD)"
+          rust=false frontend=false desktop=false
+          while IFS= read -r f; do
+            case "$f" in
+              '') ;;
+              .github/*|ci/*|Dockerfile*|.dockerignore|rust-toolchain.toml)
+                rust=true frontend=true desktop=true ;;
+              apps/rustnzb/frontend/*) frontend=true ;;
+              desktop/*) desktop=true ;;
+              crates/*|apps/*|benchnzb/*|fuzz/*|e2e/*|packaging/*|Cargo.toml|Cargo.lock)
+                rust=true ;;
+            esac
+          done <<<"$files"
+          printf 'rust=%s\nfrontend=%s\ndesktop=%s\n' "$rust" "$frontend" "$desktop" | tee -a "$GITHUB_OUTPUT"
+
   rust:
     # Dependabot PRs update dependency metadata only; avoid consuming a
     # self-hosted runner for every automated update. Skipped jobs report a
     # successful check, so required checks do not remain pending.
-    if: github.event_name != 'pull_request' || github.event.pull_request.user.type != 'Bot'
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: [self-hosted]
     env:
       CARGO_BUILD_JOBS: 1
@@ -46,7 +94,8 @@ jobs:
           RUSTFLAGS: -C linker=/usr/bin/gcc -C link-arg=-fuse-ld=gold
 
   frontend:
-    if: github.event_name != 'pull_request' || github.event.pull_request.user.type != 'Bot'
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
     runs-on: [self-hosted]
     steps:
       - uses: actions/checkout@v7
@@ -64,7 +113,10 @@ jobs:
         run: npm run build -- --configuration=production
 
   e2e:
-    if: github.event_name != 'pull_request' || (github.event.pull_request.user.type != 'Bot' && github.event.pull_request.head.repo.full_name == github.repository)
+    needs: changes
+    if: >-
+      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.frontend == 'true') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, docker, publish]
     env:
       GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
@@ -79,7 +131,10 @@ jobs:
           if-no-files-found: ignore
 
   desktop:
-    if: github.event_name != 'pull_request' || (github.event.pull_request.user.type != 'Bot' && github.event.pull_request.head.repo.full_name == github.repository)
+    needs: changes
+    if: >-
+      needs.changes.outputs.desktop == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, docker, publish]
     env:
       GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
@@ -88,8 +143,12 @@ jobs:
       - run: ci/run desktop-test
 
   container-smoke:
-    needs: rust
-    if: github.event_name != 'pull_request' || (github.event.pull_request.user.type != 'Bot' && github.event.pull_request.head.repo.full_name == github.repository)
+    needs: [changes, rust]
+    # always() so a frontend-only PR (rust skipped) still smoke-tests the image.
+    if: >-
+      always() && !cancelled() && needs.changes.result == 'success' && needs.rust.result != 'failure' &&
+      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.frontend == 'true') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, docker, publish]
     env:
       GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}

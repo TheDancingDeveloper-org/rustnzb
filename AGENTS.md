@@ -151,6 +151,9 @@ CLI args > environment > TOML > defaults. When you add a setting, add it to
 - Add or update tests for behavior changes, and describe user-visible
   behavior, compatibility implications, and test coverage in the PR body.
 - Rebase stacked branches on `main` before asking for review.
+- CI is path-scoped on PRs and runs in full in the merge queue. Land by
+  enqueuing (`gh pr merge --auto --rebase`), not by rebasing on every sibling
+  merge. See [docs/ci.md](docs/ci.md).
 - Releases are cut from `main` — see [docs/RELEASING.md](docs/RELEASING.md).
   A release PR bumps versions only; it does not carry feature work.
 
