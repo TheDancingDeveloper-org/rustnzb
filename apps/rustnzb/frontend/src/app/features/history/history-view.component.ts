@@ -345,6 +345,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
   nameFilter = '';
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private loadInFlight = false;
 
   constructor(
     private api: ApiService,
@@ -358,7 +359,13 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
       next: s => this.webdavEnabled.set(!!s.webdav_enabled),
       error: err => showHttpError(this.snack, err, 'Failed to load WebDAV status'),
     });
-    this.pollTimer = setInterval(() => this.load(), 5000);
+    this.pollTimer = setInterval(() => this.poll(), 5000);
+  }
+
+  /** Background refresh: skipped while the tab is hidden or a load is still running. */
+  poll(): void {
+    if (document.hidden || this.loadInFlight) return;
+    this.load();
   }
 
   ngOnDestroy(): void {
@@ -379,11 +386,13 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
 
   load(): void {
     const seq = ++this.loadSeq;
+    this.loadInFlight = true;
     const params = { offset: String(this.offset()), limit: String(PAGE_SIZE), ...this.filterParams() };
     this.api.get<HistoryPage>('/history', params).subscribe({
       next: r => {
         // A slower response for superseded filters/page must not win.
         if (seq !== this.loadSeq) return;
+        this.loadInFlight = false;
         const entries = r.entries || [];
         const total = r.total ?? entries.length;
         // The page we were on vanished (deletes, retention): go to the last one.
@@ -401,6 +410,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
       },
       error: err => {
         if (seq !== this.loadSeq) return;
+        this.loadInFlight = false;
         this.loadError.set(httpErrorMessage(err, "Couldn't load download history"));
         this.loading.set(false);
       },
