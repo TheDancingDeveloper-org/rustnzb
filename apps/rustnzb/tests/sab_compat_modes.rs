@@ -107,13 +107,24 @@ async fn warnings_clear_is_acknowledged() {
 }
 
 #[tokio::test]
-async fn change_complete_action_is_accepted_as_a_no_op() {
+async fn change_complete_action_refuses_power_actions_and_accepts_a_clear() {
     let server = start_compat_server().await;
 
-    // *arr clients send this; main has no custom complete actions, so the
-    // mode acknowledges and changes nothing.
+    // RustNZB cannot act on the host, so power actions are refused rather
+    // than silently ignored.
     let body = sab_call(&server, "mode=change_complete_action&value=shutdown").await;
-    assert_eq!(body, serde_json::json!({ "status": true }));
+    assert_eq!(body["status"], serde_json::json!(false));
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("shutdown"),
+        "error should name the refused action: {body}"
+    );
+
+    // An empty value clears the action.
+    let cleared = sab_call(&server, "mode=change_complete_action&value=").await;
+    assert_eq!(cleared, serde_json::json!({ "status": true }));
 }
 
 #[tokio::test]
