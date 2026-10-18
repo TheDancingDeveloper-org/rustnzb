@@ -7,7 +7,8 @@ name: Dependency review
 
 on:
   pull_request:
-    paths-ignore: ["*.md", "docs/**", "design/**", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"]
+  # Posts its context in the queue; the review itself already ran on the PR.
+  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -27,7 +28,9 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
       - name: Review dependency changes
+        if: github.event_name == 'pull_request'
         uses: actions/dependency-review-action@v4
         with:
           # Fail the check on newly introduced high/critical advisories; lower

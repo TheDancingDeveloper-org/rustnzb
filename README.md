@@ -273,6 +273,9 @@ For exact CI parity, use the checked-in container task interface:
 ./ci/run e2e
 ```
 
+Pull requests run only the CI areas they touch; the merge queue runs the full
+suite before anything reaches `main` — see [docs/ci.md](docs/ci.md).
+
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the full task list and
 build details. See [CONTRIBUTING.md](CONTRIBUTING.md) for repository workflow
 and [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) for current user-visible
