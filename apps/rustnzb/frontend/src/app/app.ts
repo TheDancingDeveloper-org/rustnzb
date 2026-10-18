@@ -12,8 +12,8 @@ import {
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { NavigationEnd, Router, RouterModule } from '@angular/router';
-import { filter } from 'rxjs';
-import { ApiService } from './core/services/api.service';
+import { filter, timeout } from 'rxjs';
+import { ApiService, POLL_TIMEOUT_MS, pageHidden } from './core/services/api.service';
 import { AuthService } from './core/services/auth.service';
 import { StatusResponse } from './core/models/queue.model';
 import { formatBytes, formatSpeed } from './core/format';
@@ -451,6 +451,7 @@ export class App implements OnInit, OnDestroy {
     { label: '2 hours', secs: 2 * 60 * 60 },
   ];
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private statusInFlight = false;
   private docClickHandler = (e: MouseEvent) => {
     if (!this.pauseMenuOpen) return;
     const el = (e.target as HTMLElement).closest('.pause-group');
@@ -477,7 +478,9 @@ export class App implements OnInit, OnDestroy {
 
   ngOnInit(): void {
     this.pollStatus();
-    this.pollTimer = setInterval(() => this.pollStatus(), 2000);
+    this.pollTimer = setInterval(() => {
+      if (!pageHidden() && !this.statusInFlight) this.pollStatus();
+    }, 2000);
     document.addEventListener('click', this.docClickHandler);
   }
 
@@ -488,8 +491,10 @@ export class App implements OnInit, OnDestroy {
 
   pollStatus(): void {
     if (!this.authenticated()) return;
-    this.api.get<StatusResponse>('/status').subscribe({
+    this.statusInFlight = true;
+    this.api.get<StatusResponse>('/status').pipe(timeout(POLL_TIMEOUT_MS)).subscribe({
       next: (s) => {
+        this.statusInFlight = false;
         this.speed.set(s.speed_bps);
         this.paused.set(s.paused);
         this.queueCount.set(s.queue_size);
@@ -499,7 +504,10 @@ export class App implements OnInit, OnDestroy {
         this.loaded.set(true);
         this.offline.set(false);
       },
-      error: () => this.offline.set(true),
+      error: () => {
+        this.statusInFlight = false;
+        this.offline.set(true);
+      },
     });
   }
 

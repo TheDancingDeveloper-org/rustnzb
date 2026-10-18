@@ -3,7 +3,7 @@ import '@angular/compiler';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { firstValueFrom, of, Subject, throwError } from 'rxjs';
 
-import { ApiService } from '../../core/services/api.service';
+import { ApiService, POLL_TIMEOUT_MS } from '../../core/services/api.service';
 import { HistoryEntry } from '../../core/models/queue.model';
 import { HistoryViewComponent } from './history-view.component';
 
@@ -82,9 +82,22 @@ describe('HistoryViewComponent', () => {
       path === '/status' ? of({}) : pending,
     );
     component.ngOnInit();
-    vi.advanceTimersByTime(15000);
+    vi.advanceTimersByTime(10000);
     expect(historyCalls()).toHaveLength(1);
     pending.next({ entries: [] });
+    vi.advanceTimersByTime(5000);
+    expect(historyCalls()).toHaveLength(2);
+    component.ngOnDestroy();
+  });
+
+  it('gives up on a load that never answers so polling resumes', () => {
+    const never = new Subject<unknown>();
+    api.get.mockImplementation((path: string) =>
+      path === '/status' ? of({}) : historyCalls().length === 1 ? never : of({ entries: [] }),
+    );
+    component.ngOnInit();
+    vi.advanceTimersByTime(POLL_TIMEOUT_MS - 1);
+    expect(historyCalls()).toHaveLength(1);
     vi.advanceTimersByTime(5000);
     expect(historyCalls()).toHaveLength(2);
     component.ngOnDestroy();
