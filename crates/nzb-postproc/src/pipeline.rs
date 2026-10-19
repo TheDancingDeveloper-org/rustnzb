@@ -17,10 +17,12 @@ use tracing::{debug, error, info, warn};
 use crate::detect::{
     ArchiveType, find_archives, find_cleanup_files, find_par2_files, is_par2_volume,
 };
+use crate::fold_repair::repair_from_fold;
 use crate::inflight::{VerifySource, map_fits, verify_set};
 use crate::par2::par2_repair;
 use crate::resources::PostProcResourcePool;
 use crate::unpack::{ArchivePasswordRequired, extract_7z, extract_rar, extract_tar, extract_zip};
+use nzb_decode::SharedFold;
 
 fn increment_counter(name: &'static str) {
     opentelemetry::global::meter_provider()
@@ -57,6 +59,7 @@ enum VerifyRepairOutcome {
     },
     Damaged {
         verify: VerifyNote,
+        repair: RepairNote,
         intact: usize,
         damaged: usize,
         missing: usize,
@@ -113,6 +116,34 @@ impl VerifyNote {
     }
 }
 
+/// How one recovery set was repaired, for its stage result (WI-148).
+#[derive(Debug, Clone)]
+struct RepairNote {
+    /// `fold` when solved from the in-flight fold, `disk` otherwise.
+    path: &'static str,
+    /// Why the fold was not used, when it was offered and refused.
+    fallback: Option<String>,
+    /// Intact slices read from disk by the repair itself.
+    slices_read: usize,
+    seconds: f64,
+}
+
+impl RepairNote {
+    /// Suffix for the Repair stage message, parsed by benchnzb:
+    /// `[repair: fold, 3 slices read, 0.012s]`.
+    fn tag(&self) -> String {
+        let fallback = self
+            .fallback
+            .as_ref()
+            .map(|r| format!(", fold refused: {r}"))
+            .unwrap_or_default();
+        format!(
+            " [repair: {}, {} slices read, {:.3}s{fallback}]",
+            self.path, self.slices_read, self.seconds
+        )
+    }
+}
+
 /// Pick the in-flight slice map for each set. The map carries no recovery set
 /// id, so it is matched by slice count, and only when exactly one set fits.
 fn maps_for_sets<'a>(
@@ -143,6 +174,7 @@ fn verify_repair_set(
     file_set: &rust_par2::Par2FileSet,
     dir: &Path,
     map: Option<&SliceMapSummary>,
+    fold: Option<&SharedFold>,
 ) -> VerifyRepairOutcome {
     let started = Instant::now();
     let set_verify = verify_set(file_set, dir, map);
@@ -171,13 +203,73 @@ fn verify_repair_set(
         blocks_needed,
         "Native PAR2 verify: damage detected, attempting native repair"
     );
+    let started = Instant::now();
+    let mut fallback = None;
+    if let Some(fold) = fold
+        && blocks_needed <= blocks_available
+    {
+        match repair_from_fold(file_set, dir, &verify_result, fold) {
+            Ok(done) => {
+                // A disk-verified set keeps the post-repair check.
+                let checked = verify.source != VerifySource::Disk || {
+                    let after = rust_par2::verify(file_set, dir);
+                    after.all_correct()
+                };
+                if checked {
+                    return VerifyRepairOutcome::Damaged {
+                        verify,
+                        repair: RepairNote {
+                            path: "fold",
+                            fallback: None,
+                            slices_read: done.slices_read_at_solve,
+                            seconds: started.elapsed().as_secs_f64(),
+                        },
+                        intact,
+                        damaged,
+                        missing,
+                        blocks_needed,
+                        blocks_available,
+                        repair_result: Ok(rust_par2::RepairResult {
+                            success: true,
+                            blocks_repaired: done.blocks_repaired,
+                            files_repaired: done.files_repaired,
+                            message: format!(
+                                "All files repaired from the in-flight fold ({} blocks)",
+                                done.blocks_repaired
+                            ),
+                        }),
+                    };
+                }
+                warn!("Fold repair did not verify; repairing from disk");
+                fallback = Some("post-repair verify failed".to_string());
+            }
+            Err(e) => {
+                info!("In-flight repair fold not usable, repairing from disk: {e}");
+                fallback = Some(e.to_string());
+            }
+        }
+    }
+    let started = Instant::now();
     let repair_result = if verify.source == VerifySource::Disk {
         rust_par2::repair_from_verify(file_set, dir, &verify_result)
     } else {
         rust_par2::repair_from_verify_no_reverify(file_set, dir, &verify_result)
     };
+    let repair = RepairNote {
+        path: "disk",
+        fallback,
+        // The disk path reads every intact slice of the set.
+        slices_read: file_set
+            .files
+            .values()
+            .map(|f| f.size.div_ceil(file_set.slice_size.max(1)) as usize)
+            .sum::<usize>()
+            .saturating_sub(blocks_needed as usize),
+        seconds: started.elapsed().as_secs_f64(),
+    };
     VerifyRepairOutcome::Damaged {
         verify,
+        repair,
         intact,
         damaged,
         missing,
@@ -252,6 +344,9 @@ pub struct PostProcConfig {
     /// `par2.trust_inflight_verify`: false forces the full disk verify pass
     /// even when a slice map is present.
     pub trust_inflight_verify: bool,
+    /// The download's in-flight repair fold (WI-148). Used for the set the
+    /// slice map was matched to; any shortfall falls back to disk repair.
+    pub repair_fold: Option<SharedFold>,
 }
 
 impl Default for PostProcConfig {
@@ -267,6 +362,7 @@ impl Default for PostProcConfig {
             max_nested_archive_depth: 5,
             slice_map: None,
             trust_inflight_verify: true,
+            repair_fold: None,
         }
     }
 }
@@ -468,6 +564,7 @@ async fn run_stages(
                 .into_iter()
                 .map(|m| m.cloned())
                 .collect();
+            let fold = config.repair_fold.clone();
             // Verify (and repair when needed) every set in a single
             // spawn_blocking call. This keeps CPU-intensive work off the async
             // runtime and keeps each non-Send VerifyResult on one thread so the
@@ -477,7 +574,10 @@ async fn run_stages(
                     file_sets
                         .iter()
                         .zip(&maps)
-                        .map(|(file_set, map)| verify_repair_set(file_set, &dir, map.as_ref()))
+                        .map(|(file_set, map)| {
+                            let fold = map.as_ref().and(fold.as_ref());
+                            verify_repair_set(file_set, &dir, map.as_ref(), fold)
+                        })
                         .collect::<Vec<_>>()
                 }),
                 tracing::info_span!("par2_verify", recovery_sets = recovery_set_count),
@@ -515,6 +615,7 @@ async fn run_stages(
                             }
                             VerifyRepairOutcome::Damaged {
                                 verify,
+                                repair,
                                 intact,
                                 damaged,
                                 missing,
@@ -558,8 +659,9 @@ async fn run_stages(
                                                 StageStatus::Failed
                                             },
                                             message: Some(format!(
-                                                "Recovery set {set_number}/{recovery_set_count}: {}",
-                                                result.message
+                                                "Recovery set {set_number}/{recovery_set_count}: {}{}",
+                                                result.message,
+                                                repair.tag()
                                             )),
                                             duration_secs: duration,
                                         });
@@ -582,7 +684,8 @@ async fn run_stages(
                                             name: "Repair".to_string(),
                                             status: StageStatus::Failed,
                                             message: Some(format!(
-                                                "Recovery set {set_number}/{recovery_set_count}: repair failed: {e}"
+                                                "Recovery set {set_number}/{recovery_set_count}: repair failed: {e}{}",
+                                                repair.tag()
                                             )),
                                             duration_secs: duration,
                                         });
