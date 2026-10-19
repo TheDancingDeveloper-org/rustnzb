@@ -75,6 +75,13 @@ impl DamageRelease {
     /// Generate the standard release. The same `name` and `seed` always give
     /// the same bytes.
     pub fn generate(name: &str, seed: u64) -> Self {
+        Self::generate_with_volumes(name, seed, &RECOVERY_VOLUME_BLOCKS)
+    }
+
+    /// Generate the standard data files and index with recovery volumes of
+    /// the given block counts, in order. An empty list gives an index-only
+    /// release with no recovery slices.
+    pub fn generate_with_volumes(name: &str, seed: u64, volume_blocks: &[u32]) -> Self {
         let mut rng = SplitMix64(seed);
         let mkv_name = format!("{name}.mkv");
         let nfo_name = format!("{name}.nfo");
@@ -88,7 +95,7 @@ impl DamageRelease {
 
         let mut volumes = Vec::new();
         let mut next_exponent = 0u32;
-        for blocks in RECOVERY_VOLUME_BLOCKS {
+        for &blocks in volume_blocks {
             let exponents: Vec<u32> = (next_exponent..next_exponent + blocks).collect();
             let filename = format!("{name}.vol{next_exponent:02}+{blocks:02}.par2");
             let payload = par2.volume_bytes(&exponents);
