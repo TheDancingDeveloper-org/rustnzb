@@ -3,7 +3,7 @@
 # CI toolchain images are intentionally linux/amd64. The current Woodpecker
 # runners are amd64 and use the cross image to produce arm64 application
 # artifacts. Update ci/images.lock only after all four targets self-test.
-FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS core
+FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS core
 
 ARG NODE_VERSION=22.17.1
 ARG NODE_SHA256=ff04bc7c3ed7699ceb708dbaaf3580d899ff8bf67f17114f979e83aa74fc5a49
@@ -14,7 +14,7 @@ ARG SCCACHE_SHA256=ecda4ddc89a49f1ec6f35bdce5ecbf6f205b399a680d11119d4ce9f6d9621
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_INCREMENTAL=0 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    RUSTUP_TOOLCHAIN=1.88.0
+    RUSTUP_TOOLCHAIN=1.95.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -61,7 +61,7 @@ RUN rustup component add rustfmt clippy \
     && npm --version \
     && protoc --version \
     && sccache --version \
-    && test "$(rustc --version | awk '{print $2}')" = "1.88.0" \
+    && test "$(rustc --version | awk '{print $2}')" = "1.95.0" \
     && test "$(node --version)" = "v${NODE_VERSION}" \
     && test "$(npm --version)" = "${NPM_VERSION}" \
     && test "$(sccache --version | awk '{print $2}')" = "${SCCACHE_VERSION}"

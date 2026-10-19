@@ -100,7 +100,7 @@ cargo build -p rustnzb --release
 ./target/release/rustnzb
 ```
 
-Requirements: Rust 1.88+ (2024 edition), `7z` for archive extraction.
+Requirements: Rust 1.95+ (2024 edition), `7z` for archive extraction.
 
 ---
 

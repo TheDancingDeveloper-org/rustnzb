@@ -18,6 +18,7 @@ exclude = ["benchnzb", "desktop"]
 [workspace.package]
 version = "1.7.0"
 edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 
 [workspace.lints.clippy]
