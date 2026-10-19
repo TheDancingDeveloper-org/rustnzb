@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use md5::{Digest, Md5};
 use nzb_core::models::{NzbJob, SliceMapSummary, SliceVerdict};
 use nzb_core::{CandidateFile, PAR2_HASH_16K_LEN, Par2FileRef, match_files_by_hash16k};
-use nzb_decode::repair_fold::{batch_len, max_rows};
+use nzb_decode::repair_fold::{GrowthTicket, batch_len, max_rows};
 use nzb_decode::{RepairFold, SharedFold, SliceState, SliceVerifier};
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
@@ -332,6 +332,7 @@ impl JobSlices {
                 pending.extend(this.match_by_hash(&[id]));
             }
             this.verify_all(pending);
+            this.spawn_grow();
         };
         if let Err(e) = tokio::task::spawn_blocking(task).await {
             warn!("PAR2 slice verify task failed: {e}");
@@ -367,7 +368,8 @@ impl JobSlices {
                 runtime.spawn_blocking(move || this.feed_prefix(&fold, rows, plan.slice_size));
             }
         } else if !idle {
-            runtime.spawn_blocking(move || this.grow_fold());
+            drop(runtime);
+            this.spawn_grow();
         }
     }
 
@@ -610,7 +612,24 @@ impl JobSlices {
                 SliceState::Unknown => {}
             }
         }
-        self.grow_fold();
+    }
+
+    /// Open or grow the fold on a detached blocking task, so the worker that
+    /// verified the slice is not held up by disk reads. A no-op without
+    /// damage, without a runtime, or once the fold is refused.
+    fn spawn_grow(self: &std::sync::Arc<Self>) {
+        if self.damage_hint() == 0 || matches!(*self.fold.lock(), FoldSlot::Refused) {
+            return;
+        }
+        if let Some(fold) = self.active_fold()
+            && fold.lock().growing()
+        {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let this = self.clone();
+            runtime.spawn_blocking(move || this.grow_fold());
+        }
     }
 
     fn active_fold(&self) -> Option<SharedFold> {
@@ -690,13 +709,24 @@ impl JobSlices {
         match existing {
             None => self.open_fold(want, total, slice_size),
             Some(fold) => {
-                let mut fold = fold.lock();
-                let have = fold.rows();
-                if damage <= have || have >= want {
-                    return;
-                }
-                let target = want.max(rows_for(have, recovery, slice_size));
-                let exps = self.exponents(have..target);
+                let (have, ticket) = {
+                    let mut f = fold.lock();
+                    let have = f.rows();
+                    if f.growing() || damage <= have || have >= want {
+                        return;
+                    }
+                    let target = want.max(rows_for(have, recovery, slice_size));
+                    match f.begin_growth(&self.exponents(have..target)) {
+                        Ok(Some(ticket)) => (have, ticket),
+                        Ok(None) => return,
+                        Err(e) => {
+                            // The fold stays usable with its current rows;
+                            // post-processing falls back if they are too few.
+                            warn!(damage, rows = have, "Repair fold could not grow: {e}");
+                            return;
+                        }
+                    }
+                };
                 let state = &self.state;
                 let read = |gi: usize| {
                     let source = match &*state.lock() {
@@ -707,18 +737,13 @@ impl JobSlices {
                         source.ok_or_else(|| std::io::Error::other("slice has no path"))?;
                     read_range(&source.path, source.offset, source.len)
                 };
-                match fold.extend_rows(&exps, read) {
-                    Ok(added) => {
-                        info!(
-                            rows = fold.rows(),
-                            added, damage, "Repair fold rows extended"
-                        );
-                    }
-                    Err(e) => {
-                        // The fold stays usable with its current rows;
-                        // post-processing falls back if they are too few.
-                        warn!(damage, rows = have, "Repair fold could not grow: {e}");
-                    }
+                if backfill_growth(&fold, ticket, slice_size, read) {
+                    info!(
+                        rows = fold.lock().rows(),
+                        from = have,
+                        damage,
+                        "Repair fold rows extended"
+                    );
                 }
             }
         }
@@ -885,6 +910,35 @@ impl JobSlices {
     }
 }
 
+/// Fold a growth's slices into its new rows, reading them back with `read`
+/// in bounded batches. The fold lock is taken only to fold each batch, never
+/// across a read, so workers keep feeding the fold meanwhile. Returns whether
+/// the growth completed; a read failure abandons it.
+fn backfill_growth<R>(fold: &SharedFold, ticket: GrowthTicket, slice_size: u64, mut read: R) -> bool
+where
+    R: FnMut(usize) -> std::io::Result<Vec<u8>>,
+{
+    for chunk in ticket.slices.chunks(batch_len(slice_size)) {
+        let mut batch = Vec::with_capacity(chunk.len());
+        for &gi in chunk {
+            match read(gi) {
+                Ok(bytes) => batch.push((gi, bytes)),
+                Err(e) => {
+                    warn!(slice = gi, "Repair fold growth abandoned, read failed: {e}");
+                    fold.lock().abandon_growth_of(ticket.generation);
+                    return false;
+                }
+            }
+        }
+        let refs: Vec<(usize, &[u8])> = batch.iter().map(|(i, b)| (*i, b.as_slice())).collect();
+        if !fold.lock().backfill(ticket.generation, &refs) {
+            // Post-processing took the fold and dropped the growth.
+            return false;
+        }
+    }
+    true
+}
+
 fn pending_for(verifier: &SliceVerifier, path: &Path, done: Vec<usize>) -> Vec<PendingSlice> {
     done.into_iter()
         .filter_map(|gi| {
@@ -921,4 +975,86 @@ fn read_range(path: &Path, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len as usize];
     file.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+
+    fn slice(i: usize, len: usize) -> Vec<u8> {
+        (0..len).map(|b| (b * 13 + i * 7 + 1) as u8).collect()
+    }
+
+    /// The growth backfill never holds the fold while it reads: a worker can
+    /// take the lock and feed a slice during every read, and the grown rows
+    /// still solve.
+    #[test]
+    fn growth_backfill_does_not_block_workers() {
+        let (n, size) = (40usize, 64usize);
+        // Small batches: one slice each would hide a lock held across reads.
+        let data: Vec<Vec<u8>> = (0..n).map(|i| slice(i, size)).collect();
+        let fold: SharedFold =
+            std::sync::Arc::new(Mutex::new(RepairFold::new(n, size as u64, &[0]).unwrap()));
+        for (i, d) in data.iter().enumerate().take(20) {
+            fold.lock().feed(i, d).unwrap();
+        }
+        let ticket = fold.lock().begin_growth(&[0, 1, 2]).unwrap().unwrap();
+        assert_eq!(ticket.slices.len(), 20);
+        let mut next_worker_slice = 20;
+        let mut reads = 0;
+        let done = backfill_growth(&fold, ticket, size as u64, |gi| {
+            reads += 1;
+            // A worker verifies a slice right now: the lock must be free.
+            let mut f = fold.try_lock().expect("fold locked during a disk read");
+            if next_worker_slice < n - 3 {
+                f.feed(next_worker_slice, &data[next_worker_slice]).unwrap();
+                next_worker_slice += 1;
+            }
+            Ok(data[gi].clone())
+        });
+        assert!(done);
+        assert_eq!(reads, 20, "each pre-growth slice read once");
+        let f = fold.lock();
+        assert!(!f.growing());
+        assert_eq!(f.complete_rows(), 3);
+        drop(f);
+        // Feed the rest except the three damaged ones, then solve.
+        let damaged = [n - 3, n - 2, n - 1];
+        for (i, d) in data.iter().enumerate().take(n - 3).skip(next_worker_slice) {
+            fold.lock().feed(i, d).unwrap();
+        }
+        let constants = rust_par2::matrix::par2_input_constants(n);
+        let recovery: HashMap<u32, Vec<u8>> = (0..3u32)
+            .map(|e| {
+                let mut out = vec![0u8; size];
+                for (i, d) in data.iter().enumerate() {
+                    rust_par2::gf_simd::mul_add_buffer(
+                        &mut out,
+                        d,
+                        rust_par2::gf::pow(constants[i], e),
+                    );
+                }
+                (e, out)
+            })
+            .collect();
+        for (gi, bytes) in fold.lock().solve(&damaged, &recovery).unwrap() {
+            assert_eq!(bytes, data[gi]);
+        }
+    }
+
+    /// A failed read abandons the growth and leaves the old rows usable.
+    #[test]
+    fn failed_backfill_read_abandons_the_growth() {
+        let size = 32usize;
+        let fold: SharedFold =
+            std::sync::Arc::new(Mutex::new(RepairFold::new(4, size as u64, &[0]).unwrap()));
+        fold.lock().feed(0, &slice(0, size)).unwrap();
+        let ticket = fold.lock().begin_growth(&[1]).unwrap().unwrap();
+        assert!(!backfill_growth(&fold, ticket, size as u64, |_| {
+            Err(std::io::Error::other("gone"))
+        }));
+        let f = fold.lock();
+        assert!(!f.growing());
+        assert_eq!(f.rows(), 1);
+    }
 }

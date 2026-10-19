@@ -115,6 +115,9 @@ pub fn repair_from_fold(
         return Err(FoldRepairError::Mismatch);
     }
     let damaged = damaged_indices(&placed, verify);
+    // Rows still being backfilled by the download do not count; drop them
+    // so the solve can add rows of its own.
+    fold.abandon_growth();
     let slices_prefed = fold.fed_count();
     let slice = set.slice_size;
 
