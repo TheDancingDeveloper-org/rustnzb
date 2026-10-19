@@ -18,6 +18,7 @@ pub mod article_failure;
 pub mod bandwidth;
 pub mod dispatch_engine;
 pub mod download_engine;
+mod held_volumes;
 pub mod slice_layout;
 mod slice_tracker;
 pub mod telemetry;

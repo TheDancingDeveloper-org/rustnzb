@@ -648,6 +648,12 @@ pub(crate) struct JobContext {
     span: Mutex<Option<tracing::Span>>,
     /// In-flight PAR2 slice verification for this job.
     pub(crate) slices: Arc<crate::slice_tracker::JobSlices>,
+    /// Recovery volumes by NZB file id → `(first exponent, blocks)`. Empty
+    /// when the job has no PAR2 index or a volume's size is unknown, which
+    /// turns deferral off for the job.
+    par2_volumes: HashMap<String, (u32, u32)>,
+    /// Recovery volumes held back until the slice map shows damage.
+    held: crate::held_volumes::HeldVolumes,
 }
 
 pub(crate) type JobContextMap = Arc<Mutex<HashMap<String, Arc<JobContext>>>>;
@@ -687,6 +693,8 @@ impl JobContext {
             finished: AtomicBool::new(false),
             waiting_for_providers_reported: AtomicBool::new(false),
             slices: Arc::new(crate::slice_tracker::JobSlices::new(job)),
+            par2_volumes: deferrable_volumes(job),
+            held: Default::default(),
             span: Mutex::new(Some(tracing::info_span!(
                 parent: None,
                 "download",
@@ -759,11 +767,75 @@ impl JobContext {
     /// Decrement articles_remaining. If it reaches zero, run deobfuscation
     /// and emit the job-finished/aborted terminal update. Idempotent.
     fn resolve_one(&self) {
+        // Still owning one remaining article keeps the count above zero, so a
+        // release here can never race the data-end decision below.
+        self.release_held(false);
         let prev = self.articles_remaining.fetch_sub(1, Ordering::Relaxed);
         if prev != 1 {
             return;
         }
+        if self.release_held(true) {
+            return;
+        }
         self.emit_terminal();
+    }
+
+    /// Release held recovery volumes the slice map says the job needs.
+    /// In flight the damage is the tracker's running estimate; at data end
+    /// (`at_data_end`, no article outstanding) it is the exact map, with
+    /// undecided slices counted as damaged. Returns true when work was added
+    /// back to the queue.
+    fn release_held(&self, at_data_end: bool) -> bool {
+        if self.held.is_empty()
+            || self.cancelled.load(Ordering::Relaxed)
+            || self.abort_reason.lock().is_some()
+        {
+            return false;
+        }
+        let released = if at_data_end {
+            match self.slices.summary() {
+                Some(map) => {
+                    let damage = map.damaged + map.unknown;
+                    if damage == 0 {
+                        return false;
+                    }
+                    let need = damage + crate::held_volumes::REPAIR_MARGIN;
+                    if damage > self.held.total_blocks() {
+                        // Hopeless on the volumes this NZB carries; fetch
+                        // them all and leave the verdict to repair (WI-145).
+                        warn!(
+                            job_id = %self.job_id,
+                            damage,
+                            recovery_blocks = self.held.total_blocks(),
+                            "Damage exceeds every recovery volume on hand"
+                        );
+                    }
+                    self.held.release_for(need)
+                }
+                // No slice map to judge by: fetch every volume.
+                None => self.held.release_all(),
+            }
+        } else {
+            let damage = self.slices.damage_hint();
+            if damage == 0 {
+                return false;
+            }
+            self.held
+                .release_for(damage + crate::held_volumes::REPAIR_MARGIN)
+        };
+        let Some((queue, items)) = released else {
+            return false;
+        };
+        info!(
+            job_id = %self.job_id,
+            articles = items.len(),
+            at_data_end,
+            "Releasing held PAR2 recovery volumes"
+        );
+        self.articles_remaining
+            .fetch_add(items.len(), Ordering::Relaxed);
+        queue.submit_items(items);
+        true
     }
 
     /// Emit the terminal (JobFinished / JobAborted) message. Safe to call
@@ -1162,6 +1234,8 @@ pub struct WorkerPool {
     /// watchdog. Useful for tests and observability — a non-zero value
     /// means at least one worker stalled long enough to be reclaimed.
     evictions: AtomicU64,
+    /// `par2.defer_volumes`: hold recovery volumes until damage shows.
+    defer_par2_volumes: AtomicBool,
     workers: Mutex<HashMap<String, Vec<ActiveWorker>>>,
     shutdown: Arc<AtomicBool>,
     supervisor_handle: Mutex<Option<JoinHandle<()>>>,
@@ -1191,10 +1265,16 @@ impl WorkerPool {
             max_worker_idle: Mutex::new(DEFAULT_MAX_WORKER_IDLE),
             starvation_log: Mutex::new(HashMap::new()),
             evictions: AtomicU64::new(0),
+            defer_par2_volumes: AtomicBool::new(true),
             workers: Mutex::new(HashMap::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
             supervisor_handle: Mutex::new(None),
         })
+    }
+
+    /// Set `par2.defer_volumes` for jobs submitted from now on.
+    pub fn set_defer_par2_volumes(&self, on: bool) {
+        self.defer_par2_volumes.store(on, Ordering::Relaxed);
     }
 
     /// Override the worker idle eviction threshold. Tests use this to make
@@ -1389,7 +1469,26 @@ impl WorkerPool {
             ctx.emit_terminal();
             return;
         }
-        self.job_contexts.lock().insert(job_id.clone(), ctx);
+        self.job_contexts.lock().insert(job_id.clone(), ctx.clone());
+        let items =
+            if self.defer_par2_volumes.load(Ordering::Relaxed) && !ctx.par2_volumes.is_empty() {
+                let total = items.len();
+                let now = ctx
+                    .held
+                    .hold(items, &ctx.par2_volumes, self.work_queue.clone());
+                ctx.articles_remaining
+                    .fetch_sub(total - now.len(), Ordering::Relaxed);
+                now
+            } else {
+                items
+            };
+        if items.is_empty() {
+            // Only held volumes are left (a resumed job): decide on them now.
+            if !ctx.release_held(true) {
+                ctx.emit_terminal();
+            }
+            return;
+        }
         self.work_queue.submit_items(items);
         self.report_provider_outage();
         debug!(job_id = %job_id, queue_len = self.work_queue.len(), "Job submitted to worker pool");
@@ -3090,6 +3189,32 @@ fn requeue_all(in_flight: &mut HashMap<u64, WorkItem>, work_queue: &Arc<SharedWo
     for item in items {
         work_queue.push_front(item);
     }
+}
+
+/// The job's recovery volumes as NZB file id → `(first exponent, blocks)`,
+/// or none when deferring them is unsafe: no PAR2 index to build a slice map
+/// from, or a volume whose exponent or block count the name does not give.
+fn deferrable_volumes(job: &NzbJob) -> HashMap<String, (u32, u32)> {
+    if !job
+        .files
+        .iter()
+        .any(|f| crate::slice_tracker::is_par2_index(&f.filename))
+    {
+        return HashMap::new();
+    }
+    let mut volumes = HashMap::new();
+    for file in &job.files {
+        if par2_sort_key(&file.filename) != 1 {
+            continue;
+        }
+        match (file.par2_vol, file.par2_blocks) {
+            (Some(vol), Some(blocks)) => {
+                volumes.insert(file.id.clone(), (vol, blocks));
+            }
+            _ => return HashMap::new(),
+        }
+    }
+    volumes
 }
 
 /// Sort key for work-queue prioritisation of PAR2 files. Index files (0)

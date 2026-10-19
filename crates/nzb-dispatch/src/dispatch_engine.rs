@@ -94,6 +94,10 @@ pub trait DispatchEngine: Send + Sync {
     /// make the watchdog converge in seconds; production uses the default.
     fn set_max_worker_idle(&self, d: Duration);
 
+    /// `par2.defer_volumes`: hold PAR2 recovery volumes until the job's slice
+    /// map shows damage. Applies to jobs submitted afterwards.
+    fn set_defer_par2_volumes(&self, _on: bool) {}
+
     /// Lifetime count of worker evictions performed by the heartbeat
     /// watchdog. Increases by 1 each time the supervisor reclaims a stalled
     /// worker. Useful for tests and observability.
@@ -239,6 +243,10 @@ impl DispatchEngine for DispatchHandle {
 
     fn set_max_worker_idle(&self, d: Duration) {
         self.0.set_max_worker_idle(d);
+    }
+
+    fn set_defer_par2_volumes(&self, on: bool) {
+        self.0.set_defer_par2_volumes(on);
     }
 
     fn eviction_count(&self) -> u64 {
