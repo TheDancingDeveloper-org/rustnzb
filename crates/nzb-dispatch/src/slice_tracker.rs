@@ -37,6 +37,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use md5::{Digest, Md5};
 use nzb_core::models::{NzbJob, SliceMapSummary, SliceVerdict};
@@ -116,6 +117,10 @@ pub(crate) struct JobSlices {
     /// NZB file id → whether every terminal failure in it was a confirmed
     /// absence (refused by every server). Absent: no failures.
     failures: Mutex<HashMap<String, bool>>,
+    /// Articles confirmed missing everywhere so far.
+    confirmed_missing: AtomicUsize,
+    /// Slices that failed their checksum so far.
+    damaged_seen: AtomicUsize,
 }
 
 /// True for a PAR2 index file name (`.par2` without `.vol`).
@@ -181,6 +186,8 @@ impl JobSlices {
             index_on_disk,
             state: Mutex::new(state),
             failures: Mutex::new(HashMap::new()),
+            confirmed_missing: AtomicUsize::new(0),
+            damaged_seen: AtomicUsize::new(0),
         }
     }
 
@@ -277,6 +284,9 @@ impl JobSlices {
     /// Note a terminal article failure in `file_id`. `confirmed` is true when
     /// every server refused the article.
     pub(crate) fn record_failure(&self, file_id: &str, confirmed: bool) {
+        if confirmed {
+            self.confirmed_missing.fetch_add(1, Ordering::Relaxed);
+        }
         let mut failures = self.failures.lock();
         let entry = failures.entry(file_id.to_string()).or_insert(true);
         *entry &= confirmed;
@@ -500,14 +510,24 @@ impl JobSlices {
             if let State::Ready(tracked) = &mut *self.state.lock() {
                 let verdict = tracked.verifier.verify(slice.global_index, &bytes);
                 if verdict == SliceState::Damaged {
+                    self.damaged_seen.fetch_add(1, Ordering::Relaxed);
                     debug!(slice = slice.global_index, "PAR2 slice damaged");
                 }
             }
         }
     }
 
+    /// A running estimate of the damage while articles are still arriving:
+    /// slices that failed their checksum plus articles confirmed missing
+    /// (each takes out at least one slice). [`summary`](Self::summary) gives
+    /// the exact count once the data is in.
+    pub(crate) fn damage_hint(&self) -> usize {
+        self.damaged_seen.load(Ordering::Relaxed) + self.confirmed_missing.load(Ordering::Relaxed)
+    }
+
     /// Decide the remaining slices and summarise the map. `None` when no map
-    /// was ever built. Called once, when the job's articles are all resolved.
+    /// was ever built. Called when the job's data articles are all resolved
+    /// (to size the recovery volumes it needs) and again at job end.
     pub(crate) fn summary(&self) -> Option<SliceMapSummary> {
         let mut state = self.state.lock();
         let State::Ready(tracked) = &mut *state else {

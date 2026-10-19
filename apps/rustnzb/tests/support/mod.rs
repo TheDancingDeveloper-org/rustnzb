@@ -92,6 +92,7 @@ async fn start_test_server_inner(
         dav: base.dav,
         config_version: base.config_version,
         notifications: base.notifications,
+        par2: base.par2,
     };
 
     let db = Database::open_memory().expect("Failed to create in-memory database");

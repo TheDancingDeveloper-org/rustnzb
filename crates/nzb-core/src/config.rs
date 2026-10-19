@@ -25,6 +25,8 @@ pub struct AppConfig {
     pub dav: DavConfig,
     #[serde(default)]
     pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub par2: Par2Config,
 }
 
 impl Default for AppConfig {
@@ -38,6 +40,25 @@ impl Default for AppConfig {
             rss_feeds: Vec::new(),
             dav: DavConfig::default(),
             notifications: NotificationConfig::default(),
+            par2: Par2Config::default(),
+        }
+    }
+}
+
+/// PAR2 handling during download.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Par2Config {
+    /// Hold PAR2 recovery volumes until the in-flight slice map shows
+    /// damage, then fetch only as many as the damage needs. Off fetches every
+    /// volume up front.
+    pub defer_volumes: bool,
+}
+
+impl Default for Par2Config {
+    fn default() -> Self {
+        Self {
+            defer_volumes: true,
         }
     }
 }

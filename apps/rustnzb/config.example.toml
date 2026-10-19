@@ -143,6 +143,12 @@ metrics_enabled = false
 metrics_endpoint = "http://localhost:4317"
 service_name = "rustnzb"
 
+# PAR2 recovery volumes are held until the in-flight slice map shows damage,
+# then only enough volumes to cover it (plus a margin) are fetched. Set
+# false to fetch every volume up front.
+[par2]
+defer_volumes = true
+
 [dav]
 enabled = false
 auto_send_all = false

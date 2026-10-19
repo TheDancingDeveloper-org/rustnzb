@@ -2069,6 +2069,12 @@ impl QueueManager {
         self.queue_complete_persist.store(persist, Ordering::SeqCst);
     }
 
+    /// `par2.defer_volumes`: hold PAR2 recovery volumes until the slice map
+    /// shows damage. Applies to downloads started afterwards.
+    pub fn set_defer_par2_volumes(&self, on: bool) {
+        self.dispatch.set_defer_par2_volumes(on);
+    }
+
     /// Start the complete action in the background, for callers that are not
     /// async. Without a Tokio runtime there is nothing to run it on, so the
     /// action is skipped.
