@@ -65,7 +65,7 @@ jobs:
     # successful check, so required checks do not remain pending.
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: [self-hosted]
+    runs-on: [self-hosted, gcp-rust]
     env:
       CARGO_BUILD_JOBS: 1
     steps:
