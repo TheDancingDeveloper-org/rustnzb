@@ -3120,8 +3120,6 @@ pub async fn h_dav_status(
             },
             fail_message: h.fail_message,
             completed_at: h.created_at.and_utc().to_rfc3339(),
-            par2_volumes_fetched: None,
-            par2_volumes_available: None,
         })
         .collect();
 
