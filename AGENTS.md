@@ -42,7 +42,7 @@ drive it.
 | `docs/` | Development, releasing, known issues, performance status |
 | `website/` | Project site and browser demo |
 
-Cargo workspace: `resolver = "3"`, Rust 2024 edition, MSRV 1.88.
+Cargo workspace: `resolver = "3"`, Rust 2024 edition, MSRV 1.95.
 `default-members = ["apps/rustnzb"]`; `benchnzb` and `desktop` are excluded and
 must be built or tested with their own manifests.
 

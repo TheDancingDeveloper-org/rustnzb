@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.88 or newer
+- Rust 1.95 or newer
 - Node.js 22 for the Angular frontend
 - Docker and Docker Buildx for container and browser-task workflows
 - `7z` for archive extraction at runtime
