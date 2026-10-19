@@ -302,11 +302,7 @@ fn parse_duration(text: &str) -> Option<f64> {
             }
         }
     }
-    if total > 0.0 {
-        Some(total)
-    } else {
-        None
-    }
+    if total > 0.0 { Some(total) } else { None }
 }
 
 fn is_valid_api_key(value: &str) -> bool {

@@ -233,6 +233,13 @@ impl RustnzbClient {
                             timing.record_verify(source, skipped);
                         }
                     }
+                    if name == "Repair" {
+                        if let Some((path, read, secs)) =
+                            stage["message"].as_str().and_then(parse_repair_tag)
+                        {
+                            timing.record_repair(path, read, secs);
+                        }
+                    }
                     match name {
                         "Verify" | "Repair" => timing.par2_sec += duration,
                         "Extract" => timing.unpack_sec += duration,
@@ -449,9 +456,39 @@ pub fn parse_verify_tag(message: &str) -> Option<(&str, u64)> {
     Some((source, skipped))
 }
 
+/// Parse the `[repair: <path>, <n> slices read, <secs>s...]` suffix rustnzb
+/// appends to a Repair stage message (WI-148).
+pub fn parse_repair_tag(message: &str) -> Option<(&str, u64, f64)> {
+    let tag = message.rsplit_once("[repair: ")?.1;
+    let (path, rest) = tag.split_once(", ")?;
+    let (read, rest) = rest.split_once(" slices read, ")?;
+    let secs = rest.split_once('s')?.0.parse().ok()?;
+    Some((path, read.parse().ok()?, secs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_the_repair_tag() {
+        let msg = "Recovery set 1/1: All files repaired from the in-flight fold (3 blocks) [repair: fold, 0 slices read, 0.012s]";
+        assert_eq!(parse_repair_tag(msg), Some(("fold", 0, 0.012)));
+        let msg = "Recovery set 1/1: All files repaired [repair: disk, 6820 slices read, 4.500s, fold refused: decode matrix is singular]";
+        assert_eq!(parse_repair_tag(msg), Some(("disk", 6820, 4.5)));
+        assert_eq!(parse_repair_tag("Recovery set 1/1: done"), None);
+    }
+
+    #[test]
+    fn any_disk_repair_marks_the_run_disk() {
+        let mut timing = StageTiming::default();
+        timing.record_repair("fold", 0, 0.5);
+        timing.record_repair("disk", 10, 1.0);
+        timing.record_repair("fold", 2, 0.25);
+        assert_eq!(timing.repair_path.as_deref(), Some("disk"));
+        assert_eq!(timing.repair_slices_read, 12);
+        assert!((timing.repair_sec - 1.75).abs() < 1e-9);
+    }
 
     #[test]
     fn parses_the_verify_tag() {
