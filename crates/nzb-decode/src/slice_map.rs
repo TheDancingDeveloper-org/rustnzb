@@ -186,6 +186,11 @@ impl SliceVerifier {
         self.cells.iter().map(|c| c.state).collect()
     }
 
+    /// The set's slice size.
+    pub fn slice_size(&self) -> u64 {
+        self.slice_size
+    }
+
     /// Total number of slices in the set.
     pub fn total_slices(&self) -> usize {
         self.cells.len()

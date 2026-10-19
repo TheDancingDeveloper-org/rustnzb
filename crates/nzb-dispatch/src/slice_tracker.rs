@@ -31,6 +31,16 @@
 //!   its buffered writes are replayed. A file that never matches leaves its
 //!   slices `Unknown`.
 //!
+//! WI-148 adds the repair fold. Once damage is first seen, the tracker opens a
+//! [`RepairFold`] with rows sized to the damage (bounded by the fold's memory
+//! budget and the set's recovery count), folds the slices already verified
+//! from disk once, in bounded batches with the fold lock released between
+//! batches so workers keep feeding, and from then on folds every slice it
+//! verifies straight from the bytes it already read. When damage outgrows the
+//! rows, the rows are doubled and the fed slices are re-read for the new rows
+//! only. Post-processing takes the fold from `JobFinished` and only has the
+//! D×D solve and the writes left.
+//!
 //! Parsing, read-back and hashing all run on blocking tasks, and each worker
 //! awaits its own verification before it resolves the article, so the map is
 //! complete before `JobFinished` is emitted.
@@ -42,7 +52,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use md5::{Digest, Md5};
 use nzb_core::models::{NzbJob, SliceMapSummary, SliceVerdict};
 use nzb_core::{CandidateFile, PAR2_HASH_16K_LEN, Par2FileRef, match_files_by_hash16k};
-use nzb_decode::{SliceState, SliceVerifier};
+use nzb_decode::repair_fold::{batch_len, max_rows};
+use nzb_decode::{RepairFold, SharedFold, SliceState, SliceVerifier};
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
@@ -102,6 +113,25 @@ enum State {
     Ready(Box<Tracked>),
 }
 
+/// The repair fold's lifecycle within one job.
+enum FoldSlot {
+    /// No damage seen yet.
+    Idle,
+    /// The set cannot be folded (slice size, budget); post-processing uses
+    /// the disk path.
+    Refused,
+    Active(SharedFold),
+}
+
+/// Rows to open for `damage` known damaged slices: twice the damage, at least
+/// eight, within the budget and the recovery count.
+fn rows_for(damage: usize, recovery: u32, slice_size: u64) -> usize {
+    (damage * 2)
+        .max(8)
+        .min(recovery as usize)
+        .min(max_rows(slice_size))
+}
+
 /// The per-job slice tracker. Cheap when disabled: one uncontended lock per
 /// article.
 pub(crate) struct JobSlices {
@@ -121,6 +151,8 @@ pub(crate) struct JobSlices {
     confirmed_missing: AtomicUsize,
     /// Slices that failed their checksum so far.
     damaged_seen: AtomicUsize,
+    /// The in-flight repair fold (WI-148).
+    fold: Mutex<FoldSlot>,
 }
 
 /// True for a PAR2 index file name (`.par2` without `.vol`).
@@ -188,6 +220,7 @@ impl JobSlices {
             failures: Mutex::new(HashMap::new()),
             confirmed_missing: AtomicUsize::new(0),
             damaged_seen: AtomicUsize::new(0),
+            fold: Mutex::new(FoldSlot::Idle),
         }
     }
 
@@ -497,7 +530,8 @@ impl JobSlices {
         pending
     }
 
-    /// Read each slice back and verify it. Runs on a blocking task.
+    /// Read each slice back and verify it, folding the verified ones into the
+    /// repair fold when one is open. Runs on a blocking task.
     fn verify_all(&self, pending: Vec<PendingSlice>) {
         for slice in pending {
             let bytes = match read_range(&slice.path, slice.offset, slice.len) {
@@ -507,14 +541,185 @@ impl JobSlices {
                     continue;
                 }
             };
-            if let State::Ready(tracked) = &mut *self.state.lock() {
-                let verdict = tracked.verifier.verify(slice.global_index, &bytes);
-                if verdict == SliceState::Damaged {
+            let verdict = match &mut *self.state.lock() {
+                State::Ready(tracked) => tracked.verifier.verify(slice.global_index, &bytes),
+                _ => continue,
+            };
+            let fold = self.active_fold();
+            match verdict {
+                SliceState::Damaged => {
                     self.damaged_seen.fetch_add(1, Ordering::Relaxed);
                     debug!(slice = slice.global_index, "PAR2 slice damaged");
+                    if let Some(fold) = fold {
+                        fold.lock().note_corrupt(slice.global_index);
+                    }
+                }
+                SliceState::Verified => {
+                    if let Some(fold) = fold
+                        && let Err(e) = fold.lock().feed(slice.global_index, &bytes)
+                    {
+                        warn!("Repair fold feed failed: {e}");
+                    }
+                }
+                SliceState::Unknown => {}
+            }
+        }
+        self.grow_fold();
+    }
+
+    fn active_fold(&self) -> Option<SharedFold> {
+        match &*self.fold.lock() {
+            FoldSlot::Active(fold) => Some(fold.clone()),
+            _ => None,
+        }
+    }
+
+    /// The fold for post-processing: open and not poisoned.
+    pub(crate) fn fold(&self) -> Option<SharedFold> {
+        self.active_fold().filter(|f| !f.lock().is_poisoned())
+    }
+
+    /// Where a slice lives on disk, for folding it from there.
+    fn slice_source(tracked: &Tracked, gi: usize) -> Option<PendingSlice> {
+        let (file_index, offset, len) = tracked.verifier.slice_range(gi)?;
+        let path = tracked
+            .files
+            .values()
+            .find(|(index, _)| *index == file_index)
+            .map(|(_, path)| path.clone())?;
+        Some(PendingSlice {
+            global_index: gi,
+            path,
+            offset,
+            len,
+        })
+    }
+
+    /// Open the fold once damage is first seen, or grow its rows when the
+    /// damage outruns them. Runs on a blocking task.
+    fn grow_fold(&self) {
+        let damage = self.damage_hint();
+        if damage == 0 {
+            return;
+        }
+        let existing = match &*self.fold.lock() {
+            FoldSlot::Refused => return,
+            FoldSlot::Active(fold) => Some(fold.clone()),
+            FoldSlot::Idle => None,
+        };
+        let (slice_size, total, recovery) = match &*self.state.lock() {
+            State::Ready(t) => (
+                t.verifier.slice_size(),
+                t.verifier.total_slices(),
+                t.recovery_block_count,
+            ),
+            _ => return,
+        };
+        let want = rows_for(damage, recovery, slice_size);
+        match existing {
+            None => self.open_fold(want, total, slice_size),
+            Some(fold) => {
+                let mut fold = fold.lock();
+                let have = fold.rows();
+                if damage <= have || have >= want {
+                    return;
+                }
+                let target = want.max(rows_for(have, recovery, slice_size));
+                let exps: Vec<u32> = (have as u32..target as u32).collect();
+                let state = &self.state;
+                let read = |gi: usize| {
+                    let source = match &*state.lock() {
+                        State::Ready(t) => Self::slice_source(t, gi),
+                        _ => None,
+                    };
+                    let source =
+                        source.ok_or_else(|| std::io::Error::other("slice has no path"))?;
+                    read_range(&source.path, source.offset, source.len)
+                };
+                match fold.extend_rows(&exps, read) {
+                    Ok(added) => {
+                        info!(
+                            rows = fold.rows(),
+                            added, damage, "Repair fold rows extended"
+                        );
+                    }
+                    Err(e) => {
+                        // The fold stays usable with its current rows;
+                        // post-processing falls back if they are too few.
+                        warn!(damage, rows = have, "Repair fold could not grow: {e}");
+                    }
                 }
             }
         }
+    }
+
+    fn open_fold(&self, rows: usize, total: usize, slice_size: u64) {
+        let exps: Vec<u32> = (0..rows as u32).collect();
+        let fold = match RepairFold::new(total, slice_size, &exps) {
+            Ok(fold) => std::sync::Arc::new(Mutex::new(fold)),
+            Err(e) => {
+                info!(
+                    slice_size,
+                    rows, "In-flight repair fold refused, disk repair will be used: {e}"
+                );
+                *self.fold.lock() = FoldSlot::Refused;
+                return;
+            }
+        };
+        {
+            let mut slot = self.fold.lock();
+            if !matches!(*slot, FoldSlot::Idle) {
+                return;
+            }
+            *slot = FoldSlot::Active(fold.clone());
+        }
+        // Slices verified before the fold existed: fold them from disk once,
+        // a bounded batch at a time, with the fold lock released between
+        // batches so workers keep folding what they verify meanwhile.
+        let sources: Vec<PendingSlice> = match &*self.state.lock() {
+            State::Ready(t) => t
+                .verifier
+                .states()
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| **s == SliceState::Verified)
+                .filter_map(|(gi, _)| Self::slice_source(t, gi))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut from_disk = 0usize;
+        for chunk in sources.chunks(batch_len(slice_size)) {
+            let batch: Vec<(usize, Vec<u8>)> = chunk
+                .iter()
+                .filter(|s| !fold.lock().is_fed(s.global_index))
+                .filter_map(|s| match read_range(&s.path, s.offset, s.len) {
+                    Ok(bytes) => Some((s.global_index, bytes)),
+                    Err(e) => {
+                        // Left unfed; post-processing folds it at the end.
+                        debug!(
+                            slice = s.global_index,
+                            "Repair fold prefix read failed: {e}"
+                        );
+                        None
+                    }
+                })
+                .collect();
+            let refs: Vec<(usize, &[u8])> = batch.iter().map(|(i, b)| (*i, b.as_slice())).collect();
+            let mut fold = fold.lock();
+            match fold.feed_batch(&refs) {
+                Ok(n) => {
+                    fold.note_disk_fed(n);
+                    from_disk += n;
+                }
+                Err(e) => warn!("Repair fold prefix feed failed: {e}"),
+            }
+        }
+        info!(
+            rows,
+            slice_size,
+            prefix_slices = from_disk,
+            "In-flight repair fold opened"
+        );
     }
 
     /// A running estimate of the damage while articles are still arriving:

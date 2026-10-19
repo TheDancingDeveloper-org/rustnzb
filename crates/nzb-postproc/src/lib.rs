@@ -7,6 +7,7 @@
 //! - `pipeline` — Orchestrate: verify -> repair -> extract -> cleanup
 
 pub mod detect;
+pub mod fold_repair;
 pub mod inflight;
 pub mod par2;
 pub mod pipeline;

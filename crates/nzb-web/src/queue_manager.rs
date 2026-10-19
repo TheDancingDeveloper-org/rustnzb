@@ -1394,6 +1394,9 @@ struct JobState {
     direct_unpacker: Option<DirectUnpacker>,
     /// Hopeless job tracker (None until download starts).
     hopeless_tracker: Option<HopelessTracker>,
+    /// The download's in-flight PAR2 repair fold, handed to post-processing
+    /// (WI-148). In memory only: a restart repairs from disk.
+    repair_fold: Option<nzb_decode::SharedFold>,
     /// Active download duration captured at terminal download resolution,
     /// including `prior_download_secs`.
     download_time_secs: Option<f64>,
@@ -2501,6 +2504,7 @@ impl QueueManager {
                 nzb_data,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                repair_fold: None,
                 download_time_secs: None,
                 prior_download_secs: 0.0,
                 carried_bytes,
@@ -2528,6 +2532,7 @@ impl QueueManager {
             nzb_data,
             direct_unpacker: None,
             hopeless_tracker: None,
+            repair_fold: None,
             download_time_secs: None,
             prior_download_secs: 0.0,
             carried_bytes,
@@ -3266,6 +3271,7 @@ impl QueueManager {
                     articles_failed,
                     download_time_secs,
                     slice_map,
+                    repair_fold,
                     ..
                 } => {
                     // The slice map gives the exact damage: refuse to hand a
@@ -3340,6 +3346,7 @@ impl QueueManager {
                             state.job.status = JobStatus::PostProcessing;
                             state.job.completed_at = Some(chrono::Utc::now());
                             state.job.slice_map = slice_map;
+                            state.repair_fold = repair_fold;
                             state.par2_volumes = par2_volume_counts(&state.job, &held);
                         }
                     }
@@ -3481,6 +3488,7 @@ impl QueueManager {
             content_articles_failed,
             delete_archives,
             slice_map,
+            repair_fold,
         ) = {
             let mut jobs = self.jobs.lock();
             let Some(state) = jobs.get_mut(job_id) else {
@@ -3517,6 +3525,7 @@ impl QueueManager {
                 content_failed,
                 state.job.delete_archives.unwrap_or(true),
                 state.job.slice_map.clone(),
+                state.repair_fold.take(),
             )
         };
         // Record the reserved folder so a restart resumes into it.
@@ -3626,6 +3635,7 @@ impl QueueManager {
                 max_nested_archive_depth: self.max_nested_archive_depth,
                 slice_map,
                 trust_inflight_verify: self.trust_inflight_verify.load(Ordering::SeqCst),
+                repair_fold,
             };
 
             let pp_span = tracing::info_span!(parent: None, "postproc", job_id = %job_id, pp_level);
@@ -5901,6 +5911,7 @@ impl QueueManager {
                 nzb_data,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                repair_fold: None,
                 download_time_secs,
                 prior_download_secs,
                 carried_bytes,
@@ -6497,6 +6508,7 @@ mod global_pause_tests {
                 nzb_data: None,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                repair_fold: None,
                 download_time_secs: None,
                 prior_download_secs: 0.0,
                 carried_bytes: 0,

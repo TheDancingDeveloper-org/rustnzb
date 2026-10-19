@@ -105,6 +105,11 @@ pub fn max_rows(slice_size: u64) -> usize {
     }
 }
 
+/// How many `slice_size` slices one disk batch may hold.
+pub fn batch_len(slice_size: u64) -> usize {
+    ((MAX_BATCH_BYTES / slice_size.max(1)) as usize).clamp(1, MAX_REPAIR_BATCH)
+}
+
 impl RepairFold {
     /// A fold over `total_slices` input slices with one row per exponent.
     pub fn new(total_slices: usize, slice_size: u64, exponents: &[u32]) -> Result<Self, FoldError> {
@@ -144,6 +149,10 @@ impl RepairFold {
     }
     pub fn disk_fed(&self) -> usize {
         self.disk_fed
+    }
+    /// Count slices the caller folded from disk through [`feed_batch`](Self::feed_batch).
+    pub fn note_disk_fed(&mut self, count: usize) {
+        self.disk_fed += count;
     }
     pub fn is_fed(&self, index: usize) -> bool {
         self.fed.get(index).copied().unwrap_or(false)
@@ -396,7 +405,7 @@ where
     R: FnMut(usize) -> std::io::Result<Vec<u8>>,
     A: FnMut(&mut Vec<(usize, Vec<u8>)>),
 {
-    let per_batch = ((MAX_BATCH_BYTES as usize) / slice_size.max(1)).clamp(1, MAX_REPAIR_BATCH);
+    let per_batch = batch_len(slice_size as u64);
     for chunk in indices.chunks(per_batch) {
         let mut batch = Vec::with_capacity(chunk.len());
         for &index in chunk {

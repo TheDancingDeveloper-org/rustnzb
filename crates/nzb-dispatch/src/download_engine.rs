@@ -561,6 +561,10 @@ pub enum ProgressUpdate {
         /// In-flight PAR2 slice verdicts, when the job's PAR2 index arrived
         /// during the download (WI-1228).
         slice_map: Option<nzb_core::models::SliceMapSummary>,
+        /// The in-flight repair fold, when damage was seen during the download
+        /// (WI-148). Post-processing solves from it instead of re-reading the
+        /// intact slices.
+        repair_fold: Option<nzb_decode::SharedFold>,
     },
     JobAborted {
         job_id: String,
@@ -921,6 +925,7 @@ impl JobContext {
                 articles_failed: failed,
                 download_time_secs: active_elapsed.as_secs_f64(),
                 slice_map,
+                repair_fold: self.slices.fold(),
             },
         );
     }
