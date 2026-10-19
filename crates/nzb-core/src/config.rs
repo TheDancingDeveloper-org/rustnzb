@@ -53,12 +53,17 @@ pub struct Par2Config {
     /// damage, then fetch only as many as the damage needs. Off fetches every
     /// volume up front.
     pub defer_volumes: bool,
+    /// Accept a PAR2 set as verified from the in-flight slice map when it
+    /// covers every file, skipping the disk verify pass. Off always verifies
+    /// from disk.
+    pub trust_inflight_verify: bool,
 }
 
 impl Default for Par2Config {
     fn default() -> Self {
         Self {
             defer_volumes: true,
+            trust_inflight_verify: true,
         }
     }
 }
@@ -707,6 +712,14 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn par2_trust_inflight_verify_defaults_on_and_can_be_disabled() {
+        assert!(Par2Config::default().trust_inflight_verify);
+        let off: Par2Config = toml::from_str("trust_inflight_verify = false").unwrap();
+        assert!(!off.trust_inflight_verify);
+        assert!(off.defer_volumes);
+    }
+
     use super::*;
 
     #[test]
