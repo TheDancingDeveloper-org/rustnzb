@@ -2,6 +2,7 @@ import { Component, OnInit, OnDestroy, signal, ElementRef, ViewChild, computed }
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
+import { httpErrorMessage, isAuthHandledError } from '../../core/http/http-error';
 
 interface LogEntry {
   seq: number;
@@ -51,6 +52,9 @@ interface LogsResponse {
       </div>
 
       <div class="body flush logs" #logContainer>
+        @if (loadError()) {
+          <div class="empty load-error" role="alert">{{ loadError() }}</div>
+        }
         @for (e of visibleEntries(); track e.seq) {
           <div class="l">
             <span class="t">{{ formatTs(e.timestamp) }}</span>
@@ -59,7 +63,7 @@ interface LogsResponse {
             <span class="msg">{{ e.message }}</span>
           </div>
         }
-        @if (entries().length === 0) {
+        @if (entries().length === 0 && !loadError()) {
           <div class="empty">No log entries yet.</div>
         }
         @if (entries().length > 0 && visibleEntries().length === 0) {
@@ -101,6 +105,8 @@ export class LogsViewComponent implements OnInit, OnDestroy {
   filter = signal('');
   levelFilter = signal('');
   follow = signal(true);
+  /** Last poll failure, shown inline (a toast every poll would spam). */
+  loadError = signal<string | null>(null);
 
   /** Highest seq received so far; null until the first entry (seq 0 is valid). */
   private lastSeq: number | null = null;
@@ -128,6 +134,7 @@ export class LogsViewComponent implements OnInit, OnDestroy {
     if (this.lastSeq !== null) params['after_seq'] = String(this.lastSeq);
     this.api.get<LogsResponse>('/logs', params).subscribe({
       next: r => {
+        this.loadError.set(null);
         if (this.serverRestarted(r)) {
           // Sequence numbers restarted at 0 in a new process, so our cursor
           // would filter out every new line. Start over from the new buffer.
@@ -145,7 +152,10 @@ export class LogsViewComponent implements OnInit, OnDestroy {
           setTimeout(() => this.scrollToBottom(), 50);
         }
       },
-      error: () => {},
+      error: err => {
+        if (isAuthHandledError(err)) return;
+        this.loadError.set(httpErrorMessage(err, "Couldn't load logs"));
+      },
     });
   }
 

@@ -265,6 +265,23 @@ describe('QueueViewComponent', () => {
     expect(snackBar.open).toHaveBeenCalledWith('Job paused', 'Close', { duration: 2500 });
   });
 
+  it('shows a failed status poll inline and clears it on the next success', () => {
+    let failStatus = true;
+    const { component } = makeComponent({
+      get: vi.fn((path: string) => {
+        if (path === '/status' && failStatus) {
+          return throwError(() => ({ status: 500, error: { human_readable: 'db locked' } }));
+        }
+        return of(path === '/queue' ? { jobs: [], paused: false } : {});
+      }),
+    });
+    component.loadQueue();
+    expect(component.statusError()).toBe("Couldn't load download status: db locked");
+    failStatus = false;
+    component.loadQueue();
+    expect(component.statusError()).toBeNull();
+  });
+
   describe('queue poll sequencing (BUG-126)', () => {
     /** /queue responses are held until the test flushes them, in any order. */
     function controlledQueue(overrides: Partial<ApiStub> = {}) {

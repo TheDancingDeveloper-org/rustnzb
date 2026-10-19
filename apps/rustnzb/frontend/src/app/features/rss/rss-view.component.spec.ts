@@ -18,6 +18,14 @@ function createComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {
 }
 
 describe('RssViewComponent', () => {
+  it('shows a toast for each list that fails to load', () => {
+    const { component, snack } = createComponent({ get: vi.fn(() => throwError(() => ({ status: 500, error: { human_readable: 'db locked' } }))) });
+    component.loadAll();
+    expect(snack.open).toHaveBeenCalledWith('Failed to load RSS feeds: db locked', 'Close', expect.anything());
+    expect(snack.open).toHaveBeenCalledWith('Failed to load RSS rules: db locked', 'Close', expect.anything());
+    expect(snack.open).toHaveBeenCalledWith('Failed to load RSS items: db locked', 'Close', expect.anything());
+  });
+
   it('formats item sizes; blank when unknown (BUG-120)', () => {
     const { component } = createComponent();
     expect(component.formatBytes(1024 ** 4)).toBe('1.0 TB');

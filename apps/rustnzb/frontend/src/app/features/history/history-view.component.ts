@@ -356,7 +356,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
     this.load();
     this.api.get<StatusResponse>('/status').subscribe({
       next: s => this.webdavEnabled.set(!!s.webdav_enabled),
-      error: () => {},
+      error: err => showHttpError(this.snack, err, 'Failed to load WebDAV status'),
     });
     this.pollTimer = setInterval(() => this.load(), 5000);
   }

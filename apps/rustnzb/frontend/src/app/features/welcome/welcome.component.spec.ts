@@ -9,10 +9,18 @@ import { WelcomeComponent } from './welcome.component';
 function makeComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {}) {
   const api = { get: vi.fn(() => of({ has_servers: false })), post: vi.fn(() => of({})), postForm: vi.fn(() => of({})), ...overrides };
   const router = { navigate: vi.fn(() => Promise.resolve(true)) };
-  return { component: new WelcomeComponent(api as unknown as ApiService, router as never), api, router };
+  const snack = { open: vi.fn() };
+  return { component: new WelcomeComponent(api as unknown as ApiService, router as never, snack as never), api, router, snack };
 }
 
 describe('WelcomeComponent', () => {
+  it('shows a toast when the setup status check fails', () => {
+    const { component, router, snack } = makeComponent({ get: vi.fn(() => throwError(() => ({ status: 500, error: { human_readable: 'db locked' } }))) });
+    component.ngOnInit();
+    expect(router.navigate).not.toHaveBeenCalled();
+    expect(snack.open).toHaveBeenCalledWith("Couldn't check setup status: db locked", 'Close', expect.anything());
+  });
+
   it('redirects established installations and validates required API import fields', () => {
     const { component, router } = makeComponent({ get: vi.fn(() => of({ has_servers: true })) });
     component.ngOnInit();

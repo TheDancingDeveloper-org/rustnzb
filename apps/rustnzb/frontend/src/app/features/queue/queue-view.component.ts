@@ -62,6 +62,9 @@ interface PipelineStep {
     </div>
 
     <!-- ============ Stat cards ============ -->
+    @if (statusError()) {
+      <div class="upload-warn" role="alert">{{ statusError() }}</div>
+    }
     <div class="cards4">
       <div class="card">
         <div class="label">Download speed</div>
@@ -1131,6 +1134,8 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   loading = signal(true);
   /** Set when the last queue fetch failed; the table shows it with a Retry. */
   loadError = signal<string | null>(null);
+  /** Last /status poll failure, shown inline (a toast every poll would spam). */
+  statusError = signal<string | null>(null);
   jobs = signal<NzbJob[]>([]);
   remainingBytes = signal(0);
   categories = signal<CategoryConfig[]>([]);
@@ -1240,9 +1245,13 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     this.api.get<StatusResponse>('/status').subscribe({
       next: (s) => {
         this.status.set(s);
+        this.statusError.set(null);
         this.updateConnectionHold(s.nntp_connections ?? [], Date.now());
       },
-      error: () => {},
+      error: (err) => {
+        if (isAuthHandledError(err)) return;
+        this.statusError.set(httpErrorMessage(err, "Couldn't load download status"));
+      },
     });
   }
 

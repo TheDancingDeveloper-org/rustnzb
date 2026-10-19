@@ -1,7 +1,7 @@
 import '@angular/compiler';
 
 import { describe, expect, it, vi } from 'vitest';
-import { Observable, of } from 'rxjs';
+import { Observable, of, throwError } from 'rxjs';
 
 import { ApiService } from '../../core/services/api.service';
 import { LogsViewComponent } from './logs-view.component';
@@ -25,6 +25,22 @@ function setup() {
 }
 
 describe('LogsViewComponent', () => {
+  it('shows a failed poll inline and clears it on the next success', () => {
+    const { api, component } = setup();
+    api.get.mockReturnValueOnce(throwError(() => ({ status: 500, error: { human_readable: 'db locked' } })));
+    component.loadLogs();
+    expect(component.loadError()).toBe("Couldn't load logs: db locked");
+    component.loadLogs();
+    expect(component.loadError()).toBeNull();
+  });
+
+  it('leaves a 401 to the auth flow', () => {
+    const { api, component } = setup();
+    api.get.mockReturnValueOnce(throwError(() => ({ status: 401 })));
+    component.loadLogs();
+    expect(component.loadError()).toBeNull();
+  });
+
   it('reactively combines level and regex filters', () => {
     const { component } = setup();
     component.levelFilter.set('ERROR');
