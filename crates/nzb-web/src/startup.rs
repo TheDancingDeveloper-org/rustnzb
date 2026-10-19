@@ -365,6 +365,7 @@ pub async fn initialize(
     queue_manager.set_notifications(&config.notifications);
     queue_manager.set_queue_complete_persist(config.general.queue_complete_pers);
     queue_manager.set_defer_par2_volumes(config.par2.defer_volumes);
+    queue_manager.set_trust_inflight_verify(config.par2.trust_inflight_verify);
 
     // Restore any in-progress jobs from the database
     if let Err(e) = queue_manager.restore_from_db() {

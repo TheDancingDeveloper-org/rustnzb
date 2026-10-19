@@ -1617,6 +1617,8 @@ pub struct QueueManager {
     complete_action: Mutex<Option<String>>,
     /// `queue_complete_pers`: keep the action after it has run once.
     queue_complete_persist: AtomicBool,
+    /// `par2.trust_inflight_verify`: let post-processing accept the slice map.
+    trust_inflight_verify: AtomicBool,
     /// Stage-specific resource gates shared by all post-processing jobs.
     postproc_resources: Arc<PostProcResourcePool>,
     /// Category configs for post-processing decisions.
@@ -1749,6 +1751,7 @@ impl QueueManager {
             notifier: Mutex::new(Arc::new(Notifier::disabled())),
             complete_action: Mutex::new(None),
             queue_complete_persist: AtomicBool::new(false),
+            trust_inflight_verify: AtomicBool::new(true),
             postproc_resources: PostProcResourcePool::new(postproc_limits),
             categories: Mutex::new(categories),
             min_free_space: AtomicU64::new(min_free_space),
@@ -2096,6 +2099,12 @@ impl QueueManager {
     /// Set `queue_complete_pers`, from the `general` config.
     pub fn set_queue_complete_persist(&self, persist: bool) {
         self.queue_complete_persist.store(persist, Ordering::SeqCst);
+    }
+
+    /// `par2.trust_inflight_verify`: false makes post-processing verify every
+    /// PAR2 set from disk. Applies to post-processing started afterwards.
+    pub fn set_trust_inflight_verify(&self, on: bool) {
+        self.trust_inflight_verify.store(on, Ordering::SeqCst);
     }
 
     /// `par2.defer_volumes`: hold PAR2 recovery volumes until the slice map
@@ -3616,7 +3625,7 @@ impl QueueManager {
                 password: password.clone(),
                 max_nested_archive_depth: self.max_nested_archive_depth,
                 slice_map,
-                trust_inflight_verify: true,
+                trust_inflight_verify: self.trust_inflight_verify.load(Ordering::SeqCst),
             };
 
             let pp_span = tracing::info_span!(parent: None, "postproc", job_id = %job_id, pp_level);
@@ -6997,6 +7006,15 @@ mod global_pause_tests {
                 .get_setting(QueueManager::QUEUE_COMPLETE_ACTION_SETTING),
             Some(String::new())
         );
+    }
+
+    /// `par2.trust_inflight_verify` is on by default and the setter turns it off.
+    #[tokio::test]
+    async fn trust_inflight_verify_defaults_on_and_follows_config() {
+        let (manager, _tempdir) = manager();
+        assert!(manager.trust_inflight_verify.load(Ordering::SeqCst));
+        manager.set_trust_inflight_verify(false);
+        assert!(!manager.trust_inflight_verify.load(Ordering::SeqCst));
     }
 
     /// With `queue_complete_pers` the action survives its run.

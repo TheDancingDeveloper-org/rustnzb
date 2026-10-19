@@ -146,8 +146,11 @@ service_name = "rustnzb"
 # PAR2 recovery volumes are held until the in-flight slice map shows damage,
 # then only enough volumes to cover it (plus a margin) are fetched. Set
 # false to fetch every volume up front.
+# trust_inflight_verify accepts a PAR2 set as verified from the in-flight
+# slice map when it covers every file; set false to always verify from disk.
 [par2]
 defer_volumes = true
+trust_inflight_verify = true
 
 [dav]
 enabled = false
