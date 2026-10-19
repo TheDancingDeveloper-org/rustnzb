@@ -75,6 +75,7 @@ async fn start_app() -> App {
     let root = temp.path().to_path_buf();
     for id in ["job-a", "job-b"] {
         let job = NzbJob {
+            slice_map: None,
             id: id.into(),
             name: id.into(),
             category: "Default".into(),

@@ -56,6 +56,7 @@ fn one_article_job(job_id: &str, root: &Path) -> NzbJob {
         tries: 0,
     };
     NzbJob {
+        slice_map: None,
         id: job_id.into(),
         name: job_id.into(),
         category: "Default".into(),

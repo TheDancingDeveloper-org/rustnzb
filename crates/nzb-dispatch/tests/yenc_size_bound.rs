@@ -39,6 +39,7 @@ fn undeclared_job(root: &Path, message_ids: &[&str]) -> NzbJob {
         })
         .collect();
     NzbJob {
+        slice_map: None,
         id: "job".into(),
         name: "job".into(),
         category: "Default".into(),

@@ -870,6 +870,7 @@ impl Database {
         let jobs = stmt
             .query_map([], |row| {
                 Ok(NzbJob {
+                    slice_map: None,
                     id: row.get(0)?,
                     name: row.get(1)?,
                     category: row.get(2)?,
@@ -1776,6 +1777,7 @@ mod tests {
 
     fn make_job(id: &str, name: &str) -> NzbJob {
         NzbJob {
+            slice_map: None,
             id: id.into(),
             name: name.into(),
             category: "Default".into(),

@@ -140,6 +140,33 @@ pub struct ServerArticleStats {
     pub bytes_downloaded: u64,
 }
 
+/// The verdict for one PAR2 slice, as the download engine left it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SliceVerdict {
+    /// Not fully written, not checked, or its only gap is an article whose
+    /// absence was not confirmed by every server.
+    Unknown,
+    /// Fully written and its MD5 and CRC32 match the PAR2 checksums.
+    Verified,
+    /// A checksum mismatched, or an article overlapping it is confirmed
+    /// missing on every server.
+    Damaged,
+}
+
+/// The per-job slice map the download engine emits with `JobFinished`
+/// (WI-1228), read by the hopeless check (WI-145) and the verify skip
+/// (WI-147).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SliceMapSummary {
+    /// One verdict per global slice, in PAR2 Main-packet file order.
+    pub states: Vec<SliceVerdict>,
+    /// Recovery slices carried by the PAR2 file the map was built from.
+    pub recovery_block_count: u32,
+    pub damaged: usize,
+    pub unknown: usize,
+}
+
 /// A complete download job (parsed from one NZB file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NzbJob {
@@ -195,6 +222,10 @@ pub struct NzbJob {
     /// "+Delete"); `None` or `Some(true)` deletes them, the default.
     #[serde(default)]
     pub delete_archives: Option<bool>,
+    /// In-flight PAR2 slice verdicts from the download phase (WI-144). Set
+    /// when the download ends, if the job's PAR2 index arrived during it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_map: Option<SliceMapSummary>,
     /// Files in this job
     #[serde(skip)]
     pub files: Vec<NzbFile>,

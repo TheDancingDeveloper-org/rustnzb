@@ -3265,6 +3265,7 @@ mod tests {
 
     fn queue_job(id: &str, name: &str, category: &str, status: JobStatus) -> NzbJob {
         NzbJob {
+            slice_map: None,
             id: id.into(),
             name: name.into(),
             category: category.into(),
@@ -3329,6 +3330,7 @@ mod tests {
     fn postprocessing_job() -> NzbJob {
         let now = chrono::Utc::now();
         NzbJob {
+            slice_map: None,
             id: "postprocessing-job".into(),
             name: "Still Unpacking".into(),
             category: "tv".into(),
@@ -3908,6 +3910,7 @@ mod tests {
             .single()
             .expect("valid fixture time");
         let job = NzbJob {
+            slice_map: None,
             id: "contract-queue-job".into(),
             name: "SAB contract fixture".into(),
             category: "tv".into(),
@@ -4050,6 +4053,7 @@ mod tests {
 
     fn add_live_job(test_state: &TestState, id: &str) {
         let job = NzbJob {
+            slice_map: None,
             id: id.into(),
             name: "Compat Layer Fixture".into(),
             category: "tv".into(),
@@ -4083,6 +4087,7 @@ mod tests {
 
     fn add_live_job_with_category(test_state: &TestState, id: &str, category: &str) {
         let job = NzbJob {
+            slice_map: None,
             id: id.into(),
             name: "Change Cat Fixture".into(),
             category: category.into(),
