@@ -111,7 +111,7 @@ docker_args=(
     --env CI=true
     --env RUSTC_WRAPPER=sccache
     --env "SCCACHE_REDIS=${SCCACHE_REDIS:-redis://100.92.54.45:6380}"
-    --env "SCCACHE_REDIS_KEY_PREFIX=rustnzb-rust-1.88-$task"
+    --env "SCCACHE_REDIS_KEY_PREFIX=rustnzb-rust-1.95-$task"
 )
 
 if [ "$copy_workspace" = false ]; then
