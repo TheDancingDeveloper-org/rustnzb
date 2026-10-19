@@ -80,6 +80,11 @@ pub struct RepairFold {
     fed: Vec<bool>,
     fed_count: usize,
     poisoned: bool,
+    /// Rows being added without holding the caller's lock (see
+    /// [`begin_growth`](RepairFold::begin_growth)).
+    growth: Option<Growth>,
+    /// Bumped whenever a growth ends, so stale backfills are ignored.
+    generation: u64,
     /// Slices folded from disk rather than from the network path.
     disk_fed: usize,
 }
@@ -103,6 +108,24 @@ pub fn max_rows(slice_size: u64) -> usize {
     } else {
         (MAX_REPAIR_ROW_BYTES / slice_size) as usize
     }
+}
+
+/// Rows added to a live fold: new slices go into them at once, the slices
+/// fed before the growth are backfilled in batches.
+#[derive(Debug)]
+struct Growth {
+    /// First new row.
+    start: usize,
+    /// Slices fed before the growth and not yet folded into the new rows.
+    pending: std::collections::HashSet<usize>,
+}
+
+/// A growth handed to the caller to backfill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrowthTicket {
+    pub generation: u64,
+    /// Slices to read back and pass to [`RepairFold::backfill`].
+    pub slices: Vec<usize>,
 }
 
 /// How many `slice_size` slices one disk batch may hold.
@@ -129,6 +152,8 @@ impl RepairFold {
             fed_count: 0,
             poisoned: false,
             disk_fed: 0,
+            growth: None,
+            generation: 0,
         })
     }
 
@@ -217,6 +242,7 @@ impl RepairFold {
     where
         R: FnMut(usize) -> std::io::Result<Vec<u8>>,
     {
+        self.abandon_growth();
         let new: Vec<u32> = exponents
             .iter()
             .copied()
@@ -250,6 +276,101 @@ impl RepairFold {
             return Err(e);
         }
         Ok(new.len())
+    }
+
+    /// Start adding rows for `exponents` without holding the fold while the
+    /// fed slices are re-read. The new rows are live at once (slices fed from
+    /// now on go into them), and the slices fed so far are returned in the
+    /// ticket, to be read back outside the lock and passed to
+    /// [`backfill`](Self::backfill) a batch at a time. The rows count for
+    /// [`solve`](Self::solve) only once every slice is backfilled. `None`
+    /// when a growth is already running or no exponent is new.
+    pub fn begin_growth(&mut self, exponents: &[u32]) -> Result<Option<GrowthTicket>, FoldError> {
+        if self.growth.is_some() {
+            return Ok(None);
+        }
+        let new: Vec<u32> = exponents
+            .iter()
+            .copied()
+            .filter(|e| !self.exponents.contains(e))
+            .collect();
+        if new.is_empty() {
+            return Ok(None);
+        }
+        if self.rows.len() + new.len() > max_rows(self.slice_size as u64) {
+            return Err(FoldError::NoRows);
+        }
+        let start = self.rows.len();
+        self.exponents.extend(&new);
+        self.rows
+            .extend(new.iter().map(|_| vec![0u8; self.slice_size]));
+        let slices: Vec<usize> = (0..self.fed.len()).filter(|i| self.fed[*i]).collect();
+        let pending = slices.iter().copied().collect();
+        self.growth = Some(Growth { start, pending });
+        if slices.is_empty() {
+            self.growth = None;
+            self.generation += 1;
+        }
+        Ok(Some(GrowthTicket {
+            generation: self.generation,
+            slices,
+        }))
+    }
+
+    /// Fold a batch of a growth's slices into its new rows. Returns false
+    /// when the growth is gone (finished, abandoned or superseded).
+    pub fn backfill(&mut self, generation: u64, slices: &[(usize, &[u8])]) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        let Some(growth) = self.growth.as_mut() else {
+            return false;
+        };
+        let fresh: Vec<(usize, &[u8])> = slices
+            .iter()
+            .copied()
+            .filter(|(i, _)| growth.pending.remove(i))
+            .collect();
+        let start = growth.start;
+        let done = growth.pending.is_empty();
+        fold_into(
+            &mut self.rows[start..],
+            &self.exponents[start..],
+            &self.constants,
+            self.slice_size,
+            &fresh,
+        );
+        if done {
+            self.growth = None;
+            self.generation += 1;
+        }
+        true
+    }
+
+    /// Whether rows are still being backfilled.
+    pub fn growing(&self) -> bool {
+        self.growth.is_some()
+    }
+
+    /// Drop the rows of the growth `generation`, if it is still unfinished.
+    pub fn abandon_growth_of(&mut self, generation: u64) {
+        if generation == self.generation {
+            self.abandon_growth();
+        }
+    }
+
+    /// Drop the rows of an unfinished growth.
+    pub fn abandon_growth(&mut self) {
+        if let Some(growth) = self.growth.take() {
+            self.rows.truncate(growth.start);
+            self.exponents.truncate(growth.start);
+            self.generation += 1;
+        }
+    }
+
+    /// Rows that count for [`solve`](Self::solve).
+    pub fn complete_rows(&self) -> usize {
+        self.growth.as_ref().map_or(self.rows.len(), |g| g.start)
     }
 
     /// Fold every slice that is neither fed nor in `damaged`, reading it with
@@ -312,7 +433,8 @@ impl RepairFold {
         if d == 0 {
             return Ok(Vec::new());
         }
-        let usable: Vec<usize> = (0..self.rows.len())
+        let complete = self.growth.as_ref().map_or(self.rows.len(), |g| g.start);
+        let usable: Vec<usize> = (0..complete)
             .filter(|r| {
                 recovery
                     .get(&self.exponents[*r])
@@ -333,22 +455,21 @@ impl RepairFold {
             }
         }
         let inverse = matrix.invert().ok_or(FoldError::Singular)?;
-        let adjusted: Vec<Vec<u8>> = usable
+        // out_j = Σ_e inv[j][e]·(row_e ⊕ R_e) = Σ_e inv[j][e]·row_e ⊕
+        // Σ_e inv[j][e]·R_e: two passes, no copy of the rows.
+        let rows: Vec<&[u8]> = usable.iter().map(|&r| self.rows[r].as_slice()).collect();
+        let recs: Vec<&[u8]> = usable
             .iter()
-            .map(|&r| {
-                let mut row = self.rows[r].clone();
-                rust_par2::gf_simd::xor_buffers(&mut row, &recovery[&self.exponents[r]]);
-                row
-            })
+            .map(|&r| recovery[&self.exponents[r]].as_slice())
             .collect();
-        let refs: Vec<&[u8]> = adjusted.iter().map(Vec::as_slice).collect();
         Ok(damaged
             .iter()
             .enumerate()
             .map(|(j, &idx)| {
                 let mut out = vec![0u8; self.slice_size];
                 let coeffs: Vec<u16> = (0..d).map(|e| inverse.get(j, e)).collect();
-                mul_add_multi(&mut out, &refs, &coeffs);
+                mul_add_multi(&mut out, &rows, &coeffs);
+                mul_add_multi(&mut out, &recs, &coeffs);
                 (idx, out)
             })
             .collect())
@@ -423,6 +544,56 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn growth_backfills_in_batches_while_feeding_continues() {
+        let (n, slice) = (12, 32);
+        let d = data(n, slice);
+        let rec = encode(&d, slice, &[0, 1, 2, 3]);
+        let damaged = [1usize, 6, 10];
+        let mut fold = RepairFold::new(n, slice as u64, &[0]).unwrap();
+        for i in [0, 2, 3, 4] {
+            fold.feed(i, &d[i]).unwrap();
+        }
+        let ticket = fold.begin_growth(&[0, 1, 2, 3]).unwrap().unwrap();
+        assert_eq!(ticket.slices, vec![0, 2, 3, 4]);
+        // A second growth waits for the first.
+        assert_eq!(fold.begin_growth(&[5]).unwrap(), None);
+        // New slices land in every row, the old ones are backfilled.
+        for i in [5, 7, 8, 9, 11] {
+            fold.feed(i, &d[i]).unwrap();
+        }
+        assert_eq!(fold.complete_rows(), 1);
+        assert!(matches!(
+            fold.solve(&damaged, &rec),
+            Err(FoldError::NotEnoughRows {
+                needed: 3,
+                usable: 1
+            })
+        ));
+        assert!(fold.backfill(ticket.generation, &[(0, &d[0]), (2, &d[2])]));
+        assert!(fold.growing());
+        assert!(fold.backfill(ticket.generation, &[(3, &d[3]), (4, &d[4])]));
+        assert!(!fold.growing());
+        assert_eq!(fold.complete_rows(), 4);
+        // A stale ticket is ignored.
+        assert!(!fold.backfill(ticket.generation, &[(0, &d[0])]));
+        for (idx, bytes) in fold.solve(&damaged, &rec).unwrap() {
+            assert_eq!(&bytes[..d[idx].len()], &d[idx][..]);
+        }
+    }
+
+    #[test]
+    fn abandoned_growth_leaves_the_old_rows() {
+        let (n, slice) = (6, 16);
+        let d = data(n, slice);
+        let mut fold = RepairFold::new(n, slice as u64, &[0]).unwrap();
+        fold.feed(0, &d[0]).unwrap();
+        let ticket = fold.begin_growth(&[1, 2]).unwrap().unwrap();
+        fold.abandon_growth();
+        assert_eq!(fold.rows(), 1);
+        assert!(!fold.backfill(ticket.generation, &[(0, &d[0])]));
+    }
 
     /// Encode recovery slices the way PAR2 defines them.
     fn encode(data: &[Vec<u8>], slice: usize, exps: &[u32]) -> HashMap<u32, Vec<u8>> {
