@@ -126,7 +126,7 @@ if [ "$cold" = true ]; then
         --env CI_COLD_CACHE=true
     )
 else
-    cargo_volume=rustnzb-ci-cargo-rust-1.88
+    cargo_volume=rustnzb-ci-cargo-rust-1.95
     npm_volume=rustnzb-ci-npm-node-22
     docker volume create "$cargo_volume" >/dev/null
     docker volume create "$npm_volume" >/dev/null
