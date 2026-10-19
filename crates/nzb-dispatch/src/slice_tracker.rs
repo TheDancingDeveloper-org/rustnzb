@@ -13,8 +13,23 @@
 //! `Unknown`. A gap in a file whose failed articles were all refused by every
 //! server is confirmed missing, so its unfilled slices are `Damaged`. A gap in
 //! a file with an unconfirmed failure (a timeout, a local write error) stays
-//! `Unknown`. Files that already had bytes on disk when the job was submitted
-//! (a resumed job) are never tracked; their slices stay `Unknown`.
+//! `Unknown`.
+//!
+//! WI-1229 extends this to the cases the first cut left `Unknown`:
+//!
+//! - **Late index.** When the index lands after data files have completed, the
+//!   replay reads those files' slices back from disk once, on the blocking task
+//!   of the worker that completed the index, while the other workers keep the
+//!   network busy.
+//! - **Restart.** A resumed file's already-written segments carry their decoded
+//!   offsets (`data_begin`, `data_size`), so they are seeded as writes and their
+//!   slices are verified from disk once. A resumed file with a downloaded
+//!   segment of unknown offset stays untracked. If the index itself finished
+//!   before the restart, the verifier installs on the first write.
+//! - **Obfuscated names.** An NZB file whose name matches no PAR2 file is
+//!   matched by the MD5 of its first 16 KiB once those bytes have landed, then
+//!   its buffered writes are replayed. A file that never matches leaves its
+//!   slices `Unknown`.
 //!
 //! Parsing, read-back and hashing all run on blocking tasks, and each worker
 //! awaits its own verification before it resolves the article, so the map is
@@ -23,8 +38,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use md5::{Digest, Md5};
 use nzb_core::models::{NzbJob, SliceMapSummary, SliceVerdict};
-use nzb_core::{CandidateFile, Par2FileRef, match_files_by_hash16k};
+use nzb_core::{CandidateFile, PAR2_HASH_16K_LEN, Par2FileRef, match_files_by_hash16k};
 use nzb_decode::{SliceState, SliceVerifier};
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
@@ -55,6 +71,23 @@ struct Tracked {
     /// submission). Their slices are never decided here.
     untracked: HashSet<usize>,
     recovery_block_count: u32,
+    /// Every layout file's `hash_16k` and size, by layout index.
+    par2_files: Vec<([u8; 16], u64)>,
+    /// Layout indices already mapped to an NZB file.
+    claimed: HashSet<usize>,
+    /// NZB data files not yet mapped to a PAR2 file, with their writes so far.
+    unmatched: HashMap<String, Vec<Write>>,
+    /// (NZB file id, prefix length) pairs already hashed, so each prefix is
+    /// read from disk at most once.
+    hashed: HashSet<(String, u64)>,
+}
+
+/// What one write asks of the caller beyond verifying `pending`.
+struct Marked {
+    pending: Vec<PendingSlice>,
+    /// The write landed in the first 16 KiB of an unmatched file; try the
+    /// hash matcher.
+    try_match: bool,
 }
 
 enum State {
@@ -74,8 +107,11 @@ pub(crate) struct JobSlices {
     work_dir: PathBuf,
     /// NZB file id → NZB filename (the name the assembler writes under).
     filenames: HashMap<String, String>,
-    /// NZB files that already had downloaded articles at submission.
+    /// NZB files resumed with a downloaded segment of unknown offset. They are
+    /// never tracked.
     resumed: HashSet<String>,
+    /// The index file, when it was already complete at submission.
+    index_on_disk: Option<String>,
     state: Mutex<State>,
     /// NZB file id → whether every terminal failure in it was a confirmed
     /// absence (refused by every server). Absent: no failures.
@@ -91,9 +127,44 @@ pub(crate) fn is_par2_index(filename: &str) -> bool {
 impl JobSlices {
     pub(crate) fn new(job: &NzbJob) -> Self {
         let has_index = job.files.iter().any(|f| is_par2_index(&f.filename));
+        // Seed the writes a resumed job made before the restart.
+        let mut seeded: HashMap<String, Vec<Write>> = HashMap::new();
+        let mut resumed = HashSet::new();
+        for file in &job.files {
+            let done: Vec<_> = file.articles.iter().filter(|a| a.downloaded).collect();
+            if done.is_empty() {
+                continue;
+            }
+            let writes: Option<Vec<Write>> = done
+                .iter()
+                .map(|a| {
+                    Some(Write {
+                        offset: a.data_begin?,
+                        len: a.data_size?,
+                    })
+                })
+                .collect();
+            match writes {
+                Some(writes) => {
+                    seeded.insert(file.id.clone(), writes);
+                }
+                None => {
+                    resumed.insert(file.id.clone());
+                }
+            }
+        }
+        let index_on_disk = job
+            .files
+            .iter()
+            .find(|f| {
+                is_par2_index(&f.filename)
+                    && !f.articles.is_empty()
+                    && f.articles.iter().all(|a| a.downloaded)
+            })
+            .map(|f| f.id.clone());
         let state = if has_index {
             State::Pending {
-                writes: HashMap::new(),
+                writes: seeded,
                 installing: false,
             }
         } else {
@@ -106,12 +177,8 @@ impl JobSlices {
                 .iter()
                 .map(|f| (f.id.clone(), f.filename.clone()))
                 .collect(),
-            resumed: job
-                .files
-                .iter()
-                .filter(|f| f.articles.iter().any(|a| a.downloaded))
-                .map(|f| f.id.clone())
-                .collect(),
+            resumed,
+            index_on_disk,
             state: Mutex::new(state),
             failures: Mutex::new(HashMap::new()),
         }
@@ -119,27 +186,41 @@ impl JobSlices {
 
     /// Record a successful write of `len` bytes at `offset` into `file_id`.
     /// Returns the slices that became fully written and must be verified.
-    fn mark(&self, file_id: &str, offset: u64, len: u64) -> Vec<PendingSlice> {
+    fn mark(&self, file_id: &str, offset: u64, len: u64) -> Marked {
+        let none = Marked {
+            pending: Vec::new(),
+            try_match: false,
+        };
         let mut state = self.state.lock();
         match &mut *state {
-            State::Disabled => Vec::new(),
+            State::Disabled => none,
             State::Pending { writes, .. } => {
                 writes
                     .entry(file_id.to_string())
                     .or_default()
                     .push(Write { offset, len });
-                Vec::new()
+                none
             }
             State::Ready(tracked) => {
+                if let Some(writes) = tracked.unmatched.get_mut(file_id) {
+                    writes.push(Write { offset, len });
+                    return Marked {
+                        pending: Vec::new(),
+                        try_match: offset < PAR2_HASH_16K_LEN as u64,
+                    };
+                }
                 let Some((index, path)) = tracked.files.get(file_id) else {
-                    return Vec::new();
+                    return none;
                 };
                 if tracked.untracked.contains(index) {
-                    return Vec::new();
+                    return none;
                 }
                 let (index, path) = (*index, path.clone());
                 let done = tracked.verifier.mark_written(index, offset, len);
-                pending_for(&tracked.verifier, &path, done)
+                Marked {
+                    pending: pending_for(&tracked.verifier, &path, done),
+                    try_match: false,
+                }
             }
         }
     }
@@ -154,17 +235,22 @@ impl JobSlices {
         len: u64,
         file_complete: bool,
     ) {
-        let mut pending = self.mark(file_id, offset, len);
-        if file_complete
+        let Marked {
+            mut pending,
+            try_match,
+        } = self.mark(file_id, offset, len);
+        let completed_index = (file_complete
             && self
                 .filenames
                 .get(file_id)
-                .is_some_and(|name| is_par2_index(name))
+                .is_some_and(|name| is_par2_index(name)))
+        .then(|| file_id.to_string())
+        .or_else(|| self.index_on_disk.clone());
+        if let Some(index_id) = completed_index
             && self.claim_install()
         {
             let this = self.clone();
-            let file_id = file_id.to_string();
-            match tokio::task::spawn_blocking(move || this.install(&file_id)).await {
+            match tokio::task::spawn_blocking(move || this.install(&index_id)).await {
                 Ok(more) => pending.extend(more),
                 Err(e) => {
                     warn!("PAR2 slice map install task failed: {e}");
@@ -172,11 +258,18 @@ impl JobSlices {
                 }
             }
         }
-        if pending.is_empty() {
+        let to_match = try_match.then(|| file_id.to_string());
+        if pending.is_empty() && to_match.is_none() {
             return;
         }
         let this = self.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || this.verify_all(pending)).await {
+        let task = move || {
+            if let Some(id) = to_match {
+                pending.extend(this.match_by_hash(&[id]));
+            }
+            this.verify_all(pending);
+        };
+        if let Err(e) = tokio::task::spawn_blocking(task).await {
             warn!("PAR2 slice verify task failed: {e}");
         }
     }
@@ -256,15 +349,31 @@ impl JobSlices {
                 untracked.insert(*index);
             }
         }
-        // A PAR2 file no NZB file maps to can never be written.
-        let unmatched = (0..layout.files.len()).filter(|i| !matched.values().any(|m| m == i));
-        untracked.extend(unmatched);
+        // A PAR2 file no NZB file maps to cannot be written until a data file
+        // is matched to it by hash.
+        let claimed: HashSet<usize> = matched.values().copied().collect();
+        untracked.extend((0..layout.files.len()).filter(|i| !claimed.contains(i)));
+        // Data files the names did not map, still open to the hash matcher.
+        let unmatched: HashMap<String, Vec<Write>> = self
+            .filenames
+            .iter()
+            .filter(|(id, name)| {
+                !name.to_lowercase().ends_with(".par2")
+                    && !matched.contains_key(*id)
+                    && !self.resumed.contains(*id)
+            })
+            .map(|(id, _)| (id.clone(), Vec::new()))
+            .collect();
 
         let mut tracked = Box::new(Tracked {
             verifier: SliceVerifier::new(&layout),
             files,
             untracked,
             recovery_block_count: set.recovery_block_count,
+            par2_files: par2_refs.iter().map(|p| (p.hash_16k, p.size)).collect(),
+            claimed,
+            unmatched,
+            hashed: HashSet::new(),
         });
         info!(
             slices = tracked.verifier.total_slices(),
@@ -279,7 +388,13 @@ impl JobSlices {
             _ => HashMap::new(),
         };
         let mut pending = Vec::new();
+        let mut to_match = Vec::new();
         for (file_id, writes) in buffered {
+            if let Some(held) = tracked.unmatched.get_mut(&file_id) {
+                held.extend(writes);
+                to_match.push(file_id);
+                continue;
+            }
             let Some((index, path)) = tracked.files.get(&file_id) else {
                 continue;
             };
@@ -293,6 +408,82 @@ impl JobSlices {
             }
         }
         *state = State::Ready(tracked);
+        drop(state);
+        pending.extend(self.match_by_hash(&to_match));
+        pending
+    }
+
+    /// Try to map each unmatched NZB file in `file_ids` to a PAR2 file by the
+    /// MD5 of its first 16 KiB (or of the whole PAR2 file, when shorter), read
+    /// from disk once its prefix has landed. A match replays the file's
+    /// buffered writes; the slices that replay completes are returned. Runs on
+    /// a blocking task.
+    fn match_by_hash(&self, file_ids: &[String]) -> Vec<PendingSlice> {
+        let mut pending = Vec::new();
+        for file_id in file_ids {
+            // Prefix lengths worth hashing: one per distinct unclaimed PAR2
+            // prefix length the landed bytes now cover, not hashed before.
+            let lens: Vec<u64> = {
+                let mut state = self.state.lock();
+                let State::Ready(tracked) = &mut *state else {
+                    return pending;
+                };
+                let Some(writes) = tracked.unmatched.get(file_id) else {
+                    continue;
+                };
+                let covered = covered_prefix(writes);
+                let mut lens: Vec<u64> = tracked
+                    .par2_files
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !tracked.claimed.contains(i))
+                    .map(|(_, (_, size))| (*size).min(PAR2_HASH_16K_LEN as u64))
+                    .filter(|len| *len > 0 && *len <= covered)
+                    .collect();
+                lens.sort_unstable();
+                lens.dedup();
+                lens.retain(|len| tracked.hashed.insert((file_id.clone(), *len)));
+                lens
+            };
+            let path = self.work_dir.join(&self.filenames[file_id]);
+            for len in lens {
+                let digest: [u8; 16] = match read_range(&path, 0, len) {
+                    Ok(bytes) => Md5::digest(&bytes).into(),
+                    Err(e) => {
+                        debug!(path = %path.display(), "16 KiB prefix unreadable: {e}");
+                        continue;
+                    }
+                };
+                let mut state = self.state.lock();
+                let State::Ready(tracked) = &mut *state else {
+                    return pending;
+                };
+                let found = tracked
+                    .par2_files
+                    .iter()
+                    .enumerate()
+                    .position(|(i, (h, s))| {
+                        !tracked.claimed.contains(&i)
+                            && *h == digest
+                            && (*s).min(PAR2_HASH_16K_LEN as u64) == len
+                    });
+                let Some(index) = found else {
+                    continue;
+                };
+                let Some(writes) = tracked.unmatched.remove(file_id) else {
+                    break;
+                };
+                tracked.claimed.insert(index);
+                tracked.untracked.remove(&index);
+                tracked.files.insert(file_id.clone(), (index, path.clone()));
+                info!(file = %self.filenames[file_id], par2_file = index, "Obfuscated file matched to PAR2 by 16 KiB hash");
+                for w in writes {
+                    let done = tracked.verifier.mark_written(index, w.offset, w.len);
+                    pending.extend(pending_for(&tracked.verifier, &path, done));
+                }
+                break;
+            }
+        }
         pending
     }
 
@@ -385,6 +576,20 @@ fn pending_for(verifier: &SliceVerifier, path: &Path, done: Vec<usize>) -> Vec<P
                 })
         })
         .collect()
+}
+
+/// End of the contiguous run of written bytes starting at offset 0.
+fn covered_prefix(writes: &[Write]) -> u64 {
+    let mut sorted: Vec<Write> = writes.to_vec();
+    sorted.sort_unstable_by_key(|w| w.offset);
+    let mut end = 0;
+    for w in sorted {
+        if w.offset > end {
+            break;
+        }
+        end = end.max(w.offset + w.len);
+    }
+    end
 }
 
 fn read_range(path: &Path, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {

@@ -24,10 +24,10 @@ anyhow = "1"
 thiserror = "2"
 unicode-normalization = "0.1"
 rust-par2 = { workspace = true }
+md-5 = "0.11"
 
 [dev-dependencies]
 mock-nntp-server = { workspace = true }
-md-5 = "0.11"
 nzb-nntp = { version = "0.2.26", path = "../nzb-nntp", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
