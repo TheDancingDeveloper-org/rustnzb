@@ -226,6 +226,12 @@ pub struct NzbJob {
     /// when the download ends, if the job's PAR2 index arrived during it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slice_map: Option<SliceMapSummary>,
+    /// Bytes of PAR2 recovery volumes held back by `par2.defer_volumes` and
+    /// not yet released. Queue sizes and ETAs leave them out, as SABnzbd
+    /// does; a release grows the job's size by the volumes it lets through.
+    /// Filled in by the queue snapshot, never persisted.
+    #[serde(default)]
+    pub held_par2_bytes: u64,
     /// Files in this job
     #[serde(skip)]
     pub files: Vec<NzbFile>,
@@ -298,6 +304,15 @@ pub struct HistoryEntry {
     /// Per-server download statistics
     #[serde(default)]
     pub server_stats: Vec<ServerArticleStats>,
+    /// PAR2 recovery volumes downloaded, out of
+    /// [`par2_volumes_available`](Self::par2_volumes_available) in the NZB.
+    /// Fewer than available when `par2.defer_volumes` left some unfetched.
+    /// `None` for rows recorded before it was stored.
+    #[serde(default)]
+    pub par2_volumes_fetched: Option<u32>,
+    /// PAR2 recovery volumes the NZB carries.
+    #[serde(default)]
+    pub par2_volumes_available: Option<u32>,
     /// Raw NZB XML data (for retry)
     #[serde(skip_serializing)]
     pub nzb_data: Option<Vec<u8>>,

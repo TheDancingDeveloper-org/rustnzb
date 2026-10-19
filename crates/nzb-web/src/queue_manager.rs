@@ -248,6 +248,20 @@ fn retry_checkpoint_work_dir(retry_data: &[u8]) -> Option<std::path::PathBuf> {
         .work_dir
 }
 
+/// `(fetched, available)` PAR2 recovery volumes for a job whose download
+/// ended with the volume files `held` still unfetched, or `None` when the NZB
+/// carries no volumes.
+fn par2_volume_counts(job: &NzbJob, held: &[String]) -> Option<(u32, u32)> {
+    let volumes = job.files.iter().filter(|file| {
+        let lower = file.filename.to_lowercase();
+        lower.ends_with(".par2") && lower.contains(".vol")
+    });
+    let (available, held) = volumes.fold((0_u32, 0_u32), |(available, held_n), file| {
+        (available + 1, held_n + u32::from(held.contains(&file.id)))
+    });
+    (available > 0).then(|| (available - held, available))
+}
+
 /// Per-server totals. The `today_*`, `week_*` and `month_*` fields are rolling
 /// windows (the last 24 hours, 7 days and 30 days before the request), not
 /// calendar periods; the UI labels them "24 hours", "7 days" and "30 days".
@@ -1380,6 +1394,9 @@ struct JobState {
     /// Typed terminal failure code, tracked in memory until it is persisted to
     /// the terminal history row.
     failure_code: Option<JobFailureCode>,
+    /// PAR2 recovery volumes `(fetched, available)` when the download
+    /// finished, recorded on the history row.
+    par2_volumes: Option<(u32, u32)>,
     /// Whether `job.output_dir` is a complete-directory folder this job
     /// reserved for itself. Reserving happens when output is first written,
     /// not at add time, so queued jobs never hold a name.
@@ -2467,6 +2484,7 @@ impl QueueManager {
                 prior_download_secs: 0.0,
                 carried_bytes,
                 failure_code: None,
+                par2_volumes: None,
                 output_dir_claimed: false,
                 persisted_status: None,
             };
@@ -2493,6 +2511,7 @@ impl QueueManager {
             prior_download_secs: 0.0,
             carried_bytes,
             failure_code: None,
+            par2_volumes: None,
             output_dir_claimed: false,
             persisted_status: None,
         };
@@ -3284,7 +3303,9 @@ impl QueueManager {
                     // The final article has resolved, so no worker can write
                     // another segment for this job. Release the worker-pool
                     // context now to close its persistent assembler handles
-                    // before PAR2/unpack opens the completed files.
+                    // before PAR2/unpack opens the completed files. Read the
+                    // volumes it left held first, for the history row.
+                    let held = self.dispatch.held_par2_files(&job_id).unwrap_or_default();
                     self.dispatch.release_completed_job(&job_id);
 
                     // Mark as PostProcessing immediately so the slot is freed
@@ -3298,6 +3319,7 @@ impl QueueManager {
                             state.job.status = JobStatus::PostProcessing;
                             state.job.completed_at = Some(chrono::Utc::now());
                             state.job.slice_map = slice_map;
+                            state.par2_volumes = par2_volume_counts(&state.job, &held);
                         }
                     }
                     self.history_changed();
@@ -3935,6 +3957,8 @@ impl QueueManager {
             server_stats: state.job.server_stats.clone(),
             nzb_data: state.nzb_data.clone(),
             retry_data,
+            par2_volumes_fetched: state.par2_volumes.map(|(fetched, _)| fetched),
+            par2_volumes_available: state.par2_volumes.map(|(_, available)| available),
         };
 
         let db = self.db.lock();
@@ -4511,6 +4535,8 @@ impl QueueManager {
                     server_stats: state.job.server_stats.clone(),
                     nzb_data: state.nzb_data.clone(),
                     retry_data: None,
+                    par2_volumes_fetched: None,
+                    par2_volumes_available: None,
                 };
                 if let Err(e) =
                     db.history_insert_with_carried_bytes(&history_entry, state.carried_bytes)
@@ -4809,17 +4835,38 @@ impl QueueManager {
 
     /// Get a snapshot of all jobs in the queue.
     pub fn get_jobs(&self) -> Vec<NzbJob> {
-        let jobs = self.jobs.lock();
-        let order = self.job_order.lock();
-        let mut result = Vec::with_capacity(order.len());
-        for id in order.iter() {
-            if let Some(state) = jobs.get(id) {
-                let mut job = state.job.clone();
-                job.speed_bps = state.speed.bps();
-                result.push(job);
+        let mut result = {
+            let jobs = self.jobs.lock();
+            let order = self.job_order.lock();
+            let mut result = Vec::with_capacity(order.len());
+            for id in order.iter() {
+                if let Some(state) = jobs.get(id) {
+                    let mut job = state.job.clone();
+                    job.speed_bps = state.speed.bps();
+                    result.push(job);
+                }
             }
+            result
+        };
+        // The dispatcher's job map is a separate lock; never take it under
+        // the job list.
+        for job in &mut result {
+            self.fill_held_par2_bytes(job);
         }
         result
+    }
+
+    /// Set `job.held_par2_bytes` from the volumes the dispatcher still holds.
+    fn fill_held_par2_bytes(&self, job: &mut NzbJob) {
+        job.held_par2_bytes = match self.dispatch.held_par2_files(&job.id) {
+            Some(held) if !held.is_empty() => job
+                .files
+                .iter()
+                .filter(|file| held.contains(&file.id))
+                .map(|file| file.bytes)
+                .sum(),
+            _ => 0,
+        };
     }
 
     /// Get jobs that are still actionable in the active download queue.
@@ -4841,12 +4888,13 @@ impl QueueManager {
 
     /// Get a single job by ID (with files included).
     pub fn get_job(&self, job_id: &str) -> Option<NzbJob> {
-        let jobs = self.jobs.lock();
-        jobs.get(job_id).map(|state| {
+        let mut job = self.jobs.lock().get(job_id).map(|state| {
             let mut job = state.job.clone();
             job.speed_bps = state.speed.bps();
             job
-        })
+        })?;
+        self.fill_held_par2_bytes(&mut job);
+        Some(job)
     }
 
     /// Get the current download speed in bytes per second.
@@ -5829,6 +5877,7 @@ impl QueueManager {
                 prior_download_secs,
                 carried_bytes,
                 failure_code: None,
+                par2_volumes: None,
                 output_dir_claimed,
                 persisted_status: None,
             };
@@ -6174,6 +6223,7 @@ mod global_pause_tests {
     fn job(id: &str, status: JobStatus, root: &std::path::Path) -> NzbJob {
         NzbJob {
             slice_map: None,
+            held_par2_bytes: 0,
             id: id.to_string(),
             name: id.to_string(),
             category: "Default".to_string(),
@@ -6333,6 +6383,8 @@ mod global_pause_tests {
             server_stats: Vec::new(),
             nzb_data: Some(DUPLICATE_NZB.to_vec()),
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         };
         manager.db.lock().history_insert(&finished).unwrap();
 
@@ -6366,6 +6418,8 @@ mod global_pause_tests {
             server_stats: Vec::new(),
             nzb_data: Some(DUPLICATE_NZB.to_vec()),
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         };
         manager.db.lock().history_insert(&failed).unwrap();
 
@@ -6419,6 +6473,7 @@ mod global_pause_tests {
                 prior_download_secs: 0.0,
                 carried_bytes: 0,
                 failure_code: None,
+                par2_volumes: None,
                 output_dir_claimed: false,
                 persisted_status: None,
             },
@@ -6710,6 +6765,8 @@ mod global_pause_tests {
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         };
         let retry_data = serde_json::to_vec(&checkpoint).unwrap();
 
@@ -8124,6 +8181,8 @@ mod global_pause_tests {
                 retry_data: None,
                 delete_archives: None,
                 post_processing: None,
+                par2_volumes_fetched: None,
+                par2_volumes_available: None,
             })
             .unwrap();
         insert_job(&manager, finished);
