@@ -19,10 +19,58 @@ use tokio::time::Instant;
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How a test bends the standard scenario run.
+#[derive(Default)]
+struct Twist {
+    /// Refuse the PAR2 index on every server for this many attempts, so it
+    /// lands after the data (each refusal round costs a confirm delay).
+    index_refusals: usize,
+    /// Rename every data file in the NZB, as an obfuscated post does.
+    obfuscate: bool,
+    /// Data-file segments (file index, segment number) already written before
+    /// a restart.
+    resumed: Vec<(usize, u32)>,
+    /// The PAR2 index was already downloaded before the restart.
+    index_resumed: bool,
+    /// Stall timeout for the pool, in seconds (0: none).
+    stall_timeout_secs: u64,
+}
+
+struct Run {
+    fixture: ScenarioFixture,
+    map: SliceMapSummary,
+    /// NZB file ids in the order their last article completed.
+    completion_order: Vec<String>,
+    job: nzb_core::models::NzbJob,
+}
+
 /// Run `scenario` to `JobFinished` and return its slice map.
 async fn run(scenario: DamageScenario) -> (ScenarioFixture, SliceMapSummary) {
+    let run = run_with(scenario, Twist::default()).await;
+    (run.fixture, run.map)
+}
+
+async fn run_with(scenario: DamageScenario, twist: Twist) -> Run {
     let fixture = scenario.fixture();
-    let servers: Vec<MockNntpServer> = fixture.start_servers().await;
+    let mut server_configs = fixture.server_configs();
+    if twist.index_refusals > 0 {
+        for config in &mut server_configs {
+            let sequences = config
+                .article_response_sequences
+                .get_or_insert_with(Default::default);
+            for segment in &fixture.release.par2_index.segments {
+                let mid = segment.message_id.clone();
+                let refusals = (0..twist.index_refusals)
+                    .map(|_| (430u16, format!("No article: <{mid}>")))
+                    .collect();
+                sequences.lock().insert(mid, refusals);
+            }
+        }
+    }
+    let mut servers = Vec::new();
+    for config in server_configs {
+        servers.push(MockNntpServer::start(config).await);
+    }
     let configs = servers
         .iter()
         .enumerate()
@@ -38,28 +86,106 @@ async fn run(scenario: DamageScenario) -> (ScenarioFixture, SliceMapSummary) {
     let pool = DispatchHandle::new(
         Arc::new(Mutex::new(configs)),
         Arc::new(BandwidthLimiter::new(BandwidthConfig::default())),
-        0,
+        twist.stall_timeout_secs,
     );
     pool.start();
 
+    let mut xml = String::from_utf8(fixture.nzb_xml()).unwrap();
+    if twist.obfuscate {
+        for (i, file) in fixture.release.data_files.iter().enumerate() {
+            xml = xml.replace(
+                &format!("\"{}\"", file.filename),
+                &format!("\"a7f3c9e{i}0b12\""),
+            );
+        }
+    }
     let root = tempfile::tempdir().unwrap();
-    let mut job = nzb_core::nzb_parser::parse_nzb(scenario.slug(), &fixture.nzb_xml()).unwrap();
+    let mut job = nzb_core::nzb_parser::parse_nzb(scenario.slug(), xml.as_bytes()).unwrap();
     job.work_dir = root.path().to_path_buf();
     job.output_dir = root.path().join("complete");
+
+    // Lay down what a download interrupted by a restart left on disk.
+    let data_names: Vec<String> = job
+        .files
+        .iter()
+        .filter(|f| !f.filename.to_lowercase().ends_with(".par2"))
+        .map(|f| f.filename.clone())
+        .collect();
+    for (file_index, number) in &twist.resumed {
+        let source = &fixture.release.data_files[*file_index];
+        let name = if twist.obfuscate {
+            format!("a7f3c9e{file_index}0b12")
+        } else {
+            source.filename.clone()
+        };
+        assert!(data_names.contains(&name));
+        let segment = &source.segments[*number as usize - 1];
+        write_at(&root.path().join(&name), segment.offset, &segment.body);
+        let file = job.files.iter_mut().find(|f| f.filename == name).unwrap();
+        let article = file
+            .articles
+            .iter_mut()
+            .find(|a| a.segment_number == *number)
+            .unwrap();
+        article.downloaded = true;
+        article.data_begin = Some(segment.offset);
+        article.data_size = Some(segment.body.len() as u64);
+    }
+    if twist.index_resumed {
+        let index = &fixture.release.par2_index;
+        std::fs::write(root.path().join(&index.filename), &index.payload).unwrap();
+        let file = job
+            .files
+            .iter_mut()
+            .find(|f| f.filename == index.filename)
+            .unwrap();
+        for (article, segment) in file.articles.iter_mut().zip(&index.segments) {
+            article.downloaded = true;
+            article.data_begin = Some(segment.offset);
+            article.data_size = Some(segment.body.len() as u64);
+        }
+    }
 
     let (tx, mut rx) = mpsc::channel(10_000);
     pool.submit_job(&job, tx);
     let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut completion_order = Vec::new();
     loop {
         let event = tokio::time::timeout_at(deadline, rx.recv())
             .await
             .unwrap_or_else(|_| panic!("{scenario:?}: timed out before JobFinished"))
             .expect("progress channel closed before JobFinished");
-        if let ProgressUpdate::JobFinished { slice_map, .. } = event {
-            let map = slice_map.unwrap_or_else(|| panic!("{scenario:?}: no slice map"));
-            return (fixture, map);
+        match event {
+            ProgressUpdate::ArticleComplete {
+                file_id,
+                file_complete: true,
+                ..
+            } => completion_order.push(file_id),
+            ProgressUpdate::JobFinished { slice_map, .. } => {
+                let map = slice_map.unwrap_or_else(|| panic!("{scenario:?}: no slice map"));
+                drop(root);
+                return Run {
+                    fixture,
+                    map,
+                    completion_order,
+                    job,
+                };
+            }
+            _ => {}
         }
     }
+}
+
+fn write_at(path: &std::path::Path, offset: u64, bytes: &[u8]) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(bytes).unwrap();
 }
 
 fn slices_with(map: &SliceMapSummary, verdict: SliceVerdict) -> BTreeSet<u32> {
@@ -142,4 +268,126 @@ async fn missing_on_primary_only_verifies_every_slice() {
     let (fixture, map) = run(scenario).await;
     assert!(fixture.expect.damaged_slices.is_empty());
     assert_map(scenario, &fixture, &map);
+}
+
+/// The index's file id, and assert it completed after every data file.
+fn assert_index_last(run: &Run) {
+    let index_name = &run.fixture.release.par2_index.filename;
+    let id_of = |name: &str| {
+        run.job
+            .files
+            .iter()
+            .find(|f| f.filename == name)
+            .map(|f| f.id.clone())
+            .unwrap()
+    };
+    let index_at = run
+        .completion_order
+        .iter()
+        .position(|id| *id == id_of(index_name))
+        .expect("index completed");
+    for file in run
+        .job
+        .files
+        .iter()
+        .filter(|f| !f.filename.to_lowercase().ends_with(".par2"))
+    {
+        if let Some(at) = run.completion_order.iter().position(|id| *id == file.id) {
+            assert!(at < index_at, "{} completed after the index", file.filename);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn index_delivered_last_still_completes_the_map() {
+    let scenario = DamageScenario::CorruptBody;
+    let run = run_with(
+        scenario,
+        Twist {
+            index_refusals: 2,
+            ..Twist::default()
+        },
+    )
+    .await;
+    assert_index_last(&run);
+    assert_map(scenario, &run.fixture, &run.map);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn obfuscated_names_are_mapped_by_16k_hash() {
+    let scenario = DamageScenario::MissingEverywhere;
+    let run = run_with(
+        scenario,
+        Twist {
+            obfuscate: true,
+            ..Twist::default()
+        },
+    )
+    .await;
+    assert_map(scenario, &run.fixture, &run.map);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn obfuscated_names_with_index_last_are_mapped() {
+    let scenario = DamageScenario::CorruptBody;
+    let run = run_with(
+        scenario,
+        Twist {
+            obfuscate: true,
+            index_refusals: 2,
+            ..Twist::default()
+        },
+    )
+    .await;
+    assert_index_last(&run);
+    assert_map(scenario, &run.fixture, &run.map);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_verifies_segments_written_before_it() {
+    let scenario = DamageScenario::CorruptBody;
+    let run = run_with(
+        scenario,
+        Twist {
+            resumed: vec![(0, 1), (0, 2), (0, 3)],
+            ..Twist::default()
+        },
+    )
+    .await;
+    assert_map(scenario, &run.fixture, &run.map);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_with_index_already_on_disk_installs_on_first_write() {
+    let scenario = DamageScenario::MissingEverywhere;
+    let run = run_with(
+        scenario,
+        Twist {
+            resumed: vec![(0, 1), (0, 2)],
+            index_resumed: true,
+            ..Twist::default()
+        },
+    )
+    .await;
+    assert_map(scenario, &run.fixture, &run.map);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transport_timeout_on_last_server_leaves_slices_unknown() {
+    let scenario = DamageScenario::TransportTimeoutOnLastServer;
+    let Run { fixture, map, .. } = run_with(
+        scenario,
+        Twist {
+            stall_timeout_secs: 1,
+            ..Twist::default()
+        },
+    )
+    .await;
+    assert!(!fixture.expect.unknown_slices.is_empty());
+    assert_eq!(slices_with(&map, SliceVerdict::Damaged), BTreeSet::new());
+    assert_eq!(
+        slices_with(&map, SliceVerdict::Unknown),
+        fixture.expect.unknown_slices
+    );
+    assert_eq!(map.unknown, fixture.expect.unknown_slices.len());
 }
