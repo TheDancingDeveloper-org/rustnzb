@@ -1,6 +1,6 @@
 [package]
 name = "nzb-decode"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 description = "yEnc decoding, file assembly, and article cache for NZB download clients"
 license = "MIT"
@@ -17,6 +17,7 @@ anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt"] }
 parking_lot = "0.12"
+rust-par2 = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
