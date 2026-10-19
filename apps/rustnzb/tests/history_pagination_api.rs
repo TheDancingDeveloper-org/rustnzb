@@ -36,6 +36,8 @@ fn history(i: usize, status: JobStatus, category: &str, age_days: i64) -> Histor
         server_stats: Vec::new(),
         nzb_data: None,
         retry_data: None,
+        par2_volumes_fetched: None,
+        par2_volumes_available: None,
     }
 }
 

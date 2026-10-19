@@ -265,6 +265,7 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
 
     Ok(NzbJob {
         slice_map: None,
+        held_par2_bytes: 0,
         id: uuid::Uuid::new_v4().to_string(),
         name: crate::path::sanitize_job_name(name),
         category: "Default".into(),

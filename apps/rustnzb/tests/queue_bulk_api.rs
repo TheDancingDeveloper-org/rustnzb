@@ -76,6 +76,7 @@ async fn start_app() -> App {
     for id in ["job-a", "job-b"] {
         let job = NzbJob {
             slice_map: None,
+            held_par2_bytes: 0,
             id: id.into(),
             name: id.into(),
             category: "Default".into(),

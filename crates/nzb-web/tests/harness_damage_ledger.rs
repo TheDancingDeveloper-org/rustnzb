@@ -8,7 +8,7 @@ mod harness;
 use std::time::Duration;
 
 use harness::{HarnessBuilder, ServerProfile};
-use mock_nntp_server::damage::{DamageScenario, ScenarioFixture};
+use mock_nntp_server::damage::{DamageScenario, RECOVERY_VOLUME_BLOCKS, ScenarioFixture};
 use nzb_web::nzb_core::models::JobStatus;
 use nzb_web::nzb_core::{LedgerRecord, LedgerState};
 
@@ -133,4 +133,47 @@ async fn transport_timeout_on_last_server_is_held_provisionally() {
             .unwrap()
     );
     assert_rest_present(&fixture, &records, &[4]);
+}
+
+/// WI-1231: with `par2.defer_volumes` (on by default) a repairable job
+/// fetches only the volumes the damage needs, and its history row says how
+/// many of the NZB's volumes it fetched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_everywhere_history_records_par2_volumes_fetched() {
+    let (engine, job_id, fixture) = run(DamageScenario::MissingEverywhere).await;
+    let entry = engine
+        .queue_manager
+        .history_get(&job_id)
+        .expect("history read")
+        .expect("history row");
+    let available = fixture.release.volumes.len() as u32;
+    assert_eq!(entry.par2_volumes_available, Some(available));
+    // The smallest prefix of volumes covering the damage plus the repair
+    // margin (8 blocks), as WI-1230 releases them.
+    let need = fixture.expect.damaged_slices.len() + 8;
+    let mut blocks = 0;
+    let prefix = RECOVERY_VOLUME_BLOCKS
+        .iter()
+        .take_while(|b| {
+            let short = blocks < need;
+            blocks += **b as usize;
+            short
+        })
+        .count() as u32;
+    assert!(prefix > 0);
+    assert_eq!(entry.par2_volumes_fetched, Some(prefix));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clean_job_history_records_no_par2_volumes_fetched() {
+    let (engine, job_id, fixture) = run(DamageScenario::MissingOnPrimaryOnly).await;
+    let entry = engine
+        .queue_manager
+        .history_get(&job_id)
+        .expect("history read")
+        .expect("history row");
+    assert_eq!(
+        (entry.par2_volumes_fetched, entry.par2_volumes_available),
+        (Some(0), Some(fixture.release.volumes.len() as u32))
+    );
 }

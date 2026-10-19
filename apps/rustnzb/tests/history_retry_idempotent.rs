@@ -44,6 +44,8 @@ fn failed_history_entry(id: &str, complete_dir: &std::path::Path) -> HistoryEntr
         server_stats: Vec::new(),
         nzb_data: Some(sample_nzb_bytes()),
         retry_data: None,
+        par2_volumes_fetched: None,
+        par2_volumes_available: None,
     }
 }
 

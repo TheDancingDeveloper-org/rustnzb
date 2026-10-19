@@ -21,6 +21,7 @@ pub(crate) const REPAIR_MARGIN: usize = 8;
 
 /// One held recovery volume and the work items that fetch it.
 struct HeldVolume {
+    file_id: String,
     first_exponent: u32,
     blocks: u32,
     items: Vec<WorkItem>,
@@ -59,6 +60,7 @@ impl HeldVolumes {
                 Some((file_id, &(first_exponent, blocks))) => by_file
                     .entry(file_id.as_str())
                     .or_insert_with(|| HeldVolume {
+                        file_id: file_id.clone(),
                         first_exponent,
                         blocks,
                         items: Vec::new(),
@@ -100,6 +102,16 @@ impl HeldVolumes {
     /// Release every held volume.
     pub(crate) fn release_all(&self) -> Option<(Arc<SharedWorkQueue>, Vec<WorkItem>)> {
         self.release_for(usize::MAX)
+    }
+
+    /// NZB file ids of the volumes still held, lowest first exponent first.
+    pub(crate) fn held_file_ids(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .held
+            .iter()
+            .map(|v| v.file_id.clone())
+            .collect()
     }
 
     /// Recovery blocks released plus those still held.
@@ -160,6 +172,7 @@ mod tests {
         let (h, now) = held();
         assert_eq!(files(&now), ["data"]);
         assert_eq!(h.total_blocks(), 15);
+        assert_eq!(h.held_file_ids(), ["v1", "v2", "v4", "v8"]);
     }
 
     #[test]
@@ -173,6 +186,7 @@ mod tests {
         assert_eq!(more.len(), 2);
         let (_, rest) = h.release_for(100).unwrap();
         assert_eq!(files(&rest), ["v8"]);
+        assert!(h.held_file_ids().is_empty());
         assert!(h.is_empty());
         assert!(h.release_all().is_none());
     }

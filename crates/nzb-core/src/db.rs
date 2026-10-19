@@ -602,6 +602,57 @@ impl Database {
             commit_migration(tx, 18)?;
         }
 
+        if version < 19 {
+            info!("Applying database migration v19: PAR2 volumes fetched and available");
+            // Stored in history and copied to history_list_meta, so list
+            // queries read them without walking the NZB blob (v18).
+            let has_history: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'history'",
+                [],
+                |row| row.get(0),
+            )?;
+            let has_triggers: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'trigger' AND name LIKE 'history_list_meta_%'",
+                [],
+                |row| row.get(0),
+            )?;
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE history_list_meta ADD COLUMN par2_volumes_fetched INTEGER;
+                 ALTER TABLE history_list_meta ADD COLUMN par2_volumes_available INTEGER;",
+            )?;
+            if has_history > 0 {
+                tx.execute_batch(
+                    "ALTER TABLE history ADD COLUMN par2_volumes_fetched INTEGER;
+                     ALTER TABLE history ADD COLUMN par2_volumes_available INTEGER;",
+                )?;
+            }
+            if has_triggers > 0 {
+                tx.execute_batch(
+                    "DROP TRIGGER history_list_meta_insert;
+                    DROP TRIGGER history_list_meta_update;
+                    CREATE TRIGGER history_list_meta_insert AFTER INSERT ON history BEGIN
+                        INSERT OR REPLACE INTO history_list_meta VALUES (
+                            NEW.id, NEW.download_time_secs, NEW.server_stats,
+                            NEW.failure_code, NEW.post_processing, NEW.delete_archives,
+                            NEW.par2_volumes_fetched, NEW.par2_volumes_available);
+                    END;
+                    CREATE TRIGGER history_list_meta_update AFTER UPDATE OF
+                        id, download_time_secs, server_stats, failure_code,
+                        post_processing, delete_archives, par2_volumes_fetched,
+                        par2_volumes_available ON history BEGIN
+                        DELETE FROM history_list_meta WHERE id = OLD.id;
+                        INSERT OR REPLACE INTO history_list_meta VALUES (
+                            NEW.id, NEW.download_time_secs, NEW.server_stats,
+                            NEW.failure_code, NEW.post_processing, NEW.delete_archives,
+                            NEW.par2_volumes_fetched, NEW.par2_volumes_available);
+                    END;",
+                )?;
+            }
+            commit_migration(tx, 19)?;
+        }
+
         Ok(())
     }
 
@@ -929,6 +980,7 @@ impl Database {
             .query_map([], |row| {
                 Ok(NzbJob {
                     slice_map: None,
+                    held_par2_bytes: 0,
                     id: row.get(0)?,
                     name: row.get(1)?,
                     category: row.get(2)?,
@@ -1029,9 +1081,9 @@ impl Database {
             "INSERT INTO history (id, name, category, status, total_bytes, downloaded_bytes,
              added_at, completed_at, download_time_secs, output_dir, stages, error_message,
              nzb_data, server_stats, retry_data, failure_code, post_processing, delete_archives,
-             nzb_digest)
+             nzb_digest, par2_volumes_fetched, par2_volumes_available)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-             ?17, ?18, ?19)",
+             ?17, ?18, ?19, ?20, ?21)",
             params![
                 entry.id,
                 entry.name,
@@ -1052,6 +1104,8 @@ impl Database {
                 entry.post_processing,
                 entry.delete_archives,
                 entry.nzb_data.as_deref().map(nzb_digest),
+                entry.par2_volumes_fetched,
+                entry.par2_volumes_available,
             ],
         )?;
 
@@ -1264,7 +1318,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT h.id, h.name, h.category, h.status, h.total_bytes, h.downloaded_bytes,
              h.added_at, h.completed_at, m.download_time_secs, h.output_dir, h.stages,
-             h.error_message, m.server_stats, m.failure_code, m.post_processing, m.delete_archives
+             h.error_message, m.server_stats, m.failure_code, m.post_processing, m.delete_archives,
+             m.par2_volumes_fetched, m.par2_volumes_available
              FROM history h LEFT JOIN history_list_meta m ON m.id = h.id WHERE h.id = ?1",
         )?;
 
@@ -1294,6 +1349,8 @@ impl Database {
                 server_stats,
                 nzb_data: None,
                 retry_data: None,
+                par2_volumes_fetched: row.get(16)?,
+                par2_volumes_available: row.get(17)?,
             })
         });
 
@@ -1652,7 +1709,7 @@ impl Database {
 const HISTORY_LIST_COLUMNS: &str = "h.id, h.name, h.category, h.status, h.total_bytes,
      h.downloaded_bytes, h.added_at, h.completed_at, m.download_time_secs, h.output_dir, h.stages,
      h.error_message, m.server_stats, typeof(h.nzb_data) <> 'null' AS has_nzb, m.failure_code,
-     m.post_processing, m.delete_archives";
+     m.post_processing, m.delete_archives, m.par2_volumes_fetched, m.par2_volumes_available";
 
 /// Source of [`HISTORY_LIST_COLUMNS`].
 const HISTORY_LIST_FROM: &str = "history h LEFT JOIN history_list_meta m ON m.id = h.id";
@@ -1694,6 +1751,8 @@ fn history_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
         // Don't load actual blob in list - just note if it exists
         nzb_data: if has_nzb { Some(Vec::new()) } else { None },
         retry_data: None,
+        par2_volumes_fetched: row.get(17)?,
+        par2_volumes_available: row.get(18)?,
     })
 }
 
@@ -1842,6 +1901,7 @@ mod tests {
     fn make_job(id: &str, name: &str) -> NzbJob {
         NzbJob {
             slice_map: None,
+            held_par2_bytes: 0,
             id: id.into(),
             name: name.into(),
             category: "Default".into(),
@@ -1940,6 +2000,8 @@ mod tests {
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         }
     }
 
@@ -2137,6 +2199,34 @@ mod tests {
         let listed = db.history_list(10).unwrap();
         let level = listed.iter().find(|entry| entry.id == "pp-level").unwrap();
         assert_eq!(level.post_processing, Some(1));
+    }
+
+    #[test]
+    fn history_round_trips_par2_volume_counts() {
+        let db = Database::open_memory().unwrap();
+        let mut stored = make_history("par2-vols", "Vols");
+        stored.par2_volumes_fetched = Some(2);
+        stored.par2_volumes_available = Some(5);
+        db.history_insert(&stored).unwrap();
+        db.history_insert(&make_history("par2-legacy", "Legacy"))
+            .unwrap();
+
+        let got = db.history_get("par2-vols").unwrap().unwrap();
+        assert_eq!(
+            (got.par2_volumes_fetched, got.par2_volumes_available),
+            (Some(2), Some(5))
+        );
+        let listed = db.history_list(10).unwrap();
+        let vols = listed.iter().find(|entry| entry.id == "par2-vols").unwrap();
+        assert_eq!(
+            (vols.par2_volumes_fetched, vols.par2_volumes_available),
+            (Some(2), Some(5))
+        );
+        let legacy = listed
+            .iter()
+            .find(|entry| entry.id == "par2-legacy")
+            .unwrap();
+        assert_eq!(legacy.par2_volumes_available, None);
     }
 
     #[test]
