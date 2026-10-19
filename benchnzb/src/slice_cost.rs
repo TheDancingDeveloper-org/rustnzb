@@ -116,8 +116,8 @@ fn job(
     let start = Instant::now();
     for article in encoded {
         let t = Instant::now();
-        let decoded = yenc_simd::decode_yenc(article)
-            .map_err(|e| anyhow::anyhow!("decode: {e:?}"))?;
+        let decoded =
+            yenc_simd::decode_yenc(article).map_err(|e| anyhow::anyhow!("decode: {e:?}"))?;
         decode += t.elapsed();
         file.seek(SeekFrom::Start(written as u64))?;
         file.write_all(&decoded.data)?;

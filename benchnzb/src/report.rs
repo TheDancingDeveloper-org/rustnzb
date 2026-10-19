@@ -289,7 +289,9 @@ h2 {{ margin-top:2.4em; }} .kicker {{ color:var(--accent); font-weight:700; text
 
 fn client_cell(result: &ClientResult) -> String {
     let outcome = match result.outcome {
-        crate::runner::BenchmarkOutcome::Succeeded if result.payload_verified => "<span class=\"ok\">verified</span>",
+        crate::runner::BenchmarkOutcome::Succeeded if result.payload_verified => {
+            "<span class=\"ok\">verified</span>"
+        }
         crate::runner::BenchmarkOutcome::Succeeded => "<span class=\"bad\">unverified</span>",
         _ => "<span class=\"bad\">failed</span>",
     };
