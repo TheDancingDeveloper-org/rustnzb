@@ -6167,6 +6167,40 @@ mod global_pause_tests {
         assert_eq!(manager.queue_size(), 1);
     }
 
+    /// Writes an executable script from a child `sh`, so the open write
+    /// handle never lives in this process. Otherwise another test thread can
+    /// fork while it is open, the child inherits it, and running the script
+    /// fails with "Text file busy" (ETXTBSY). Same fix as nzb-postproc.
+    #[cfg(unix)]
+    fn write_exec_script(path: &std::path::Path, contents: &str) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("cat > \"$1\" && chmod 755 \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+        assert!(
+            child.wait().unwrap().success(),
+            "writing {}",
+            path.display()
+        );
+    }
+
+    #[cfg(not(unix))]
+    fn write_exec_script(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+    }
+
     fn manager() -> (Arc<QueueManager>, tempfile::TempDir) {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db = Database::open_memory().expect("database");
@@ -6536,12 +6570,7 @@ mod global_pause_tests {
     async fn script_output_is_bounded_and_captured() {
         let (manager, tempdir) = manager();
         let script = tempdir.path().join("script.sh");
-        std::fs::write(&script, b"#!/bin/sh\nprintf '1234567890'\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_exec_script(&script, "#!/bin/sh\nprintf '1234567890'\n");
         manager.set_postproc_scripts(None, Some(script), None, 2, 4);
         let mut completed = job("script-job", JobStatus::Completed, tempdir.path());
         completed.output_dir = tempdir.path().join("output");
@@ -6567,12 +6596,7 @@ mod global_pause_tests {
 { for a in "$@"; do printf 'arg:%s\n' "$a"; done; env | grep -E '^(NZBPP|SAB)_' | sort; } > RECORD_PATH
 "#
         .replace("RECORD_PATH", &record.to_string_lossy());
-        std::fs::write(&script, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_exec_script(&script, &body);
         manager.set_postproc_scripts(None, Some(script), None, 5, 4096);
         let mut completed = job("script-job", JobStatus::Completed, tempdir.path());
         completed.category = "tv".into();
@@ -6654,16 +6678,10 @@ mod global_pause_tests {
         std::fs::create_dir_all(root.join("complete")).unwrap();
         let marker = root.join("drained.txt");
         let script = scripts.join("done.sh");
-        std::fs::write(
+        write_exec_script(
             &script,
-            format!("#!/bin/sh\necho ran >> '{}'\n", marker.display()),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+            &format!("#!/bin/sh\necho ran >> '{}'\n", marker.display()),
+        );
         manager.set_postproc_scripts(Some(scripts), None, None, 5, 4096);
         manager
             .set_queue_complete_action(Some("script_done.sh"))
