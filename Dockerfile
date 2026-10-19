@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:89f1f570acb0f8e6514ffcca39bd9f26305263d95274e4c170eedf867d113ad9
+ARG CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:d747454fca94ebfd9dba1f566d9f549c4c9fbedf785c6aba36a0c383d9b9a955
 ARG UNRAR_VERSION=7.2.3
 ARG UNRAR_SHA256=3995af0aa32b1505a566da053725551a1f0698dc42b2fdf7ba7d65db0d004e33
 
