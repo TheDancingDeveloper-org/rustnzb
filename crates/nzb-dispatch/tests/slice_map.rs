@@ -42,6 +42,10 @@ struct Run {
     /// NZB file ids in the order their last article completed.
     completion_order: Vec<String>,
     job: nzb_core::models::NzbJob,
+    /// The repair fold `JobFinished` carried (WI-148).
+    fold: Option<nzb_decode::SharedFold>,
+    /// The job's working directory, still holding what was downloaded.
+    dir: tempfile::TempDir,
 }
 
 /// Run `scenario` to `JobFinished` and return its slice map.
@@ -161,14 +165,19 @@ async fn run_with(scenario: DamageScenario, twist: Twist) -> Run {
                 file_complete: true,
                 ..
             } => completion_order.push(file_id),
-            ProgressUpdate::JobFinished { slice_map, .. } => {
+            ProgressUpdate::JobFinished {
+                slice_map,
+                repair_fold,
+                ..
+            } => {
                 let map = slice_map.unwrap_or_else(|| panic!("{scenario:?}: no slice map"));
-                drop(root);
                 return Run {
                     fixture,
                     map,
                     completion_order,
                     job,
+                    fold: repair_fold,
+                    dir: root,
                 };
             }
             _ => {}
@@ -390,4 +399,86 @@ async fn transport_timeout_on_last_server_leaves_slices_unknown() {
         fixture.expect.unknown_slices
     );
     assert_eq!(map.unknown, fixture.expect.unknown_slices.len());
+}
+
+/// WI-148: a damaged job's fold is built during the download, holds every
+/// intact slice once, and post-processing repairs from it without reading the
+/// intact slices again; the bytes match the payload.
+async fn repairs_from_the_fold(scenario: DamageScenario) {
+    let run = run_with(scenario, Twist::default()).await;
+    assert_map(scenario, &run.fixture, &run.map);
+    let fold = run
+        .fold
+        .clone()
+        .unwrap_or_else(|| panic!("{scenario:?}: damage seen but no fold: {:?}", run.map));
+    let (fed, disk_fed, total) = {
+        let f = fold.lock();
+        assert!(!f.is_poisoned());
+        assert!(f.rows() >= run.map.damaged, "{f:?}");
+        (f.fed_count(), f.disk_fed(), f.total_slices())
+    };
+    let verified = slices_with(&run.map, SliceVerdict::Verified).len();
+    // Every fed slice is a verified one, fed once; the pre-damage prefix is
+    // the only part read back from disk for the fold.
+    assert!(fed <= verified, "fed {fed} of {verified} verified");
+    assert!(disk_fed <= fed);
+    assert_eq!(total, run.map.states.len());
+    // The download wrote everything except the damaged articles; drop in the
+    // recovery volumes it would have fetched.
+    let dir = run.dir.path();
+    for volume in &run.fixture.release.volumes {
+        std::fs::write(dir.join(&volume.file.filename), &volume.file.payload).unwrap();
+    }
+    let config = nzb_postproc::PostProcConfig {
+        articles_failed: 1,
+        content_articles_failed: 1,
+        slice_map: Some(run.map.clone()),
+        trust_inflight_verify: true,
+        repair_fold: Some(fold.clone()),
+        ..Default::default()
+    };
+    let fold_after = fold;
+    let result = nzb_postproc::run_repair_pipeline(dir, &config, None).await;
+    assert!(result.success, "{scenario:?}: {result:?}");
+    let repair = result
+        .stages
+        .iter()
+        .find(|s| s.name == "Repair")
+        .and_then(|s| s.message.clone())
+        .unwrap_or_default();
+    assert!(repair.contains("[repair: fold,"), "{scenario:?}: {repair}");
+    // Every intact slice went into the rows exactly once, and the fold read
+    // from disk only what the network path had not handed it.
+    let f = fold_after.lock();
+    assert_eq!(f.fed_count(), verified, "{scenario:?}: {f:?}");
+    assert!(
+        f.disk_fed() <= verified - fed + disk_fed,
+        "{scenario:?}: {f:?}"
+    );
+    drop(f);
+    for file in &run.fixture.release.data_files {
+        let bytes = std::fs::read(dir.join(&file.filename)).unwrap();
+        assert!(
+            bytes == file.payload,
+            "{scenario:?}: {} not repaired",
+            file.filename
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_everywhere_repairs_from_the_fold() {
+    repairs_from_the_fold(DamageScenario::MissingEverywhere).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn corrupt_body_repairs_from_the_fold() {
+    repairs_from_the_fold(DamageScenario::CorruptBody).await;
+}
+
+/// No damage, no fold: a clean job pays nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clean_job_opens_no_fold() {
+    let run = run_with(DamageScenario::MissingOnPrimaryOnly, Twist::default()).await;
+    assert!(run.fold.is_none());
 }

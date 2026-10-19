@@ -123,6 +123,26 @@ enum FoldSlot {
     Active(SharedFold),
 }
 
+/// A tracked set's shape, for sizing the fold.
+struct Plan {
+    slice_size: u64,
+    total: usize,
+    recovery: u32,
+}
+
+/// The recovery exponents a job's volumes carry, from their names.
+fn recovery_exponents(job: &NzbJob) -> Vec<u32> {
+    let mut exps: Vec<u32> = job
+        .files
+        .iter()
+        .filter_map(|f| Some((f.par2_vol?, f.par2_blocks?)))
+        .flat_map(|(vol, blocks)| vol..vol.saturating_add(blocks))
+        .collect();
+    exps.sort_unstable();
+    exps.dedup();
+    exps
+}
+
 /// Rows to open for `damage` known damaged slices: twice the damage, at least
 /// eight, within the budget and the recovery count.
 fn rows_for(damage: usize, recovery: u32, slice_size: u64) -> usize {
@@ -153,6 +173,9 @@ pub(crate) struct JobSlices {
     damaged_seen: AtomicUsize,
     /// The in-flight repair fold (WI-148).
     fold: Mutex<FoldSlot>,
+    /// Recovery exponents the NZB's volumes carry, ascending (from their
+    /// `.volNN+MM` names). Empty when the names do not say.
+    recovery_exponents: Vec<u32>,
 }
 
 /// True for a PAR2 index file name (`.par2` without `.vol`).
@@ -221,6 +244,7 @@ impl JobSlices {
             confirmed_missing: AtomicUsize::new(0),
             damaged_seen: AtomicUsize::new(0),
             fold: Mutex::new(FoldSlot::Idle),
+            recovery_exponents: recovery_exponents(job),
         }
     }
 
@@ -316,13 +340,35 @@ impl JobSlices {
 
     /// Note a terminal article failure in `file_id`. `confirmed` is true when
     /// every server refused the article.
-    pub(crate) fn record_failure(&self, file_id: &str, confirmed: bool) {
+    pub(crate) fn record_failure(self: &std::sync::Arc<Self>, file_id: &str, confirmed: bool) {
         if confirmed {
             self.confirmed_missing.fetch_add(1, Ordering::Relaxed);
         }
-        let mut failures = self.failures.lock();
-        let entry = failures.entry(file_id.to_string()).or_insert(true);
-        *entry &= confirmed;
+        {
+            let mut failures = self.failures.lock();
+            let entry = failures.entry(file_id.to_string()).or_insert(true);
+            *entry &= confirmed;
+        }
+        // Confirmed damage opens (or grows) the fold now, off the worker, so
+        // the prefix is folded while the rest of the job downloads.
+        if !confirmed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let idle = matches!(*self.fold.lock(), FoldSlot::Idle);
+        let this = self.clone();
+        if idle && let Some(plan) = self.plan() {
+            // Allocate here so the fold exists before the job can finish;
+            // the prefix read happens on a blocking task.
+            let rows = rows_for(self.damage_hint(), plan.recovery, plan.slice_size);
+            if let Some(fold) = self.create_fold(rows, plan.total, plan.slice_size) {
+                runtime.spawn_blocking(move || this.feed_prefix(&fold, rows, plan.slice_size));
+            }
+        } else if !idle {
+            runtime.spawn_blocking(move || this.grow_fold());
+        }
     }
 
     /// Take the right to install. Only the first completed index wins.
@@ -595,6 +641,31 @@ impl JobSlices {
         })
     }
 
+    /// The set's shape for sizing the fold; `None` before the index is in.
+    fn plan(&self) -> Option<Plan> {
+        let (slice_size, total, recovery) = match &*self.state.lock() {
+            State::Ready(t) => (
+                t.verifier.slice_size(),
+                t.verifier.total_slices(),
+                t.recovery_block_count,
+            ),
+            _ => return None,
+        };
+        // The index rarely carries recovery slices itself; the volume names
+        // say how many the set has. With neither, open rows on exponents
+        // 0.. and let the solve add rows for what is on disk.
+        let recovery = match (self.recovery_exponents.len() as u32, recovery) {
+            (0, 0) => u32::MAX,
+            (0, r) => r,
+            (named, _) => named,
+        };
+        Some(Plan {
+            slice_size,
+            total,
+            recovery,
+        })
+    }
+
     /// Open the fold once damage is first seen, or grow its rows when the
     /// damage outruns them. Runs on a blocking task.
     fn grow_fold(&self) {
@@ -607,13 +678,13 @@ impl JobSlices {
             FoldSlot::Active(fold) => Some(fold.clone()),
             FoldSlot::Idle => None,
         };
-        let (slice_size, total, recovery) = match &*self.state.lock() {
-            State::Ready(t) => (
-                t.verifier.slice_size(),
-                t.verifier.total_slices(),
-                t.recovery_block_count,
-            ),
-            _ => return,
+        let Some(Plan {
+            slice_size,
+            total,
+            recovery,
+        }) = self.plan()
+        else {
+            return;
         };
         let want = rows_for(damage, recovery, slice_size);
         match existing {
@@ -625,7 +696,7 @@ impl JobSlices {
                     return;
                 }
                 let target = want.max(rows_for(have, recovery, slice_size));
-                let exps: Vec<u32> = (have as u32..target as u32).collect();
+                let exps = self.exponents(have..target);
                 let state = &self.state;
                 let read = |gi: usize| {
                     let source = match &*state.lock() {
@@ -653,26 +724,52 @@ impl JobSlices {
         }
     }
 
+    /// Exponents for rows `range`: the named volumes' exponents in order,
+    /// else `range` itself.
+    fn exponents(&self, range: std::ops::Range<usize>) -> Vec<u32> {
+        if self.recovery_exponents.is_empty() {
+            (range.start as u32..range.end as u32).collect()
+        } else {
+            let end = range.end.min(self.recovery_exponents.len());
+            self.recovery_exponents[range.start.min(end)..end].to_vec()
+        }
+    }
+
     fn open_fold(&self, rows: usize, total: usize, slice_size: u64) {
-        let exps: Vec<u32> = (0..rows as u32).collect();
-        let fold = match RepairFold::new(total, slice_size, &exps) {
-            Ok(fold) => std::sync::Arc::new(Mutex::new(fold)),
+        if let Some(fold) = self.create_fold(rows, total, slice_size) {
+            self.feed_prefix(&fold, rows, slice_size);
+        }
+    }
+
+    /// Allocate the fold and make it the job's, without any I/O: from here
+    /// on every slice that verifies is folded. `None` when one already exists
+    /// or the set cannot be folded.
+    fn create_fold(&self, rows: usize, total: usize, slice_size: u64) -> Option<SharedFold> {
+        let exps = self.exponents(0..rows);
+        let mut slot = self.fold.lock();
+        if !matches!(*slot, FoldSlot::Idle) {
+            return None;
+        }
+        match RepairFold::new(total, slice_size, &exps) {
+            Ok(fold) => {
+                let fold = std::sync::Arc::new(Mutex::new(fold));
+                *slot = FoldSlot::Active(fold.clone());
+                Some(fold)
+            }
             Err(e) => {
                 info!(
                     slice_size,
                     rows, "In-flight repair fold refused, disk repair will be used: {e}"
                 );
-                *self.fold.lock() = FoldSlot::Refused;
-                return;
+                *slot = FoldSlot::Refused;
+                None
             }
-        };
-        {
-            let mut slot = self.fold.lock();
-            if !matches!(*slot, FoldSlot::Idle) {
-                return;
-            }
-            *slot = FoldSlot::Active(fold.clone());
         }
+    }
+
+    /// Fold the slices verified before the fold existed. Runs on a blocking
+    /// task.
+    fn feed_prefix(&self, fold: &SharedFold, rows: usize, slice_size: u64) {
         // Slices verified before the fold existed: fold them from disk once,
         // a bounded batch at a time, with the fold lock released between
         // batches so workers keep folding what they verify meanwhile.
