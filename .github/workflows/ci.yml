@@ -70,6 +70,15 @@ jobs:
       CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v7
+      # GCP runner images carry no Node; build the real frontend so build.rs
+      # embeds it instead of its placeholder (e2e_full_pipeline asserts this).
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/rustnzb/frontend/package-lock.json
+      - working-directory: apps/rustnzb/frontend
+        run: npm ci --no-audit --no-fund && npm run build -- --configuration=production
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0

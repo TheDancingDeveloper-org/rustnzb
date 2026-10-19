@@ -289,6 +289,13 @@ async fn test_upload_nzb_and_verify_queue() {
         body.contains("rustnzb"),
         "Index page should contain 'rustnzb'"
     );
+    // build.rs embeds a placeholder page when npm is unavailable; that must
+    // not pass for the real Angular frontend.
+    assert!(
+        !body.contains("Frontend not built") && body.contains("<app-root"),
+        "Index page is the build.rs placeholder, not the Angular frontend; \
+         build apps/rustnzb/frontend before running this test"
+    );
     eprintln!("Static file serving: OK");
 
     eprintln!("\nAll integration tests passed!");
