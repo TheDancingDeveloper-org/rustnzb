@@ -70,6 +70,13 @@ pub trait DispatchEngine: Send + Sync {
         None
     }
 
+    /// NZB file ids of `job_id`'s PAR2 recovery volumes held back by
+    /// `par2.defer_volumes` and not yet released, or `None` when the job is
+    /// not registered. Queue sizes leave these out, as SABnzbd does.
+    fn held_par2_files(&self, _job_id: &str) -> Option<Vec<String>> {
+        None
+    }
+
     /// Release a terminal job's dispatcher and assembler resources before
     /// post-processing opens the completed files.
     fn release_completed_job(&self, job_id: &str);
@@ -202,6 +209,10 @@ impl DispatchEngine for DispatchHandle {
 
     fn job_active_secs(&self, job_id: &str) -> Option<f64> {
         self.0.job_active_secs(job_id)
+    }
+
+    fn held_par2_files(&self, job_id: &str) -> Option<Vec<String>> {
+        self.0.held_par2_files(job_id)
     }
 
     fn release_completed_job(&self, job_id: &str) {

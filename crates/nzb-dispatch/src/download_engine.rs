@@ -1792,6 +1792,15 @@ impl WorkerPool {
             .get(job_id)
             .map(|ctx| ctx.active_elapsed().as_secs_f64())
     }
+
+    /// NZB file ids of `job_id`'s PAR2 recovery volumes still held back
+    /// (`par2.defer_volumes`), or `None` when the job is not registered.
+    pub fn held_par2_files(&self, job_id: &str) -> Option<Vec<String>> {
+        self.job_contexts
+            .lock()
+            .get(job_id)
+            .map(|ctx| ctx.held.held_file_ids())
+    }
 }
 
 async fn await_worker_shutdown(mut handles: Vec<JoinHandle<()>>, timeout: Duration) {
@@ -3797,6 +3806,7 @@ mod tests {
     fn test_job(job_id: &str, root: &std::path::Path) -> NzbJob {
         NzbJob {
             slice_map: None,
+            held_par2_bytes: 0,
             id: job_id.to_string(),
             name: job_id.to_string(),
             category: "Default".to_string(),

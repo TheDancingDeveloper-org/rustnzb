@@ -1580,7 +1580,7 @@ fn build_queue_response(
     let active_totals = jobs.iter().filter(|job| queue_totals_include(job));
     let total_bytes = active_totals
         .clone()
-        .map(|job| job.total_bytes)
+        .map(queue_size_bytes)
         .fold(0_u64, u64::saturating_add);
     let bytes_left = active_totals
         .map(remaining_bytes)
@@ -1918,6 +1918,8 @@ fn summary_entry(summary: &HistorySummary) -> HistoryEntry {
         server_stats: Vec::new(),
         nzb_data: None,
         retry_data: None,
+        par2_volumes_fetched: None,
+        par2_volumes_available: None,
     }
 }
 
@@ -2842,10 +2844,11 @@ impl SabQueueSlot {
         speed_bps: u64,
         pp_level: u8,
     ) -> Self {
-        let mb = job.total_bytes as f64 / 1_048_576.0;
+        let size = queue_size_bytes(job);
+        let mb = size as f64 / 1_048_576.0;
         let mbleft = remaining_bytes(job) as f64 / 1_048_576.0;
-        let pct = if job.total_bytes > 0 {
-            (job.downloaded_bytes as f64 / job.total_bytes as f64 * 100.0) as u32
+        let pct = if size > 0 {
+            (job.downloaded_bytes as f64 / size as f64 * 100.0).min(100.0) as u32
         } else {
             0
         };
@@ -2885,7 +2888,7 @@ impl SabQueueSlot {
                 format_timeleft(running_bytes, speed_bps)
             },
             avg_age: "-".into(),
-            size: format_size_human(job.total_bytes),
+            size: format_size_human(size),
             sizeleft: format_size_human(remaining_bytes(job)),
             time_added: job.added_at.timestamp(),
         }
@@ -2896,8 +2899,14 @@ fn queue_nzo_id(job: &NzbJob) -> String {
     format!("SABnzbd_nzo_{}", sab_id_prefix(&job.id))
 }
 
+/// The job's size as the queue reports it: PAR2 recovery volumes held by
+/// `par2.defer_volumes` are left out until released, as SABnzbd does.
+fn queue_size_bytes(job: &NzbJob) -> u64 {
+    job.total_bytes.saturating_sub(job.held_par2_bytes)
+}
+
 fn remaining_bytes(job: &NzbJob) -> u64 {
-    job.total_bytes.saturating_sub(job.downloaded_bytes)
+    queue_size_bytes(job).saturating_sub(job.downloaded_bytes)
 }
 
 fn sab_priority_name(priority: Priority) -> &'static str {
@@ -2998,7 +3007,7 @@ struct SabStageLog {
 
 impl SabHistorySlot {
     fn from_entry(entry: &HistoryEntry) -> Self {
-        let stage_log: Vec<SabStageLog> = entry
+        let mut stage_log: Vec<SabStageLog> = entry
             .stages
             .iter()
             .map(|s| SabStageLog {
@@ -3006,6 +3015,21 @@ impl SabHistorySlot {
                 actions: vec![s.message.clone().unwrap_or_default()],
             })
             .collect();
+        if let (Some(fetched), Some(available)) =
+            (entry.par2_volumes_fetched, entry.par2_volumes_available)
+        {
+            let action = format!("PAR2 recovery volumes fetched: {fetched} of {available}");
+            match stage_log.iter_mut().find(|stage| stage.name == "Download") {
+                Some(stage) => stage.actions.push(action),
+                None => stage_log.insert(
+                    0,
+                    SabStageLog {
+                        name: "Download".into(),
+                        actions: vec![action],
+                    },
+                ),
+            }
+        }
 
         let storage = entry.output_dir.to_string_lossy().to_string();
         let bytes = entry.downloaded_bytes;
@@ -3266,6 +3290,7 @@ mod tests {
     fn queue_job(id: &str, name: &str, category: &str, status: JobStatus) -> NzbJob {
         NzbJob {
             slice_map: None,
+            held_par2_bytes: 0,
             id: id.into(),
             name: name.into(),
             category: category.into(),
@@ -3324,6 +3349,8 @@ mod tests {
             server_stats: Vec::new(),
             nzb_data: (status == JobStatus::Failed).then(Vec::new),
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         }
     }
 
@@ -3331,6 +3358,7 @@ mod tests {
         let now = chrono::Utc::now();
         NzbJob {
             slice_map: None,
+            held_par2_bytes: 0,
             id: "postprocessing-job".into(),
             name: "Still Unpacking".into(),
             category: "tv".into(),
@@ -3374,6 +3402,66 @@ mod tests {
         for (status, expected) in cases {
             assert_eq!(sab_queue_status(status), expected);
         }
+    }
+
+    fn queue_sizes(job: &NzbJob) -> (serde_json::Value, serde_json::Value) {
+        let response = build_queue_response(
+            std::slice::from_ref(job),
+            false,
+            1_048_576,
+            0,
+            &SabApiRequest::default(),
+            |_| 3,
+        );
+        let queue = &response["queue"];
+        let slot = &queue["slots"][0];
+        assert_eq!(queue["mb"], slot["mb"]);
+        assert_eq!(queue["mbleft"], slot["mbleft"]);
+        (slot["mb"].clone(), slot["mbleft"].clone())
+    }
+
+    #[test]
+    fn held_par2_volumes_stay_out_of_queue_size_until_released() {
+        // 10 MiB in the NZB, 3 MiB of it recovery volumes held back.
+        let mut job = queue_job("held-par2", "Held", "tv", JobStatus::Downloading);
+        job.held_par2_bytes = 3 * 1_048_576;
+        assert_eq!(queue_sizes(&job), ("7.00".into(), "5.00".into()));
+
+        // Releasing a 2 MiB volume grows the size by that volume.
+        job.held_par2_bytes = 1_048_576;
+        assert_eq!(queue_sizes(&job), ("9.00".into(), "7.00".into()));
+
+        job.held_par2_bytes = 0;
+        assert_eq!(queue_sizes(&job), ("10.00".into(), "8.00".into()));
+    }
+
+    #[test]
+    fn history_stage_log_reports_par2_volumes_fetched_of_available() {
+        let mut entry = history_entry("vols", "Vols", "tv", JobStatus::Completed, 5);
+        entry.par2_volumes_fetched = Some(2);
+        entry.par2_volumes_available = Some(5);
+        let slot = serde_json::to_value(SabHistorySlot::from_entry(&entry)).unwrap();
+        let download = slot["stage_log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stage| stage["name"] == "Download")
+            .expect("Download stage");
+        assert_eq!(
+            download["actions"],
+            serde_json::json!(["PAR2 recovery volumes fetched: 2 of 5"])
+        );
+
+        entry.par2_volumes_fetched = None;
+        entry.par2_volumes_available = None;
+        let slot = serde_json::to_value(SabHistorySlot::from_entry(&entry)).unwrap();
+        assert!(
+            slot["stage_log"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|stage| stage["name"] != "Download")
+        );
     }
 
     #[test]
@@ -3581,6 +3669,8 @@ mod tests {
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         };
 
         assert_eq!(SabHistorySlot::from_entry(&entry).download_time, 2);
@@ -3911,6 +4001,7 @@ mod tests {
             .expect("valid fixture time");
         let job = NzbJob {
             slice_map: None,
+            held_par2_bytes: 0,
             id: "contract-queue-job".into(),
             name: "SAB contract fixture".into(),
             category: "tv".into(),
@@ -3990,6 +4081,8 @@ mod tests {
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         };
         state.state.queue_manager.with_db(|database| {
             database
@@ -4054,6 +4147,7 @@ mod tests {
     fn add_live_job(test_state: &TestState, id: &str) {
         let job = NzbJob {
             slice_map: None,
+            held_par2_bytes: 0,
             id: id.into(),
             name: "Compat Layer Fixture".into(),
             category: "tv".into(),
@@ -4088,6 +4182,7 @@ mod tests {
     fn add_live_job_with_category(test_state: &TestState, id: &str, category: &str) {
         let job = NzbJob {
             slice_map: None,
+            held_par2_bytes: 0,
             id: id.into(),
             name: "Change Cat Fixture".into(),
             category: category.into(),
@@ -5466,6 +5561,8 @@ mod tests {
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         };
         test_state.state.queue_manager.with_db(|database| {
             database
