@@ -867,9 +867,23 @@ struct HopelessTracker {
     content_articles_failed: usize,
     /// Total content articles expected (non-par2).
     content_articles_total: usize,
+    /// The job carries at least one PAR2 file, so the parity tier applies
+    /// instead of the article-count grace (WI-145).
+    has_par2_set: bool,
+    /// Every recovery volume's block count is known from its filename. When
+    /// one is not, the declared total undercounts and the parity tier stays
+    /// out of the way.
+    recovery_blocks_known: bool,
+    /// Content files with at least one article refused by every server.
+    /// PAR2 slices never span files, so each is at least one damaged slice.
+    confirmed_missing_files: std::collections::HashSet<String>,
+    /// Confirmed-missing content articles not attributed to a file.
+    confirmed_missing_unattributed: usize,
 }
 
-/// Number of bad articles allowed before any abort checks kick in.
+/// Number of bad articles allowed before the byte-based abort checks kick in.
+/// Jobs with a PAR2 set are first judged by the parity tier, which needs no
+/// grace; this remains the only guard for jobs with no PAR2 set at all.
 const HOPELESS_GRACE_ARTICLES: usize = 5;
 /// Minimum content articles checked before the early failure check fires.
 const EARLY_CHECK_MIN_ARTICLES: usize = 10;
@@ -892,9 +906,15 @@ impl HopelessTracker {
         let mut recovery_capacity_by_set = HashMap::new();
         let mut content_file_sets = HashMap::new();
         let mut pending_file_classifications = std::collections::HashSet::new();
+        let mut has_par2_set = false;
+        let mut recovery_blocks_known = true;
 
         for file in &job.files {
             if file.is_par2 {
+                has_par2_set = true;
+                if file.par2_vol.is_some() && file.par2_blocks.is_none() {
+                    recovery_blocks_known = false;
+                }
                 // A plain .par2 is the index. Only .volNN+MM.par2 or
                 // .volNN-MM.par2 recovery volumes declare usable blocks.
                 if file.par2_vol.is_some() && file.par2_blocks.is_some_and(|blocks| blocks > 0) {
@@ -950,6 +970,10 @@ impl HopelessTracker {
             content_articles_checked: 0,
             content_articles_failed: 0,
             content_articles_total,
+            has_par2_set,
+            recovery_blocks_known,
+            confirmed_missing_files: std::collections::HashSet::new(),
+            confirmed_missing_unattributed: 0,
         }
     }
 
@@ -975,6 +999,11 @@ impl HopelessTracker {
     ) {
         self.content_bytes = self.content_bytes.saturating_sub(file_bytes);
         self.content_articles_total = self.content_articles_total.saturating_sub(article_count);
+        self.has_par2_set = true;
+        if volume.is_some() && blocks.is_none() {
+            self.recovery_blocks_known = false;
+        }
+        self.confirmed_missing_files.remove(file_id);
         if volume.is_some() && blocks.is_some_and(|count| count > 0) {
             self.recovery_capacity_bytes = self.recovery_capacity_bytes.saturating_add(file_bytes);
             self.recovery_blocks_total = self
@@ -1042,6 +1071,16 @@ impl HopelessTracker {
             return;
         }
         self.content_articles_checked += 1;
+        // Only an article refused by every server is a missing slice. A
+        // decode error may be a transport fault and stays unestablished.
+        if kind == nzb_dispatch::ArticleFailureKind::NotFound {
+            match file_id {
+                Some(id) => {
+                    self.confirmed_missing_files.insert(id.to_string());
+                }
+                None => self.confirmed_missing_unattributed += 1,
+            }
+        }
         // Only failures that count toward "definitively not retrievable"
         // increment the failed counter and missing-bytes total. A 502 or
         // AuthFailed on one server doesn't mean the article is gone.
@@ -1077,6 +1116,14 @@ impl HopelessTracker {
     ) -> Option<HopelessAbort> {
         if !abort_hopeless {
             return None;
+        }
+
+        // Tier 0: parity. With a PAR2 set, judge confirmed damage against
+        // the recovery slices the release declares, not an article count.
+        if self.has_par2_set && self.pending_file_classifications.is_empty() {
+            if let Some(abort) = self.parity_check() {
+                return Some(abort);
+            }
         }
 
         // Tier 1: grace period — allow minor gaps that par2 can fix
@@ -1198,6 +1245,63 @@ impl HopelessTracker {
 
         None
     }
+}
+
+impl HopelessTracker {
+    /// Recovery slices still obtainable: declared by volume filenames, less
+    /// those lost to failed volume articles.
+    fn recovery_blocks_available(&self) -> u64 {
+        self.recovery_blocks_total
+            .saturating_sub(self.recovery_blocks_unavailable)
+    }
+
+    /// A lower bound on damaged slices from confirmed-missing articles. Only
+    /// articles every server refused count; provisional, transport-failed
+    /// and unasked articles are unestablished. Slices never span files, so
+    /// each file with a confirmed hole holds at least one damaged slice.
+    fn damaged_slices_lower_bound(&self) -> u64 {
+        let files = self.confirmed_missing_files.len() as u64;
+        if files == 0 && self.confirmed_missing_unattributed > 0 {
+            1
+        } else {
+            files
+        }
+    }
+
+    /// Hopeless when the slices certainly damaged exceed the recovery
+    /// slices available. Mid-download the damaged count is a lower bound;
+    /// the exact count comes from the slice map at job end
+    /// ([`parity_diagnosis`]).
+    fn parity_check(&self) -> Option<HopelessAbort> {
+        if !self.recovery_blocks_known {
+            return None;
+        }
+        let damaged = self.damaged_slices_lower_bound();
+        let available = self.recovery_blocks_available();
+        (damaged > available).then(|| HopelessAbort {
+            tier: "parity",
+            reason: format!(
+                "Aborted: at least {damaged} slice(s) missing but the release only \
+                 carries {available} recovery slice(s)"
+            ),
+        })
+    }
+}
+
+/// The end-of-download parity decision (WI-145). `damaged` slices are those
+/// the slice map confirmed; `Unknown` slices are unestablished and do not
+/// count. Recovery is the larger of what the PAR2 index carries and what the
+/// volume filenames declare, so neither source alone can cause an abort.
+/// `declared_available` is `None` when a volume's block count is unknown;
+/// then there is no decision.
+fn parity_diagnosis(map: &SliceMapSummary, declared_available: Option<u64>) -> Option<String> {
+    let damaged = map.damaged as u64;
+    let available = declared_available?.max(u64::from(map.recovery_block_count));
+    (damaged > available).then(|| {
+        format!(
+            "{damaged} slice(s) missing but the release only carries {available} recovery slice(s)"
+        )
+    })
 }
 
 /// Result of a positive [`HopelessTracker::check`] — both the reason string
@@ -3118,6 +3222,40 @@ impl QueueManager {
                     slice_map,
                     ..
                 } => {
+                    // The slice map gives the exact damage: refuse to hand a
+                    // release to PAR2 when it holds more damaged slices than
+                    // recovery slices (WI-145).
+                    let diagnosis = self
+                        .abort_hopeless
+                        .then(|| {
+                            let map = slice_map.as_ref()?;
+                            let jobs = self.jobs.lock();
+                            let tracker = jobs.get(&job_id)?.hopeless_tracker.as_ref()?;
+                            let declared = tracker
+                                .recovery_blocks_known
+                                .then(|| tracker.recovery_blocks_available());
+                            parity_diagnosis(map, declared)
+                        })
+                        .flatten();
+                    if let Some(diagnosis) = diagnosis {
+                        warn!(
+                            job_id = %job_id,
+                            tier = "parity",
+                            reason = %diagnosis,
+                            "Job is hopeless — not repairable"
+                        );
+                        if let Some(state) = self.jobs.lock().get_mut(&job_id) {
+                            state.job.slice_map = slice_map;
+                        }
+                        self.finish_aborted(
+                            &job_id,
+                            format!("Aborted: {diagnosis}"),
+                            articles_failed,
+                            download_time_secs,
+                        )
+                        .await;
+                        break;
+                    }
                     let repairable_damage = self.jobs.lock().get(&job_id).is_some_and(|state| {
                         state.hopeless_tracker.as_ref().is_some_and(|tracker| {
                             let usable = tracker
@@ -3169,66 +3307,78 @@ impl QueueManager {
                     download_time_secs,
                     ..
                 } => {
-                    crate::increment_counter("jobs.hopeless_aborts");
-                    warn!(
-                        job_id = %job_id,
-                        reason = %reason,
-                        articles_failed,
-                        "Job aborted by download engine"
-                    );
-                    // The terminal update is emitted only after queued and
-                    // in-flight articles drain. Dropping this context closes
-                    // all assembler handles before history or any later stage
-                    // can inspect the work directory.
-                    self.dispatch.release_completed_job(&job_id);
-                    let queue_drained = {
-                        let mut jobs = self.jobs.lock();
-                        let finished = if let Some(state) = jobs.get_mut(&job_id) {
-                            state.download_time_secs =
-                                Some(state.prior_download_secs + download_time_secs);
-                            state.job.status = JobStatus::Failed;
-                            state.job.error_message = Some(reason.clone());
-                            state.failure_code = Some(JobFailureCode::ArticlesUnavailable);
-                            state.job.articles_failed =
-                                state.job.articles_failed.max(articles_failed);
-                            state.job.completed_at = Some(chrono::Utc::now());
-                            let tracker = state.hopeless_tracker.as_ref();
-                            warn!(
-                                job_id = %job_id,
-                                terminal_reason = %reason,
-                                missing_content_bytes = tracker.map_or(0, |t| t.content_bytes_missing),
-                                usable_recovery_bytes = tracker.map_or(0, |t| t.recovery_capacity_bytes.saturating_sub(t.recovery_bytes_unavailable)),
-                                recovery_blocks_total = tracker.map_or(0, |t| t.recovery_blocks_total),
-                                recovery_blocks_unavailable = tracker.map_or(0, |t| t.recovery_blocks_unavailable),
-                                "Terminal job summary"
-                            );
-                            // Confirmed hopeless damage must not enter PAR2,
-                            // extraction, or cleanup. Persist the original
-                            // reason directly as a failed history row.
-                            self.move_to_history(state, Vec::new());
-                            true
-                        } else {
-                            false
-                        };
-                        finished && queue_drained_by(&jobs, &job_id)
-                    };
-                    self.persist_job_progress_blocking(&job_id).await;
-                    self.start_next_queued();
-                    if queue_drained {
-                        self.run_queue_complete_action().await;
-                    }
-                    let jid = job_id.clone();
-                    let qm = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(8)).await;
-                        qm.jobs.lock().remove(&jid);
-                        qm.job_order.lock().retain(|id| id != &jid);
-                    });
+                    self.finish_aborted(&job_id, reason, articles_failed, download_time_secs)
+                        .await;
                     break;
                 }
             }
         }
         self.flush_ledger(&job_id, &mut ledger);
+    }
+
+    /// Tear down a job the download stopped as hopeless: record the failure
+    /// with `reason` and move it straight to history, skipping PAR2,
+    /// extraction and cleanup.
+    async fn finish_aborted(
+        self: &Arc<Self>,
+        job_id: &str,
+        reason: String,
+        articles_failed: usize,
+        download_time_secs: f64,
+    ) {
+        crate::increment_counter("jobs.hopeless_aborts");
+        warn!(
+            job_id = %job_id,
+            reason = %reason,
+            articles_failed,
+            "Job aborted by download engine"
+        );
+        // The terminal update is emitted only after queued and
+        // in-flight articles drain. Dropping this context closes
+        // all assembler handles before history or any later stage
+        // can inspect the work directory.
+        self.dispatch.release_completed_job(job_id);
+        let queue_drained = {
+            let mut jobs = self.jobs.lock();
+            let finished = if let Some(state) = jobs.get_mut(job_id) {
+                state.download_time_secs = Some(state.prior_download_secs + download_time_secs);
+                state.job.status = JobStatus::Failed;
+                state.job.error_message = Some(reason.clone());
+                state.failure_code = Some(JobFailureCode::ArticlesUnavailable);
+                state.job.articles_failed = state.job.articles_failed.max(articles_failed);
+                state.job.completed_at = Some(chrono::Utc::now());
+                let tracker = state.hopeless_tracker.as_ref();
+                warn!(
+                    job_id = %job_id,
+                    terminal_reason = %reason,
+                    missing_content_bytes = tracker.map_or(0, |t| t.content_bytes_missing),
+                    usable_recovery_bytes = tracker.map_or(0, |t| t.recovery_capacity_bytes.saturating_sub(t.recovery_bytes_unavailable)),
+                    recovery_blocks_total = tracker.map_or(0, |t| t.recovery_blocks_total),
+                    recovery_blocks_unavailable = tracker.map_or(0, |t| t.recovery_blocks_unavailable),
+                    "Terminal job summary"
+                );
+                // Confirmed hopeless damage must not enter PAR2,
+                // extraction, or cleanup. Persist the original
+                // reason directly as a failed history row.
+                self.move_to_history(state, Vec::new());
+                true
+            } else {
+                false
+            };
+            finished && queue_drained_by(&jobs, job_id)
+        };
+        self.persist_job_progress_blocking(job_id).await;
+        self.start_next_queued();
+        if queue_drained {
+            self.run_queue_complete_action().await;
+        }
+        let jid = job_id.to_string();
+        let qm = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            qm.jobs.lock().remove(&jid);
+            qm.job_order.lock().retain(|id| id != &jid);
+        });
     }
 
     /// Ids of the servers a fetch could use; they fingerprint ledger records.
@@ -8113,7 +8263,118 @@ mod hopeless_tests {
             content_articles_checked: 0,
             content_articles_failed: 0,
             content_articles_total: content_articles,
+            has_par2_set: par2_articles > 0,
+            recovery_blocks_known: true,
+            confirmed_missing_files: std::collections::HashSet::new(),
+            confirmed_missing_unattributed: 0,
         }
+    }
+
+    /// A tracker for a job with a PAR2 set carrying `recovery_blocks` slices.
+    fn par2_tracker(recovery_blocks: u64) -> HopelessTracker {
+        let mut t = make_tracker(1000, 0);
+        t.has_par2_set = true;
+        t.recovery_blocks_total = recovery_blocks;
+        t.recovery_capacity_bytes = recovery_blocks * 750_000;
+        t
+    }
+
+    fn fail(t: &mut HopelessTracker, file: &str, kind: nzb_dispatch::ArticleFailureKind) {
+        t.record_file_failure(Some(file), false, 750_000, kind);
+    }
+
+    #[test]
+    fn parity_aborts_when_damage_exceeds_zero_recovery() {
+        let mut t = par2_tracker(0);
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::NotFound);
+        let abort = t.check(true, true, 100.2).expect("no recovery: hopeless");
+        assert_eq!(abort.tier, "parity");
+        assert!(
+            abort
+                .reason
+                .contains("slice(s) missing but the release only carries 0 recovery slice(s)"),
+            "{}",
+            abort.reason
+        );
+    }
+
+    #[test]
+    fn parity_does_not_abort_within_recovery() {
+        let mut t = par2_tracker(20);
+        for _ in 0..6 {
+            fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::NotFound);
+        }
+        assert!(t.check(true, true, 100.2).is_none());
+    }
+
+    #[test]
+    fn parity_counts_each_damaged_file_once_at_least() {
+        let mut t = par2_tracker(2);
+        for file in ["a", "b", "c"] {
+            fail(&mut t, file, nzb_dispatch::ArticleFailureKind::NotFound);
+        }
+        assert_eq!(t.damaged_slices_lower_bound(), 3);
+        assert_eq!(t.check(true, true, 100.2).unwrap().tier, "parity");
+    }
+
+    #[test]
+    fn parity_ignores_decode_errors_and_transient_failures() {
+        let mut t = par2_tracker(0);
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::DecodeError);
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::Timeout);
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::ServerDown);
+        assert_eq!(t.damaged_slices_lower_bound(), 0);
+        assert!(t.parity_check().is_none());
+    }
+
+    #[test]
+    fn parity_stands_aside_when_a_volume_block_count_is_unknown() {
+        let mut t = par2_tracker(0);
+        t.recovery_blocks_known = false;
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::NotFound);
+        assert!(t.parity_check().is_none());
+    }
+
+    #[test]
+    fn parity_waits_for_obfuscated_files_to_be_classified() {
+        let mut t = par2_tracker(0);
+        t.pending_file_classifications.insert("x".into());
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::NotFound);
+        assert!(t.check(true, true, 100.2).is_none());
+    }
+
+    #[test]
+    fn job_without_par2_keeps_the_article_grace() {
+        let mut t = make_tracker(1000, 0);
+        for _ in 0..3 {
+            fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::NotFound);
+        }
+        assert!(t.check(true, true, 100.2).is_none());
+    }
+
+    fn map(damaged: usize, unknown: usize, recovery: u32) -> SliceMapSummary {
+        let mut states = vec![SliceVerdict::Damaged; damaged];
+        states.extend(vec![SliceVerdict::Unknown; unknown]);
+        SliceMapSummary {
+            states,
+            recovery_block_count: recovery,
+            damaged,
+            unknown,
+        }
+    }
+
+    #[test]
+    fn parity_diagnosis_uses_confirmed_damage_only() {
+        assert_eq!(
+            parity_diagnosis(&map(7, 0, 0), Some(5)).as_deref(),
+            Some("7 slice(s) missing but the release only carries 5 recovery slice(s)")
+        );
+        // Unknown slices are unestablished and never tip the balance.
+        assert_eq!(parity_diagnosis(&map(2, 40, 0), Some(2)), None);
+        // The index's own count can cover what filenames do not declare.
+        assert_eq!(parity_diagnosis(&map(3, 0, 4), Some(0)), None);
+        // Unknown declared recovery: no decision.
+        assert_eq!(parity_diagnosis(&map(9, 0, 0), None), None);
     }
 
     #[test]
