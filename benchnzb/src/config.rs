@@ -270,11 +270,7 @@ pub fn resolve_scenarios(selector: &str) -> Vec<Scenario> {
             .cloned()
             .collect(),
         _ => {
-            let matched: Vec<Scenario> = all
-                .iter()
-                .filter(|s| s.name == sel)
-                .cloned()
-                .collect();
+            let matched: Vec<Scenario> = all.iter().filter(|s| s.name == sel).cloned().collect();
             if matched.is_empty() {
                 tracing::error!("No scenarios matched: {selector}");
                 tracing::info!(
