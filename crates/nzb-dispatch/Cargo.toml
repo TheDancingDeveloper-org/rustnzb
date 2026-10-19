@@ -36,6 +36,7 @@ uuid = { version = "1", features = ["v4"] }
 serial_test = "3"
 yenc-simd = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+nzb-postproc = { path = "../nzb-postproc" }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

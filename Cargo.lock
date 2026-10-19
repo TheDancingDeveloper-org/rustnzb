@@ -1839,6 +1839,7 @@ dependencies = [
  "nzb-core",
  "nzb-decode",
  "nzb-nntp",
+ "nzb-postproc",
  "opentelemetry",
  "parking_lot",
  "rust-par2",
