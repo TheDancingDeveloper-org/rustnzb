@@ -14,7 +14,7 @@ groups-db = ["nzb-postproc/groups-db"]
 nzb-nntp = { version = "0.2.26", path = "../nzb-nntp" }
 nzb-decode = { version = "0.1.5", path = "../nzb-decode" }
 nzb-postproc = { version = "0.2.9", path = "../nzb-postproc" }
-nzb-dispatch = { version = "0.2.9", path = "../nzb-dispatch" }
+nzb-dispatch = { version = "0.2.11", path = "../nzb-dispatch" }
 axum = { version = "0.8", features = ["multipart"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace"] }

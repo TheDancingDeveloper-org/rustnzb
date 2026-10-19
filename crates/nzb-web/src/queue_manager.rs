@@ -3115,6 +3115,7 @@ impl QueueManager {
                     success,
                     articles_failed,
                     download_time_secs,
+                    slice_map,
                     ..
                 } => {
                     let repairable_damage = self.jobs.lock().get(&job_id).is_some_and(|state| {
@@ -3152,6 +3153,7 @@ impl QueueManager {
                                 Some(state.prior_download_secs + download_time_secs);
                             state.job.status = JobStatus::PostProcessing;
                             state.job.completed_at = Some(chrono::Utc::now());
+                            state.job.slice_map = slice_map;
                         }
                     }
                     self.history_changed();
@@ -6015,6 +6017,7 @@ mod global_pause_tests {
 
     fn job(id: &str, status: JobStatus, root: &std::path::Path) -> NzbJob {
         NzbJob {
+            slice_map: None,
             id: id.to_string(),
             name: id.to_string(),
             category: "Default".to_string(),

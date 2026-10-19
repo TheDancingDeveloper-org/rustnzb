@@ -19,6 +19,7 @@ pub mod bandwidth;
 pub mod dispatch_engine;
 pub mod download_engine;
 pub mod slice_layout;
+mod slice_tracker;
 pub mod telemetry;
 pub mod util;
 

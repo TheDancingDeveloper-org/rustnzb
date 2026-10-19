@@ -558,6 +558,9 @@ pub enum ProgressUpdate {
         success: bool,
         articles_failed: usize,
         download_time_secs: f64,
+        /// In-flight PAR2 slice verdicts, when the job's PAR2 index arrived
+        /// during the download (WI-1228).
+        slice_map: Option<nzb_core::models::SliceMapSummary>,
     },
     JobAborted {
         job_id: String,
@@ -643,6 +646,8 @@ pub(crate) struct JobContext {
     /// The job's download-phase span. Taken and closed when the job reaches
     /// its terminal state; carries the cumulative decode and assemble times.
     span: Mutex<Option<tracing::Span>>,
+    /// In-flight PAR2 slice verification for this job.
+    pub(crate) slices: Arc<crate::slice_tracker::JobSlices>,
 }
 
 pub(crate) type JobContextMap = Arc<Mutex<HashMap<String, Arc<JobContext>>>>;
@@ -681,6 +686,7 @@ impl JobContext {
             pinned_file_sizes: Mutex::new(HashMap::new()),
             finished: AtomicBool::new(false),
             waiting_for_providers_reported: AtomicBool::new(false),
+            slices: Arc::new(crate::slice_tracker::JobSlices::new(job)),
             span: Mutex::new(Some(tracing::info_span!(
                 parent: None,
                 "download",
@@ -823,6 +829,17 @@ impl JobContext {
         }
 
         let failed = self.articles_failed.load(Ordering::Relaxed);
+        let slice_map = self.slices.summary();
+        if let Some(map) = &slice_map {
+            info!(
+                job_id = %self.job_id,
+                slices = map.states.len(),
+                damaged = map.damaged,
+                unknown = map.unknown,
+                recovery_blocks = map.recovery_block_count,
+                "In-flight PAR2 slice map"
+            );
+        }
         try_send_progress(
             &self.progress_tx,
             &self.job_id,
@@ -831,6 +848,7 @@ impl JobContext {
                 success: failed == 0,
                 articles_failed: failed,
                 download_time_secs: active_elapsed.as_secs_f64(),
+                slice_map,
             },
         );
     }
@@ -2071,6 +2089,14 @@ async fn run_worker_serial(
                 if let Some(n) = std::num::NonZeroU32::new(process_result.decoded_bytes as u32) {
                     let _ = pool.bandwidth.acquire_download(n).await;
                 }
+                ctx.slices
+                    .record_write(
+                        &item.file_id,
+                        process_result.write_offset,
+                        process_result.decoded_bytes,
+                        process_result.file_complete,
+                    )
+                    .await;
                 send_outcome(&ctx, &item, nzb_core::Outcome::Present);
                 try_send_progress(
                     &ctx.progress_tx,
@@ -2193,6 +2219,7 @@ async fn run_worker_serial(
             Err(ArticleError::AssemblyError(msg)) => {
                 // The server served a decodable body; only the local write failed.
                 send_outcome(&ctx, &item, nzb_core::Outcome::Present);
+                ctx.slices.record_failure(&item.file_id, false);
                 error!(job_id = %item.job_id, file_id = %item.file_id, segment_number = item.segment_number, message_id = %item.message_id, server_id = %primary_server.id, worker_id = %worker_id, original_failure_kind = "decode_error", terminal_failure_kind = "decode_error", "Assembly error: {msg}");
                 try_send_progress(
                     &ctx.progress_tx,
@@ -2457,6 +2484,14 @@ async fn run_worker_pipelined(
                                     let _ = pool.bandwidth.acquire_download(n).await;
                                 }
                                 perf_bandwidth_us += bw_t.elapsed().as_micros() as u64;
+                                ctx.slices
+                                    .record_write(
+                                        &item.file_id,
+                                        process_result.write_offset,
+                                        process_result.decoded_bytes,
+                                        process_result.file_complete,
+                                    )
+                                    .await;
                                 send_outcome(&ctx, &item, nzb_core::Outcome::Present);
                                 try_send_progress(
                                     &ctx.progress_tx,
@@ -2528,6 +2563,7 @@ async fn run_worker_pipelined(
                             }
                             Err(ArticleError::AssemblyError(msg)) => {
                                 send_outcome(&ctx, &item, nzb_core::Outcome::Present);
+                                ctx.slices.record_failure(&item.file_id, false);
                                 error!(job_id = %item.job_id, file_id = %item.file_id, segment_number = item.segment_number, message_id = %item.message_id, server_id = %primary_server.id, worker_id = %worker_id, original_failure_kind = "decode_error", terminal_failure_kind = "decode_error", "Assembly error: {msg}");
                                 try_send_progress(
                                     &ctx.progress_tx,
@@ -2989,6 +3025,10 @@ fn fail_article_everywhere(
         increment_counter("articles.explicit_global_absence");
         crate::article_failure::ArticleFailure::not_found_anywhere(server_id, outcomes)
     };
+    ctx.slices.record_failure(
+        &item.file_id,
+        final_kind == crate::article_failure::ArticleFailureKind::NotFound,
+    );
     try_send_progress(
         &ctx.progress_tx,
         &item.job_id,
@@ -3363,6 +3403,8 @@ async fn fetch_article_with_retry(
 #[derive(Debug)]
 struct ProcessResult {
     decoded_bytes: u64,
+    /// File offset the decoded bytes were written at.
+    write_offset: u64,
     file_complete: bool,
     yenc_filename: Option<String>,
     decode_us: u64,
@@ -3588,6 +3630,7 @@ fn decode_and_assemble(
 
     Ok(ProcessResult {
         decoded_bytes: decoded_len,
+        write_offset: data_begin,
         file_complete,
         yenc_filename,
         decode_us: decode_us as u64,
@@ -3628,6 +3671,7 @@ mod tests {
 
     fn test_job(job_id: &str, root: &std::path::Path) -> NzbJob {
         NzbJob {
+            slice_map: None,
             id: job_id.to_string(),
             name: job_id.to_string(),
             category: "Default".to_string(),

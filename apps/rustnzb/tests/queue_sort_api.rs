@@ -85,6 +85,7 @@ async fn start_app() -> App {
         ("job-c", "bravo", 200, 20, Priority::Normal, 20),
     ] {
         let job = NzbJob {
+            slice_map: None,
             id: id.into(),
             name: name.into(),
             category: "Default".into(),
