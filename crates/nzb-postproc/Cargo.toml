@@ -29,6 +29,7 @@ tempfile = "3"
 # `tests/support/par2_fixture.rs`), which requires writing spec-correct
 # packet MD5s. Version tracks what `rust-par2` itself parses with.
 md-5 = "0.11"
+mock-nntp-server = { path = "../mock-nntp-server" }
 crc32fast = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 

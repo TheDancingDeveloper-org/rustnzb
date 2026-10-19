@@ -526,6 +526,12 @@ async fn run_client(
     if let Ok(stages) = stage_result {
         result.par2_sec = stages.par2_sec;
         result.unpack_sec = stages.unpack_sec;
+        if let Some(source) = &stages.verify_source {
+            tracing::info!(
+                "  {client_name}: PAR2 verify {source}, {} bytes not re-read",
+                stages.verify_bytes_skipped
+            );
+        }
         // Derive download time from harness-measured total minus post-processing
         // stages.  Client-reported download_time is integer-second granularity
         // (SABnzbd API limitation), while total_sec has full precision.

@@ -164,6 +164,8 @@ async fn normal_subjects_pipeline_finds_files() {
         skip_extract: false,
         password: None,
         max_nested_archive_depth: 5,
+        slice_map: None,
+        trust_inflight_verify: true,
     };
     let result = run_pipeline(dir.path(), &config_zero).await;
     let verify = result.stages.iter().find(|s| s.name == "Verify").unwrap();
@@ -192,6 +194,8 @@ async fn normal_subjects_pipeline_finds_files() {
         skip_extract: false,
         password: None,
         max_nested_archive_depth: 5,
+        slice_map: None,
+        trust_inflight_verify: true,
     };
     let result = run_pipeline(dir.path(), &config_fail).await;
     let repair = result.stages.iter().find(|s| s.name == "Repair").unwrap();
@@ -328,6 +332,8 @@ async fn obfuscated_pipeline_skips_everything() {
         skip_extract: false,
         password: None,
         max_nested_archive_depth: 5,
+        slice_map: None,
+        trust_inflight_verify: true,
     };
 
     let result = run_pipeline(dir.path(), &config).await;
@@ -522,6 +528,8 @@ async fn deobfuscation_enables_full_pipeline() {
         skip_extract: false,
         password: None,
         max_nested_archive_depth: 5,
+        slice_map: None,
+        trust_inflight_verify: true,
     };
     let result = run_pipeline(dir.path(), &config).await;
     let verify = result.stages.iter().find(|s| s.name == "Verify").unwrap();
@@ -546,6 +554,8 @@ async fn deobfuscation_enables_full_pipeline() {
         skip_extract: false,
         password: None,
         max_nested_archive_depth: 5,
+        slice_map: None,
+        trust_inflight_verify: true,
     };
     let result = run_pipeline(dir.path(), &config_fail).await;
     let repair = result.stages.iter().find(|s| s.name == "Repair").unwrap();
@@ -713,6 +723,8 @@ async fn pipeline_with_only_archives_no_par2() {
         skip_extract: false,
         password: None,
         max_nested_archive_depth: 5,
+        slice_map: None,
+        trust_inflight_verify: true,
     };
 
     let result = run_pipeline(dir.path(), &config).await;

@@ -6,6 +6,31 @@ pub struct StageTiming {
     pub download_sec: f64,
     pub par2_sec: f64,
     pub unpack_sec: f64,
+    /// Where rustnzb's PAR2 verify verdicts came from (WI-147): the least
+    /// trusting source across the run's recovery sets, `disk` over `partial`
+    /// over `in-flight`. `None` when no set was verified.
+    pub verify_source: Option<String>,
+    /// Data-file bytes the in-flight slice map spared the verify pass.
+    pub verify_bytes_skipped: u64,
+}
+
+impl StageTiming {
+    /// Fold one recovery set's verify source into the run's.
+    pub fn record_verify(&mut self, source: &str, bytes_skipped: u64) {
+        let rank = |s: &str| match s {
+            "disk" => 2,
+            "partial" => 1,
+            _ => 0,
+        };
+        if self
+            .verify_source
+            .as_deref()
+            .is_none_or(|current| rank(source) > rank(current))
+        {
+            self.verify_source = Some(source.to_string());
+        }
+        self.verify_bytes_skipped += bytes_skipped;
+    }
 }
 
 // ---------------------------------------------------------------------------

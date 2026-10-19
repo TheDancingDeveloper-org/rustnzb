@@ -3471,6 +3471,7 @@ impl QueueManager {
             password,
             content_articles_failed,
             delete_archives,
+            slice_map,
         ) = {
             let mut jobs = self.jobs.lock();
             let Some(state) = jobs.get_mut(job_id) else {
@@ -3506,6 +3507,7 @@ impl QueueManager {
                 pw,
                 content_failed,
                 state.job.delete_archives.unwrap_or(true),
+                state.job.slice_map.clone(),
             )
         };
         // Record the reserved folder so a restart resumes into it.
@@ -3613,6 +3615,8 @@ impl QueueManager {
                 skip_extract: direct_unpack_success,
                 password: password.clone(),
                 max_nested_archive_depth: self.max_nested_archive_depth,
+                slice_map,
+                trust_inflight_verify: true,
             };
 
             let pp_span = tracing::info_span!(parent: None, "postproc", job_id = %job_id, pp_level);

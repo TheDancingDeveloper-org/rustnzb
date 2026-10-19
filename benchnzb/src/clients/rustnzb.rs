@@ -226,6 +226,13 @@ impl RustnzbClient {
                 for stage in stages {
                     let name = stage["name"].as_str().unwrap_or("");
                     let duration = stage["duration_secs"].as_f64().unwrap_or(0.0);
+                    if name == "Verify" {
+                        if let Some((source, skipped)) =
+                            stage["message"].as_str().and_then(parse_verify_tag)
+                        {
+                            timing.record_verify(source, skipped);
+                        }
+                    }
                     match name {
                         "Verify" | "Repair" => timing.par2_sec += duration,
                         "Extract" => timing.unpack_sec += duration,
@@ -430,5 +437,39 @@ impl RustnzbClient {
             .delete(format!("{}/api/history", self.url))
             .send()
             .await;
+    }
+}
+
+/// Parse the `[verify: <source>, <n> bytes not re-read, ...]` suffix rustnzb
+/// appends to a Verify stage message (WI-147).
+pub fn parse_verify_tag(message: &str) -> Option<(&str, u64)> {
+    let tag = message.rsplit_once("[verify: ")?.1;
+    let (source, rest) = tag.split_once(", ")?;
+    let skipped = rest.split_once(" bytes not re-read")?.0.parse().ok()?;
+    Some((source, skipped))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_verify_tag() {
+        let msg = "Recovery set 1/1: all 2 files correct [verify: in-flight, 5368709120 bytes not re-read, 0.004s]";
+        assert_eq!(parse_verify_tag(msg), Some(("in-flight", 5_368_709_120)));
+        assert_eq!(
+            parse_verify_tag("Recovery set 1/1: all 2 files correct"),
+            None
+        );
+    }
+
+    #[test]
+    fn least_trusting_source_wins() {
+        let mut timing = StageTiming::default();
+        timing.record_verify("in-flight", 10);
+        timing.record_verify("disk", 0);
+        timing.record_verify("partial", 5);
+        assert_eq!(timing.verify_source.as_deref(), Some("disk"));
+        assert_eq!(timing.verify_bytes_skipped, 15);
     }
 }

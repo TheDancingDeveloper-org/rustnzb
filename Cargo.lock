@@ -1898,6 +1898,7 @@ dependencies = [
  "anyhow",
  "crc32fast",
  "md-5 0.11.0",
+ "mock-nntp-server",
  "nzb-core",
  "opentelemetry",
  "rust-par2",
