@@ -8,6 +8,7 @@ mod mock_nntp;
 mod nzb;
 mod report;
 mod runner;
+mod slice_cost;
 mod stress;
 mod stress_charts;
 mod stress_report;
@@ -60,6 +61,18 @@ enum Command {
         port: u16,
         #[arg(long, default_value = "8080")]
         health_port: u16,
+    },
+    /// Measure in-flight PAR2 slice-verify cost per article against yEnc
+    /// decode cost, with the verifier on and off (WI-1229). Prints JSON.
+    SliceCost {
+        #[arg(long, default_value = "2000")]
+        articles: usize,
+        #[arg(long, default_value = "716800")]
+        article_bytes: usize,
+        #[arg(long, default_value = "768000")]
+        slice_bytes: usize,
+        #[arg(long, default_value = "5")]
+        rounds: usize,
     },
     /// Run stress-test benchmark (v2: duration-based, continuous load)
     Stress {
@@ -133,6 +146,16 @@ fn main() -> anyhow::Result<()> {
                 std::fs::create_dir_all(&out)?;
                 charts::generate_all(&results, &out)?;
                 tracing::info!("Charts written to {}", out.display());
+                Ok(())
+            }
+            Command::SliceCost {
+                articles,
+                article_bytes,
+                slice_bytes,
+                rounds,
+            } => {
+                let report = slice_cost::run(articles, article_bytes, slice_bytes, rounds)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
             Command::SynthNntp { port, health_port } => synth_nntp::run(port, health_port).await,
