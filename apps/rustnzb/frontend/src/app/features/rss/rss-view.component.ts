@@ -334,15 +334,15 @@ export class RssViewComponent implements OnInit {
   loadAll(): void {
     this.api.get<RssFeed[]>('/config/rss-feeds').subscribe({
       next: feeds => this.feeds.set(feeds),
-      error: () => {},
+      error: err => showHttpError(this.snack, err, 'Failed to load RSS feeds'),
     });
     this.api.get<RssRule[]>('/rss/rules').subscribe({
       next: rules => this.rules.set(rules),
-      error: () => {},
+      error: err => showHttpError(this.snack, err, 'Failed to load RSS rules'),
     });
     this.api.get<RssItem[]>('/rss/items').subscribe({
       next: items => this.items.set(items),
-      error: () => {},
+      error: err => showHttpError(this.snack, err, 'Failed to load RSS items'),
     });
   }
 
