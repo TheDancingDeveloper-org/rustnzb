@@ -12,6 +12,13 @@ pub struct StageTiming {
     pub verify_source: Option<String>,
     /// Data-file bytes the in-flight slice map spared the verify pass.
     pub verify_bytes_skipped: u64,
+    /// How rustnzb repaired (WI-148): `fold` when every damaged set was solved
+    /// from the in-flight fold, `disk` when any set used the disk path.
+    pub repair_path: Option<String>,
+    /// Intact slices the repair itself read from disk, summed over sets.
+    pub repair_slices_read: u64,
+    /// Seconds spent in the repair itself, summed over sets.
+    pub repair_sec: f64,
 }
 
 impl StageTiming {
@@ -30,6 +37,15 @@ impl StageTiming {
             self.verify_source = Some(source.to_string());
         }
         self.verify_bytes_skipped += bytes_skipped;
+    }
+
+    /// Fold one recovery set's repair tag into the run's.
+    pub fn record_repair(&mut self, path: &str, slices_read: u64, seconds: f64) {
+        if self.repair_path.as_deref() != Some("disk") {
+            self.repair_path = Some(path.to_string());
+        }
+        self.repair_slices_read += slices_read;
+        self.repair_sec += seconds;
     }
 }
 

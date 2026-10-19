@@ -1,6 +1,6 @@
 use crate::clients::rustnzb::RustnzbClient;
 use crate::clients::sabnzbd::SabnzbdClient;
-use crate::config::{self, Scenario, GB, MB};
+use crate::config::{self, GB, MB, Scenario};
 use crate::metrics::{MetricSample, MetricsCollector};
 use crate::{charts, datagen, docker, report};
 use anyhow::Result;
@@ -364,8 +364,8 @@ fn validate_rustnzb_verification(
                 || article_not_found == 0 =>
         {
             anyhow::bail!(
-                    "rustnzb failed verified fault fixture: outcome={outcome:?}, payload_verified={payload_verified}, article_not_found={article_not_found}"
-                );
+                "rustnzb failed verified fault fixture: outcome={outcome:?}, payload_verified={payload_verified}, article_not_found={article_not_found}"
+            );
         }
         _ => {}
     }
@@ -530,6 +530,13 @@ async fn run_client(
             tracing::info!(
                 "  {client_name}: PAR2 verify {source}, {} bytes not re-read",
                 stages.verify_bytes_skipped
+            );
+        }
+        if let Some(path) = &stages.repair_path {
+            tracing::info!(
+                "  {client_name}: PAR2 repair {path}, {} intact slices read, {:.3}s solve+write",
+                stages.repair_slices_read,
+                stages.repair_sec
             );
         }
         // Derive download time from harness-measured total minus post-processing
@@ -792,8 +799,8 @@ const fn requires_payload_verification(test_type: config::TestType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_terminal_status, requires_payload_verification, validate_rustnzb_verification,
-        BenchmarkOutcome, FixtureMetrics,
+        BenchmarkOutcome, FixtureMetrics, classify_terminal_status, requires_payload_verification,
+        validate_rustnzb_verification,
     };
 
     #[test]
@@ -834,52 +841,64 @@ mod tests {
 
     #[test]
     fn verified_unpack_fixture_requires_success_and_matching_payload() {
-        assert!(validate_rustnzb_verification(
-            "verify_32mb_unpack",
-            &BenchmarkOutcome::Succeeded,
-            true,
-            0,
-        )
-        .is_ok());
-        assert!(validate_rustnzb_verification(
-            "verify_32mb_unpack",
-            &BenchmarkOutcome::Succeeded,
-            false,
-            0,
-        )
-        .is_err());
+        assert!(
+            validate_rustnzb_verification(
+                "verify_32mb_unpack",
+                &BenchmarkOutcome::Succeeded,
+                true,
+                0,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_rustnzb_verification(
+                "verify_32mb_unpack",
+                &BenchmarkOutcome::Succeeded,
+                false,
+                0,
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn fault_fixture_requires_observable_injected_fault() {
-        assert!(validate_rustnzb_verification(
-            "verify_fault_32mb_par2",
-            &BenchmarkOutcome::Succeeded,
-            true,
-            1,
-        )
-        .is_ok());
-        assert!(validate_rustnzb_verification(
-            "verify_fault_32mb_par2",
-            &BenchmarkOutcome::Succeeded,
-            true,
-            0,
-        )
-        .is_err());
-        assert!(validate_rustnzb_verification(
-            "verify_fault_32mb_par2",
-            &BenchmarkOutcome::Failed,
-            true,
-            1,
-        )
-        .is_err());
-        assert!(validate_rustnzb_verification(
-            "verify_fault_32mb_par2",
-            &BenchmarkOutcome::Succeeded,
-            false,
-            1,
-        )
-        .is_err());
+        assert!(
+            validate_rustnzb_verification(
+                "verify_fault_32mb_par2",
+                &BenchmarkOutcome::Succeeded,
+                true,
+                1,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_rustnzb_verification(
+                "verify_fault_32mb_par2",
+                &BenchmarkOutcome::Succeeded,
+                true,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_rustnzb_verification(
+                "verify_fault_32mb_par2",
+                &BenchmarkOutcome::Failed,
+                true,
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_rustnzb_verification(
+                "verify_fault_32mb_par2",
+                &BenchmarkOutcome::Succeeded,
+                false,
+                1,
+            )
+            .is_err()
+        );
     }
 
     #[test]
