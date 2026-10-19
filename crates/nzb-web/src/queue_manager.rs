@@ -1120,10 +1120,11 @@ impl HopelessTracker {
 
         // Tier 0: parity. With a PAR2 set, judge confirmed damage against
         // the recovery slices the release declares, not an article count.
-        if self.has_par2_set && self.pending_file_classifications.is_empty() {
-            if let Some(abort) = self.parity_check() {
-                return Some(abort);
-            }
+        if self.has_par2_set
+            && self.pending_file_classifications.is_empty()
+            && let Some(abort) = self.parity_check()
+        {
+            return Some(abort);
         }
 
         // Tier 1: grace period — allow minor gaps that par2 can fix
