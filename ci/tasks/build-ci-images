@@ -5,7 +5,7 @@ task_start build-ci-images docker
 
 : "${GIT_AUTH_TOKEN:?GIT_AUTH_TOKEN is required to publish CI images}"
 source_sha=${CI_COMMIT_SHA:-$(git rev-parse HEAD)}
-toolchain_tag=${CI_TOOLCHAIN_TAG:-rust-1.88-node-22-v1}
+toolchain_tag=${CI_TOOLCHAIN_TAG:-rust-1.95-node-22-v1}
 registry=${CI_IMAGE_REGISTRY:-repo.indexarr.net/indexarr}
 builder=${CI_BUILDX_BUILDER:-rustnzb-release-builder}
 docker_config=$(mktemp -d)
