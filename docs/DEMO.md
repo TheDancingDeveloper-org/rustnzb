@@ -28,3 +28,20 @@ generated `main-*.js` module in `index.html`:
 ```sh
 npm run build -- --configuration=production --base-href=/demo/ --output-path=../../../website/demo-build
 ```
+
+## README screenshots
+
+The images in `docs/img/` are taken from a fresh production build of the UI
+with `mock-api.js`, served under a path other than `/demo/` so the demo
+banner and "Exit demo" button stay hidden. Change `<base href>` to match that
+path, and shift the history dates in the scratch copy of `mock-api.js` to
+recent ones so the times read naturally. Capture at 1440×900 (Downloads,
+Settings), 1440×1700 for the History section (open `/history`), and 390×844
+for the phone view. Headless Chrome works:
+
+```sh
+google-chrome --headless=new --hide-scrollbars --window-size=1440,900 \
+  --virtual-time-budget=8000 --screenshot=downloads.png \
+  http://127.0.0.1:4173/ui/downloads
+```
+
