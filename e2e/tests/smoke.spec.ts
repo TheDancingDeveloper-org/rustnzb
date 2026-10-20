@@ -105,9 +105,11 @@ test.describe('Smoke Tests', () => {
 
   test('status bar shows info', async ({ page }) => {
     await page.goto('/');
-    // Status pills: "Daemon running" or "Paused", speed, queue count, disk space
+    // Status pills: the daemon state ("Live" or "Paused"), speed, queue count
+    // and disk space. The state pill is a placeholder until the first /status
+    // poll lands, so retry rather than reading it once.
     await expect(page.locator('.pill').first()).toBeVisible();
-    await expect(page.locator('.pill', { hasText: /Daemon running|Paused/ })).toBeVisible();
+    await expect(page.locator('.status .pill[role="status"]')).toHaveText(/Live|Paused/);
   });
 
   test('groups API returns seeded data', async ({ request }) => {

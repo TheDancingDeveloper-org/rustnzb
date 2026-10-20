@@ -27,7 +27,11 @@ type SnackBarStub = {
   undo: ReturnType<typeof vi.fn>;
 };
 type ConfirmStub = { confirm: ReturnType<typeof vi.fn> };
-type RouteStub = { data: Observable<Record<string, unknown>>; queryParamMap: Observable<ParamMap> };
+type RouteStub = {
+  data: Observable<Record<string, unknown>>;
+  queryParamMap: Observable<ParamMap>;
+  fragment: Observable<string | null>;
+};
 type RouterStub = { navigate: ReturnType<typeof vi.fn> };
 
 function installLocalStorageMock(): Storage {
@@ -82,6 +86,7 @@ function makeComponent(
   const route: RouteStub = {
     data: of({}),
     queryParamMap: of(convertToParamMap({})),
+    fragment: of(null),
   };
   const router: RouterStub = {
     navigate: vi.fn(() => Promise.resolve(true)),
@@ -480,6 +485,29 @@ describe('QueueViewComponent', () => {
       replaceUrl: true,
     });
     expect(component.historyCollapsed()).toBe(false);
+    component.ngOnDestroy();
+  });
+
+  it('expands a collapsed history panel on the #history deep link', () => {
+    const { component, route } = makeComponent();
+    route.fragment = of('history');
+    component.historyCollapsed.set(true);
+    vi.spyOn(component as unknown as { loadAll(): void }, 'loadAll').mockImplementation(() => {});
+
+    component.ngOnInit();
+
+    expect(component.historyCollapsed()).toBe(false);
+    component.ngOnDestroy();
+  });
+
+  it('leaves the history panel alone without the deep link', () => {
+    const { component } = makeComponent();
+    component.historyCollapsed.set(true);
+    vi.spyOn(component as unknown as { loadAll(): void }, 'loadAll').mockImplementation(() => {});
+
+    component.ngOnInit();
+
+    expect(component.historyCollapsed()).toBe(true);
     component.ngOnDestroy();
   });
 

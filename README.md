@@ -47,12 +47,29 @@ for a feature comparison and a settings import.
 | **PAR2 verify & repair** | Automatic verification after download. Damaged files are rebuilt from recovery blocks in pure Rust — no external par2 binary. |
 | **Archive extraction** | Automatic extraction of RAR, 7z, and ZIP archives after repair, multi-part sets included, with cleanup. |
 | **Overlapped pipeline** | Independent downloads, PAR2 repair, and extraction can progress together under explicit per-stage worker limits. |
-| **Web UI** | Queue, history with per-download insights and undoable deletes, lifetime statistics, live logs, drag-and-drop NZB upload, and selectable themes. |
+| **Web UI** | Queue, history with per-download insights and undoable deletes, lifetime statistics, live logs, drag-and-drop NZB upload, selectable themes, and keyboard shortcuts (`?` lists them). |
 | **Automation** | RSS feeds with regex rules, a watch folder, and a newsgroup browser with header search and threaded views. |
 | **Media library** | WebDAV library that streams files on demand, straight from Usenet, without downloading first. |
 | **REST API** | Full HTTP API with Swagger/OpenAPI documentation, plus a compatibility API for *arr applications. |
 | **Desktop app** | Native application for Windows, macOS, and Linux powered by Tauri. System tray with queue count and speed. |
 | **OpenTelemetry** | Built-in tracing and metrics export via OTLP. Ship logs and metrics to Grafana, Jaeger, or any OTLP-compatible backend. |
+
+### Keyboard shortcuts
+
+Press `?` anywhere in a signed-in page to open the list. A shortcut is ignored
+while you are typing in a field, and a two-key chord such as `g d` must be
+pressed within 1.5 seconds.
+
+| Keys | Action |
+|------|--------|
+| `p` | Pause or resume all downloads |
+| `u` | Add an NZB |
+| `/` | Search Usenet headers |
+| `g d` | Go to Downloads |
+| `g h` | Go to Downloads with History expanded |
+| `g s` | Go to Settings |
+| `w` | Toggle compact / expanded width |
+| `?` | Show the shortcut list |
 
 ---
 

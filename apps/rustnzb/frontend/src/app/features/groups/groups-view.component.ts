@@ -1,11 +1,22 @@
-import { Component, OnDestroy, OnInit, signal, computed } from '@angular/core';
+import {
+  AfterViewInit,
+  Component,
+  ElementRef,
+  OnDestroy,
+  OnInit,
+  ViewChild,
+  signal,
+  computed,
+} from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatDialog, MatDialogModule } from '@angular/material/dialog';
+import { Subscription } from 'rxjs';
 import { GroupService } from '../../core/services/group.service';
 import { GroupRow, HeaderRow } from '../../core/models/group.model';
 import { GroupBrowserDialogComponent } from './group-browser-dialog.component';
+import { KeyboardShortcutsService } from '../../core/services/keyboard-shortcuts.service';
 import { IconComponent } from '../../shared/icon.component';
 import { showHttpError } from '../../core/http/http-error';
 import { ToastService } from '../../core/services/toast.service';
@@ -25,6 +36,9 @@ import { formatBytes } from '../../core/format';
       <div class="body">
         <div class="search-bar">
           <input
+            #searchInput
+            type="search"
+            aria-label="Search title, poster or subject"
             placeholder="Search title, poster, subject…"
             [(ngModel)]="searchQuery"
             (keyup.enter)="searchHeaders()"
@@ -387,7 +401,7 @@ import { formatBytes } from '../../core/format';
     `,
   ],
 })
-export class GroupsViewComponent implements OnInit, OnDestroy {
+export class GroupsViewComponent implements OnInit, AfterViewInit, OnDestroy {
   groups = signal<GroupRow[]>([]);
   selectedGroup = signal<GroupRow | null>(null);
   groupFilter = '';
@@ -406,6 +420,10 @@ export class GroupsViewComponent implements OnInit, OnDestroy {
   articleLoading = signal(false);
   private fetchPoll: ReturnType<typeof setInterval> | null = null;
   private fetchGiveUp: ReturnType<typeof setTimeout> | null = null;
+  private searchFocusSub: Subscription | null = null;
+  /** A focus request that arrived before the view (and its input) existed. */
+  private focusSearchPending = false;
+  @ViewChild('searchInput') searchInput?: ElementRef<HTMLInputElement>;
 
   filteredGroups = computed(() => {
     const f = this.groupNameFilter().toLowerCase();
@@ -427,14 +445,38 @@ export class GroupsViewComponent implements OnInit, OnDestroy {
     private svc: GroupService,
     private toast: ToastService,
     private dialog: MatDialog,
+    private shortcuts: KeyboardShortcutsService,
   ) {}
 
   ngOnInit(): void {
     this.loadGroups();
+    // The shell's `/` shortcut asks for focus here rather than reaching into
+    // this component's DOM. The request can land before the router outlet has
+    // attached the view, so a miss is remembered and retried after render.
+    if (this.shortcuts.consumeSearchFocus()) this.focusSearchInput();
+    this.searchFocusSub = this.shortcuts.searchFocus$.subscribe(() => {
+      this.focusSearchInput();
+    });
+  }
+
+  ngAfterViewInit(): void {
+    if (this.focusSearchPending) this.focusSearchInput();
+  }
+
+  private focusSearchInput(): void {
+    const input = this.searchInput?.nativeElement;
+    if (!input) {
+      this.focusSearchPending = true;
+      return;
+    }
+    this.focusSearchPending = false;
+    input.focus();
+    input.select();
   }
 
   ngOnDestroy(): void {
     this.stopFetchPolling();
+    this.searchFocusSub?.unsubscribe();
   }
 
   loadGroups(): void {
