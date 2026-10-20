@@ -186,6 +186,13 @@ pairs; until then their hex literals are a known gap.
 `--accent-fill` is for filled surfaces. Never put white text on `--accent`: on
 Rust dark that is 3.68:1 and on Midnight 3.33:1, and both fail AA.
 
+**The System-Default Rule.** Until a user picks a theme, the OS setting
+decides: `prefers-color-scheme: light` starts on Daylight, anything else on
+Rust dark, and a change in the OS setting is followed live. An explicit pick in
+Settings wins from then on; the **System** option there drops it and goes back
+to following. The `theme-color` meta tag follows the active theme's `--bg`, so
+the browser chrome matches the page.
+
 **The State-Owns-Colour Rule.** Green, amber, red and violet mean ok, warn,
 fail and post-processing everywhere. Don't use them for decoration, category
 tags or brand. A category tag is neutral (`--mute` on `--panel2`).
@@ -297,6 +304,19 @@ lift on hover. Hover changes the border to `--accent` or the row background to
   placeholder is not a label.
 - **Error:** `--danger` border and a Meta-size message under the control
   naming the problem and the fix.
+
+### Motion
+Every transition and animation is decorative. Under
+`prefers-reduced-motion: reduce` the global stylesheet collapses them all to
+0.01ms and drops smooth scrolling; never re-introduce a long animation in a
+component without checking that override still covers it.
+
+### Announcements
+Results that arrive without a focus change are spoken through
+`AnnouncerService`: `announce()` for routine outcomes, `announceError()` for
+failures. The app shell owns the only two live regions (`role="status"`
+polite, `role="alert"` assertive); a page must not add its own. Inline form
+errors that must read as errors carry `role="alert"` themselves.
 
 ### Focus ring (global)
 `:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }`.

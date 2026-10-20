@@ -26,13 +26,14 @@ import { httpErrorDetail } from '../../core/http/http-error';
         } @else {
           <form (ngSubmit)="onSubmit()" class="login-form">
             @if (errorMessage()) {
-              <div class="login-error">{{ errorMessage() }}</div>
+              <div class="login-error" role="alert" id="login-error">{{ errorMessage() }}</div>
             }
 
             <div class="form-group">
               <label class="form-label" for="username">Username</label>
               <input
                 id="username"
+                [attr.aria-describedby]="errorMessage() ? 'login-error' : null"
                 type="text"
                 class="form-input"
                 [(ngModel)]="username"
@@ -46,6 +47,7 @@ import { httpErrorDetail } from '../../core/http/http-error';
               <label class="form-label" for="password">Password</label>
               <input
                 id="password"
+                [attr.aria-describedby]="errorMessage() ? 'login-error' : null"
                 type="password"
                 class="form-input"
                 [(ngModel)]="password"
@@ -60,6 +62,7 @@ import { httpErrorDetail } from '../../core/http/http-error';
                 <label class="form-label" for="confirmPassword">Confirm Password</label>
                 <input
                   id="confirmPassword"
+                [attr.aria-describedby]="errorMessage() ? 'login-error' : null"
                   type="password"
                   class="form-input"
                   [(ngModel)]="confirmPassword"

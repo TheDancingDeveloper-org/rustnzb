@@ -942,13 +942,27 @@ function emptyCategory(): CategoryConfig {
             <h3>Appearance</h3>
             <div class="body">
               <div class="theme-grid" role="radiogroup" aria-label="Application theme">
+                <button
+                  type="button"
+                  class="theme-option"
+                  [class.active]="theme.followsSystem()"
+                  role="radio"
+                  [attr.aria-checked]="theme.followsSystem()"
+                  (click)="followSystemTheme()"
+                >
+                  <span class="theme-swatch system" aria-hidden="true">⌂</span>
+                  <span class="theme-copy">
+                    <b>System</b>
+                    <span class="setting-description">Match this device's light or dark setting.</span>
+                  </span>
+                </button>
                 @for (option of theme.options; track option.id) {
                   <button
                     type="button"
                     class="theme-option"
-                    [class.active]="theme.current() === option.id"
+                    [class.active]="!theme.followsSystem() && theme.current() === option.id"
                     role="radio"
-                    [attr.aria-checked]="theme.current() === option.id"
+                    [attr.aria-checked]="!theme.followsSystem() && theme.current() === option.id"
                     (click)="setTheme(option.id)"
                   >
                     <span class="theme-swatch" [attr.data-preview-theme]="option.id">
@@ -1475,7 +1489,7 @@ function emptyCategory(): CategoryConfig {
       }
       .theme-grid {
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(4, minmax(0, 1fr));
         gap: 10px;
       }
       .theme-option {
@@ -1491,6 +1505,9 @@ function emptyCategory(): CategoryConfig {
         border-radius: 7px;
         font: inherit;
         cursor: pointer;
+      }
+      @media (max-width: 1100px) {
+        .theme-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       }
       .theme-option:hover,
       .theme-option.active { border-color: var(--accent); }
@@ -1509,6 +1526,14 @@ function emptyCategory(): CategoryConfig {
       }
       .theme-swatch[data-preview-theme='midnight'] { background: #080d1a; border-color: #263552; }
       .theme-swatch[data-preview-theme='light'] { background: #f3f6fa; border-color: #d2d9e3; }
+      .theme-swatch.system {
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(110deg, #0f1419 50%, #f3f6fa 50%);
+        border-color: var(--line-strong);
+        color: var(--text);
+        font-size: 14px;
+      }
       .theme-swatch i { display: block; width: 8px; background: #3b82f6; border-radius: 2px; }
       .theme-swatch i:nth-child(1) { height: 11px; }
       .theme-swatch i:nth-child(2) { height: 20px; }
@@ -1962,6 +1987,9 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     }
   }
 
+  followSystemTheme(): void {
+    this.theme.followSystem();
+  }
   setTheme(theme: AppTheme): void {
     this.theme.set(theme);
   }
