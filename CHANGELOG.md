@@ -15,6 +15,8 @@ also carries generated release notes with the merged pull requests.
 
 ### Added
 
+- **config:** Back up and restore every setting as one TOML file, with a masked
+  export by default and a validated import
 - **ledger:** Prune damage-ledger rows for removed jobs and expired holes
 - **queue:** Leave held PAR2 volumes out of queue size and record volumes fetched in history
 - **dispatch:** Hold PAR2 recovery volumes until the slice map shows damage

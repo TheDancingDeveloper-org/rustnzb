@@ -225,7 +225,9 @@ Unknown keys are an error, and the error names the file and key. To check a
 config without starting the server, run `rustnzb --config <path> --check-config`:
 it exits 0 when the file is usable and 1 with the problems listed. Config files
 are written with owner-only permissions (0600) because they hold passwords and
-API keys.
+API keys. To move settings to another install, **Settings → Backup & restore**
+exports them as one TOML file and validates an import before writing anything —
+see [backup and restore](docs/CONFIGURATION.md#backup-and-restore).
 
 The HTTP API exposes `/api/health` (liveness) and `/api/ready` (readiness,
 503 once shutdown has begun) for probes and load balancers.
