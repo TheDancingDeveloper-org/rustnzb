@@ -3,6 +3,11 @@ import { readToken } from '../helpers/auth';
 
 const BASE_URL = 'http://localhost:9190';
 
+// Unique per run and test, so a leftover category from an earlier or retried
+// run cannot make the add fail with 409 "already exists".
+const uniqueName = (base: string): string =>
+  `${base}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+
 async function apiAddCategory(token: string, name: string, outputDir?: string): Promise<void> {
   const r = await fetch(`${BASE_URL}/api/config/categories`, {
     method: 'POST',
@@ -37,7 +42,7 @@ test.describe('3. Category Management', () => {
   // ── 3.1 Add a category ────────────────────────────────────────────────────
 
   test('3.1 add a category', async ({ page }) => {
-    const catName = 'e2e-cat';
+    const catName = uniqueName('e2e-cat');
 
     await navigateToCategories(page);
 
@@ -65,7 +70,7 @@ test.describe('3. Category Management', () => {
   // Add "e2e-cat" in beforeEach (via API), edit it, verify snackbar.
 
   test('3.2 edit category output directory', async ({ page }) => {
-    const catName = 'e2e-cat';
+    const catName = uniqueName('e2e-cat');
     const token = readToken();
     await apiAddCategory(token, catName);
 
@@ -98,7 +103,7 @@ test.describe('3. Category Management', () => {
   // ── 3.3 Delete category ───────────────────────────────────────────────────
 
   test('3.3 delete category with confirm', async ({ page }) => {
-    const catName = 'e2e-del';
+    const catName = uniqueName('e2e-del');
     const token = readToken();
     await apiAddCategory(token, catName);
 
