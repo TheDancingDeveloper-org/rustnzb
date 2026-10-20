@@ -87,6 +87,16 @@ pub struct RepairFold {
     generation: u64,
     /// Slices folded from disk rather than from the network path.
     disk_fed: usize,
+    /// Slices read back from disk to be folded (WI-1236). A slice verified
+    /// before damage was known must be read at most once; a second read is
+    /// counted in `disk_rereads` so a caller can assert that.
+    disk_read: Vec<bool>,
+    /// Slices read back from disk to be folded, total.
+    disk_reads: usize,
+    /// Of those, slices that had already been read back once.
+    disk_rereads: usize,
+    /// Bytes read back from disk to be folded, total.
+    disk_read_bytes: u64,
 }
 
 impl fmt::Debug for RepairFold {
@@ -152,6 +162,10 @@ impl RepairFold {
             fed_count: 0,
             poisoned: false,
             disk_fed: 0,
+            disk_read: vec![false; total_slices],
+            disk_reads: 0,
+            disk_rereads: 0,
+            disk_read_bytes: 0,
             growth: None,
             generation: 0,
         })
@@ -178,6 +192,34 @@ impl RepairFold {
     /// Count slices the caller folded from disk through [`feed_batch`](Self::feed_batch).
     pub fn note_disk_fed(&mut self, count: usize) {
         self.disk_fed += count;
+    }
+
+    /// Slices read back from disk to be folded so far (WI-1236).
+    pub fn disk_reads(&self) -> usize {
+        self.disk_reads
+    }
+
+    /// Of [`disk_reads`](Self::disk_reads), how many were a second read of a
+    /// slice already read back once.
+    pub fn disk_rereads(&self) -> usize {
+        self.disk_rereads
+    }
+
+    /// Bytes read back from disk to be folded so far (WI-1236).
+    pub fn disk_read_bytes(&self) -> u64 {
+        self.disk_read_bytes
+    }
+
+    /// Count a slice about to be read back from disk. The caller counts
+    /// before the read, so a read that fails still counts as an attempt.
+    pub fn note_disk_read(&mut self, index: usize, len: u64) {
+        match self.disk_read.get_mut(index) {
+            Some(seen) if *seen => self.disk_rereads += 1,
+            Some(seen) => *seen = true,
+            None => self.disk_rereads += 1,
+        }
+        self.disk_reads += 1;
+        self.disk_read_bytes += len;
     }
     pub fn is_fed(&self, index: usize) -> bool {
         self.fed.get(index).copied().unwrap_or(false)
@@ -581,6 +623,27 @@ mod tests {
         for (idx, bytes) in fold.solve(&damaged, &rec).unwrap() {
             assert_eq!(&bytes[..d[idx].len()], &d[idx][..]);
         }
+    }
+
+    /// WI-1236: the download engine's disk feed is counted per slice, and a
+    /// second read of the same slice is visible as a re-read.
+    #[test]
+    fn disk_reads_are_counted_once_per_slice() {
+        let (n, slice) = (6, 16);
+        let mut fold = RepairFold::new(n, slice as u64, &[0]).unwrap();
+        assert_eq!((fold.disk_reads(), fold.disk_rereads()), (0, 0));
+        fold.note_disk_read(2, slice as u64);
+        fold.note_disk_read(4, slice as u64);
+        assert_eq!(fold.disk_reads(), 2);
+        assert_eq!(fold.disk_rereads(), 0, "first reads are not re-reads");
+        assert_eq!(fold.disk_read_bytes(), 2 * slice as u64);
+        // The same slice read again for a growth's new rows.
+        fold.note_disk_read(2, slice as u64);
+        assert_eq!(fold.disk_reads(), 3);
+        assert_eq!(fold.disk_rereads(), 1);
+        // The counter is independent of what was folded, so a read the caller
+        // discarded (already fed by a worker) is still visible.
+        assert_eq!(fold.fed_count(), 0);
     }
 
     #[test]

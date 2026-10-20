@@ -795,10 +795,22 @@ impl JobSlices {
     /// Fold the slices verified before the fold existed. Runs on a blocking
     /// task.
     fn feed_prefix(&self, fold: &SharedFold, rows: usize, slice_size: u64) {
-        // Slices verified before the fold existed: fold them from disk once,
-        // a bounded batch at a time, with the fold lock released between
-        // batches so workers keep folding what they verify meanwhile.
-        let sources: Vec<PendingSlice> = match &*self.state.lock() {
+        // The selection is a snapshot. A slice a worker verifies after it is
+        // folded once, from the worker's own bytes, and a slice in the
+        // snapshot that the worker got to first is not read here at all: the
+        // feeder re-checks `is_fed` under the fold lock before each read.
+        let prefix_reads = feed_from_disk(fold, &self.prefix_sources(), slice_size);
+        info!(
+            rows,
+            slice_size, prefix_reads, "In-flight repair fold opened"
+        );
+    }
+
+    /// Every slice the verifier holds `Verified`, with where it lives on disk.
+    /// The prefix is the set's, not one file's, so this one pass covers every
+    /// slice that verified before damage opened the fold.
+    fn prefix_sources(&self) -> Vec<PendingSlice> {
+        match &*self.state.lock() {
             State::Ready(t) => t
                 .verifier
                 .states()
@@ -808,40 +820,7 @@ impl JobSlices {
                 .filter_map(|(gi, _)| Self::slice_source(t, gi))
                 .collect(),
             _ => Vec::new(),
-        };
-        let mut from_disk = 0usize;
-        for chunk in sources.chunks(batch_len(slice_size)) {
-            let batch: Vec<(usize, Vec<u8>)> = chunk
-                .iter()
-                .filter(|s| !fold.lock().is_fed(s.global_index))
-                .filter_map(|s| match read_range(&s.path, s.offset, s.len) {
-                    Ok(bytes) => Some((s.global_index, bytes)),
-                    Err(e) => {
-                        // Left unfed; post-processing folds it at the end.
-                        debug!(
-                            slice = s.global_index,
-                            "Repair fold prefix read failed: {e}"
-                        );
-                        None
-                    }
-                })
-                .collect();
-            let refs: Vec<(usize, &[u8])> = batch.iter().map(|(i, b)| (*i, b.as_slice())).collect();
-            let mut fold = fold.lock();
-            match fold.feed_batch(&refs) {
-                Ok(n) => {
-                    fold.note_disk_fed(n);
-                    from_disk += n;
-                }
-                Err(e) => warn!("Repair fold prefix feed failed: {e}"),
-            }
         }
-        info!(
-            rows,
-            slice_size,
-            prefix_slices = from_disk,
-            "In-flight repair fold opened"
-        );
     }
 
     /// A running estimate of the damage while articles are still arriving:
@@ -910,9 +889,63 @@ impl JobSlices {
     }
 }
 
+/// Fold slices listed on disk into the fold's rows, reading each one once.
+///
+/// The read bound is the WI-148 one, shared by the prefix feed and a growth's
+/// backfill: [`batch_len`] slices (at most 8) and [`MAX_BATCH_BYTES`] (48 MiB)
+/// are in flight at a time, and the fold lock is held only to fold a batch,
+/// never across a read, so workers keep folding what they verify meanwhile.
+///
+/// A slice already folded — by a worker, between the snapshot and this read —
+/// is skipped without reading it. Returns how many slices it read; a read
+/// failure counts as an attempt on the fold's counter but skips the slice
+/// (post-processing folds it at the end).
+fn feed_from_disk(fold: &SharedFold, sources: &[PendingSlice], slice_size: u64) -> usize {
+    let mut read = 0usize;
+    for chunk in sources.chunks(batch_len(slice_size)) {
+        let mut batch: Vec<(usize, Vec<u8>)> = Vec::with_capacity(chunk.len());
+        for source in chunk {
+            {
+                // Skip before reading: the worker's bytes are already folded.
+                let mut f = fold.lock();
+                if f.is_fed(source.global_index) {
+                    continue;
+                }
+                f.note_disk_read(source.global_index, source.len);
+            }
+            match read_range(&source.path, source.offset, source.len) {
+                Ok(bytes) => {
+                    read += 1;
+                    batch.push((source.global_index, bytes));
+                }
+                Err(e) => {
+                    debug!(
+                        slice = source.global_index,
+                        "Repair fold disk feed read failed: {e}"
+                    );
+                }
+            }
+        }
+        if batch.is_empty() {
+            continue;
+        }
+        let refs: Vec<(usize, &[u8])> = batch.iter().map(|(i, b)| (*i, b.as_slice())).collect();
+        let mut fold = fold.lock();
+        match fold.feed_batch(&refs) {
+            Ok(n) => fold.note_disk_fed(n),
+            Err(e) => warn!("Repair fold disk feed failed: {e}"),
+        }
+    }
+    read
+}
+
 /// Fold a growth's slices into its new rows, reading them back with `read`
 /// in bounded batches. The fold lock is taken only to fold each batch, never
-/// across a read, so workers keep feeding the fold meanwhile. Returns whether
+/// across a read, so workers keep feeding the fold meanwhile.
+///
+/// A growth re-reads slices already folded into its existing rows: the new
+/// rows are fresh zeros and need that contribution again. A slice that came
+/// off disk before is therefore counted as a `disk_reread`. Returns whether
 /// the growth completed; a read failure abandons it.
 fn backfill_growth<R>(fold: &SharedFold, ticket: GrowthTicket, slice_size: u64, mut read: R) -> bool
 where
@@ -922,7 +955,12 @@ where
         let mut batch = Vec::with_capacity(chunk.len());
         for &gi in chunk {
             match read(gi) {
-                Ok(bytes) => batch.push((gi, bytes)),
+                Ok(bytes) => {
+                    let mut f = fold.lock();
+                    f.note_disk_read(gi, bytes.len() as u64);
+                    drop(f);
+                    batch.push((gi, bytes));
+                }
                 Err(e) => {
                     warn!(slice = gi, "Repair fold growth abandoned, read failed: {e}");
                     fold.lock().abandon_growth_of(ticket.generation);
@@ -1040,6 +1078,54 @@ mod fold_tests {
         for (gi, bytes) in fold.lock().solve(&damaged, &recovery).unwrap() {
             assert_eq!(bytes, data[gi]);
         }
+    }
+
+    /// WI-1236: the prefix feed reads at most `batch_len` slices per batch
+    /// (8 at the 256 KiB-and-under sizes, fewer for big slices) and folds each
+    /// one once. A slice a worker already folded between the snapshot and the
+    /// read is skipped without being read.
+    #[test]
+    fn prefix_feed_is_bounded_and_skips_what_is_already_fed() {
+        let size = 32usize;
+        let n = 40usize;
+        let data: Vec<Vec<u8>> = (0..n).map(|i| slice(i, size)).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let fold: SharedFold =
+            std::sync::Arc::new(Mutex::new(RepairFold::new(n, size as u64, &[0]).unwrap()));
+        // Every slice but #5 was verified before the fold existed.
+        let mut sources = Vec::new();
+        for (gi, bytes) in data.iter().enumerate() {
+            if gi == 5 {
+                continue;
+            }
+            let path = dir.path().join(format!("s{gi}.bin"));
+            std::fs::write(&path, bytes).unwrap();
+            sources.push(PendingSlice {
+                global_index: gi,
+                path,
+                offset: 0,
+                len: size as u64,
+            });
+        }
+        // A worker folded #11 in the window between the snapshot and the feed.
+        fold.lock().feed(11, &data[11]).unwrap();
+        let read = feed_from_disk(&fold, &sources, size as u64);
+        assert_eq!(
+            read,
+            n - 2,
+            "skipped the worker's slice and the damaged one"
+        );
+        let f = fold.lock();
+        assert_eq!(f.fed_count(), n - 1);
+        assert_eq!(f.disk_reads(), n - 2);
+        assert_eq!(f.disk_rereads(), 0);
+        assert!(!f.is_fed(5), "a damaged slice is never fed");
+        drop(f);
+        // The bound is the WI-148 one: one batch is at most 8 slices.
+        assert_eq!(batch_len(size as u64), 8);
+        assert_eq!(batch_len(8 << 20), 6, "48 MiB / 8 MiB");
+        assert_eq!(batch_len(32 << 20), 1, "a 32 MiB slice alone is 48 MiB-max");
+        assert_eq!(sources.len(), n - 1);
     }
 
     /// A failed read abandons the growth and leaves the old rows usable.

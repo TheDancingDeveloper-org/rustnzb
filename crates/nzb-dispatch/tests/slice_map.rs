@@ -34,6 +34,9 @@ struct Twist {
     index_resumed: bool,
     /// Stall timeout for the pool, in seconds (0: none).
     stall_timeout_secs: u64,
+    /// `par2.defer_volumes` (WI-1230): hold recovery volumes until the slice
+    /// map shows damage.
+    defer_volumes: bool,
 }
 
 struct Run {
@@ -92,6 +95,7 @@ async fn run_with(scenario: DamageScenario, twist: Twist) -> Run {
         Arc::new(BandwidthLimiter::new(BandwidthConfig::default())),
         twist.stall_timeout_secs,
     );
+    pool.set_defer_par2_volumes(twist.defer_volumes);
     pool.start();
 
     let mut xml = String::from_utf8(fixture.nzb_xml()).unwrap();
@@ -474,6 +478,128 @@ async fn missing_everywhere_repairs_from_the_fold() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn corrupt_body_repairs_from_the_fold() {
     repairs_from_the_fold(DamageScenario::CorruptBody).await;
+}
+
+/// WI-1236: with `par2.defer_volumes` on, a `MissingEverywhere` job's fold is
+/// driven by the download engine alone. At job end it holds every recovery row
+/// the set needs, and every slice that verified before damage was known is
+/// read back from disk at most once — the prefix feed is the only disk read
+/// the fold does, and it is done in bounded batches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_everywhere_with_defer_builds_the_fold_from_the_prefix() {
+    let scenario = DamageScenario::MissingEverywhere;
+    let run = run_with(
+        scenario,
+        Twist {
+            defer_volumes: true,
+            ..Twist::default()
+        },
+    )
+    .await;
+    assert_map(scenario, &run.fixture, &run.map);
+    assert_deferred_fold(
+        scenario,
+        &run,
+        "missing_everywhere_with_defer_builds_the_fold_from_the_prefix",
+    );
+}
+
+/// WI-1236: the same assertions with the PAR2 index arriving after the data.
+/// Nothing can be folded while the slices verify — there is no fold to fold
+/// into — so every intact slice reaches the fold through the prefix feed, and
+/// each is still read from disk exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_index_with_defer_reads_the_prefix_once() {
+    let scenario = DamageScenario::MissingEverywhere;
+    let run = run_with(
+        scenario,
+        Twist {
+            defer_volumes: true,
+            index_refusals: 2,
+            ..Twist::default()
+        },
+    )
+    .await;
+    assert_map(scenario, &run.fixture, &run.map);
+    assert_deferred_fold(
+        scenario,
+        &run,
+        "late_index_with_defer_reads_the_prefix_once",
+    );
+    let fold = run.fold.clone().expect("damage seen, so a fold exists");
+    let f = fold.lock();
+    let verified = run
+        .map
+        .states
+        .iter()
+        .filter(|s| **s == SliceVerdict::Verified)
+        .count();
+    // The index landed late, so the fold was opened by the replay's damage
+    // rather than by a worker: most of the prefix came off disk.
+    assert_eq!(f.fed_count(), verified, "{f:?}");
+    assert!(
+        f.disk_reads() >= verified / 2,
+        "late index should need a disk pass: {f:?}"
+    );
+}
+
+/// The WI-1236 fold assertions, shared by both deferral shapes: the fold holds
+/// a row for every damaged slice, every verified slice is fed, and no slice is
+/// ever read back from disk twice for the prefix.
+fn assert_deferred_fold(scenario: DamageScenario, run: &Run, name: &str) {
+    let fold = run
+        .fold
+        .clone()
+        .unwrap_or_else(|| panic!("{scenario:?}: damage seen but no fold: {:?}", run.map));
+    let verified = run
+        .map
+        .states
+        .iter()
+        .filter(|s| **s == SliceVerdict::Verified)
+        .count();
+    let damaged = run.map.damaged;
+    let f = fold.lock();
+    assert!(!f.is_poisoned(), "{name}: poisoned");
+    assert!(
+        f.rows() >= damaged,
+        "{name}: {} rows for {damaged} damage",
+        f.rows()
+    );
+    assert_eq!(f.fed_count(), verified, "{name}: {f:?}");
+    assert_eq!(
+        f.disk_rereads(),
+        0,
+        "{name}: a prefix slice read twice: {f:?}"
+    );
+    // The prefix is only part of the verified slices once damage opens the
+    // fold mid-download; it can never be more than all of them.
+    assert!(
+        f.disk_reads() <= verified,
+        "{name}: read {} of {verified} verified slices: {f:?}",
+        f.disk_reads()
+    );
+    assert!(
+        f.disk_read_bytes() <= verified as u64 * run.fixture.release.par2.slice_size(),
+        "{name}: {f:?}"
+    );
+    drop(f);
+    // Every recovery row the solve consumes is one the download's volumes
+    // carry: the fold did not need post-processing to add any.
+    let volume_exponents: BTreeSet<u32> = run
+        .fixture
+        .release
+        .volumes
+        .iter()
+        .flat_map(|v| v.exponents.iter().copied())
+        .collect();
+    let fold = run.fold.clone().unwrap();
+    let f = fold.lock();
+    for (row, exponent) in f.exponents().iter().enumerate() {
+        assert!(
+            volume_exponents.contains(exponent),
+            "{name}: row {row} on exponent {exponent}, not a volume's"
+        );
+    }
 }
 
 /// No damage, no fold: a clean job pays nothing.
