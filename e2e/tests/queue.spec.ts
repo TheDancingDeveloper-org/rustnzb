@@ -113,9 +113,13 @@ test('4.6 NZB file upload is accepted by the UI', async ({ page }) => {
 
   // Either a new job appeared or a snackbar is present (success or error is fine —
   // the important thing is the upload path exercised without a JS exception).
+  // Scoped past the shell's sr-only live regions: the assertive one is a
+  // [role="alert"] that is always mounted, so matching it proves nothing.
   const newJobOrFeedback =
     (await page.locator('.job-name').count()) >= 2 ||
-    (await page.locator('.snackbar, [class*="snack"], [class*="toast"], [role="alert"]').count()) > 0;
+    (await page
+      .locator('.snackbar, [class*="snack"], [class*="toast"], .cdk-overlay-container [role="alert"]')
+      .count()) > 0;
   expect(newJobOrFeedback).toBeTruthy();
 });
 
@@ -132,11 +136,11 @@ test('4.7 selecting jobs shows bulk selection count', async ({ page }) => {
   const rows = page.locator('.data tbody tr');
   await rows.nth(0).locator('input[type="checkbox"]').check();
 
-  // Bulk action UI or selection count must appear. Scope to the bulk bar: the
-  // count is also mirrored into the always-mounted sr-only live region, which
-  // makes a page-wide text match ambiguous.
+  // Bulk action UI or selection count must appear. Scoped to the filter bar:
+  // the shell mirrors the count into an sr-only live region, and an
+  // unscoped getByText matches both.
   const bulkCount = page.locator('.filter-bar .bulk-count');
-  const selectionCount = bulkCount.or(page.locator('.bulk-actions'));
+  const selectionCount = bulkCount.or(page.locator('.filter-bar .bulk-actions'));
   await expect(selectionCount.first()).toBeVisible();
   await expect(bulkCount).toHaveText(/1 selected/i);
 
@@ -144,7 +148,7 @@ test('4.7 selecting jobs shows bulk selection count', async ({ page }) => {
   await rows.nth(1).locator('input[type="checkbox"]').check();
 
   // Count shows 2
-  await expect(bulkCount).toHaveText(/2 selected/i);
+  await expect(bulkCount).toHaveText('2 selected');
 });
 
 // ── 4.1 Queue page loads with stat cards ─────────────────────────────────────

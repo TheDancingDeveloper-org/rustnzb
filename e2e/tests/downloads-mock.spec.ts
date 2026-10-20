@@ -18,10 +18,13 @@ test.describe("Mock-backed downloads", () => {
       .getByRole("button", { name: "Upload", exact: true })
       .click();
 
-    // Scope to the snackbar: the message is mirrored into the sr-only live
-    // region, so a page-wide text match is ambiguous.
+    // Scoped to the snackbar's inner text label, inside the overlay. The
+    // shell mirrors this sentence into its sr-only polite live region (an
+    // unscoped text match hits both), and Material nests a second
+    // .mat-mdc-snack-bar-label around the label, so the mdc class is the one
+    // distinct node.
     await expect(
-      page.locator('.cdk-overlay-container .mdc-snackbar__label', {
+      page.locator(".cdk-overlay-container .mdc-snackbar__label", {
         hasText: /added to queue/i,
       }),
     ).toBeVisible({ timeout: 10000 });
