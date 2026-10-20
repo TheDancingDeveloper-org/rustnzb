@@ -252,9 +252,20 @@ async fn clearing_headers_deletes_them_and_resets_the_watermark() {
             .await
     );
 
-    let Json(body) = h_header_clear(State(state.clone()), IdPath(group_id))
-        .await
-        .expect("clear headers");
+    // The fetch stores its last batch before it quits the connection and
+    // drops its in-flight guard, so a clear can still see it running for a
+    // moment; retry the 409 until the fetch has finished.
+    let mut attempts = 0;
+    let Json(body) = loop {
+        match h_header_clear(State(state.clone()), IdPath(group_id)).await {
+            Ok(body) => break body,
+            Err(err) if attempts < 200 && err.status() == axum::http::StatusCode::CONFLICT => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(err) => panic!("clear headers: {err:?}"),
+        }
+    };
     assert_eq!(body["deleted"], 3);
     assert_eq!(header_count(&state, group_id), 0);
     assert_eq!(last_scanned(&state, group_id), 0);
