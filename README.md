@@ -276,6 +276,21 @@ inline one, which wins over a password embedded in the NZB.
 
 The *arr-compatible API is served at `/sabnzbd/api`.
 
+### Authenticating the SABnzbd-compatible API
+
+A client can send the API key in the `X-Api-Key` header instead of the
+`apikey` query parameter:
+
+```bash
+curl -H "X-Api-Key: your-secret-key" \
+  "http://localhost:9090/sabnzbd/api?mode=queue&output=json"
+```
+
+`apikey` in the query string or a request body still works, because that is
+what SABnzbd and the *arr apps send. The header is the safer form: a URL ends
+up in the access logs of every reverse proxy in front of rustnzb, while a
+header does not. When both are present the header wins.
+
 ---
 
 ## Development

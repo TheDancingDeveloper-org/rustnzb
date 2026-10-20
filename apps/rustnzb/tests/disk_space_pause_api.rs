@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use axum::body::to_bytes;
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use nzb_web::auth::{CredentialStore, TokenStore};
 use nzb_web::log_buffer::LogBuffer;
@@ -83,6 +84,7 @@ async fn sab(state: Arc<AppState>, mode: &str) -> serde_json::Value {
             mode: Some(mode.to_string()),
             ..Default::default()
         }),
+        HeaderMap::new(),
     )
     .await
     .unwrap()

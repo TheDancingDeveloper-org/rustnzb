@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use axum::body::to_bytes;
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use http::StatusCode;
 use nzb_web::auth::{CredentialStore, TokenStore};
@@ -72,6 +73,7 @@ async fn sab_queue_item_resume_reports_failure_during_global_pause() {
             value: Some("SABnzbd_nzo_any-job".to_string()),
             ..Default::default()
         }),
+        HeaderMap::new(),
     )
     .await
     .unwrap()
