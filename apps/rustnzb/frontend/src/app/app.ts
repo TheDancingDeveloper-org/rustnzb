@@ -935,11 +935,10 @@ export class App implements OnInit, OnDestroy {
     if (event.defaultPrevented) return;
     if (event.ctrlKey || event.metaKey || event.altKey) return;
     if (isEditableTarget(event.target)) return;
-    // A menu or dialog owns its own keys (Escape, arrows) while it is open.
-    if (document.querySelector('.cdk-overlay-container .cdk-overlay-pane')) return;
+    if (this.overlayOwnsKeys()) return;
 
     const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
-    if (key === 'shift') return; // bare modifier press
+    if (event.key === 'Shift') return; // bare modifier press
 
     if (this.chordPrefix) {
       const prefix = this.chordPrefix;
@@ -961,6 +960,28 @@ export class App implements OnInit, OnDestroy {
     if (!action) return;
     event.preventDefault();
     this.runShortcut(action);
+  }
+
+  /**
+   * True while an overlay on screen owns the keyboard (Escape, arrows, typing).
+   *
+   * Not "any `.cdk-overlay-pane`": a snackbar, tooltip or select panel shares
+   * that container, and CDK can leave a detached pane behind, so matching the
+   * container outright silently disabled every shortcut after the first toast.
+   * Ask the dialog service and this shell's own menus instead, and only then
+   * look for the panels that do take keys.
+   */
+  private overlayOwnsKeys(): boolean {
+    if (this.dialog.openDialogs.length > 0) return true;
+    if (this.pauseMenuOpen || this.speedMenuOpen) return true;
+    return !!document.querySelector(
+      [
+        '.cdk-overlay-pane .mat-mdc-dialog-container',
+        '.cdk-overlay-pane .mat-mdc-menu-panel',
+        '.cdk-overlay-pane .mat-mdc-select-panel',
+        '.cdk-overlay-pane .mat-mdc-autocomplete-panel',
+      ].join(', '),
+    );
   }
 
   private beginChord(prefix: string): void {
@@ -1019,13 +1040,9 @@ export class App implements OnInit, OnDestroy {
     }
   }
 
+  /** The queue view owns the landing: it expands the panel and scrolls to it. */
   private goHistory(): void {
-    if (this.router.url.startsWith('/downloads')) {
-      void this.router.navigate(['/downloads'], { fragment: 'history' });
-      document.getElementById('history')?.scrollIntoView({ block: 'start' });
-    } else {
-      void this.router.navigate(['/downloads'], { fragment: 'history' });
-    }
+    void this.router.navigate(['/downloads'], { fragment: 'history' });
   }
 
   openShortcuts(): void {
