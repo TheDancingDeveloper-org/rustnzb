@@ -1,0 +1,231 @@
+# Configuration reference
+
+This page lists every rustnzb setting: its TOML key, its default, and the
+environment variable or command-line flag that overrides it. The annotated
+example file is [`apps/rustnzb/config.example.toml`](../apps/rustnzb/config.example.toml).
+
+Most settings can also be changed in the web UI (**Settings**), which saves
+them to the same `config.toml`.
+
+## Where the config lives
+
+| Install | Config file |
+|---------|-------------|
+| Container image | `/config/config.toml`, created empty on first start (an empty file means "all defaults") |
+| Binary, no `--config` | `$XDG_CONFIG_HOME/rustnzb/config.toml`, or `~/.config/rustnzb/config.toml`, created on first start |
+| Binary with `--config <path>` / `RUSTNZB_CONFIG` | That path, which must already exist |
+
+rustnzb writes the file with owner-only permissions (0600), because it holds
+server passwords and API keys.
+
+## Precedence
+
+Highest first:
+
+1. Command-line flag
+2. Environment variable
+3. `config.toml`
+4. Built-in default
+
+A value from a flag or an environment variable applies only while the process
+runs, and is never written to `config.toml`. The web UI shows such a setting
+as locked and names its source (`cli`, `env:NAME`). Remove the flag or
+variable to edit the setting again.
+
+Unknown keys are an error. The message names the file and the key. To check a
+file without starting the server:
+
+```bash
+rustnzb --config /path/to/config.toml --check-config
+```
+
+It prints the result and exits 0 if the file is usable, 1 if not.
+
+## Command-line flags and environment variables
+
+| Flag | Environment variable | Overrides | Notes |
+|------|----------------------|-----------|-------|
+| `-c`, `--config <path>` | `RUSTNZB_CONFIG` | — | Config file path. A path given here must exist. |
+| `--check-config` | — | — | Validate the config, print the result and exit. |
+| `--listen-addr <addr>` | `RUSTNZB_LISTEN_ADDR` | `general.listen_addr` | |
+| `-p`, `--port <port>` | `RUSTNZB_PORT` | `general.port` | In the container, also remap the host port (see the README). |
+| `--data-dir <path>` | `RUSTNZB_DATA_DIR` | `general.data_dir` | The container sets `--data-dir /data`. |
+| `--log-level <level>` | `RUSTNZB_LOG_LEVEL` | `general.log_level` | `RUST_LOG`, when set, overrides all three with a full filter. |
+| `--log-file <path>` | `RUSTNZB_LOG_FILE` | `general.log_file` | Daily rotation, newest 7 files kept. |
+| `--log-format <text\|json>` | `RUSTNZB_LOG_FORMAT` | — | Default `text`. `json` writes one JSON object per line. |
+| `--smoke-test` | — | — | Check that `7z` (and `unrar`, if present) work, then exit. |
+| — | `OTEL_ENABLED` | `otel.enabled` | Boolean (see below). |
+| — | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel.endpoint` | |
+| — | `OTEL_LOGS_ENABLED` | `otel.logs_enabled` | Boolean. |
+| — | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | `otel.logs_endpoint` | |
+| — | `OTEL_METRICS_ENABLED` | `otel.metrics_enabled` | Boolean. |
+| — | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | `otel.metrics_endpoint` | |
+| — | `OTEL_SERVICE_NAME` | `otel.service_name` | |
+| — | `RUSTNZB_DAV_ENABLED` (alias `ENABLE_DAV`) | `dav.enabled` | Can only turn DAV **on**. A false value leaves the file's setting alone. |
+
+Boolean variables accept `1`, `true`, `yes` or `on`, in any case. Any other
+value is false.
+
+### Container-only variables
+
+The container image (built on the linuxserver.io Alpine base) also reads:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `PUID` | `1000` in the example compose file, `911` in the base image | User ID that owns `/config`, `/data` and the download directories, and runs rustnzb |
+| `PGID` | `1000` in the example compose file, `911` in the base image | Group ID for the same |
+| `TZ` | `UTC` | Timezone for log timestamps and schedules |
+
+## `[general]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `listen_addr` | `"0.0.0.0"` | HTTP listen address. |
+| `port` | `9090` | HTTP port. |
+| `api_key` | unset | API key. The SABnzbd-compatible API (`/api`, `/sabnzbd/api`) takes it as `apikey`, and the native API accepts it as an `X-Api-Key` header. Settings → API & SABnzbd compat can show and rotate it. |
+| `incomplete_dir` | `"/downloads/incomplete"` | Where jobs download. |
+| `complete_dir` | `"/downloads/complete"` | Where finished jobs go. Category `output_dir` is relative to this. |
+| `data_dir` | `"/data"` | Database, RSS state, credentials. |
+| `speed_limit_bps` | `0` | Download limit in bytes per second. `0` is unlimited. |
+| `cache_size` | `524288000` (500 MB) | Article cache in bytes. The API accepts 16 MiB to 64 GiB. |
+| `log_level` | `"info"` | `trace`, `debug`, `info`, `warn`, `error`, `off`, or a full filter such as `info,nzb_nntp=debug`. Applied at start. |
+| `log_file` | unset | Also log to this file. Daily rotation, newest 7 kept. Applied at start. |
+| `history_retention` | unset (keep all) | Number of history entries to keep. `0` also keeps all. |
+| `max_active_downloads` | `1` | Jobs downloading at once. `0` is unlimited. The API accepts at most 100. |
+| `max_post_processing_jobs` | `2` | Jobs in post-processing at once. Applied at start. |
+| `max_repair_workers` | `1` | Concurrent PAR2 verify/repair workers. Applied at start. |
+| `max_extract_workers` | `1` | Concurrent extraction workers. Applied at start. |
+| `min_free_space_bytes` | `1073741824` (1 GB) | Pause downloads when free space drops below this. |
+| `watch_dir` | unset | Folder watched for `.nzb` files to queue. |
+| `rss_history_limit` | `500` | RSS feed items kept. Unset keeps all. |
+| `rss_downloaded_item_expiry_days` | unset | Remove downloaded RSS records after this many days. |
+| `direct_unpack` | `true` | Extract RAR volumes during the download. Needs `unrar`. |
+| `max_nested_archive_depth` | `5` | Archive layers extracted after the outer one. `0` extracts only the outer archive. The API accepts 0 to 10. |
+| `abort_hopeless` | `true` | Abort jobs that cannot complete because too many articles are missing. Applied at start. |
+| `early_failure_check` | `true` | Abort an NZB early if most of its first articles are missing. Needs `abort_hopeless`. Applied at start. |
+| `required_completion_pct` | `100.2` | Minimum completion, counting PAR2 recovery, to keep downloading. Values above 100 keep a repair margin. Range 100.0 to 200.0. Applied at start. |
+| `article_timeout_secs` | `30` | Wait for one article response before reconnecting. `0` disables the timeout. The API accepts at most 3600. Applied at start. |
+| `auto_sort_remaining_pct` | `false` | Keep queued jobs ordered by remaining work. |
+| `duplicate_policy` | `"warn"` | When an NZB matches a queued or history job by name or content: `allow`, `warn` (log it) or `skip` (refuse it). |
+| `local_import_dir` | unset | The only directory SABnzbd `addlocalfile` may read. Unset refuses the mode. It also needs an API key. |
+| `queue_complete_pers` | `false` | Keep the SABnzbd `change_complete_action` after it runs once. SABnzbd's default is to reset it. |
+| `scripts_dir` | unset | Directory of post-processing scripts. |
+| `script_success` | unset | Script run after a successful job. |
+| `script_failure` | unset | Script run after a failed job. |
+| `script_timeout_secs` | `300` | Maximum script run time. |
+| `script_max_output_bytes` | `1048576` | Script output kept. |
+| `fetch_allow_private` | `false` | Let URL fetches (add-url, SABnzbd `addurl`, RSS, SABnzbd import) reach private LAN addresses. Loopback and link-local addresses stay blocked. |
+| `fetch_allowed_hosts` | `[]` | Hosts that URL fetches may always reach: IP addresses, CIDR blocks or exact hostnames, such as `["prowlarr", "192.168.1.0/24"]`. |
+| `group_max_headers` | `100000` | Headers kept per newsgroup, oldest pruned first. `0` keeps all. |
+| `shutdown_timeout_secs` | `30` | Wait for connections and downloads on SIGINT/SIGTERM before exiting. `0` waits forever. |
+
+Scripts run without a shell, with SABnzbd's positional arguments (final
+directory, NZB name, job name, report number, category, group, status 0-3,
+URL) and `SAB_*` / `NZBPP_*` environment variables.
+
+## `[[servers]]`
+
+One table per NNTP server. Only `host` is required.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `id` | derived from host and port | Stable identifier. |
+| `name` | `""` | Display name. |
+| `host` | — | Server hostname. |
+| `port` | `563` | Server port. |
+| `ssl` | `true` | Use TLS. |
+| `ssl_verify` | `true` | Verify the TLS certificate. |
+| `trusted_fingerprint` | unset | SHA-256 fingerprint of the server certificate. When set, only this fingerprint is checked, and `ssl_verify` is ignored. Use it for self-signed certificates. |
+| `username`, `password` | unset | Credentials. |
+| `connections` | `8` | Maximum connections. |
+| `priority` | `0` | `0` is tried first. Higher numbers fill in missing articles. |
+| `enabled` | `true` | |
+| `optional` | `false` | If true, a failure on this server is not fatal. |
+| `retention` | `0` | Retention in days. `0` is unlimited. |
+| `pipelining` | `4` | Article requests in flight per connection. |
+| `compress` | `false` | Negotiate `XFEATURE COMPRESS GZIP`. |
+| `ramp_up_delay_ms` | `50` | Delay between opening connections, to avoid rate limits. |
+| `recv_buffer_size` | `2097152` (2 MiB) | TCP receive buffer. `0` uses the OS default. |
+| `connect_timeout_secs` | `30` | Time allowed to connect, negotiate TLS, read the banner and log in. |
+| `proxy_url` | unset | SOCKS5 proxy: `socks5://[user:pass@]host:port`. |
+
+## `[[categories]]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `name` | — | Category name. One path component. |
+| `output_dir` | unset | Output directory: absolute, or relative to `complete_dir`. Unset uses `complete_dir`. |
+| `post_processing` | `3` | `0` none, `1` repair, `2` unpack, `3` repair and unpack. |
+| `cleanup_patterns` | `[]` | Globs removed after unpacking, such as `["*.nfo", "sample/*"]`. |
+| `unwanted_extensions` | `[]` | Extensions removed after unpacking, with or without the dot. |
+
+A fresh config has one category, `Default`.
+
+## `[[rss_feeds]]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `name` | — | Display name. |
+| `url` | — | RSS 2.0 or Atom feed URL. |
+| `poll_interval_secs` | `900` | Poll interval. Minimum 60. |
+| `category` | unset | Category for NZBs from this feed. |
+| `filter_regex` | unset | Rust `regex` matched against titles, such as `(?i)ubuntu\|debian`. |
+| `enabled` | `true` | |
+| `auto_download` | `false` | Queue every item that passes `filter_regex`, without a rule. |
+| `max_age_days` | unset | Ignore items older than this. |
+
+## `[par2]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `defer_volumes` | `true` | Hold PAR2 recovery volumes until damage shows up, then fetch only as many as needed. `false` fetches all of them up front. |
+
+## `[dav]`
+
+The WebDAV media library, which streams files from Usenet on demand.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Serve `/dav`. |
+| `auto_send_all` | `false` | Send every completed download to the library. |
+| `category_rules` | `[]` | Categories sent to the library when `auto_send_all` is false. |
+| `username`, `password` | unset | Basic auth for `/dav`. |
+| `api_key` | unset | `X-Api-Key` header accepted instead of Basic auth. |
+
+If `username`, `password` and `api_key` are all unset, `/dav` needs no
+authentication.
+
+## `[notifications]`
+
+Each target is off until its URL or topic is set. Changes apply after a
+restart.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `webhook_url` | `""` | POST a JSON document for each event. |
+| `apprise_api_url` | `""` | Apprise API notify endpoint, such as `http://apprise:8000/notify`. |
+| `apprise_urls` | `""` | Comma-separated Apprise URLs. Leave empty if the endpoint has a config key. |
+| `ntfy_server` | `"https://ntfy.sh"` | ntfy server. |
+| `ntfy_topic` | `""` | ntfy topic. |
+| `ntfy_token` | `""` | ntfy access token. |
+
+See [NOTIFICATIONS.md](NOTIFICATIONS.md) for events and browser alerts.
+
+## `[otel]`
+
+OpenTelemetry export over OTLP gRPC. See [OBSERVABILITY.md](OBSERVABILITY.md).
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Fallback switch for logs and metrics. |
+| `endpoint` | `"http://localhost:4317"` | Fallback endpoint for logs and metrics. |
+| `logs_enabled` | unset (uses `enabled`) | Export logs. |
+| `logs_endpoint` | unset (uses `endpoint`) | Log endpoint. |
+| `metrics_enabled` | unset (uses `enabled`) | Export metrics. |
+| `metrics_endpoint` | unset (uses `endpoint`) | Metrics endpoint. |
+| `service_name` | `"rustnzb"` | Service name reported to the collector. |
+
+## Other keys
+
+`config_version` at the top of the file is the schema version. rustnzb writes
+it on every save and migrates older files on load. Don't edit it.
