@@ -9,6 +9,8 @@ import { StatusResponse } from '../../core/models/queue.model';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
 import { AppTheme, ThemeService } from '../../core/services/theme.service';
+import { I18nService } from '../../core/i18n/i18n.service';
+import { TranslatePipe } from '../../core/i18n/translate.pipe';
 import { BrowserNotificationsService } from '../../core/services/browser-notifications.service';
 import { httpErrorMessage, showHttpError } from '../../core/http/http-error';
 import { ToastService } from '../../core/services/toast.service';
@@ -221,7 +223,7 @@ function emptyCategory(): CategoryConfig {
 @Component({
   selector: 'app-settings-view',
   standalone: true,
-  imports: [CommonModule, FormsModule, RouterModule, MatSnackBarModule, IconComponent],
+  imports: [CommonModule, FormsModule, RouterModule, MatSnackBarModule, IconComponent, TranslatePipe],
   template: `
     <div class="settings-shell">
       <!-- Sidebar -->
@@ -1173,15 +1175,15 @@ function emptyCategory(): CategoryConfig {
           }
           <div class="section-head">
             <div>
-              <h2>General</h2>
-              <div class="sub">Global speed limit, concurrency, history retention.</div>
+              <h2>{{ 'settings.general.title' | t }}</h2>
+              <div class="sub">{{ 'settings.general.sub' | t }}</div>
             </div>
           </div>
 
           <div class="panel">
-            <h3>Appearance</h3>
+            <h3>{{ 'settings.appearance.title' | t }}</h3>
             <div class="body">
-              <div class="theme-grid" role="radiogroup" aria-label="Application theme">
+              <div class="theme-grid" role="radiogroup" [attr.aria-label]="'settings.appearance.themeLabel' | t">
                 <button
                   type="button"
                   class="theme-option"
@@ -1192,8 +1194,8 @@ function emptyCategory(): CategoryConfig {
                 >
                   <span class="theme-swatch system" aria-hidden="true">⌂</span>
                   <span class="theme-copy">
-                    <b>System</b>
-                    <span class="setting-description">Match this device's light or dark setting.</span>
+                    <b>{{ 'settings.appearance.system' | t }}</b>
+                    <span class="setting-description">{{ 'settings.appearance.systemDescription' | t }}</span>
                   </span>
                 </button>
                 @for (option of theme.options; track option.id) {
@@ -1214,6 +1216,27 @@ function emptyCategory(): CategoryConfig {
                     </span>
                   </button>
                 }
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3>{{ 'settings.language.title' | t }}</h3>
+            <div class="body">
+              <div class="form">
+                <label for="ui-locale">{{ 'settings.language.label' | t }}</label>
+                <div>
+                  <select
+                    id="ui-locale"
+                    [ngModel]="i18n.locale()"
+                    (ngModelChange)="i18n.set($event)"
+                  >
+                    @for (option of i18n.locales; track option.id) {
+                      <option [value]="option.id" [attr.lang]="option.id">{{ option.name }}</option>
+                    }
+                  </select>
+                  <div class="setting-description">{{ 'settings.language.description' | t }}</div>
+                </div>
               </div>
             </div>
           </div>
@@ -1931,6 +1954,7 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     private confirmSvc: ConfirmService,
     public readonly theme: ThemeService,
     public readonly notifications: BrowserNotificationsService,
+    public readonly i18n: I18nService = new I18nService(),
   ) {}
 
   ngOnInit(): void {

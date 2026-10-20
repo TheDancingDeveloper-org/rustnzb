@@ -41,6 +41,9 @@ import { MatDialog } from '@angular/material/dialog';
 import { showHttpError } from './core/http/http-error';
 import { ToastService } from './core/services/toast.service';
 import { ShortcutsDialogComponent } from './shared/shortcuts-dialog.component';
+import { TranslationKey } from './core/i18n/en';
+import { I18nService, Translate, translateEn } from './core/i18n/i18n.service';
+import { TranslatePipe } from './core/i18n/translate.pipe';
 
 export function isDemoPath(pathname: string): boolean {
   return pathname === '/demo' || pathname.startsWith('/demo/');
@@ -61,18 +64,18 @@ const VIEWPORT_GUTTER = 8;
 
 // Browser-tab name for each page. The legacy /queue and /history paths keep the
 // tab names they had, so a bookmarked tab still reads the same.
-const PAGE_TITLES: Record<string, string> = {
-  '/downloads': 'Downloads',
-  '/queue': 'Downloads',
-  '/history': 'History',
-  '/groups': 'Search',
-  '/rss': 'RSS',
-  '/media': 'Media',
-  '/logs': 'Logs',
-  '/statistics': 'Statistics',
-  '/settings': 'Settings',
-  '/welcome': 'Welcome',
-  '/login': 'Sign in',
+const PAGE_TITLES: Record<string, TranslationKey> = {
+  '/downloads': 'nav.downloads',
+  '/queue': 'nav.downloads',
+  '/history': 'nav.history',
+  '/groups': 'nav.search',
+  '/rss': 'nav.rss',
+  '/media': 'nav.media',
+  '/logs': 'nav.logs',
+  '/statistics': 'nav.statistics',
+  '/settings': 'nav.settings',
+  '/welcome': 'nav.welcome',
+  '/login': 'nav.signIn',
 };
 
 export interface LiveTitleState {
@@ -86,23 +89,27 @@ export interface LiveTitleState {
  * Pass `null` for live state when it is unknown or stale (offline, not signed in).
  * The Downloads page is left out of the suffix because it is the home page.
  */
-export function documentTitle(url: string, live: LiveTitleState | null): string {
+export function documentTitle(
+  url: string,
+  live: LiveTitleState | null,
+  t: Translate = translateEn,
+): string {
   const path = url.split(/[?#]/)[0];
   const parts: string[] = [];
   if (live) {
-    if (live.paused) parts.push('Paused');
+    if (live.paused) parts.push(t('status.paused'));
     else if (live.speedBps > 0) parts.push(`↓ ${formatSpeed(live.speedBps)}`);
-    if (live.queueSize > 0) parts.push(`${live.queueSize} left`);
+    if (live.queueSize > 0) parts.push(t('status.left', { count: live.queueSize }));
   }
   const page = PAGE_TITLES[path];
-  if (page && page !== 'Downloads') parts.push(page);
+  if (page && page !== 'nav.downloads') parts.push(t(page));
   return parts.length ? `${parts.join(' · ')} – rustnzb` : 'rustnzb';
 }
 
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [CommonModule, FormsModule, RouterModule, IconComponent],
+  imports: [CommonModule, FormsModule, RouterModule, IconComponent, TranslatePipe],
   template: `
     @if (!showChrome()) {
       <!-- Full-screen login / welcome (no chrome) -->
@@ -114,27 +121,27 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
             <span class="brand">rust<span>nzb</span></span>
             <span class="ver">v{{ version() }}</span>
             <div class="sep"></div>
-            <a routerLink="/downloads" routerLinkActive="active">Downloads</a>
-            <a routerLink="/groups" routerLinkActive="active">Search</a>
-            <a routerLink="/rss" routerLinkActive="active">RSS</a>
+            <a routerLink="/downloads" routerLinkActive="active">{{ 'nav.downloads' | t }}</a>
+            <a routerLink="/groups" routerLinkActive="active">{{ 'nav.search' | t }}</a>
+            <a routerLink="/rss" routerLinkActive="active">{{ 'nav.rss' | t }}</a>
             @if (webdavEnabled()) {
-              <a routerLink="/media" routerLinkActive="active">Media</a>
+              <a routerLink="/media" routerLinkActive="active">{{ 'nav.media' | t }}</a>
             }
-            <a routerLink="/logs" routerLinkActive="active">Logs</a>
-            <a routerLink="/statistics" routerLinkActive="active">Statistics</a>
-            <a routerLink="/settings" routerLinkActive="active">Settings</a>
+            <a routerLink="/logs" routerLinkActive="active">{{ 'nav.logs' | t }}</a>
+            <a routerLink="/statistics" routerLinkActive="active">{{ 'nav.statistics' | t }}</a>
+            <a routerLink="/settings" routerLinkActive="active">{{ 'nav.settings' | t }}</a>
             <div class="spacer"></div>
             @if (demoMode) {
-              <a class="action demo-exit" href="/">Exit demo</a>
+              <a class="action demo-exit" href="/">{{ 'nav.exitDemo' | t }}</a>
             }
-            <div class="status" [class.stale]="offline()" [attr.title]="offline() ? 'Stale: showing the last known values' : null">
+            <div class="status" [class.stale]="offline()" [attr.title]="offline() ? ('status.stale' | t) : null">
               @if (offline()) {
-                <span class="pill err" role="status">● Offline</span>
+                <span class="pill err" role="status">● {{ 'status.offline' | t }}</span>
               } @else if (!loaded()) {
                 <span class="pill" role="status">—</span>
               } @else {
                 <span class="pill" [class.ok]="!paused()" [class.warn]="paused()" role="status">
-                  ● {{ paused() ? 'Paused' : 'Live' }}
+                  ● {{ (paused() ? 'status.paused' : 'status.live') | t }}
                 </span>
               }
               <div class="speed-group" (keydown.escape)="closeSpeedMenu()">
@@ -143,7 +150,7 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
                   type="button"
                   class="pill pill-btn"
                   (click)="toggleSpeedMenu(speedBtn)"
-                  title="Set speed limit"
+                  [title]="'speed.setLimit' | t"
                   aria-haspopup="true"
                   [attr.aria-expanded]="speedMenuOpen"
                 >
@@ -157,8 +164,8 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
                     [style.left.px]="menuAnchor.left"
                     (click)="$event.stopPropagation()"
                   >
-                    <div class="pm-title">Speed limit</div>
-                    <div class="pm-current">Current: {{ speedLimit() > 0 ? formatSpeed(speedLimit()) : 'off' }}</div>
+                    <div class="pm-title">{{ 'speed.title' | t }}</div>
+                    <div class="pm-current">{{ 'speed.current' | t: { value: speedLimit() > 0 ? formatSpeed(speedLimit()) : ('speed.off' | t) } }}</div>
                     @for (opt of speedPresets; track opt.bps) {
                       <button
                         class="pm-item"
@@ -175,25 +182,25 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
                         min="0.1"
                         step="any"
                         placeholder="MB/s"
-                        aria-label="Custom speed limit in MB/s"
+                        [attr.aria-label]="'speed.customLabel' | t"
                         [(ngModel)]="customSpeedMb"
                         (keydown.enter)="setCustomSpeedLimit()"
                       />
-                      <button class="pm-go" (click)="setCustomSpeedLimit()">Set</button>
+                      <button class="pm-go" (click)="setCustomSpeedLimit()">{{ 'speed.set' | t }}</button>
                     </div>
                   </div>
                 }
               </div>
-              <span class="pill">{{ loaded() ? queueCount() : '—' }} queued</span>
-              <span class="pill">{{ loaded() ? formatBytes(diskFree()) : '—' }} free</span>
+              <span class="pill">{{ 'status.queued' | t: { count: loaded() ? queueCount() : '—' } }}</span>
+              <span class="pill">{{ 'status.free' | t: { size: loaded() ? formatBytes(diskFree()) : '—' } }}</span>
             </div>
-            <div class="mode-toggle" role="group" aria-label="Layout width">
+            <div class="mode-toggle" role="group" [attr.aria-label]="'layout.width' | t">
               <button
                 type="button"
                 [class.active]="widthMode.mode() === 'compact'"
                 (click)="widthMode.set('compact')"
-                title="Compact"
-                aria-label="Compact layout"
+                [title]="'layout.compact' | t"
+                [attr.aria-label]="'layout.compactLabel' | t"
                 [attr.aria-pressed]="widthMode.mode() === 'compact'"
               >
                 <svg
@@ -210,8 +217,8 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
                 type="button"
                 [class.active]="widthMode.mode() === 'expanded'"
                 (click)="widthMode.set('expanded')"
-                title="Expanded"
-                aria-label="Expanded layout"
+                [title]="'layout.expanded' | t"
+                [attr.aria-label]="'layout.expandedLabel' | t"
                 [attr.aria-pressed]="widthMode.mode() === 'expanded'"
               >
                 <svg
@@ -225,13 +232,13 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
                 </svg>
               </button>
             </div>
-            <button class="action primary" (click)="onAddNzb()">+ Upload NZB</button>
+            <button class="action primary" (click)="onAddNzb()">{{ 'actions.uploadNzb' | t }}</button>
             <div class="pause-group" (keydown.escape)="closePauseMenu()">
               <button class="action" (click)="togglePause()">
                 @if (paused()) {
-                  <app-icon name="play" [size]="11" /> Resume
+                  <app-icon name="play" [size]="11" /> {{ 'actions.resume' | t }}
                 } @else {
-                  <app-icon name="pause" [size]="11" /> Pause
+                  <app-icon name="pause" [size]="11" /> {{ 'actions.pause' | t }}
                 }
               </button>
               @if (!paused()) {
@@ -239,8 +246,8 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
                   #pauseCaretBtn
                   class="action pause-caret"
                   (click)="togglePauseMenu(pauseCaretBtn)"
-                  title="Pause for…"
-                  aria-label="Pause for…"
+                  [title]="'actions.pauseFor' | t"
+                  [attr.aria-label]="'actions.pauseFor' | t"
                   aria-haspopup="true"
                   [attr.aria-expanded]="pauseMenuOpen"
                 >
@@ -254,7 +261,7 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
                     [style.right.px]="menuAnchor.right"
                     (click)="$event.stopPropagation()"
                   >
-                    <div class="pm-title">Pause for…</div>
+                    <div class="pm-title">{{ 'actions.pauseFor' | t }}</div>
                     @for (opt of pauseTimerOptions; track opt.secs) {
                       <button class="pm-item" role="menuitem" (click)="pauseFor(opt.secs)">
                         {{ opt.label }}
@@ -265,11 +272,11 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
                         type="number"
                         min="1"
                         placeholder="min"
-                        aria-label="Custom pause duration in minutes"
+                        [attr.aria-label]="'actions.customPauseLabel' | t"
                         [(ngModel)]="customPauseMin"
                         (keydown.enter)="pauseForCustom()"
                       />
-                      <button class="pm-go" (click)="pauseForCustom()">Go</button>
+                      <button class="pm-go" (click)="pauseForCustom()">{{ 'actions.go' | t }}</button>
                     </div>
                   </div>
                 }
@@ -278,20 +285,22 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
             <button
               class="action muted shortcuts-open"
               (click)="openShortcuts()"
-              title="Keyboard shortcuts (?)"
-              aria-label="Keyboard shortcuts"
+              [title]="'actions.shortcutsTitle' | t"
+              [attr.aria-label]="'actions.shortcuts' | t"
             >
               ?
             </button>
-            <button class="action muted" (click)="onLogout()" title="Sign out">Sign out</button>
+            <button class="action muted" (click)="onLogout()" [title]="'actions.signOut' | t">
+              {{ 'actions.signOut' | t }}
+            </button>
           </div>
         </nav>
 
         @if (noServers()) {
           <div class="setup-banner" role="status">
             <div class="wrap">
-              <span>No news servers are set up yet, so downloads will not start.</span>
-              <a routerLink="/welcome">Add a server →</a>
+              <span>{{ 'shell.noServers' | t }}</span>
+              <a routerLink="/welcome">{{ 'shell.addServer' | t }}</a>
             </div>
           </div>
         }
@@ -304,7 +313,7 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
       </div>
       @if (fileDragActive()) {
         <div class="drop-overlay" aria-hidden="true">
-          <div class="drop-overlay-box">Drop .nzb files to add them</div>
+          <div class="drop-overlay-box">{{ 'shell.dropNzb' | t }}</div>
         </div>
       }
       <!-- Results that arrive without a focus change are spoken here. The
@@ -723,6 +732,7 @@ export class App implements OnInit, OnDestroy {
     readonly announcer: AnnouncerService,
     private shortcuts: KeyboardShortcutsService,
     private dialog: MatDialog,
+    private i18n: I18nService = new I18nService(),
   ) {
     this.paused = pauseState.paused;
     this.authenticated = authService.authenticated;
@@ -800,7 +810,7 @@ export class App implements OnInit, OnDestroy {
       this.loaded() && !this.offline()
         ? { paused: this.paused(), speedBps: this.speed(), queueSize: this.queueCount() }
         : null;
-    document.title = documentTitle(this.currentUrl(), live);
+    document.title = documentTitle(this.currentUrl(), live, this.i18n.t);
   }
 
   // Viewport position for whichever menu is open. Only one menu is open at a time.
