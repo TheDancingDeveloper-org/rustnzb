@@ -8,6 +8,7 @@ import { HistoryEntry, StatusResponse } from '../../core/models/queue.model';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
 import { httpErrorMessage, showHttpError } from '../../core/http/http-error';
+import { AnnouncerService } from '../../core/services/announcer.service';
 
 type StatusFilter = 'all' | 'completed' | 'failed';
 type TimeFilter = '7d' | '30d' | 'all';
@@ -28,6 +29,19 @@ interface HistoryPage {
   total?: number;
   categories?: string[];
   stats?: HistoryStats;
+}
+
+/** One per-id failure from `POST /api/history/bulk`. */
+interface BulkFailure {
+  id: string;
+  error?: { status?: number; error_kind?: string; human_readable?: string };
+}
+
+interface BulkResult {
+  status: boolean;
+  succeeded: number;
+  failed: number;
+  failures?: BulkFailure[];
 }
 
 const PAGE_SIZE = 50;
@@ -93,15 +107,46 @@ const EXPORT_PAGE_SIZE = 200;
           <button class="btn ghost" (click)="exportCsv()" [disabled]="exporting()" title="Exports every entry matching the filters">
             {{ exporting() ? 'Exporting…' : 'Export CSV' }}
           </button>
+          @if (failedCount() > 0) {
+            <button class="btn ghost" (click)="clearByStatus('failed')" [disabled]="clearingStatus() !== null">
+              {{ clearingStatus() === 'failed' ? 'Clearing…' : 'Clear failed' }}
+            </button>
+          }
+          @if (completedCount() > 0) {
+            <button class="btn ghost" (click)="clearByStatus('completed')" [disabled]="clearingStatus() !== null">
+              {{ clearingStatus() === 'completed' ? 'Clearing…' : 'Clear completed' }}
+            </button>
+          }
           @if (total() > 0) {
             <button class="btn danger" (click)="clearAll()">Clear all</button>
           }
         </div>
+        @if (selectedIds().size > 0) {
+          <div class="bulk-bar" role="group" aria-label="Bulk actions">
+            <span class="bulk-count" aria-live="polite">{{ selectedIds().size }} selected</span>
+            <button class="btn sm" (click)="bulkRetry()" [disabled]="bulkBusy()">
+              <app-icon name="retry" [size]="11" /> Retry
+            </button>
+            <button class="btn sm danger" (click)="bulkDelete()" [disabled]="bulkBusy()">Delete</button>
+            <button class="btn sm ghost" (click)="clearSelection()" aria-label="Clear selection">
+              <app-icon name="close" [size]="11" />
+            </button>
+          </div>
+        }
       </div>
       <div class="body flush">
         <table class="data">
           <thead>
             <tr>
+              <th class="select-column">
+                <input
+                  type="checkbox"
+                  aria-label="Select all entries on this page"
+                  [checked]="allPageSelected()"
+                  [disabled]="filteredEntries().length === 0"
+                  (change)="toggleSelectAll($event)"
+                />
+              </th>
               <th class="name-column">Name</th>
               <th>Category</th>
               <th>Size</th>
@@ -117,12 +162,23 @@ const EXPORT_PAGE_SIZE = 200;
               <tr
                 class="history-row"
                 [class.selected]="selectedId() === e.id"
+                [class.checked]="selectedIds().has(e.id)"
                 tabindex="0"
                 [attr.aria-expanded]="selectedId() === e.id"
                 (click)="selectEntry(e)"
                 (keydown.enter)="selectEntry(e)"
                 (keydown.space)="$event.preventDefault(); selectEntry(e)"
               >
+                <td class="select-cell" (click)="$event.stopPropagation()">
+                  <input
+                    type="checkbox"
+                    [checked]="selectedIds().has(e.id)"
+                    [attr.aria-label]="'Select ' + e.name"
+                    (change)="toggleSelected(e.id)"
+                    (keydown.enter)="$event.stopPropagation()"
+                    (keydown.space)="$event.stopPropagation()"
+                  />
+                </td>
                 <td class="name-cell">
                   <div class="e-name" [class.dim]="e.status === 'failed'" [title]="e.name">{{ e.name }}</div>
                   @if (e.error_message) {
@@ -163,7 +219,7 @@ const EXPORT_PAGE_SIZE = 200;
               @if (selectedId() === e.id) {
                 @let detail = selectedEntry() || e;
                 <tr class="detail-row">
-                  <td colspan="8">
+                  <td colspan="9">
                     @if (detailLoading()) {
                       <div class="detail-loading">Loading download details…</div>
                     } @else {
@@ -227,18 +283,18 @@ const EXPORT_PAGE_SIZE = 200;
 
             @if (loading()) {
               <tr>
-                <td colspan="8" class="empty-cell">Loading…</td>
+                <td colspan="9" class="empty-cell">Loading…</td>
               </tr>
             } @else if (loadError()) {
               <tr>
-                <td colspan="8" class="empty-cell error-cell" role="alert">
+                <td colspan="9" class="empty-cell error-cell" role="alert">
                   {{ loadError() }}
                   <button class="row-action" (click)="load()">Retry</button>
                 </td>
               </tr>
             } @else if (filteredEntries().length === 0) {
               <tr>
-                <td colspan="8" class="empty-cell">
+                <td colspan="9" class="empty-cell">
                   @if (narrowingFilters()) {
                     No entries match the current filter.
                   } @else if (filterTime === 'all') {
@@ -293,6 +349,15 @@ const EXPORT_PAGE_SIZE = 200;
       display: flex; align-items: center; justify-content: flex-end; gap: 10px;
       padding: 10px 14px; border-top: 1px solid var(--line);
     }
+    .select-column, .select-cell { width: 34px; padding-right: 0 !important; }
+    .select-cell input, .select-column input { cursor: pointer; }
+    .history-row.checked td { background: var(--row-hover); }
+    .bulk-bar {
+      display: flex; align-items: center; gap: 8px;
+      margin: -4px 0 12px; padding: 8px 10px;
+      background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+    }
+    .bulk-count { color: var(--mute); font-size: 12px; margin-right: 4px; }
     .history-row { cursor: pointer; }
     .history-row:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
     .history-row.selected td { background: var(--row-hover); border-bottom-color: transparent; }
@@ -332,11 +397,17 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
   readonly pageSize = PAGE_SIZE;
   exporting = signal(false);
   private categories = signal<string[] | null>(null);
-  private stats = signal<HistoryStats | null>(null);
+  stats = signal<HistoryStats | null>(null);
   private loadSeq = 0;
   private nameDebounce: ReturnType<typeof setTimeout> | null = null;
   selectedId = signal<string | null>(null);
   selectedEntry = signal<HistoryEntry | null>(null);
+  /** Ids ticked for a bulk action on the current page. */
+  selectedIds = signal<Set<string>>(new Set());
+  /** Set while a bulk request is in flight, so a double click cannot repeat it. */
+  bulkBusy = signal(false);
+  /** Status-wide clear in progress: `completed`, `failed` or null. */
+  clearingStatus = signal<'completed' | 'failed' | null>(null);
   detailLoading = signal(false);
   webdavEnabled = signal(false);
   filterStatus: StatusFilter = 'all';
@@ -351,6 +422,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
     private api: ApiService,
     private snack: MatSnackBar,
     private confirmSvc: ConfirmService,
+    private announcer: AnnouncerService,
   ) {}
 
   ngOnInit(): void {
@@ -402,6 +474,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
           return;
         }
         this.entries.set(entries);
+        this.pruneSelection(entries);
         this.total.set(total);
         this.categories.set(r.categories ?? null);
         this.stats.set(r.stats ?? null);
@@ -420,6 +493,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
   onFiltersChanged(): void {
     this.offset.set(0);
     this.closeDetails();
+    this.clearSelection();
     this.load();
   }
 
@@ -522,6 +596,172 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
         st?.avg_duration_secs != null ? this.formatShortDuration(st.avg_duration_secs) : '—',
     };
   });
+
+  // ---- Selection ----
+
+  /** The page's entries are the selection scope; filters change it. */
+  allPageSelected(): boolean {
+    const entries = this.filteredEntries();
+    return entries.length > 0 && entries.every((e) => this.selectedIds().has(e.id));
+  }
+
+  toggleSelected(id: string): void {
+    const next = new Set(this.selectedIds());
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    this.selectedIds.set(next);
+    this.announceSelection();
+  }
+
+  toggleSelectAll(ev: Event): void {
+    if ((ev.target as HTMLInputElement).checked) {
+      this.selectedIds.set(new Set(this.filteredEntries().map((e) => e.id)));
+    } else {
+      this.selectedIds.set(new Set());
+    }
+    this.announceSelection();
+  }
+
+  clearSelection(): void {
+    this.selectedIds.set(new Set());
+    this.announceSelection();
+  }
+
+  /** Spoken count; the visible chip is also a live region with the same text. */
+  private announceSelection(): void {
+    const count = this.selectedIds().size;
+    this.announcer.announce(count === 0 ? 'Selection cleared' : `${count} selected`);
+  }
+
+  /**
+   * Drop ids that are no longer on the page after a reload (deletion,
+   * retention, a filter change), so an action cannot name a row the user
+   * can no longer see.
+   */
+  private pruneSelection(entries: HistoryEntry[]): void {
+    const visible = new Set(entries.map((e) => e.id));
+    const cur = this.selectedIds();
+    const next = new Set([...cur].filter((id) => visible.has(id)));
+    if (next.size !== cur.size) this.selectedIds.set(next);
+  }
+
+  completedCount(): number {
+    return this.stats()?.completed ?? 0;
+  }
+
+  failedCount(): number {
+    return this.stats()?.failed ?? 0;
+  }
+
+  // ---- Bulk actions ----
+
+  /** POST /api/history/bulk; one request, per-id failures in the response. */
+  private runBulk(body: Record<string, unknown>, verb: string, count: number): void {
+    this.bulkBusy.set(true);
+    this.api.post<BulkResult>('/history/bulk', body).subscribe({
+      next: (result) => {
+        this.bulkBusy.set(false);
+        this.clearSelection();
+        const failed = result?.failed ?? 0;
+        if (failed > 0) {
+          const message = `Failed to ${verb} ${failed} of ${count} entr${count === 1 ? 'y' : 'ies'}`;
+          showHttpError(this.snack, this.bulkFailure(result), message);
+          this.announcer.announceError(httpErrorMessage(this.bulkFailure(result), message));
+        } else {
+          const done = this.bulkPast(verb, result?.succeeded ?? count);
+          this.snack.open(done, 'Close', { duration: 2000 });
+          this.announcer.announce(done);
+        }
+        this.load();
+      },
+      error: (err) => {
+        this.bulkBusy.set(false);
+        showHttpError(this.snack, err, `Failed to ${verb} history entries`);
+      },
+    });
+  }
+
+  /** The first per-id failure shaped like an HTTP error, for the toast. */
+  private bulkFailure(result: BulkResult | null): unknown {
+    const first = result?.failures?.[0];
+    if (!first) return null;
+    return {
+      status: first.error?.status ?? 500,
+      error: {
+        human_readable: first.error?.human_readable,
+        error_kind: first.error?.error_kind,
+      },
+    };
+  }
+
+  private bulkPast(verb: string, count: number): string {
+    const noun = count === 1 ? 'entry' : 'entries';
+    return verb === 'delete' ? `Deleted ${count} ${noun}` : `Retrying ${count} ${noun}`;
+  }
+
+  bulkRetry(): void {
+    const ids = Array.from(this.selectedIds());
+    if (ids.length === 0 || this.bulkBusy()) return;
+    this.runBulk({ action: 'retry', ids }, 'retry', ids.length);
+  }
+
+  bulkDelete(): void {
+    const ids = Array.from(this.selectedIds());
+    if (ids.length === 0 || this.bulkBusy()) return;
+    this.confirmSvc
+      .confirm({
+        title: `Delete ${ids.length} history entr${ids.length === 1 ? 'y' : 'ies'}?`,
+        message: 'This removes the history entries. Downloaded files are kept.',
+        confirmLabel: 'Delete',
+        danger: true,
+      })
+      .subscribe((ok) => {
+        if (!ok) return;
+        this.runBulk({ action: 'delete', ids }, 'delete', ids.length);
+      });
+  }
+
+  /**
+   * "Clear failed/completed": every entry of that status matching the
+   * current filters (not just the page). The server reports how many it
+   * removed; the button label carries the count the stat cards show.
+   */
+  clearByStatus(status: 'completed' | 'failed'): void {
+    if (this.clearingStatus() !== null) return;
+    const count = status === 'failed' ? this.failedCount() : this.completedCount();
+    this.confirmSvc
+      .confirm({
+        title: `Clear ${count} ${status} entr${count === 1 ? 'y' : 'ies'}?`,
+        message: `Every ${status} entry in the current time range${
+          this.narrowingFilters() ? ' and filter' : ''
+        } is removed. Downloaded files are kept.`,
+        confirmLabel: `Clear ${status}`,
+        danger: true,
+      })
+      .subscribe((ok) => {
+        if (!ok) return;
+        this.clearingStatus.set(status);
+        const body: Record<string, unknown> = { action: 'delete', status, ids: [] };
+        if (this.filterTime !== 'all') body['days'] = this.filterTime === '7d' ? 7 : 30;
+        if (this.filterCategory) body['category'] = this.filterCategory;
+        const search = this.nameFilter.trim();
+        if (search) body['search'] = search;
+        this.api.post<BulkResult>('/history/bulk', body).subscribe({
+          next: (result) => {
+            this.clearingStatus.set(null);
+            const removed = result?.succeeded ?? 0;
+            const done = `Cleared ${removed} ${status} entr${removed === 1 ? 'y' : 'ies'}`;
+            this.snack.open(done, 'Close', { duration: 2000 });
+            this.announcer.announce(done);
+            this.load();
+          },
+          error: (err) => {
+            this.clearingStatus.set(null);
+            showHttpError(this.snack, err, `Failed to clear ${status} history`);
+          },
+        });
+      });
+  }
 
   retry(id: string): void {
     this.api.post(`/history/${id}/retry`).subscribe({

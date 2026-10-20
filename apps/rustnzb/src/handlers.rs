@@ -1113,10 +1113,14 @@ pub struct HistoryBulkBody {
     #[serde(default)]
     pub ids: Vec<String>,
     /// For `delete` only: also delete every entry with this status
-    /// (`completed` or `failed`). This is "clear completed/failed", and it is
-    /// not narrowed by the caller's UI filters -- the response reports how
-    /// many entries it deleted so the UI can confirm the count first.
+    /// (`completed` or `failed`). This is "clear completed/failed".
     pub status: Option<String>,
+    /// With `status`, narrow the set the same way `GET /api/history` does,
+    /// so the action covers what the caller is looking at rather than all of
+    /// history. Ignored when `ids` are given.
+    pub days: Option<u32>,
+    pub category: Option<String>,
+    pub search: Option<String>,
 }
 
 /// POST /api/history/bulk -- Delete or retry several history entries.
@@ -1153,11 +1157,32 @@ pub async fn h_history_bulk(
             "status is only valid with the `delete` action",
         ));
     }
+    if action == "retry"
+        && (body.days.is_some() || body.category.is_some() || body.search.is_some())
+    {
+        return Err(ApiError::bad_request(
+            "days, category and search are only valid with the `delete` action",
+        ));
+    }
+    if body.days.is_some_and(|d| d > MAX_HISTORY_DAYS) {
+        return Err(ApiError::bad_request("days must be at most 36500"));
+    }
     if status.is_none() && body.ids.is_empty() {
         return Err(ApiError::bad_request("a bulk action needs ids or a status"));
     }
 
     let requested = body.ids;
+    let filter = HistoryFilter {
+        completed_since: body
+            .days
+            .map(|d| chrono::Utc::now() - chrono::Duration::days(i64::from(d))),
+        status,
+        category: body.category.filter(|c| !c.is_empty()),
+        search: body
+            .search
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty()),
+    };
     let (succeeded, failures) = qm_blocking(&state, move |qm| {
         // The explicit ids first, then every entry the status names. An id
         // repeated across the two is acted on once.
@@ -1167,9 +1192,9 @@ pub async fn h_history_bulk(
                 targets.push(id);
             }
         }
-        if let Some(status) = status {
-            for summary in qm.history_summaries(&HistoryFilter::default())? {
-                if summary.status == status && !targets.contains(&summary.id) {
+        if filter.status.is_some() {
+            for summary in qm.history_summaries(&filter)? {
+                if !targets.contains(&summary.id) {
                     targets.push(summary.id);
                 }
             }
