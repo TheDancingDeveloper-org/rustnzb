@@ -128,6 +128,12 @@ impl SabnzbdClient {
     }
 
     /// Return the terminal state of the current run, if the queue has drained.
+    ///
+    /// A drained queue is not enough: SABnzbd reports `Verifying` and
+    /// `Repairing` in history while post-processing runs, and those are
+    /// intermediate. Returning one as terminal truncated a damaged scenario at
+    /// the start of repair, so the comparison column was really "time to
+    /// finish downloading".
     pub async fn terminal_status(&self) -> Result<Option<String>> {
         let queue = self.api_get(&[("mode", "queue")]).await?;
         if queue["queue"]["slots"]
@@ -141,6 +147,7 @@ impl SabnzbdClient {
             .as_array()
             .and_then(|slots| slots.first())
             .and_then(|slot| slot["status"].as_str())
+            .filter(|status| is_terminal_status(status))
             .map(str::to_string))
     }
 
@@ -309,9 +316,15 @@ fn is_valid_api_key(value: &str) -> bool {
     value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// SABnzbd history statuses that end a job. Anything else (`Verifying`,
+/// `Repairing`, `Extracting`, `Moving`, ...) is still in flight.
+fn is_terminal_status(value: &str) -> bool {
+    value.eq_ignore_ascii_case("completed") || value.eq_ignore_ascii_case("failed")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_valid_api_key;
+    use super::{is_terminal_status, is_valid_api_key};
 
     #[test]
     fn accepts_a_sabnzbd_runtime_api_key() {
@@ -322,6 +335,15 @@ mod tests {
     fn rejects_missing_or_malformed_runtime_api_keys() {
         for value in ["", "not-a-key", "0123456789abcdef0123456789abcdeg"] {
             assert!(!is_valid_api_key(value), "{value} must not be accepted");
+        }
+    }
+
+    #[test]
+    fn post_processing_statuses_are_not_terminal() {
+        assert!(is_terminal_status("Completed"));
+        assert!(is_terminal_status("Failed"));
+        for value in ["Verifying", "Repairing", "Extracting", "Moving", "Queued"] {
+            assert!(!is_terminal_status(value), "{value} must not end the run");
         }
     }
 }
