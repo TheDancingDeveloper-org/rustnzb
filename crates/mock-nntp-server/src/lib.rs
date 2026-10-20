@@ -1,4 +1,6 @@
 pub mod damage;
+#[cfg(unix)]
+pub mod fake_unrar;
 pub mod par2;
 
 use std::collections::HashMap;
