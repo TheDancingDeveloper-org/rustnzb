@@ -42,7 +42,9 @@ max_nested_archive_depth = 5  # 0=outer archive only; protects against unbounded
 # article_timeout_secs = 30      # 0 = no timeout; the API accepts at most 3600
 # Post-processing hooks run without a shell, with a bounded timeout and output capture.
 # They get SABnzbd's positional arguments (final dir, NZB name, job name, report,
-# category, group, status code 0-3, URL) plus SAB_* and NZBPP_* environment variables.
+# category, group, status code 0-3, URL) plus the full SAB_* and NZBPP_* environment
+# variables, with SABnzbd's empty-string defaults for names rustnzb does not track.
+# See docs/CONFIGURATION.md for the complete variable list.
 # SABnzbd's change_complete_action can name a script_<name> from scripts_dir to run
 # once the queue drains; power actions are refused.
 # queue_complete_pers = false    # keep change_complete_action after it runs once (SABnzbd default: reset)

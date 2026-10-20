@@ -8,6 +8,12 @@ const STORAGE_KEY = 'rustnzb-browser-notifications';
 const SEEN_LIMIT = 200;
 /** Newest history rows fetched when checking for outcomes. */
 const CHECK_PAGE_SIZE = '20';
+/**
+ * How often to look for outcomes without a queue shrink. A job that finishes
+ * in the same poll window as another job is added leaves the queue size
+ * unchanged, so the shrink signal alone can miss it.
+ */
+const FALLBACK_CHECK_MS = 60_000;
 
 export interface BrowserNotice {
   /** History id for completed or failed jobs; stable tag for other alerts. */
@@ -68,6 +74,7 @@ export class BrowserNotificationsService {
   private seen: Set<string> | null = null;
   private lastQueueSize: number | null = null;
   private lastPauseReason: PauseReason | null = null;
+  private lastCheck = 0;
   private checking = false;
 
   /**
@@ -84,7 +91,13 @@ export class BrowserNotificationsService {
 
     let permission = Notification.permission;
     if (permission === 'default') {
-      permission = await Notification.requestPermission();
+      try {
+        permission = await Notification.requestPermission();
+      } catch {
+        // Some browsers reject the request (no user gesture, embedded
+        // frame, policy). Treat it as a refusal rather than throwing.
+        permission = 'denied';
+      }
     }
     this.permission.set(permission);
 
@@ -95,7 +108,22 @@ export class BrowserNotificationsService {
     // are recorded, not announced.
     this.seen = null;
     this.lastQueueSize = null;
+    this.lastCheck = 0;
     return granted;
+  }
+
+  /**
+   * Re-read the browser's permission. Permission can be revoked in the
+   * browser's site settings while the page is open, so the switch must stop
+   * claiming alerts are on. Called when the tab becomes visible again.
+   */
+  refreshPermission(): void {
+    const permission = this.currentPermission();
+    this.permission.set(permission);
+    if (this.enabled() && permission !== 'granted') {
+      this.store(false);
+      this.enabled.set(false);
+    }
   }
 
   /** Feed each successful status poll into the alert logic. */
@@ -115,14 +143,19 @@ export class BrowserNotificationsService {
         body: 'Free space on a storage volume is below the minimum.',
       });
     }
-    if (this.seen === null || queueShrank) {
+    if (this.seen === null || queueShrank || this.fallbackDue()) {
       this.checkHistory();
     }
+  }
+
+  private fallbackDue(): boolean {
+    return Date.now() - this.lastCheck >= FALLBACK_CHECK_MS;
   }
 
   private checkHistory(): void {
     if (this.checking) return;
     this.checking = true;
+    this.lastCheck = Date.now();
     this.api.get<HistoryPage>('/history', { offset: '0', limit: CHECK_PAGE_SIZE }).subscribe({
       next: (page) => {
         this.checking = false;

@@ -542,46 +542,191 @@ fn postproc_script_args(job: &NzbJob, stages: &[StageResult]) -> Vec<String> {
     ]
 }
 
-/// Environment for a post-processing script: the `SAB_*` names RustNZB has
-/// always sent, and the `NZBPP_*` names SABnzbd scripts read. The `NZBPP_*`
-/// set is a subset of SABnzbd's: identity, directory, category, outcome, size
-/// and the verify and unpack flags.
+/// Environment for a post-processing script.
+///
+/// It carries three families of names. The `SAB_*` variables follow
+/// SABnzbd's script contract, so a SABnzbd script that reads them works
+/// unchanged; every variable SABnzbd always sets is present, empty when
+/// RustNZB has no truthful value, because a missing key raises `KeyError`
+/// in a Python script. `NZBPP_*` follows NZBGet's contract, including the
+/// numeric `PARSTATUS`/`UNPACKSTATUS` codes and the `SUCCESS/ALL` shape of
+/// `NZBPP_STATUS`. `SAB_JOB`, `SAB_COMPLETE` and `RUSTNZB_STATUS` are the
+/// names RustNZB has always sent and are kept for scripts already using
+/// them.
 fn postproc_script_env(
     job: &NzbJob,
     final_status: JobStatus,
     stages: &[StageResult],
+    script: &std::path::Path,
+    pp_level: u8,
 ) -> Vec<(&'static str, String)> {
-    let file_list = regular_output_files(&job.output_dir)
-        .iter()
-        .map(|path| path.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let code = postproc_status_code(stages);
-    let outcome = if final_status == JobStatus::Completed {
-        "SUCCESS"
-    } else {
-        "FAILURE"
-    };
     let directory = job.output_dir.to_string_lossy().into_owned();
+    let code = postproc_status_code(stages);
+    let success = final_status == JobStatus::Completed;
+    let password = job.password.clone().unwrap_or_default();
+    let group = job
+        .files
+        .iter()
+        .find_map(|file| file.groups.first().cloned())
+        .unwrap_or_default();
+    let script_name = script
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let total_status = if success { "SUCCESS" } else { "FAILURE" };
     vec![
-        ("SAB_STATUS", final_status.to_string()),
-        ("SAB_JOB", job.name.clone()),
-        ("SAB_CAT", job.category.clone()),
+        // SABnzbd always sets these, so they are always present here.
+        ("SAB_SCRIPT", script_name),
+        ("SAB_NZO_ID", job.id.clone()),
+        ("SAB_FINAL_NAME", job.name.clone()),
         ("SAB_FILENAME", job.name.clone()),
+        ("SAB_COMPLETE_DIR", directory.clone()),
         ("SAB_COMPLETE", directory.clone()),
+        ("SAB_CAT", job.category.clone()),
+        ("SAB_STATUS", final_status.to_string()),
+        (
+            "SAB_FAIL_MSG",
+            if success {
+                String::new()
+            } else {
+                job.error_message.clone().unwrap_or_default()
+            },
+        ),
         ("SAB_BYTES", job.total_bytes.to_string()),
+        ("SAB_BYTES_TRIED", job.total_bytes.to_string()),
         ("SAB_BYTES_DOWNLOADED", job.downloaded_bytes.to_string()),
-        ("SAB_FILES", file_list),
-        ("RUSTNZB_STATUS", final_status.to_string()),
+        ("SAB_PP_STATUS", code.to_string()),
+        ("SAB_PP", pp_level.to_string()),
+        ("SAB_REPAIR", u8::from(pp_level & 1 != 0).to_string()),
+        ("SAB_UNPACK", u8::from(pp_level & 2 != 0).to_string()),
+        ("SAB_PRIORITY", sab_priority(job.priority).to_string()),
+        ("SAB_GROUP", group),
+        ("SAB_PASSWORD", password.clone()),
+        (
+            "SAB_CORRECT_PASSWORD",
+            if success { password } else { String::new() },
+        ),
+        ("SAB_FILES", sab_files_json(job)),
+        // RustNZB verifies and repairs PAR2 natively, so there is no
+        // par2cmdline to name.
+        ("SAB_PAR2_COMMAND", String::new()),
+        ("SAB_RAR_COMMAND", sab_tool(nzb_postproc::find_unrar)),
+        ("SAB_7ZIP_COMMAND", sab_tool(nzb_postproc::unpack::find_7z)),
+        ("SAB_JOB", job.name.clone()),
+        // Declared so a script that reads the key does not crash. RustNZB
+        // does not track these.
+        ("SAB_URL", String::new()),
+        ("SAB_FAILURE_URL", String::new()),
+        ("SAB_AGE", String::new()),
+        ("SAB_AVG_BPS", String::new()),
+        ("SAB_DOWNLOAD_TIME", String::new()),
+        ("SAB_ORIG_NZB_GZ", String::new()),
+        ("SAB_DUPLICATE", String::new()),
+        ("SAB_DUPLICATE_KEY", String::new()),
+        ("SAB_UNWANTED_EXT", "0".to_string()),
+        ("SAB_OVERSIZED", "0".to_string()),
+        ("SAB_ENCRYPTED", "0".to_string()),
+        // NZBGet's contract. `NZBPP_STATUS` is `<TOTALSTATUS>/<detail>`.
         ("NZBPP_NZBID", job.id.clone()),
         ("NZBPP_NZBNAME", job.name.clone()),
-        ("NZBPP_DIRECTORY", directory),
+        ("NZBPP_NZBFILENAME", job.name.clone()),
+        ("NZBPP_DIRECTORY", directory.clone()),
+        ("NZBPP_FINALDIR", directory),
         ("NZBPP_CATEGORY", job.category.clone()),
-        ("NZBPP_STATUS", outcome.to_string()),
+        ("NZBPP_TOTALSTATUS", total_status.to_string()),
+        (
+            "NZBPP_STATUS",
+            nzbpp_status(total_status, stages, success).to_string(),
+        ),
+        ("NZBPP_SCRIPTSTATUS", "NONE".to_string()),
         ("NZBPP_TOTALSIZE", job.total_bytes.to_string()),
-        ("NZBPP_PARSTATUS", u8::from((code & 1) != 0).to_string()),
-        ("NZBPP_UNPACKSTATUS", u8::from((code & 2) != 0).to_string()),
+        ("NZBPP_PARSTATUS", nzbpp_par_status(stages).to_string()),
+        (
+            "NZBPP_UNPACKSTATUS",
+            nzbpp_unpack_status(stages).to_string(),
+        ),
+        ("RUSTNZB_STATUS", final_status.to_string()),
     ]
+}
+
+/// A tool path for `SAB_*_COMMAND`, empty when the tool is absent — as
+/// SABnzbd sends an empty `SAB_7ZIP_COMMAND` when 7-Zip is not installed.
+fn sab_tool(find: impl FnOnce() -> Option<String>) -> String {
+    find().unwrap_or_default()
+}
+
+/// SABnzbd's priority numbering: Low -1, Normal 0, High 1, Force 2.
+fn sab_priority(priority: Priority) -> i8 {
+    match priority {
+        Priority::Low => -1,
+        Priority::Normal => 0,
+        Priority::High => 1,
+        Priority::Force => 2,
+    }
+}
+
+/// `SAB_FILES`: a JSON array of the files the job produced, relative to
+/// `SAB_COMPLETE_DIR`, as SABnzbd sends them.
+fn sab_files_json(job: &NzbJob) -> String {
+    let files: Vec<String> = regular_output_files(&job.output_dir)
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&job.output_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    serde_json::to_string(&files).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// NZBGet's `NZBPP_STATUS`: `<TOTALSTATUS>/<detail>`.
+fn nzbpp_status(total: &str, stages: &[StageResult], success: bool) -> String {
+    if success {
+        return "SUCCESS/ALL".to_string();
+    }
+    let failed = |name: &str| {
+        stages
+            .iter()
+            .any(|stage| stage.name == name && stage.status == StageStatus::Failed)
+    };
+    let detail = if failed("Verify") || failed("Repair") {
+        "PAR"
+    } else if failed("Extract") {
+        "UNPACK"
+    } else {
+        "HEALTH"
+    };
+    format!("{total}/{detail}")
+}
+
+/// NZBGet's `NZBPP_PARSTATUS`: 0 not checked, 1 checked and failed, 2
+/// checked successfully (repaired or already intact).
+fn nzbpp_par_status(stages: &[StageResult]) -> u8 {
+    let ran = stages.iter().any(|stage| {
+        (stage.name == "Verify" || stage.name == "Repair") && stage.status != StageStatus::Skipped
+    });
+    if !ran {
+        return 0;
+    }
+    let failed = stages.iter().any(|stage| {
+        (stage.name == "Verify" || stage.name == "Repair") && stage.status == StageStatus::Failed
+    });
+    if failed { 1 } else { 2 }
+}
+
+/// NZBGet's `NZBPP_UNPACKSTATUS`: 0 not run, 1 failed, 2 succeeded.
+/// NZBGet's 3 (write error) and 4 (wrong password) are not distinguishable
+/// from the stage result.
+fn nzbpp_unpack_status(stages: &[StageResult]) -> u8 {
+    match stages
+        .iter()
+        .find(|stage| stage.name == "Extract" && stage.status != StageStatus::Skipped)
+    {
+        None => 0,
+        Some(stage) if stage.status == StageStatus::Failed => 1,
+        Some(_) => 2,
+    }
 }
 
 /// SABnzbd's post-processing status code: 0 when verification and extraction
@@ -3794,7 +3939,8 @@ impl QueueManager {
         };
 
         let args = postproc_script_args(&job, stages);
-        let env = postproc_script_env(&job, final_status, stages);
+        let pp_level = self.post_processing_level(&job);
+        let env = postproc_script_env(&job, final_status, stages, &script, pp_level);
         Some(
             run_bounded_script(
                 &script,
@@ -6984,7 +7130,7 @@ mod global_pause_tests {
             "NZBPP_NZBID=script-job".to_string(),
             "NZBPP_NZBNAME=script-job".to_string(),
             "NZBPP_PARSTATUS=0".to_string(),
-            "NZBPP_STATUS=SUCCESS".to_string(),
+            "NZBPP_STATUS=SUCCESS/ALL".to_string(),
             "NZBPP_UNPACKSTATUS=0".to_string(),
             "SAB_CAT=tv".to_string(),
             "SAB_STATUS=Completed".to_string(),
@@ -6994,6 +7140,140 @@ mod global_pause_tests {
                 "missing {expected}: {recorded}"
             );
         }
+    }
+
+    /// A failed job's script sees the failure in both contracts: SABnzbd's
+    /// `SAB_FAIL_MSG`/`SAB_STATUS` and NZBGet's `NZBPP_TOTALSTATUS` and
+    /// `<TOTAL>/<detail>` status.
+    #[tokio::test]
+    async fn postproc_script_env_reports_a_failure_with_a_repair_detail() {
+        let (manager, tempdir) = manager();
+        let record = tempdir.path().join("record.txt");
+        let script = tempdir.path().join("record.sh");
+        let body = format!(
+            "#!/bin/sh\nenv | grep -E '^(NZBPP|SAB)_' | sort > {}\n",
+            record.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        manager.set_postproc_scripts(None, None, Some(script), 5, 4096);
+        let mut broken = job("broken-job", JobStatus::Failed, tempdir.path());
+        broken.error_message = Some("3 blocks could not be repaired".into());
+        broken.output_dir = tempdir.path().join("output");
+        std::fs::create_dir_all(&broken.output_dir).unwrap();
+        insert_job(&manager, broken);
+
+        let stages = [StageResult {
+            name: "Repair".into(),
+            status: StageStatus::Failed,
+            message: Some("not enough recovery blocks".into()),
+            duration_secs: 0.0,
+        }];
+        let stage = manager
+            .run_postproc_script("broken-job", JobStatus::Failed, &stages)
+            .await
+            .unwrap();
+        assert_eq!(stage.status, StageStatus::Success, "{stage:?}");
+
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        for expected in [
+            "SAB_STATUS=Failed",
+            "SAB_FAIL_MSG=3 blocks could not be repaired",
+            "SAB_PP_STATUS=1",
+            "NZBPP_TOTALSTATUS=FAILURE",
+            "NZBPP_STATUS=FAILURE/PAR",
+            "NZBPP_PARSTATUS=1",
+            "NZBPP_UNPACKSTATUS=0",
+        ] {
+            assert!(
+                recorded.lines().any(|line| line == expected),
+                "missing {expected}: {recorded}"
+            );
+        }
+    }
+
+    /// A successful unpack reports success in NZBGet's numeric codes, and a
+    /// failed extraction is `FAILURE/UNPACK` rather than a repair failure.
+    #[test]
+    fn nzbpp_codes_describe_the_stage_that_ran() {
+        let stage = |name: &str, status: StageStatus| StageResult {
+            name: name.into(),
+            status,
+            message: None,
+            duration_secs: 0.0,
+        };
+        let unpacked = [
+            stage("Verify", StageStatus::Success),
+            stage("Extract", StageStatus::Success),
+        ];
+        assert_eq!(nzbpp_par_status(&unpacked), 2);
+        assert_eq!(nzbpp_unpack_status(&unpacked), 2);
+        assert_eq!(nzbpp_status("SUCCESS", &unpacked, true), "SUCCESS/ALL");
+
+        let failed_unpack = [
+            stage("Verify", StageStatus::Success),
+            stage("Extract", StageStatus::Failed),
+        ];
+        assert_eq!(nzbpp_par_status(&failed_unpack), 2);
+        assert_eq!(nzbpp_unpack_status(&failed_unpack), 1);
+        assert_eq!(
+            nzbpp_status("FAILURE", &failed_unpack, false),
+            "FAILURE/UNPACK"
+        );
+
+        // No stages means nothing ran, not a successful check.
+        assert_eq!(nzbpp_par_status(&[]), 0);
+        assert_eq!(nzbpp_unpack_status(&[]), 0);
+        // A skipped verify is not a check; the job reported no PAR2 work.
+        let skipped = [stage("Verify", StageStatus::Skipped)];
+        assert_eq!(nzbpp_par_status(&skipped), 0);
+        assert_eq!(nzbpp_unpack_status(&skipped), 0);
+    }
+
+    /// `SAB_FILES` is SABnzbd's JSON array, relative to the complete
+    /// directory, and the priority and job level use their own numbering.
+    #[test]
+    fn sab_files_and_priority_follow_sabnzbd() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let output = tempdir.path().join("output");
+        std::fs::create_dir_all(output.join("nested")).unwrap();
+        std::fs::write(output.join("a.mkv"), b"a").unwrap();
+        std::fs::write(output.join("nested/b.srt"), b"b").unwrap();
+
+        let mut completed = job("files-job", JobStatus::Completed, tempdir.path());
+        completed.output_dir = output;
+        completed.priority = Priority::High;
+        completed.pp_override = Some(2);
+
+        let env = postproc_script_env(
+            &completed,
+            JobStatus::Completed,
+            &[],
+            std::path::Path::new("/scripts/post.sh"),
+            2,
+        );
+        let value = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+
+        let files: Vec<String> = serde_json::from_str(value("SAB_FILES")).unwrap();
+        assert_eq!(files, ["a.mkv", "nested/b.srt"]);
+        assert_eq!(value("SAB_PRIORITY"), "1");
+        assert_eq!(value("SAB_PP"), "2");
+        assert_eq!(value("SAB_REPAIR"), "0");
+        assert_eq!(value("SAB_UNPACK"), "1");
+        assert_eq!(value("SAB_SCRIPT"), "post.sh");
+
+        assert_eq!(sab_priority(Priority::Low), -1);
+        assert_eq!(sab_priority(Priority::Normal), 0);
+        assert_eq!(sab_priority(Priority::Force), 2);
     }
 
     #[test]

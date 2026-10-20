@@ -121,7 +121,71 @@ The container image (built on the linuxserver.io Alpine base) also reads:
 
 Scripts run without a shell, with SABnzbd's positional arguments (final
 directory, NZB name, job name, report number, category, group, status 0-3,
-URL) and `SAB_*` / `NZBPP_*` environment variables.
+URL) and `SAB_*` / `NZBPP_*` environment variables, described below.
+
+### Script environment
+
+Two contracts are sent at once, so a script written for either downloader
+runs unchanged. Every name SABnzbd attaches to the job is always present
+here, empty when rustnzb has no truthful value, because a missing key raises
+`KeyError` in a Python script.
+
+Four of SABnzbd's global names are deliberately not set, because rustnzb has
+nothing truthful to put in them: `SAB_VERSION`, `SAB_PROGRAM_DIR`,
+`SAB_API_URL` and `SAB_API_KEY`. Read them with a default
+(`os.environ.get("SAB_VERSION")`) rather than by index. The API key is left
+out on purpose: a script's environment is visible in `/proc`, and a script has
+no need for the key to work on the files it was given.
+
+SABnzbd's names:
+
+| Variable | Value |
+|----------|-------|
+| `SAB_SCRIPT` | File name of the script being run. |
+| `SAB_NZO_ID` | Job id, the same id the API uses. |
+| `SAB_FINAL_NAME`, `SAB_FILENAME`, `SAB_JOB` | The job's name. |
+| `SAB_COMPLETE_DIR`, `SAB_COMPLETE` | The job's final directory. |
+| `SAB_CAT` | Category, empty when the job has none. |
+| `SAB_STATUS` | `Completed` or `Failed`, the job's outcome. (SABnzbd sends `Running` while the script itself runs; rustnzb keeps its existing outcome value.) |
+| `SAB_FAIL_MSG` | The failure reason, empty on success. |
+| `SAB_BYTES` | Total NZB size in bytes. |
+| `SAB_BYTES_DOWNLOADED` | Bytes downloaded successfully. |
+| `SAB_BYTES_TRIED` | Bytes attempted; rustnzb attempts the whole NZB, so this is the total size. |
+| `SAB_PP_STATUS` | SABnzbd's code: 0 verified and unpacked, 1 verify/repair failed, 2 unpack failed, 3 both. |
+| `SAB_PP` | Post-processing level: 0 none, 1 repair, 2 unpack, 3 both. |
+| `SAB_REPAIR`, `SAB_UNPACK` | `1` when that level includes the step, else `0`. |
+| `SAB_PRIORITY` | SABnzbd's numbering: Low `-1`, Normal `0`, High `1`, Force `2`. |
+| `SAB_GROUP` | First newsgroup of the first file, empty when unknown. |
+| `SAB_PASSWORD` | The job's password, empty when it has none. |
+| `SAB_CORRECT_PASSWORD` | The password when the job succeeded, else empty. |
+| `SAB_FILES` | JSON array of files produced, relative to `SAB_COMPLETE_DIR`. |
+| `SAB_PAR2_COMMAND` | Empty: rustnzb verifies and repairs PAR2 itself. |
+| `SAB_RAR_COMMAND`, `SAB_7ZIP_COMMAND` | `unrar` and 7-Zip paths, empty when not installed. |
+
+The remaining SABnzbd names are declared empty (or `0` for the flags) so a
+script that reads them does not crash: `SAB_URL`, `SAB_FAILURE_URL`,
+`SAB_AGE`, `SAB_AVG_BPS`, `SAB_DOWNLOAD_TIME`, `SAB_ORIG_NZB_GZ`,
+`SAB_DUPLICATE`, `SAB_DUPLICATE_KEY`, `SAB_UNWANTED_EXT`, `SAB_OVERSIZED`
+and `SAB_ENCRYPTED`.
+
+NZBGet's names, including its numeric status codes:
+
+| Variable | Value |
+|----------|-------|
+| `NZBPP_NZBID` | Job id. |
+| `NZBPP_NZBNAME`, `NZBPP_NZBFILENAME` | The job's name. |
+| `NZBPP_DIRECTORY`, `NZBPP_FINALDIR` | The job's final directory. |
+| `NZBPP_CATEGORY` | Category, empty when the job has none. |
+| `NZBPP_TOTALSTATUS` | `SUCCESS` or `FAILURE`. |
+| `NZBPP_STATUS` | `<TOTALSTATUS>/<detail>`, where detail is `ALL` on success, `PAR` for a verify or repair failure, `UNPACK` for an extraction failure, and `HEALTH` otherwise. |
+| `NZBPP_SCRIPTSTATUS` | `NONE`: the script is running, so there is no result yet. |
+| `NZBPP_TOTALSIZE` | Total NZB size in bytes. |
+| `NZBPP_PARSTATUS` | 0 not checked, 1 checked and failed, 2 checked successfully. |
+| `NZBPP_UNPACKSTATUS` | 0 not run, 1 failed, 2 succeeded. NZBGet's 3 (write error) and 4 (wrong password) are not distinguishable, so a failure is always 1. |
+
+`RUSTNZB_STATUS` repeats `SAB_STATUS` for scripts already using it. A
+SABnzbd script that needs a name rustnzb does not track reads an empty
+string rather than failing.
 
 ## `[[servers]]`
 
