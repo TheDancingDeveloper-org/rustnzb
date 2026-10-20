@@ -1,12 +1,11 @@
 name: CI
 
 # Pull requests run only the areas their diff touches (see `changes`). The
-# merge queue (merge_group), pushes to main and manual runs run everything.
+# merge queue (merge_group) and manual runs run everything. There is no push
+# trigger: the queue already tested the exact tree a merge lands on main.
 # Required checks are skipped, never absent, so a skipped area still reports
 # success. See docs/ci.md.
 on:
-  push:
-    branches: [main]
   pull_request:
   merge_group:
   workflow_dispatch:

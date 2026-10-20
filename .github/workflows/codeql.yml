@@ -9,11 +9,11 @@ name: CodeQL
 # no compiler/toolchain step is needed; a single label set covers both.
 
 on:
-  push:
-    branches: [main]
   # A PR analyses only the languages its diff touches; the other language's
   # required `Analyze (...)` context still posts, with its steps skipped. The
-  # merge queue, main and the weekly schedule analyse everything.
+  # merge queue and the weekly schedule analyse everything. There is no push
+  # trigger: the queue already analysed the tree a merge lands on main, and the
+  # weekly schedule keeps the default-branch baseline current.
   pull_request:
   merge_group:
   schedule:
