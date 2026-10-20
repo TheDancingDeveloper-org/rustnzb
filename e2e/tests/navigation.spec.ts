@@ -53,12 +53,10 @@ test.describe("11. Navigation & Shell", () => {
     const pills = page.locator(".pill");
     await expect(pills.first()).toBeVisible();
 
-    // At least one pill should contain connection/daemon state text
-    const statusText = await pills.allInnerTexts();
-    const hasConnectionState = statusText.some((t) =>
-      /Daemon running|Connected|Paused|Connecting|Live/i.test(t),
-    );
-    expect(hasConnectionState).toBeTruthy();
+    // The state pill shows a placeholder until the first /status poll lands,
+    // so wait for it to settle on a daemon state rather than reading it once.
+    const statePill = page.locator(".status .pill[role=status]");
+    await expect(statePill).toHaveText(/Live|Paused/);
   });
 
   // ── 11.4 Tab links navigate to the correct routes ─────────────────────────

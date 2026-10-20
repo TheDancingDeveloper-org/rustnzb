@@ -158,8 +158,12 @@ if [ "$copy_workspace" = true ]; then
     docker "${create_args[@]}" --name "$container" "$image" \
         "/woodpecker/src/ci/tasks/$task" "${task_args[@]}" >/dev/null
     docker cp "$ROOT/." "$container:/woodpecker/src"
-    docker start -a "$container"
-    exit $?
+    status=0
+    docker start -a "$container" || status=$?
+    # Tasks write failure artifacts under .ci-artifacts; copy them out before
+    # the container is removed so the CI upload step can find them.
+    docker cp "$container:/woodpecker/src/.ci-artifacts/." "$ROOT/.ci-artifacts" >/dev/null 2>&1 || true
+    exit "$status"
 fi
 
 exec docker "${docker_args[@]}" "$image" "/woodpecker/src/ci/tasks/$task" "${task_args[@]}"
