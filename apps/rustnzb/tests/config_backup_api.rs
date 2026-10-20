@@ -14,6 +14,11 @@ use support::{TestApp, start_test_server};
 const API_KEY: &str = "backup-api-key-7a1";
 const SERVER_PASSWORD: &str = "backup-server-password-7b2";
 const PROXY_SECRET: &str = "backup-proxy-secret-7c3";
+const RSS_KEY: &str = "backup-rss-key-7d4";
+const NTFY_TOPIC: &str = "backup-ntfy-topic-7e5";
+const OTEL_SECRET: &str = "backup-otel-secret-7f6";
+
+const RSS_URL: &str = "https://indexer.example/rss?t=2000&apikey=backup-rss-key-7d4";
 
 async fn setup(client: &reqwest::Client, base_url: &str) -> String {
     let response = client
@@ -52,6 +57,20 @@ async fn seeded_app() -> TestApp {
                     output_dir: Some("tv".into()),
                     ..Default::default()
                 });
+            config
+                .rss_feeds
+                .push(nzb_web::nzb_core::config::RssFeedConfig {
+                    name: "daily".into(),
+                    url: RSS_URL.into(),
+                    poll_interval_secs: 900,
+                    category: None,
+                    filter_regex: None,
+                    enabled: true,
+                    auto_download: false,
+                    max_age_days: None,
+                });
+            config.notifications.ntfy_topic = NTFY_TOPIC.into();
+            config.otel.endpoint = format!("https://collector:{OTEL_SECRET}@otel.example:4317");
             Ok::<_, anyhow::Error>(())
         })
         .unwrap();
@@ -89,7 +108,14 @@ async fn export(client: &reqwest::Client, base_url: &str, token: &str, secrets: 
 }
 
 fn assert_no_secret(text: &str) {
-    for secret in [API_KEY, SERVER_PASSWORD, PROXY_SECRET] {
+    for secret in [
+        API_KEY,
+        SERVER_PASSWORD,
+        PROXY_SECRET,
+        RSS_KEY,
+        NTFY_TOPIC,
+        OTEL_SECRET,
+    ] {
         assert!(!text.contains(secret), "a masked export leaked {secret}");
     }
 }
@@ -130,7 +156,74 @@ async fn masked_export_carries_no_secret_and_says_which_it_is() {
     let with_secrets = export(&client, &app.base_url, &token, true).await;
     assert!(with_secrets.contains(API_KEY));
     assert!(with_secrets.contains(SERVER_PASSWORD));
+    assert!(with_secrets.contains(RSS_KEY));
     assert!(with_secrets.contains("secrets_included = true"));
+}
+
+#[tokio::test]
+async fn a_masked_export_masks_indexer_keys_and_ntfy_topics() {
+    let app = seeded_app().await;
+    let client = reqwest::Client::new();
+    let token = setup(&client, &app.base_url).await;
+
+    let body = export(&client, &app.base_url, &token, false).await;
+    assert_no_secret(&body);
+    let document = config_backup::parse(&body).expect("a valid backup");
+    assert_eq!(document.config.rss_feeds.len(), 1);
+    assert_eq!(
+        document.config.rss_feeds[0].url,
+        "https://indexer.example/rss?********"
+    );
+    assert_eq!(
+        document.config.notifications.ntfy_topic,
+        config_backup::SECRET_MASK
+    );
+    assert_eq!(
+        document.config.otel.endpoint,
+        "https://********@otel.example:4317"
+    );
+    // Before a merge the masks are exactly what validate refuses to save;
+    // the restore path merges them against the install first.
+    assert!(
+        config_backup::validate(&document.config)
+            .iter()
+            .any(|p| p.contains("rss_feeds[0]")),
+        "a masked feed URL must not be saveable as-is"
+    );
+}
+
+#[tokio::test]
+async fn restoring_a_masked_export_keeps_feed_urls_and_topics() {
+    let app = seeded_app().await;
+    let client = reqwest::Client::new();
+    let token = setup(&client, &app.base_url).await;
+    let body = export(&client, &app.base_url, &token, false).await;
+
+    let restored = post_backup(&client, &app.base_url, &token, "restore", &body).await;
+    assert_eq!(restored.status(), StatusCode::OK);
+    let restored: serde_json::Value = restored.json().await.unwrap();
+    assert!(
+        restored["summary"]["warnings"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{restored}"
+    );
+    assert_eq!(restored["summary"]["rss_feed_count"], 1, "{restored}");
+
+    let config = app.state.config();
+    assert_eq!(config.rss_feeds[0].url, RSS_URL);
+    assert_eq!(config.notifications.ntfy_topic, NTFY_TOPIC);
+    assert_eq!(
+        config.otel.endpoint,
+        format!("https://collector:{OTEL_SECRET}@otel.example:4317")
+    );
+    let saved = std::fs::read_to_string(&app.config_path).unwrap();
+    assert!(
+        saved.contains(RSS_KEY),
+        "the stored feed key was not restored"
+    );
+    assert!(!saved.contains("********"));
 }
 
 #[tokio::test]
@@ -155,7 +248,7 @@ async fn restore_of_a_masked_export_keeps_this_installs_secrets() {
     assert_eq!(preview.status(), StatusCode::OK);
     let preview: serde_json::Value = preview.json().await.unwrap();
     assert_eq!(preview["restored"], false);
-    assert_eq!(preview["summary"]["secrets_kept"], 3, "{preview}");
+    assert_eq!(preview["summary"]["secrets_kept"], 6, "{preview}");
     assert!(
         preview["summary"]["warnings"]
             .as_array()
@@ -169,7 +262,7 @@ async fn restore_of_a_masked_export_keeps_this_installs_secrets() {
     assert_eq!(restored.status(), StatusCode::OK);
     let restored: serde_json::Value = restored.json().await.unwrap();
     assert_eq!(restored["restored"], true);
-    assert_eq!(restored["summary"]["secrets_kept"], 3, "{restored}");
+    assert_eq!(restored["summary"]["secrets_kept"], 6, "{restored}");
     assert_eq!(restored["summary"]["server_count"], 1);
     assert_eq!(restored["restored"], true);
 
@@ -228,10 +321,11 @@ async fn a_masked_restore_onto_a_fresh_install_reports_what_it_could_not_keep() 
     assert_eq!(restored.status(), StatusCode::OK);
     let restored: serde_json::Value = restored.json().await.unwrap();
     assert_eq!(restored["summary"]["secrets_kept"], 0, "{restored}");
-    // general.api_key, the server password and its proxy URL were masked.
+    // general.api_key, the server password, its proxy URL, the RSS feed URL,
+    // the ntfy topic and the OTel endpoint were masked.
     assert_eq!(
         restored["summary"]["warnings"].as_array().unwrap().len(),
-        3,
+        6,
         "{restored}"
     );
     let config = target.state.config();
@@ -239,6 +333,12 @@ async fn a_masked_restore_onto_a_fresh_install_reports_what_it_could_not_keep() 
     assert_eq!(config.servers.len(), 1);
     assert!(config.servers[0].password.is_none());
     assert!(config.servers[0].proxy_url.is_none());
+    assert!(
+        config.rss_feeds.is_empty(),
+        "a feed with no URL to keep is dropped"
+    );
+    assert!(config.notifications.ntfy_topic.is_empty());
+    assert_eq!(config.otel.endpoint, "http://localhost:4317");
     let saved = std::fs::read_to_string(&target.config_path).unwrap();
     assert!(!saved.contains(config_backup::SECRET_MASK));
 }

@@ -2472,15 +2472,13 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
             filenameFromDisposition(response.headers.get('Content-Disposition')) ||
             `rustnzb-backup-${new Date().toISOString().slice(0, 10)}.toml`;
           saveText(filename, body);
-          this.snack.open(
+          this.toast.info(
             includeSecrets ? 'Backup downloaded — it contains secrets' : 'Backup downloaded',
-            'Close',
-            { duration: 3000 },
           );
         },
         error: (err) => {
           this.backupBusy = false;
-          showHttpError(this.snack, err, 'Failed to download backup');
+          showHttpError(this.toast, err, 'Failed to download backup');
         },
       });
   }
@@ -2530,7 +2528,7 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
         this.backupPreview = null;
         this.backupPreviewText = '';
         this.backupError = httpErrorMessage(err, 'This backup was refused');
-        showHttpError(this.snack, err, 'This backup was refused');
+        showHttpError(this.toast, err, 'This backup was refused');
       },
     });
   }
@@ -2570,19 +2568,20 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
             this.backupPreview = restored;
             this.backupPreviewText = text;
             this.reloadAfterRestore();
-            this.snack.open(
-              restored.restart_required.length
-                ? 'Configuration restored. Restart to apply: ' +
-                    restored.restart_required.join(', ')
-                : 'Configuration restored',
-              'Close',
-              { duration: restored.restart_required.length ? 6000 : 3000 },
-            );
+            if (restored.restart_required.length) {
+              this.toast.info(
+                'Configuration restored. Restart to apply: ' +
+                  restored.restart_required.join(', '),
+                6000,
+              );
+            } else {
+              this.toast.success('Configuration restored');
+            }
           },
           error: (err) => {
             this.backupBusy = false;
             this.backupError = httpErrorMessage(err, 'Restore failed');
-            showHttpError(this.snack, err, 'Restore failed');
+            showHttpError(this.toast, err, 'Restore failed');
           },
         });
       });
