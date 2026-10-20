@@ -22,7 +22,18 @@
 //!
 //! Memory: `rows × slice_size`, never more than [`MAX_ROW_BYTES`] and never
 //! with a slice over [`MAX_SLICE_SIZE`], plus 20 bytes per slice of digest and
-//! the recovery volumes the caller feeds (one `slice_size` each).
+//! the recovery slices the caller feeds. Recovery is retained only up to the
+//! number of rows the budget could ever open ([`RepairBudget::max_rows`]): a
+//! fold can never use more rows than that, so retaining more recovery data
+//! would be memory no solve could reach. The worst case is therefore
+//! `2 × row_bytes`, not `recovery_blocks × slice_size`.
+//!
+//! Recovery volumes are untrusted input: a packet's declared length is bounds
+//! checked without overflowing, packets that are not 4-aligned are rejected,
+//! and the packet MD5 is verified before its data is kept. Solved slices are
+//! checked against the IFSC digest the set already holds before they are
+//! returned, so a corrupt recovery slice produces an error and the caller can
+//! use the disk path rather than writing wrong bytes.
 //!
 //! There is no download-engine integration here; that is the next child.
 
@@ -110,8 +121,12 @@ pub enum FoldError {
     Poisoned,
     #[error("{0} slice(s) are neither fed nor damaged; feed them before solving")]
     Incomplete(usize),
-    #[error("recovery volume is malformed at byte {0}")]
-    Malformed(usize),
+    #[error("the rows were fixed at construction and cannot be replaced")]
+    FixedExponents,
+    #[error("solved slice {0} does not match its IFSC checksum")]
+    CorruptOutput(usize),
+    #[error("slice {0} has no IFSC checksum, so its solved bytes cannot be checked")]
+    UnverifiedOutput(usize),
     #[error("recovery slice {0} is not slice-sized")]
     RecoveryLength(u32),
     #[error(transparent)]
@@ -409,14 +424,22 @@ impl RepairFold {
     /// to this set. Packets are keyed by exponent, so volumes may arrive in
     /// any order and a repeated exponent is ignored. Returns how many were
     /// added.
+    ///
+    /// Packets that are malformed, truncated, not 4-aligned, from another set
+    /// or whose MD5 does not match are skipped: a damaged recovery article is
+    /// exactly what the digest check is for, and skipping it leaves the solve
+    /// short rather than folding wrong data into it.
+    ///
+    /// Retention is bounded by [`RepairBudget::max_rows`]: the rows can never
+    /// exceed that, so exponents beyond it could never be used.
     pub fn feed_volume(&mut self, bytes: &[u8]) -> Result<usize, FoldError> {
         let mut added = 0;
         for (exponent, data) in recovery_packets(bytes, &self.recovery_set_id) {
-            if exponent as usize >= self.available as usize {
-                continue;
-            }
             if data.len() != self.slice_size {
                 return Err(FoldError::RecoveryLength(exponent));
+            }
+            if !self.retain_recovery(exponent) {
+                continue;
             }
             if self.recovery.insert(exponent, data).is_none() {
                 added += 1;
@@ -425,12 +448,31 @@ impl RepairFold {
         Ok(added)
     }
 
+    /// Whether a recovery slice may be kept: replacing one already held
+    /// always is, a new one only while the retained set is below the most
+    /// rows the budget can ever open.
+    fn retain_recovery(&self, exponent: u32) -> bool {
+        self.recovery.contains_key(&exponent) || self.recovery.len() < self.max_recovery_slices()
+    }
+
+    /// Most recovery slices retention can ever need: no more rows can exist.
+    fn max_recovery_slices(&self) -> usize {
+        self.budget
+            .max_rows(self.slice_size as u64)
+            .min(self.available as usize)
+    }
+
+    /// Bytes the retained recovery slices hold.
+    pub fn recovery_bytes(&self) -> u64 {
+        self.recovery.len() as u64 * self.slice_size as u64
+    }
+
     /// Feed a recovery slice whose exponent the caller already knows.
     pub fn feed_recovery(&mut self, exponent: u32, data: &[u8]) -> Result<bool, FoldError> {
         if data.len() != self.slice_size {
             return Err(FoldError::RecoveryLength(exponent));
         }
-        if exponent as usize >= self.available as usize {
+        if !self.retain_recovery(exponent) {
             return Ok(false);
         }
         Ok(self.recovery.insert(exponent, data.to_vec()).is_none())
@@ -447,7 +489,7 @@ impl RepairFold {
         R: FnMut(usize) -> std::io::Result<Vec<u8>>,
     {
         if self.explicit_exponents {
-            return Err(FoldError::NoRows);
+            return Err(FoldError::FixedExponents);
         }
         let new: Vec<u32> = exponents
             .iter()
@@ -514,6 +556,11 @@ impl RepairFold {
     /// intact slice must have been fed: one neither fed nor damaged is an
     /// error, not a value to guess.
     ///
+    /// Every solved slice is checked against its IFSC digest before it is
+    /// returned. A mismatch means a recovery slice was wrong (or a row was
+    /// built from wrong data): the error is [`FoldError::CorruptOutput`] and
+    /// the caller must use the disk path rather than write the bytes.
+    ///
     /// When the rows miss recovery data the volumes hold, the error is
     /// `FoldError::Rows(FoldError::NotEnoughRows { .. })`; add rows for
     /// [`missing_row_exponents`](Self::missing_row_exponents) and solve again.
@@ -529,28 +576,40 @@ impl RepairFold {
             return Err(FoldError::Incomplete(missing));
         }
         let solved = self.rows.solve(&damaged, &self.recovery)?;
-        Ok(solved
-            .into_iter()
-            .map(|(index, bytes)| {
-                let len = self.slices[index].len as usize;
-                (index, bytes[..len].to_vec())
-            })
-            .collect())
+        let mut out = Vec::with_capacity(solved.len());
+        for (index, bytes) in solved {
+            let placed = &self.slices[index];
+            let Some(expected) = placed.expected else {
+                return Err(FoldError::UnverifiedOutput(index));
+            };
+            if digest_of(&bytes, self.slice_size) != expected {
+                return Err(FoldError::CorruptOutput(index));
+            }
+            out.push((index, bytes[..placed.len as usize].to_vec()));
+        }
+        Ok(out)
     }
 
-    /// Solve at job end, growing the rows first when the damage or the volumes
-    /// arrived after [`new`](Self::new) sized them: grow to the damage, then
-    /// add rows for the exponents the volumes carry that the rows lack.
+    /// Solve at job end, matching the rows to the job: grow to the damage,
+    /// then replace rows whose exponent has no recovery data with exponents
+    /// the volumes carry, then solve.
     ///
-    /// `read` returns a folded slice's bytes by global index, for rebuilding
-    /// the new rows. Growth is skipped when the rows are already enough, so a
-    /// job whose damage was known up front reads nothing here.
+    /// Replacing is the point: rows opened on `0..D` cost D × slice_size of
+    /// the budget even when the volumes use other exponents, so only adding
+    /// would make a fold sized exactly at the budget fail although D rows
+    /// would do. A dead row is dropped and a live one opened in its place, so
+    /// the row count — and the memory — does not grow.
+    ///
+    /// `read` returns a fed slice's bytes by global index, for rebuilding the
+    /// new rows. Growth is skipped when the rows are already enough, so a job
+    /// whose damage was known up front reads nothing here.
     pub fn solve_with<R>(&mut self, mut read: R) -> Result<Vec<(usize, Vec<u8>)>, FoldError>
     where
         R: FnMut(usize) -> std::io::Result<Vec<u8>>,
     {
         if !self.explicit_exponents {
             self.grow_to_damage(&mut read)?;
+            self.swap_dead_rows(&mut read)?;
         }
         match self.solve() {
             Err(FoldError::Rows(RowFailure::NotEnoughRows { needed, usable }))
@@ -569,6 +628,60 @@ impl RepairFold {
             }
             other => other,
         }
+    }
+
+    /// Replace rows whose exponent has no recovery data with exponents the
+    /// volumes carry and the rows lack, keeping the row count the same.
+    /// Rows that do have data are left alone, and so is a fold whose
+    /// exponents were fixed at construction.
+    fn swap_dead_rows<R>(&mut self, read: &mut R) -> Result<(), FoldError>
+    where
+        R: FnMut(usize) -> std::io::Result<Vec<u8>>,
+    {
+        // Rebuilding the rows would drop the poison flag, which is the only
+        // record that a folded contribution is wrong. Leave a poisoned fold
+        // as it is so the solve keeps refusing it.
+        if self.explicit_exponents || self.rows.is_poisoned() {
+            return Ok(());
+        }
+        let mut dead: Vec<u32> = self
+            .exponents
+            .iter()
+            .copied()
+            .filter(|e| !self.recovery.contains_key(e))
+            .collect();
+        if dead.is_empty() {
+            return Ok(());
+        }
+        let mut live = self.missing_row_exponents();
+        if live.is_empty() {
+            return Ok(());
+        }
+        let mut exponents = self.exponents.clone();
+        for slot in exponents.iter_mut() {
+            if dead.is_empty() || live.is_empty() {
+                break;
+            }
+            let Some(at) = dead.iter().position(|e| *e == *slot) else {
+                continue;
+            };
+            dead.swap_remove(at);
+            *slot = live.remove(0);
+        }
+        if exponents == self.exponents {
+            return Ok(());
+        }
+        self.rows = RowFold::new(self.slices.len(), self.slice_size as u64, &exponents)?;
+        let fed: Vec<usize> = (0..self.slices.len()).filter(|i| self.fed[*i]).collect();
+        for index in fed {
+            let bytes = read(index).map_err(|e| RowFailure::Read {
+                index,
+                message: e.to_string(),
+            })?;
+            self.rows.feed(index, &bytes)?;
+        }
+        self.exponents = exponents;
+        Ok(())
     }
 }
 
@@ -614,8 +727,14 @@ fn digest_of(bytes: &[u8], slice_size: usize) -> SliceDigest {
 }
 
 /// `(exponent, data)` for every `RecvSlic` packet in `bytes` that belongs to
-/// `set_id`. Packets that are malformed, truncated or for another set are
-/// skipped: a volume's index packets are simply packets of other types.
+/// `set_id` and whose packet MD5 matches.
+///
+/// This parses untrusted input. A packet's declared length is added with
+/// [`usize::checked_add`], lengths that are not 4-aligned or are shorter than
+/// the header are rejected, and a packet whose MD5 (bytes 16..32, over
+/// everything from byte 32) does not match is skipped. Skipping is the safe
+/// direction: the solve then has too few rows and falls back to disk, instead
+/// of folding wrong recovery data into the answer.
 fn recovery_packets(bytes: &[u8], set_id: &[u8; 16]) -> Vec<(u32, Vec<u8>)> {
     let mut out = Vec::new();
     let mut pos = 0usize;
@@ -624,18 +743,30 @@ fn recovery_packets(bytes: &[u8], set_id: &[u8; 16]) -> Vec<(u32, Vec<u8>)> {
             pos += 1;
             continue;
         }
-        let len = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap()) as usize;
-        if len < PACKET_HEADER || pos + len > bytes.len() {
+        let declared = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
+        let Ok(len) = usize::try_from(declared) else {
+            break;
+        };
+        let Some(end) = pos.checked_add(len) else {
+            break;
+        };
+        if len < PACKET_HEADER || !len.is_multiple_of(4) || end > bytes.len() {
             break;
         }
-        let packet = &bytes[pos..pos + len];
+        let packet = &bytes[pos..end];
+        let digest = &packet[16..32];
+        let body = &packet[32..];
+        if md5::Md5::digest(body).as_slice() != digest {
+            pos = end;
+            continue;
+        }
         let id = &packet[32..48];
         let kind = &packet[48..64];
         if id == set_id && kind == TYPE_RECOVERY && packet.len() >= PACKET_HEADER + 4 {
             let exponent = u32::from_le_bytes(packet[64..68].try_into().unwrap());
             out.push((exponent, packet[68..].to_vec()));
         }
-        pos += len;
+        pos = end;
     }
     out
 }
@@ -833,6 +964,37 @@ mod tests {
         .unwrap();
         fold.note_corrupt_slice(victim).unwrap();
         assert!(!fold.is_poisoned());
+    }
+
+    /// Rebuilding the rows at job end must not drop the poison flag: a fold
+    /// with a wrong contribution stays unusable even through `solve_with`.
+    #[test]
+    fn solve_with_keeps_a_poisoned_fold_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Par2Fixture::new()
+            .with_slice_size(4096)
+            .add_file("poison.bin", &seeded_bytes(8, 4096 * 8));
+        let set = set_from(&fixture, dir.path());
+        let data: Vec<Vec<u8>> = seeded_bytes(8, 4096 * 8)
+            .chunks(4096)
+            .map(|c| c.to_vec())
+            .collect();
+        let damaged = [1usize];
+        let mut fold = RepairFold::new(&set, &damaged, 4, RepairBudget::default()).unwrap();
+        for (gi, bytes) in data.iter().enumerate() {
+            if !damaged.contains(&gi) {
+                fold.feed_verified(gi, bytes).unwrap();
+            }
+        }
+        fold.note_corrupt_slice(0).unwrap();
+        // Rows on 0..1 are dead against this volume, so `solve_with` would
+        // swap them out and rebuild the rows if the poison were forgotten.
+        fold.feed_volume(&fixture.volume_bytes(&[4, 5, 6, 7]))
+            .unwrap();
+        assert!(matches!(
+            fold.solve_with(|gi| Ok(data[gi].clone())),
+            Err(FoldError::Rows(RowFailure::Poisoned))
+        ));
     }
 
     #[test]
@@ -1072,5 +1234,203 @@ mod tests {
             .add_file("other.bin", &seeded_bytes(5, 8192));
         assert_eq!(fold.feed_volume(&other.volume_bytes(&[0, 1])).unwrap(), 0);
         assert_eq!(fold.recovery_count(), 0);
+    }
+
+    /// A fold for the standard release with `damaged` known and `data` fed.
+    fn prepared(
+        release: &DamageRelease,
+        damaged: &BTreeSet<usize>,
+        dir: &Path,
+    ) -> (RepairFold, Vec<Vec<u8>>) {
+        let set = set_of(release, dir);
+        let data = slices(release);
+        let mut fold = RepairFold::new(
+            &set,
+            &damaged.iter().copied().collect::<Vec<_>>(),
+            release.recovery_blocks(),
+            RepairBudget::default(),
+        )
+        .unwrap();
+        for (gi, bytes) in data.iter().enumerate() {
+            if !damaged.contains(&gi) {
+                fold.feed_verified(gi, bytes).unwrap();
+            }
+        }
+        (fold, data)
+    }
+
+    /// The harness a review blocker needs: a volume whose first packet claims
+    /// a length that would overflow when added to its offset.
+    #[test]
+    fn a_huge_packet_length_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let (release, damaged) = missing_everywhere();
+        let (mut fold, _) = prepared(&release, &damaged, dir.path());
+
+        let mut volume = release.volumes[0].file.payload.clone();
+        // Huge declared length: `pos + len` would wrap on a 32-bit usize and
+        // makes no sense on 64-bit either.
+        volume[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(fold.feed_volume(&volume).unwrap(), 0);
+        assert_eq!(fold.recovery_count(), 0, "a bogus packet is dropped");
+
+        // A length past the end of the buffer, and one that is not 4-aligned.
+        for bad in [volume.len() as u64 + 4, 65] {
+            let mut volume = release.volumes[0].file.payload.clone();
+            volume[8..16].copy_from_slice(&bad.to_le_bytes());
+            assert_eq!(fold.feed_volume(&volume).unwrap(), 0);
+        }
+
+        // A volume truncated inside its first packet's body.
+        let short = &release.volumes[0].file.payload[..PACKET_HEADER + 100];
+        assert_eq!(fold.feed_volume(short).unwrap(), 0);
+
+        // Every truncation of a real volume is safe to feed.
+        let volume = &release.volumes[1].file.payload;
+        for cut in (0..volume.len()).step_by(97) {
+            fold.feed_volume(&volume[..cut]).unwrap();
+        }
+    }
+
+    /// A recovery slice whose packet MD5 does not match is not kept: a
+    /// damaged recovery article must not reach the solve.
+    #[test]
+    fn a_recovery_packet_with_a_bad_md5_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (release, damaged) = missing_everywhere();
+        let (mut fold, _data) = prepared(&release, &damaged, dir.path());
+
+        let volume = release.volumes[0].file.payload.clone();
+        // Flip a data byte of the first RecvSlic packet without touching its
+        // stored MD5.
+        let first = volume
+            .windows(16)
+            .position(|w| w == TYPE_RECOVERY)
+            .expect("the volume carries a RecvSlic packet")
+            + 16;
+        let mut corrupt = volume.clone();
+        corrupt[first + 8] ^= 0xFF;
+        assert_eq!(fold.feed_volume(&corrupt).unwrap(), 0);
+        assert_eq!(fold.recovery_count(), 0);
+
+        // The intact copy is kept.
+        assert!(!volume.is_empty());
+        assert_eq!(fold.feed_volume(&volume).unwrap(), 1);
+    }
+
+    /// Solved bytes are checked against the IFSC digest, so a wrong
+    /// recovery slice fails the solve instead of being written.
+    #[test]
+    fn a_solved_slice_that_does_not_match_its_digest_fails_the_solve() {
+        let dir = tempfile::tempdir().unwrap();
+        let (release, damaged) = missing_everywhere();
+        let (mut fold, data) = prepared(&release, &damaged, dir.path());
+        for volume in &release.volumes {
+            fold.feed_volume(&volume.file.payload).unwrap();
+        }
+        // Recovery data that is the right length but wrong: the rows are
+        // intact, so the solve produces bytes the set does not agree with.
+        let exponent = *fold.exponents().first().unwrap();
+        fold.feed_recovery(exponent, &vec![0xA5; fold.slice_size() as usize])
+            .unwrap();
+        match fold.solve() {
+            Err(FoldError::CorruptOutput(_)) => {}
+            other => panic!("expected CorruptOutput, got {other:?}"),
+        }
+
+        // Put the real slice back: the same fold solves cleanly.
+        let v = release
+            .volumes
+            .iter()
+            .find(|v| v.exponents.contains(&exponent))
+            .unwrap();
+        fold.feed_volume(&v.file.payload).unwrap();
+        let repaired: HashMap<usize, Vec<u8>> = fold.solve().unwrap().into_iter().collect();
+        for gi in &damaged {
+            assert_eq!(repaired[gi], data[*gi], "slice {gi}");
+        }
+    }
+
+    /// Retention is capped by the rows the budget can ever open, so feeding
+    /// far more volumes than a solve can use does not grow without bound.
+    #[test]
+    fn recovery_retention_is_bounded_by_the_row_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (release, damaged) = missing_everywhere();
+        let (mut fold, _) = prepared(&release, &damaged, dir.path());
+        let cap = fold.max_recovery_slices();
+        assert_eq!(cap, release.recovery_blocks() as usize);
+
+        // A volume with more recovery slices than the fold could ever use.
+        let extra: Vec<u32> = (0..(cap as u32 + 64)).collect();
+        let volume = release.par2.volume_bytes(&extra);
+        let added = fold.feed_volume(&volume).unwrap();
+        assert_eq!(added, cap, "only the usable exponents are retained");
+        assert_eq!(fold.recovery_count(), cap);
+        assert_eq!(fold.recovery_count(), fold.max_recovery_slices());
+        assert!(
+            fold.recovery_bytes() <= MAX_ROW_BYTES,
+            "retained recovery ({} B) stays within the row budget",
+            fold.recovery_bytes()
+        );
+    }
+
+    /// A fold sized exactly at the budget replaces dead rows instead of
+    /// adding, so the solve still fits.
+    #[test]
+    fn solve_with_replaces_rows_without_recovery_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Par2Fixture::new()
+            .with_slice_size(4096)
+            .add_file("swap.bin", &seeded_bytes(6, 4096 * 8));
+        let set = set_from(&fixture, dir.path());
+        let data: Vec<Vec<u8>> = seeded_bytes(6, 4096 * 8)
+            .chunks(4096)
+            .map(|c| c.to_vec())
+            .collect();
+        let damaged = [1usize, 3, 5, 7];
+        // Exactly four rows: no room to add a fifth.
+        let budget = RepairBudget {
+            row_bytes: 4 * 4096,
+            max_slice_size: MAX_SLICE_SIZE,
+        };
+        let mut fold = RepairFold::new(&set, &damaged, 4, budget).unwrap();
+        assert_eq!(fold.rows(), 4);
+        for (gi, bytes) in data.iter().enumerate() {
+            if !damaged.contains(&gi) {
+                fold.feed_verified(gi, bytes).unwrap();
+            }
+        }
+        // The volume starts at exponent 4, so all four rows are dead.
+        assert_eq!(
+            fold.feed_volume(&fixture.volume_bytes(&[4, 5, 6, 7]))
+                .unwrap(),
+            4
+        );
+        let repaired: HashMap<usize, Vec<u8>> = fold
+            .solve_with(|gi| Ok(data[gi].clone()))
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(fold.rows(), 4, "rows were replaced, not added");
+        for gi in damaged {
+            assert_eq!(repaired[&gi], data[gi], "slice {gi}");
+        }
+    }
+
+    #[test]
+    fn fixed_exponents_report_why_they_cannot_grow() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Par2Fixture::new()
+            .with_slice_size(4096)
+            .add_file("fixed.bin", &seeded_bytes(7, 4096 * 4));
+        let set = set_from(&fixture, dir.path());
+        let mut fold =
+            RepairFold::with_exponents(&set, &[2, 3], &[1], RepairBudget::default()).unwrap();
+        let mut read = |_gi: usize| Ok(Vec::new());
+        assert!(matches!(
+            fold.extend_rows(&[4], &mut read),
+            Err(FoldError::FixedExponents)
+        ));
     }
 }
