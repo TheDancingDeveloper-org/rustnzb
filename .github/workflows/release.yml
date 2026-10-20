@@ -27,6 +27,15 @@ jobs:
       - name: Require the tag to match the workspace version
         run: ci/check-version.sh "${GITHUB_REF_NAME}"
 
+  codeql:
+    # Static analysis for the release being cut; it does not gate the build.
+    needs: verify-release-ref
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    uses: ./.github/workflows/codeql.yml
+
   release-image:
     needs: verify-release-ref
     permissions:
