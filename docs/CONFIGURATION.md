@@ -223,6 +223,15 @@ a low-disk hold or a schedule window is in force, and each lifts only its own:
 - A `Pause All` pressed inside a window takes precedence, so the end of the
   window will not resume it.
 - The end of a window never lifts a user pause or a disk hold.
+- A **pause for a duration** covers any window already open when it starts, so
+  its expiry lifts only the user's pause: the window takes effect then rather
+  than the queue resuming straight into it. A disk hold is likewise left in
+  place. (An indefinite `Pause All` is different: it stays in force until it is
+  lifted, and the windows it covers do not pause again after it is.)
+- A manual resume inside a window lasts for that window even when **two windows
+  overlap** and one of them closes first: only a window that newly opens
+  pauses again. A rule's `id` is part of its window's identity, so a rule the
+  settings API saved back under a newly generated `id` is a different rule.
 
 ## `[par2]`
 

@@ -261,7 +261,12 @@ async fn a_speed_rule_caps_the_live_limit_without_rewriting_the_configured_one()
 #[tokio::test]
 async fn a_manual_resume_inside_a_window_is_not_undone_by_the_next_tick() {
     let (state, _temp) = test_state();
-    let rules = vec![rule(ScheduleAction::Pause)];
+    // The id is part of a window's occurrence, so a rule the API adopted under
+    // a generated id must be saved back with that id: a fresh one is a
+    // different rule, and its window is legitimately new.
+    let mut pause = rule(ScheduleAction::Pause);
+    pause.id = "quiet".into();
+    let rules = vec![pause];
     update(&state, true, rules.clone()).await;
     assert!(state.queue_manager.is_paused());
 
@@ -375,4 +380,36 @@ async fn a_window_opening_during_a_disk_hold_takes_effect_when_the_hold_lifts() 
     assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
     let body = h_schedule_get(State(Arc::clone(&state))).await.unwrap().0;
     assert!(body.paused);
+}
+
+#[tokio::test]
+async fn a_manual_resume_survives_one_of_two_overlapping_windows_closing() {
+    let (state, _temp) = test_state();
+    let manager = &state.queue_manager;
+
+    // Two pause rules overlap. Both cover every day and a wide span, so the
+    // exact clock does not matter; they are distinguished by id.
+    let mut outer = rule(ScheduleAction::Pause);
+    outer.id = "outer".into();
+    let mut inner = rule(ScheduleAction::Pause);
+    inner.id = "inner".into();
+    let body = update(&state, true, vec![outer.clone(), inner]).await;
+    assert!(body["paused"].as_bool().unwrap());
+    let both = body["active_rule_ids"].as_array().unwrap().len();
+    assert_eq!(both, 2, "both windows should be open: {body}");
+
+    manager.resume_all();
+    assert!(!manager.is_paused());
+    let body = h_schedule_get(State(Arc::clone(&state))).await.unwrap().0;
+    assert!(!body.paused);
+
+    // One rule goes away while the other is still open. That is not a new
+    // window, so the manual resume must hold.
+    let body = update(&state, true, vec![outer]).await;
+    assert_eq!(body["active_rule_ids"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        body["paused"], false,
+        "a window closing out of an overlap re-paused a manual resume: {body}"
+    );
+    assert!(!manager.is_paused());
 }

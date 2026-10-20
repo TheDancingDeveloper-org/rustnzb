@@ -2194,7 +2194,7 @@ pub async fn h_schedule_update(
     let decision = evaluate_config(&config.schedule, Local::now().naive_local());
     state
         .queue_manager
-        .apply_schedule(&decision, config.schedule.enabled, true);
+        .apply_schedule(&decision, config.schedule.enabled);
     state.schedule_wake.notify_one();
 
     h_schedule_get(State(state)).await
