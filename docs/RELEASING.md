@@ -47,11 +47,16 @@ takes the rebuild path below.
    `desktop/src-tauri/Cargo.toml` and `desktop/src-tauri/Cargo.lock` must carry
    the same number, and `ci/check-version.sh` fails the release if they do not.
    The installer takes its version from the release tag at build time.
-2. Run the checks in [DEVELOPMENT.md](DEVELOPMENT.md).
-3. Merge the release change to `main` through a reviewed pull request.
-4. Create and push an annotated `vX.Y.Z` tag on that `main` commit.
-5. Monitor the GitHub Actions release workflow.
-6. Verify the GitHub release assets, checksums, signatures, and
+2. In [CHANGELOG.md](../CHANGELOG.md), move the `[Unreleased]` entries under
+   a new `## [X.Y.Z] - YYYY-MM-DD` heading, and add its compare link at the
+   bottom. Entries follow the conventional-commit subjects since the last
+   tag: `feat` under Added, `fix` under Fixed, `perf` under Performance,
+   `docs` under Documentation.
+3. Run the checks in [DEVELOPMENT.md](DEVELOPMENT.md).
+4. Merge the release change to `main` through a reviewed pull request.
+5. Create and push an annotated `vX.Y.Z` tag on that `main` commit.
+6. Monitor the GitHub Actions release workflow.
+7. Verify the GitHub release assets, checksums, signatures, and
    multi-architecture GHCR image. The image is signed keyless with the release
    workflow's OIDC identity, and the image index carries build provenance and
    an SBOM as attestations. `SHA256SUMS-<tag>.txt` has a `.sig` and `.pem`

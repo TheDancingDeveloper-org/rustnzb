@@ -20,7 +20,20 @@ in your browser — queue, history, statistics, newsgroup search, RSS rules, the
 media library, settings, all of it. Nothing to install, no Usenet provider
 required, and nothing leaves the page.
 
-More at [rustnzb.dev](https://rustnzb.dev/) · [GitHub Releases](https://github.com/TheDancingDeveloper-org/rustnzb/releases) · [Discord](https://discord.gg/pu6chSqpnJ)
+More at [rustnzb.dev](https://rustnzb.dev/) · [GitHub Releases](https://github.com/TheDancingDeveloper-org/rustnzb/releases) · [Changelog](CHANGELOG.md) · [Discord](https://discord.gg/pu6chSqpnJ)
+
+### Screenshots
+
+![Downloads: live speed, connection pool, post-processing stages and the queue](docs/img/downloads.png)
+
+| History | Settings | Phone |
+|---|---|---|
+| ![History with filters, per-job speed and retry](docs/img/history.png) | ![News server settings](docs/img/settings.png) | ![Downloads view at phone width](docs/img/mobile.png) |
+
+Screenshots use the demo's fictional data.
+
+Coming from SABnzbd? See [Moving from SABnzbd](docs/MIGRATING_FROM_SABNZBD.md)
+for a feature comparison and a settings import.
 
 ---
 
@@ -54,10 +67,18 @@ docker run -d \
   -v ./config:/config \
   -v ./data:/data \
   -v /path/to/downloads:/downloads \
+  -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
   ghcr.io/thedancingdeveloper-org/rustnzbd:latest
 ```
 
 Open `http://localhost:9090` and add your NNTP servers via the web UI.
+
+| Variable | Meaning |
+|----------|---------|
+| `PUID` / `PGID` | User and group IDs that own `/config`, `/data` and the download directories, and that rustnzb runs as. Match them to the owner of your host directories (`id -u`, `id -g`). |
+| `TZ` | Timezone for log timestamps, such as `Europe/London`. Default `UTC`. |
+
+The image ships `unrar` and 7-Zip, so extraction works out of the box.
 
 ### Docker Compose
 
@@ -100,7 +121,9 @@ cargo build -p rustnzb --release
 ./target/release/rustnzb
 ```
 
-Requirements: Rust 1.95+ (2024 edition), `7z` for archive extraction.
+Requirements: Rust 1.95+ (2024 edition), plus `7z` (7-Zip) and `unrar` on
+`PATH` for archive extraction. `unrar` also enables direct unpack while
+downloading. Run `rustnzb --smoke-test` to check that both work.
 
 ---
 
@@ -175,9 +198,11 @@ rustnzb uses TOML configuration with CLI and environment variable overrides.
 
 **Priority:** CLI args > environment variables > TOML file > defaults
 
-Most settings can be configured through the web UI. See
-[`apps/rustnzb/config.example.toml`](apps/rustnzb/config.example.toml) for the
-full reference.
+Most settings can be configured through the web UI. Every key, its default
+and its environment variable or CLI flag are listed in the
+[configuration reference](docs/CONFIGURATION.md);
+[`apps/rustnzb/config.example.toml`](apps/rustnzb/config.example.toml) is an
+annotated example.
 
 Unknown keys are an error, and the error names the file and key. To check a
 config without starting the server, run `rustnzb --config <path> --check-config`:
@@ -193,7 +218,9 @@ The HTTP API exposes `/api/health` (liveness) and `/api/ready` (readiness,
 | Variable | Description |
 |----------|-------------|
 | `RUSTNZB_CONFIG` | Config file path. A path given here must exist; without one, the default is `$XDG_CONFIG_HOME/rustnzb/config.toml` (or `~/.config/rustnzb/config.toml`), created on first start |
-| `RUSTNZB_PORT` | Listen port |
+| `RUSTNZB_PORT` | Listen port (see the Docker note below) |
+| `RUSTNZB_LISTEN_ADDR` | Listen address |
+| `RUSTNZB_DATA_DIR` | Data directory (database, RSS state, credentials) |
 | `RUSTNZB_LOG_LEVEL` | Log level (trace/debug/info/warn/error) |
 | `RUSTNZB_LOG_FILE` | Also write logs to this file (daily rotation, newest 7 kept); see [Logging](docs/OBSERVABILITY.md#log-file) |
 | `RUSTNZB_LOG_FORMAT` | `text` (default) or `json` (one JSON object per log line) |
@@ -202,12 +229,9 @@ The HTTP API exposes `/api/health` (liveness) and `/api/ready` (readiness,
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint |
 | `OTEL_SERVICE_NAME` | Service name for telemetry |
 
-> **Docker note:** setting `RUSTNZB_PORT` changes the port the app listens
-> on *inside* the container (default `9090`). The image's `EXPOSE 9090` is
-> static Dockerfile metadata and won't follow it, so remap the host port to
-> match your chosen value yourself: `-p <host-port>:$RUSTNZB_PORT` (don't
-> rely on `-P`/auto-mapping, which only publishes the declared `EXPOSE`
-> port).
+> **Docker note:** to use a different host port, change only the host side
+> of the mapping (`-p 9095:9090`). `RUSTNZB_PORT` moves the port *inside* the
+> container, so the mapping must change to `-p <host>:$RUSTNZB_PORT` too.
 
 ### Docker volumes
 
