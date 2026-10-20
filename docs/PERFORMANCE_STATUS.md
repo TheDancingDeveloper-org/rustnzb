@@ -1,6 +1,34 @@
 # Performance status
 
-Last updated: 2026-07-28 UTC
+Last updated: 2026-10-20 UTC
+
+## In-flight repair fold — damaged-set cost (2026-10-20)
+
+WI-1237 measured the PAR2 repair stage on the in-flight fold instead of a disk
+re-read. The `damaged` benchnzb group generates one payload at two sizes, marks
+the same absolute number of articles missing in each (`missing_articles = 3`,
+so D = 3 in both), and runs repair with `par2.defer_volumes` and
+`par2.trust_inflight_verify` at their defaults. Slice size is 750,000 bytes;
+the fold opened with 8 rows.
+
+| Payload | D | rustnzb verify+repair | repair path | intact slices read | SABnzbd PAR2 stage |
+| ---: | ---: | ---: | :--- | ---: | ---: |
+| 1 GiB | 3 | 0.028 s | fold | 0 | 3.0 s |
+| 4 GiB | 3 | 0.032 s | fold | 0 | 16.0 s |
+
+With D fixed and the set size x4, the rustnzb repair stage grew by 4 ms
+(0.008 s to 0.012 s of solve/write) and read no intact slice from disk at
+either size: the stage scales with D x slice size, not with the set. The
+whole payload was covered by the in-flight slice map in both runs
+(`verify: in-flight`, 1 GiB and 4 GiB not re-read). SABnzbd, which repairs from
+disk, grew its PAR2 stage from 3.0 s to 16.0 s as the set grew. Both clients
+produced a byte-verified payload. These are loopback numbers on a shared host,
+not a general real-world performance claim.
+
+The absolute times are small because the payload is generated locally and the
+job is short; the point of the fixture is the shape of the curve, not the
+constant. The run's `benchmark_*.json` records the scenario, timings and
+stage messages alongside it.
 
 ## Buffer-pooling release summary
 
