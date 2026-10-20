@@ -2556,7 +2556,7 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     if (!this.canSave('schedule')) return;
     const problem = this.scheduleProblem();
     if (problem) {
-      this.snack.open(problem, 'Close', { duration: 4000 });
+      this.toast.error(problem, 4000);
       return;
     }
     const sent = this.formSnapshot('schedule');
@@ -2580,9 +2580,9 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
           this.schedule = { ...state, rules: rules.map((rule) => ({ ...rule })) };
         }
         this.baselines.schedule = this.formSnapshot('schedule');
-        this.snack.open('Schedule saved', 'Close', { duration: 2000 });
+        this.toast.success('Schedule saved');
       },
-      error: (err) => showHttpError(this.snack, err, 'Failed to save the schedule'),
+      error: (err) => showHttpError(this.toast, err, 'Failed to save the schedule'),
     });
   }
 

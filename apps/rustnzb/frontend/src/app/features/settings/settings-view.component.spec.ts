@@ -246,10 +246,9 @@ describe('SettingsViewComponent', () => {
     expect(component.scheduleProblem()).toBe('Rule 1: Start must be HH:MM (00:00 to 23:59).');
     component.saveSchedule();
     expect(api.put).not.toHaveBeenCalledWith('/config/schedule', expect.anything());
-    expect(snack.open).toHaveBeenCalledWith(
+    expect(snack.error).toHaveBeenCalledWith(
       'Rule 1: Start must be HH:MM (00:00 to 23:59).',
-      'Close',
-      { duration: 4000 },
+      4000,
     );
 
     component.schedule.rules[0].start = '22:00';
@@ -318,7 +317,7 @@ describe('SettingsViewComponent', () => {
     expect(component.schedule.rules[0].id).toBe('assigned');
     expect(component.scheduleActiveNow()).toBe(true);
     expect(component.formatSpeedValue(component.schedule.speed_limit_bps)).toContain('/s');
-    expect(snack.open).toHaveBeenCalledWith('Schedule saved', 'Close', { duration: 2000 });
+    expect(snack.success).toHaveBeenCalledWith('Schedule saved');
     expect(component.hasUnsavedChanges()).toBe(false);
   });
 
@@ -333,7 +332,7 @@ describe('SettingsViewComponent', () => {
   });
 
   it('keeps schedule edits dirty when the save fails and blocks saving after a failed load', () => {
-    const { component, api } = makeComponent({
+    const { component, snack } = makeComponent({
       put: vi.fn(() => throwError(() => new Error('offline'))),
     });
     component.ngOnInit();
@@ -342,6 +341,9 @@ describe('SettingsViewComponent', () => {
     expect(component.unsavedSections()).toEqual(['schedule']);
     component.saveSchedule();
     expect(component.unsavedSections()).toEqual(['schedule']);
+    expect(snack.open).toHaveBeenCalledWith('Failed to save the schedule', 'Close', {
+      duration: 5000,
+    });
 
     const { component: blocked, api: blockedApi } = makeComponent();
     failGet(blockedApi, '/config/schedule');
