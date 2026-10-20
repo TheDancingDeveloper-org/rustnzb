@@ -199,3 +199,88 @@ function failGet(api: { get: ReturnType<typeof vi.fn> }, path: string): () => vo
   api.get.mockImplementation((p: string) => (p === path ? throwError(() => new Error('offline')) : answer(p)));
   return () => api.get.mockImplementation(answer);
 }
+
+describe('SettingsViewComponent unsaved changes', () => {
+  it('is clean after load and dirty after an edit', () => {
+    const { component } = makeComponent();
+    component.ngOnInit();
+    expect(component.hasUnsavedChanges()).toBe(false);
+
+    component.speedLimit = 999;
+    expect(component.unsavedSections()).toEqual(['speedLimit']);
+    component.speedLimit = 123;
+    expect(component.hasUnsavedChanges()).toBe(false);
+  });
+
+  it('becomes clean once the save succeeds', () => {
+    const { component } = makeComponent();
+    component.ngOnInit();
+    component.abortHopeless = true;
+    expect(component.unsavedSections()).toEqual(['diskGuards']);
+    component.saveDiskGuards();
+    expect(component.hasUnsavedChanges()).toBe(false);
+  });
+
+  it('stays dirty when the save fails', () => {
+    const { component } = makeComponent({ put: vi.fn(() => throwError(() => new Error('offline'))) });
+    component.ngOnInit();
+    component.maxActiveDownloads = 9;
+    component.saveMaxActive();
+    expect(component.unsavedSections()).toEqual(['maxActive']);
+  });
+
+  it('keeps edits made while a save is in flight unsaved', () => {
+    let finish!: () => void;
+    const put = vi.fn(
+      () =>
+        new Observable((sub) => {
+          finish = () => {
+            sub.next({});
+            sub.complete();
+          };
+        }),
+    );
+    const { component } = makeComponent({ put });
+    component.ngOnInit();
+    component.historyRetention = 30;
+    component.saveRetention();
+    component.historyRetention = 60;
+    finish();
+    expect(component.unsavedSections()).toEqual(['historyRetention']);
+  });
+
+  it('does not treat a form whose load failed as dirty', () => {
+    const { component } = makeComponent({
+      get: vi.fn((path: string) =>
+        path === '/config/speed-limit' ? throwError(() => new Error('down')) : of(path.endsWith('servers') || path.endsWith('categories') || path.endsWith('stats') ? [] : {}),
+      ),
+    });
+    component.ngOnInit();
+    component.speedLimit = 5;
+    expect(component.unsavedSections()).not.toContain('speedLimit');
+  });
+
+  it('counts an open server or category editor as unsaved', () => {
+    const { component } = makeComponent();
+    component.ngOnInit();
+    component.addServer();
+    component.addCategory();
+    expect(component.unsavedSections()).toEqual(['server', 'category']);
+    component.cancelServerEdit();
+    component.cancelCategoryEdit();
+    expect(component.hasUnsavedChanges()).toBe(false);
+  });
+
+  it('asks the browser to confirm unload only when dirty', () => {
+    const { component } = makeComponent();
+    component.ngOnInit();
+    const clean = { preventDefault: vi.fn() } as unknown as BeforeUnloadEvent;
+    component.onBeforeUnload(clean);
+    expect(clean.preventDefault).not.toHaveBeenCalled();
+
+    component.speedLimit = 1;
+    const dirty = { preventDefault: vi.fn() } as unknown as BeforeUnloadEvent;
+    component.onBeforeUnload(dirty);
+    expect(dirty.preventDefault).toHaveBeenCalled();
+  });
+});
