@@ -226,7 +226,11 @@ fn damage_case(scenario: DamageScenario) -> (ScenarioFixture, SliceMapSummary, V
     (fixture, map, damaged)
 }
 
-fn scenario_config(fixture: &ScenarioFixture, map: SliceMapSummary, fold: Option<SharedFold>) -> PostProcConfig {
+fn scenario_config(
+    fixture: &ScenarioFixture,
+    map: SliceMapSummary,
+    fold: Option<SharedFold>,
+) -> PostProcConfig {
     let expect = &fixture.expect;
     let failed = expect.missing_articles.len()
         + expect.corrupt_articles.len()
@@ -278,16 +282,15 @@ async fn assert_fold_matches_disk(scenario: DamageScenario) {
         folded.error, folded.stages
     );
     let msg = repair_message(&folded);
-    assert!(msg.contains("[repair: fold, 0 slices read,"), "{slug}: {msg}");
+    assert!(
+        msg.contains("[repair: fold, 0 slices read,"),
+        "{slug}: {msg}"
+    );
 
     let disk_dir = tempfile::tempdir().unwrap();
     fixture.write_received(disk_dir.path());
-    let disk = run_repair_pipeline(
-        disk_dir.path(),
-        &scenario_config(&fixture, map, None),
-        None,
-    )
-    .await;
+    let disk =
+        run_repair_pipeline(disk_dir.path(), &scenario_config(&fixture, map, None), None).await;
     assert!(
         disk.success,
         "{slug}: disk path failed: {:?} {:?}",
@@ -340,13 +343,9 @@ async fn budget_exhaustion_falls_back_to_disk_and_still_repairs() {
     let case = case(16);
     let data = slices(&case.release);
     // One row, and no room to grow: three damaged slices need three.
-    let mut fold = RepairFold::new(
-        data.len(),
-        case.release.par2.slice_size(),
-        &[0],
-    )
-    .unwrap()
-    .with_row_limit(1);
+    let mut fold = RepairFold::new(data.len(), case.release.par2.slice_size(), &[0])
+        .unwrap()
+        .with_row_limit(1);
     for (gi, bytes) in data.iter().enumerate() {
         if !case.damaged.contains(&gi) {
             fold.feed(gi, bytes).unwrap();

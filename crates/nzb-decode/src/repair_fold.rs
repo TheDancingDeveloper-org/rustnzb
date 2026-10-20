@@ -774,7 +774,9 @@ mod tests {
     #[test]
     fn a_caller_row_cap_stops_growth() {
         let (n, slice) = (8, 16);
-        let mut fold = RepairFold::new(n, slice as u64, &[0]).unwrap().with_row_limit(2);
+        let mut fold = RepairFold::new(n, slice as u64, &[0])
+            .unwrap()
+            .with_row_limit(2);
         assert_eq!(fold.extend_rows(&[1], &mut |_| unreachable!()).unwrap(), 1);
         assert_eq!(
             fold.extend_rows(&[2], &mut |_| unreachable!()),
