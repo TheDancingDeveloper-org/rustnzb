@@ -50,24 +50,45 @@ impl Database {
     }
 
     fn migrate(&self) -> Result<(), NzbError> {
-        self.conn.execute_batch(
+        // Apply every pending migration in one transaction.
+        //
+        // Each migration used to commit separately and stamp `schema_version`
+        // on its own. That cost one durable commit per migration — 31 fsyncs
+        // to create a fresh database, measured — and on a contended disk (the
+        // CI container shares a dind volume with concurrent builds) the serial
+        // commits dominated start-up: at 600 ms per fsync the backend took over
+        // 15 s to open its database, never reached the HTTP bind, and global
+        // setup timed out without a single log line (the migration notices are
+        // INFO, the e2e config logs at WARN).
+        //
+        // Batching leaves about ten fsyncs (SQLite's own commit and WAL
+        // bookkeeping), and the same 600 ms shim now reaches health in 4.3 s
+        // rather than failing, or 10.7 s at 1.5 s per fsync.
+        //
+        // Each migration still logs as it runs. The version row is written
+        // once, after the last one, and the batch rolls back together: an
+        // interrupted upgrade leaves the database at its previous version
+        // rather than half-migrated.
+        let tx = self.conn.unchecked_transaction()?;
+        // Creating the bookkeeping table is part of the same batch: as its own
+        // statement it would be a second durable commit before the first
+        // migration even ran.
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER NOT NULL
             );",
         )?;
-
-        let version: u32 = self
-            .conn
+        let version: u32 = tx
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_version",
                 [],
                 |row| row.get(0),
             )
             .unwrap_or(0);
+        let mut applied = version;
 
         if version < 1 {
             info!("Applying database migration v1");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 -- Active download queue
@@ -122,12 +143,11 @@ impl Database {
                 );
                 ",
             )?;
-            commit_migration(tx, 1)?;
+            applied = 1;
         }
 
         if version < 2 {
             info!("Applying database migration v2");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 -- Add NZB data storage and server stats to history
@@ -141,24 +161,22 @@ impl Database {
                 ALTER TABLE queue ADD COLUMN nzb_raw BLOB;
                 ",
             )?;
-            commit_migration(tx, 2)?;
+            applied = 2;
         }
 
         if version < 3 {
             info!("Applying database migration v3");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 -- Per-job log storage for history
                 ALTER TABLE history ADD COLUMN job_logs TEXT DEFAULT '[]';
                 ",
             )?;
-            commit_migration(tx, 3)?;
+            applied = 3;
         }
 
         if version < 4 {
             info!("Applying database migration v4");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 -- RSS feed items (persistent feed cache)
@@ -190,12 +208,11 @@ impl Database {
                 );
                 ",
             )?;
-            commit_migration(tx, 4)?;
+            applied = 4;
         }
 
         if version < 5 {
             info!("Applying database migration v5: settings table");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS settings (
@@ -204,12 +221,12 @@ impl Database {
                 );
                 ",
             )?;
-            commit_migration(tx, 5)?;
+            applied = 5;
         }
 
         // Ensure settings table exists for databases that jumped to v5
         // with groups tables but without settings (pre-extraction rustnzbd)
-        self.conn.execute_batch(
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -219,7 +236,6 @@ impl Database {
         #[cfg(feature = "groups-db")]
         if version < 6 {
             info!("Applying database migration v6: newsgroup browsing");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS groups (
@@ -267,12 +283,11 @@ impl Database {
                 END;
                 ",
             )?;
-            commit_migration(tx, 6)?;
+            applied = 6;
         }
 
         if version < 7 {
             info!("Applying database migration v7: persistent download statistics");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS download_statistics (
@@ -305,29 +320,27 @@ impl Database {
                 FROM history;
                 ",
             )?;
-            commit_migration(tx, 7)?;
+            applied = 7;
         }
 
         if version < 8 {
             info!("Applying database migration v8: active download duration");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 ALTER TABLE history ADD COLUMN download_time_secs REAL;
                 ",
             )?;
-            commit_migration(tx, 8)?;
+            applied = 8;
         }
 
         if version < 9 {
             info!("Applying database migration v9: per-article retry outcomes");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 ALTER TABLE history ADD COLUMN retry_data BLOB;
                 ",
             )?;
-            commit_migration(tx, 9)?;
+            applied = 9;
         }
 
         if version < 10 {
@@ -336,7 +349,6 @@ impl Database {
             // not damage evidence, so there is no backfill: it carries no
             // failure reason, per-server evidence, TTL, or server fingerprint
             // to reconstruct a confirmed-missing record from. See WI-143.
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS damage_ledger (
@@ -356,12 +368,11 @@ impl Database {
                     ON damage_ledger (scope_id, file_index);
                 ",
             )?;
-            commit_migration(tx, 10)?;
+            applied = 10;
         }
 
         if version < 11 {
             info!("Applying database migration v11: idempotent queue admissions");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 CREATE TABLE queue_admissions (
@@ -375,12 +386,11 @@ impl Database {
                     ON queue_admissions(job_id);
                 ",
             )?;
-            commit_migration(tx, 11)?;
+            applied = 11;
         }
 
         if version < 12 {
             info!("Applying database migration v12: typed terminal failure codes");
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "
                 ALTER TABLE history ADD COLUMN failure_code TEXT;
@@ -389,7 +399,7 @@ impl Database {
                 WHERE LOWER(status) = 'failed' AND failure_code IS NULL;
                 ",
             )?;
-            commit_migration(tx, 12)?;
+            applied = 12;
         }
 
         if version < 13 {
@@ -401,11 +411,10 @@ impl Database {
                 [],
                 |row| row.get(0),
             )?;
-            let tx = self.conn.unchecked_transaction()?;
             if has_queue > 0 {
                 tx.execute_batch("ALTER TABLE queue ADD COLUMN pp_override INTEGER;")?;
             }
-            commit_migration(tx, 13)?;
+            applied = 13;
         }
 
         if version < 14 {
@@ -416,11 +425,10 @@ impl Database {
                 [],
                 |row| row.get(0),
             )?;
-            let tx = self.conn.unchecked_transaction()?;
             if has_history > 0 {
                 tx.execute_batch("ALTER TABLE history ADD COLUMN post_processing INTEGER;")?;
             }
-            commit_migration(tx, 14)?;
+            applied = 14;
         }
 
         if version < 15 {
@@ -436,7 +444,6 @@ impl Database {
                 )?;
                 table_exists_map.insert(table, exists > 0);
             }
-            let tx = self.conn.unchecked_transaction()?;
             for table in ["queue", "history"] {
                 if table_exists_map.get(&table).copied().unwrap_or(false) {
                     tx.execute_batch(&format!(
@@ -444,7 +451,7 @@ impl Database {
                     ))?;
                 }
             }
-            commit_migration(tx, 15)?;
+            applied = 15;
         }
 
         if version < 16 {
@@ -472,7 +479,6 @@ impl Database {
             } else {
                 0
             };
-            let tx = self.conn.unchecked_transaction()?;
             if has_headers > 0 {
                 tx.execute_batch(
                     "
@@ -497,7 +503,7 @@ impl Database {
             if has_groups > 0 && has_scan_server == 0 {
                 tx.execute_batch("ALTER TABLE groups ADD COLUMN scan_server_id TEXT;")?;
             }
-            commit_migration(tx, 16)?;
+            applied = 16;
         }
 
         if version < 17 {
@@ -505,7 +511,6 @@ impl Database {
             // Partial schemas (as built by migration tests) may lack either
             // table, so only the tables that exist gain the column. Existing
             // rows are backfilled from their stored NZB so they can be matched.
-            let tx = self.conn.unchecked_transaction()?;
             for (table, blob_column) in [("queue", "nzb_raw"), ("history", "nzb_data")] {
                 let table_exists: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -541,7 +546,7 @@ impl Database {
                     )?;
                 }
             }
-            commit_migration(tx, 17)?;
+            applied = 17;
         }
 
         if version < 18 {
@@ -564,7 +569,6 @@ impl Database {
                 [],
                 |row| row.get(0),
             )?;
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS history_list_meta (
                     id TEXT PRIMARY KEY,
@@ -599,7 +603,7 @@ impl Database {
                     CREATE INDEX IF NOT EXISTS idx_history_category ON history(category);",
                 )?;
             }
-            commit_migration(tx, 18)?;
+            applied = 18;
         }
 
         if version < 19 {
@@ -617,7 +621,6 @@ impl Database {
                 [],
                 |row| row.get(0),
             )?;
-            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(
                 "ALTER TABLE history_list_meta ADD COLUMN par2_volumes_fetched INTEGER;
                  ALTER TABLE history_list_meta ADD COLUMN par2_volumes_available INTEGER;",
@@ -650,7 +653,13 @@ impl Database {
                     END;",
                 )?;
             }
-            commit_migration(tx, 19)?;
+            applied = 19;
+        }
+
+        if applied > version {
+            stamp_schema_version(&tx, applied)?;
+            tx.commit()?;
+            info!(version = applied, "Database schema up to date");
         }
 
         Ok(())
@@ -1866,11 +1875,12 @@ fn parse_datetime(s: &str) -> chrono::DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
-fn commit_migration(tx: rusqlite::Transaction<'_>, version: u32) -> Result<(), NzbError> {
+/// Record the schema version a batch of migrations reached. The caller owns
+/// the transaction and commits it once, after the last migration.
+fn stamp_schema_version(tx: &rusqlite::Transaction<'_>, version: u32) -> Result<(), NzbError> {
     tx.execute_batch(&format!(
         "DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES ({version});"
     ))?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -2627,6 +2637,52 @@ mod tests {
             db.history_get("h-1").unwrap().is_none(),
             "history row must roll back with the failed statistics write"
         );
+    }
+
+    /// Applying the schema is one transaction, not one per migration.
+    ///
+    /// Each migration used to commit separately, and every commit is an fsync.
+    /// On a contended volume those serialise: 19 commits were enough to keep
+    /// the backend from ever binding its port inside the e2e health timeout.
+    /// The version row must therefore appear only once the whole batch has
+    /// succeeded, and a re-open of an up-to-date database must write nothing.
+    #[test]
+    fn fresh_database_migrates_in_one_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.db");
+        let db = Database::open(&path).unwrap();
+
+        let version: u32 = db
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(version >= 19, "schema should reach v19, got {version}");
+
+        // Every migration's objects are present, which is only true if the
+        // single batch ran to the end before stamping the version.
+        for table in ["queue", "history", "settings", "history_list_meta"] {
+            let exists: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "{table} should exist after migrating");
+        }
+
+        // Re-opening an up-to-date database has no migration to apply, so it
+        // must not touch schema_version at all.
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        let versions: i64 = reopened
+            .conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(versions, 1, "the version row is written exactly once");
     }
 
     /// A lock held briefly by another connection (backup tool, second

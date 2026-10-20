@@ -16,6 +16,16 @@ interface BackendInstance {
 
 const instances = new Map<string, BackendInstance>();
 
+/// How long a start may take before global setup calls it a failure.
+///
+/// The wait returns the moment the health route answers, so this budget costs
+/// nothing on a normal start; it only bounds how long a broken one is polled.
+/// Start-up on the CI runners shares a dind volume with concurrent builds, so
+/// a cold database's durable commits are the dominant cost: measured at 1.5 s
+/// per fsync, a fresh backend reached health in 10.7 s. 15 s left too little
+/// margin for contention spikes and produced WI-2029's false failure.
+const HEALTH_TIMEOUT_MS = 30_000;
+
 export async function startBackend(opts: {
   name: string;
   port: number;
@@ -40,7 +50,7 @@ export async function startBackend(opts: {
     // The queue manager loads its in-memory state from DB at startup, so we
     // must seed the DB BEFORE the final start so seeded queue jobs are visible.
     const proc1 = spawnBackend(name, port, runtimeConfig);
-    await waitForHealthy(`http://localhost:${port}/api/health`, 15000);
+    await waitForHealthy(`http://localhost:${port}/api/health`, HEALTH_TIMEOUT_MS, proc1, name);
     // Wait for WAL checkpoint before killing
     await new Promise(r => setTimeout(r, 600));
     proc1.kill('SIGTERM');
@@ -70,13 +80,18 @@ export async function startBackend(opts: {
 
     // Phase 2: restart with seeded data — queue manager will load seeded jobs
     const proc2 = spawnBackend(name, port, runtimeConfig);
-    await waitForHealthy(`http://localhost:${port}/api/health`, 15000);
+    await waitForHealthy(`http://localhost:${port}/api/health`, HEALTH_TIMEOUT_MS, proc2, name);
     instances.set(name, { process: proc2, port, config: runtimeConfig, dataDir: absoluteDataDir, dbPath });
   } else {
     const proc = spawnBackend(name, port, runtimeConfig);
-    await waitForHealthy(`http://localhost:${port}/api/health`, 15000);
+    await waitForHealthy(`http://localhost:${port}/api/health`, HEALTH_TIMEOUT_MS, proc, name);
     instances.set(name, { process: proc, port, config: runtimeConfig, dataDir: absoluteDataDir, dbPath });
   }
+}
+
+function backendLogPath(name: string): string | null {
+  const logDir = process.env.RUSTNZB_E2E_LOG_DIR;
+  return logDir ? path.join(logDir, `backend-${name}.log`) : null;
 }
 
 function spawnBackend(name: string, port: number, config: string): ChildProcess {
@@ -85,10 +100,8 @@ function spawnBackend(name: string, port: number, config: string): ChildProcess 
     cwd: PROJECT_ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const logDir = process.env.RUSTNZB_E2E_LOG_DIR;
-  const log = logDir
-    ? fs.createWriteStream(path.join(logDir, `backend-${name}.log`), { flags: 'a' })
-    : null;
+  const logPath = backendLogPath(name);
+  const log = logPath ? fs.createWriteStream(logPath, { flags: 'a' }) : null;
   proc.stdout?.on('data', (data: Buffer) => log?.write(data));
   proc.stderr?.on('data', (data: Buffer) => {
     const msg = data.toString();
@@ -129,14 +142,42 @@ export function cleanAllBackendData(): void {
   if (fs.existsSync(mockDir)) fs.rmSync(mockDir, { recursive: true });
 }
 
-async function waitForHealthy(url: string, timeoutMs: number): Promise<void> {
+/// Poll the health route until the backend answers, or report why it cannot.
+///
+/// A process that has already exited will never answer, so fail immediately
+/// with its exit status instead of spending the rest of the timeout polling a
+/// dead port. The log path is included because start-up output is the only
+/// record of what it was doing when it stopped.
+async function waitForHealthy(
+  url: string,
+  timeoutMs: number,
+  proc: ChildProcess,
+  name: string,
+): Promise<void> {
   const start = Date.now();
+  let exited: { code: number | null; signal: string | null } | null = null;
+  proc.once('exit', (code, signal) => {
+    exited = { code, signal };
+  });
+
+  const detail = () => {
+    const logPath = backendLogPath(name);
+    return logPath ? ` (log: ${logPath})` : '';
+  };
+
   while (Date.now() - start < timeoutMs) {
+    if (exited) {
+      const { code, signal } = exited;
+      throw new Error(
+        `Backend ${name} exited before becoming healthy ` +
+          `(code ${code}, signal ${signal})${detail()}: ${url}`,
+      );
+    }
     try {
       const r = await fetch(url);
       if (r.ok) return;
     } catch {}
     await new Promise(r => setTimeout(r, 200));
   }
-  throw new Error(`Backend not healthy within ${timeoutMs}ms: ${url}`);
+  throw new Error(`Backend not healthy within ${timeoutMs}ms${detail()}: ${url}`);
 }

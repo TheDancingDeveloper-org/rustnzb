@@ -97,12 +97,36 @@ pub fn write_file_layer(config: &AppConfig, path: &Path) -> anyhow::Result<()> {
         .transpose()?;
     let contents = merged_document(existing_text, &stamped)?;
 
-    if let Some(previous) = existing.as_deref()
-        && previous != contents.as_bytes()
-    {
-        backup(dir, previous)?;
+    if let Some(previous) = existing.as_deref() {
+        if previous == contents.as_bytes() {
+            // Nothing to save. Replacing the file would cost a durable write
+            // and a directory fsync for byte-identical content; on a contended
+            // disk that is measurable start-up time. Permissions are still
+            // tightened if an older save (or the user) left them open.
+            if !needs_permission_tightening(path) {
+                return Ok(());
+            }
+        } else {
+            backup(dir, previous)?;
+        }
     }
     write_atomic(path, contents.as_bytes())
+}
+
+/// Whether a save still has to replace `path` for its mode alone.
+fn needs_permission_tightening(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o777 != 0o600)
+            .unwrap_or(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 /// Render `config` as TOML, starting from the document already on disk so
@@ -424,6 +448,47 @@ mod tests {
         assert!(resolve_operator_config_path(&escape).is_err());
         assert!(resolve_operator_config_path(Path::new("../config.toml")).is_err());
         assert!(resolve_operator_config_path(Path::new("/")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_save_does_not_replace_the_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = AppConfig::default();
+        config.save(&path).unwrap();
+        let before = fs::metadata(&path).unwrap().ino();
+
+        config.save(&path).unwrap();
+        let after = fs::metadata(&path).unwrap().ino();
+        assert_eq!(before, after, "an unchanged save must not rewrite the file");
+
+        let leftovers: Vec<_> = fs::read_dir(&path)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_save_still_tightens_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = AppConfig::default();
+        config.save(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        config.save(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a save must not leave the config readable");
     }
 
     #[test]
