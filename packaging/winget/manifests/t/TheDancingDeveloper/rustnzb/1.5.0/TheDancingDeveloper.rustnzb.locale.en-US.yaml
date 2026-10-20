@@ -1,0 +1,25 @@
+# Template kept in the rustnzb source repository; CI never submits it.
+PackageIdentifier: TheDancingDeveloper.rustnzb
+PackageVersion: 1.5.0
+PackageLocale: en-US
+Publisher: TheDancingDeveloper
+PublisherUrl: https://github.com/TheDancingDeveloper-org
+PublisherSupportUrl: https://github.com/TheDancingDeveloper-org/rustnzb/issues
+PackageName: rustnzb
+PackageUrl: https://rustnzb.dev
+License: MIT
+LicenseUrl: https://github.com/TheDancingDeveloper-org/rustnzb/blob/main/LICENSE
+ShortDescription: Usenet NZB downloader with a SABnzbd-compatible API and web UI
+Moniker: rustnzb
+Tags:
+- usenet
+- nzb
+- sabnzbd
+- downloader
+Description: |-
+  rustnzb downloads NZBs over pipelined TLS NNTP connections, decodes yEnc,
+  verifies and repairs PAR2 sets, extracts archives, and exposes both a native
+  REST API and a SABnzbd-compatible API for *arr applications and SAB clients.
+ReleaseNotesUrl: https://github.com/TheDancingDeveloper-org/rustnzb/releases/tag/v1.5.0
+ManifestType: locale
+ManifestVersion: 1.10.0

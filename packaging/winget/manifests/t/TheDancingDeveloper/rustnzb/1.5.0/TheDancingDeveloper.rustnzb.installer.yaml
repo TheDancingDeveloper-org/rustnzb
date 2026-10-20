@@ -1,0 +1,22 @@
+# Template kept in the rustnzb source repository; CI never submits it.
+PackageIdentifier: TheDancingDeveloper.rustnzb
+PackageVersion: 1.5.0
+InstallerType: nullsoft
+Scope: machine
+UpgradeBehavior: install
+Commands:
+- rustnzb
+FileExtensions:
+- nzb
+ElevationRequirement: elevatesSelf
+ReleaseDate: "2026-09-18"
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/TheDancingDeveloper-org/rustnzb/releases/download/v1.5.0/rustnzb-v1.5.0-windows-x86_64-setup.exe
+  InstallerSha256: 2E81D4CBB8F9661C85DDEC1001D0F4F6F577A3278472FC1EF73D9395E6A0F66B
+  AppsAndFeaturesEntries:
+  - DisplayName: rustnzb 1.5.0
+    Publisher: TheDancingDeveloper
+    DisplayVersion: 1.5.0
+ManifestType: installer
+ManifestVersion: 1.10.0
