@@ -27,6 +27,7 @@
     "@angular/build": "^21.2.26",
     "@angular/cli": "^21.2.26",
     "@angular/compiler-cli": "^21.2.25",
+    "@types/node": "^22.20.5",
     "@vitest/coverage-v8": "^4.1.11",
     "jsdom": "^29.1.1",
     "prettier": "^3.8.1",

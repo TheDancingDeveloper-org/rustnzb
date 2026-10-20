@@ -667,6 +667,14 @@ mod tests {
         assert_eq!(cache_header_for("logo.png"), "max-age=3600");
     }
 
+    #[test]
+    fn web_manifest_mime_type() {
+        // Browsers ignore a PWA manifest served as application/octet-stream.
+        let mime = mime_guess::from_path("manifest.webmanifest").first_or_octet_stream();
+        assert_eq!(mime.as_ref(), "application/manifest+json");
+        assert_eq!(cache_header_for("manifest.webmanifest"), "max-age=3600");
+    }
+
     fn test_state() -> Arc<AppState> {
         let temp = tempfile::tempdir().unwrap();
         let config = AppConfig::default();
