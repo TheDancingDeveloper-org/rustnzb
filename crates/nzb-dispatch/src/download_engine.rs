@@ -641,7 +641,7 @@ pub(crate) struct JobContext {
     /// segment, and rejecting those articles corrupts a file that PAR2 would
     /// verify clean. When the NZB declared none, `first` is the write bound;
     /// a later, smaller `size=` lowers `min` but never the bound.
-    pinned_file_sizes: Mutex<HashMap<String, YencSizeRange>>,
+    pinned_file_sizes: PinnedSizes,
     /// Ensures JobFinished/JobAborted is only emitted once.
     finished: AtomicBool,
     /// Avoid repeatedly reporting the same all-provider outage while the
@@ -693,7 +693,7 @@ impl JobContext {
             active_started: Mutex::new(Some(Instant::now())),
             active_elapsed: Mutex::new(Duration::ZERO),
             total_bytes: job.total_bytes,
-            pinned_file_sizes: Mutex::new(HashMap::new()),
+            pinned_file_sizes: Arc::new(Mutex::new(HashMap::new())),
             finished: AtomicBool::new(false),
             waiting_for_providers_reported: AtomicBool::new(false),
             slices: Arc::new(crate::slice_tracker::JobSlices::new(job)),
@@ -2563,12 +2563,13 @@ async fn run_worker_pipelined(
                         let yield_t = Instant::now();
                         tokio::task::yield_now().await;
                         perf_yield_us += yield_t.elapsed().as_micros() as u64;
-                        let decode_result = decode_and_assemble(
+                        let (decode_result, raw_data) = decode_and_assemble_offloaded(
                             &item,
-                            &raw_data,
+                            raw_data,
                             &ctx.assembler,
                             Some(&ctx.pinned_file_sizes),
-                        );
+                        )
+                        .await;
                         // Return the buffer to the connection's pool so the
                         // next article's fetch reuses it instead of
                         // allocating fresh.
@@ -3409,9 +3410,9 @@ pub(crate) fn build_job_submission(
 async fn fetch_article_with_retry(
     conn: &mut NntpConnection,
     item: &WorkItem,
-    assembler: &FileAssembler,
+    assembler: &Arc<FileAssembler>,
     cancelled: &AtomicBool,
-    pinned_file_sizes: Option<&Mutex<HashMap<String, YencSizeRange>>>,
+    pinned_file_sizes: Option<&PinnedSizes>,
     _server: &ServerConfig,
     worker_id: &str,
 ) -> Result<ProcessResult, ArticleError> {
@@ -3437,7 +3438,8 @@ async fn fetch_article_with_retry(
                 conn.release_body_buffer(raw_data);
                 return Err(ArticleError::Cancelled);
             }
-            let result = decode_and_assemble(item, &raw_data, assembler, pinned_file_sizes);
+            let (result, raw_data) =
+                decode_and_assemble_offloaded(item, raw_data, assembler, pinned_file_sizes).await;
             // Return the buffer to the connection's pool so the next
             // article's fetch reuses it instead of allocating fresh.
             conn.release_body_buffer(raw_data);
@@ -3659,12 +3661,60 @@ fn validated_write_offset(
     Ok(begin)
 }
 
+/// Per-file `=ybegin size=` ranges seen so far, shared with the decode tasks.
+type PinnedSizes = Arc<Mutex<HashMap<String, YencSizeRange>>>;
+
+/// Run [`decode_and_assemble`] on the blocking pool (WI-1847).
+///
+/// yEnc decode is CPU-bound and the assembler's positional write can stall in
+/// disk writeback for tens of milliseconds at line rate. Running either inline
+/// parks a tokio worker, and the HTTP handlers share those workers, so API
+/// latency climbed with download speed. `spawn_blocking` hands the work to a
+/// pool thread and leaves the worker free; unlike `block_in_place` it does not
+/// force the runtime to migrate the worker's other tasks on every article.
+///
+/// The body buffer is handed back alongside the result so the caller can
+/// return it to the connection's pool.
+async fn decode_and_assemble_offloaded(
+    item: &WorkItem,
+    raw_data: Vec<u8>,
+    assembler: &Arc<FileAssembler>,
+    pinned_file_sizes: Option<&PinnedSizes>,
+) -> (Result<ProcessResult, ArticleError>, Vec<u8>) {
+    let task_item = item.clone();
+    let assembler = Arc::clone(assembler);
+    let pinned = pinned_file_sizes.cloned();
+    let joined = tokio::task::spawn_blocking(move || {
+        let result = decode_and_assemble(&task_item, &raw_data, &assembler, pinned.as_deref());
+        (result, raw_data)
+    })
+    .await;
+    match joined {
+        Ok(out) => out,
+        Err(e) => (
+            Err(ArticleError::AssemblyError(format!(
+                "decode task failed for {} seg {}: {e}",
+                item.filename, item.segment_number
+            ))),
+            Vec::new(),
+        ),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Decodes run on the current thread, so tests can tell inline from offloaded.
+    static DECODES_ON_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn decode_and_assemble(
     item: &WorkItem,
     raw_data: &[u8],
     assembler: &FileAssembler,
     pinned_file_sizes: Option<&Mutex<HashMap<String, YencSizeRange>>>,
 ) -> Result<ProcessResult, ArticleError> {
+    #[cfg(test)]
+    DECODES_ON_THREAD.with(|n| n.set(n.get() + 1));
     let decode_start = Instant::now();
     let decoded = decode_yenc(raw_data).map_err(|e| {
         ArticleError::DecodeError(format!(
@@ -4042,6 +4092,57 @@ mod tests {
         item
     }
 
+    #[tokio::test]
+    async fn offloaded_decode_runs_off_the_async_thread_and_returns_the_buffer() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("out.bin");
+        let assembler = Arc::new(FileAssembler::new());
+        assembler
+            .register_file("j1", "f1", path.clone(), 1)
+            .unwrap();
+        let (raw, _) = yenc_simd::encode_article(b"payload", "out.bin", 1, 1, 0, 7);
+        let pinned: PinnedSizes = Arc::new(Mutex::new(HashMap::new()));
+
+        let before = DECODES_ON_THREAD.with(|n| n.get());
+        let (result, buffer) = decode_and_assemble_offloaded(
+            &decode_test_item("j1", 1),
+            raw.clone(),
+            &assembler,
+            Some(&pinned),
+        )
+        .await;
+
+        // The decode and write ran on a blocking-pool thread, not this one.
+        assert_eq!(DECODES_ON_THREAD.with(|n| n.get()), before);
+        let result = result.unwrap();
+        assert!(result.file_complete);
+        assert_eq!(result.decoded_bytes, 7);
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+        assert_eq!(buffer, raw, "the body buffer comes back for reuse");
+        assert!(pinned.lock().contains_key("f1"));
+    }
+
+    #[tokio::test]
+    async fn offloaded_decode_reports_decode_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let assembler = Arc::new(FileAssembler::new());
+        assembler
+            .register_file("j1", "f1", temp.path().join("out.bin"), 1)
+            .unwrap();
+        let (result, buffer) = decode_and_assemble_offloaded(
+            &decode_test_item("j1", 1),
+            b"not yenc".to_vec(),
+            &assembler,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ArticleError::DecodeError(_))),
+            "{result:?}"
+        );
+        assert_eq!(buffer, b"not yenc");
+    }
+
     #[test]
     fn decode_rejects_ypart_offset_beyond_declared_file_size() {
         let temp = tempfile::tempdir().unwrap();
@@ -4356,7 +4457,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("out.bin");
-        let assembler = FileAssembler::new();
+        let assembler = Arc::new(FileAssembler::new());
         assembler
             .register_file("j1", "f1", path.clone(), 1)
             .unwrap();
@@ -4415,11 +4516,11 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("out.bin");
-        let assembler = FileAssembler::new();
+        let assembler = Arc::new(FileAssembler::new());
         assembler
             .register_file("j1", "f1", path.clone(), 2)
             .unwrap();
-        let pinned = Mutex::new(HashMap::new());
+        let pinned = Arc::new(Mutex::new(HashMap::new()));
         let not_cancelled = AtomicBool::new(false);
 
         let item1 = make_item("j1", "seg1@test", "out.bin");
