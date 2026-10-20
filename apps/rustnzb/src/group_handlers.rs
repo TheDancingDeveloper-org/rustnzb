@@ -63,18 +63,27 @@ where
     }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct GroupListQuery {
+    /// Only subscribed groups.
     pub subscribed: Option<bool>,
+    /// Case-insensitive name substring.
     pub search: Option<String>,
+    /// Maximum rows to return (default 100).
     pub limit: Option<usize>,
+    /// Rows to skip.
     pub offset: Option<usize>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HeaderListQuery {
+    /// Subject or poster substring.
     pub search: Option<String>,
+    /// Maximum rows to return (default 50).
     pub limit: Option<usize>,
+    /// Rows to skip.
     pub offset: Option<usize>,
 }
 
@@ -155,6 +164,18 @@ fn status_error(status: StatusCode, message: &'static str) -> ApiError {
 }
 
 /// GET /api/groups
+#[utoipa::path(
+    get,
+    path = "/api/groups",
+    tag = "groups",
+    summary = "List newsgroups",
+    params(GroupListQuery),
+    responses(
+        (status = 200, description = "Page of groups with the unpaged total", body = serde_json::Value),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 500, description = "The group table could not be read", body = ApiError),
+    ),
+)]
 pub async fn h_group_list(
     State(state): State<Arc<AppState>>,
     Query(q): Query<GroupListQuery>,
@@ -178,6 +199,18 @@ pub async fn h_group_list(
 }
 
 /// POST /api/groups/refresh
+#[utoipa::path(
+    post,
+    path = "/api/groups/refresh",
+    tag = "groups",
+    summary = "Refresh the group list from the provider",
+    description = "Runs `LIST ACTIVE` against the browse server and upserts the result into the group table.",
+    responses(
+        (status = 200, description = "Number of groups refreshed", body = serde_json::Value),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 500, description = "No browse server, or the provider call failed", body = ApiError),
+    ),
+)]
 pub async fn h_group_refresh(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -213,6 +246,19 @@ pub async fn h_group_refresh(
 }
 
 /// GET /api/groups/{id}
+#[utoipa::path(
+    get,
+    path = "/api/groups/{id}",
+    tag = "groups",
+    summary = "Get one newsgroup",
+    params(("id" = i64, Path, description = "Group id")),
+    responses(
+        (status = 200, description = "The group", body = serde_json::Value),
+        (status = 400, description = "The id is not an integer", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Group not found", body = ApiError),
+    ),
+)]
 pub async fn h_group_get(
     State(state): State<Arc<AppState>>,
     IdPath(id): IdPath<i64>,
@@ -226,6 +272,19 @@ pub async fn h_group_get(
 }
 
 /// GET /api/groups/{id}/status
+#[utoipa::path(
+    get,
+    path = "/api/groups/{id}/status",
+    tag = "groups",
+    summary = "Group scan and unread status",
+    params(("id" = i64, Path, description = "Group id")),
+    responses(
+        (status = 200, description = "Scan position, header and unread counts", body = serde_json::Value),
+        (status = 400, description = "The id is not an integer", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Group not found", body = ApiError),
+    ),
+)]
 pub async fn h_group_status(
     State(state): State<Arc<AppState>>,
     IdPath(id): IdPath<i64>,
@@ -250,6 +309,18 @@ pub async fn h_group_status(
 }
 
 /// POST /api/groups/{id}/subscribe
+#[utoipa::path(
+    post,
+    path = "/api/groups/{id}/subscribe",
+    tag = "groups",
+    summary = "Subscribe to a group",
+    params(("id" = i64, Path, description = "Group id")),
+    responses(
+        (status = 200, description = "Subscribed", body = serde_json::Value),
+        (status = 400, description = "The id is not an integer", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_group_subscribe(
     State(state): State<Arc<AppState>>,
     IdPath(id): IdPath<i64>,
@@ -262,6 +333,18 @@ pub async fn h_group_subscribe(
 }
 
 /// POST /api/groups/{id}/unsubscribe
+#[utoipa::path(
+    post,
+    path = "/api/groups/{id}/unsubscribe",
+    tag = "groups",
+    summary = "Unsubscribe from a group",
+    params(("id" = i64, Path, description = "Group id")),
+    responses(
+        (status = 200, description = "Unsubscribed", body = serde_json::Value),
+        (status = 400, description = "The id is not an integer", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_group_unsubscribe(
     State(state): State<Arc<AppState>>,
     IdPath(id): IdPath<i64>,
@@ -274,6 +357,18 @@ pub async fn h_group_unsubscribe(
 }
 
 /// GET /api/groups/{id}/headers
+#[utoipa::path(
+    get,
+    path = "/api/groups/{id}/headers",
+    tag = "articles",
+    summary = "List a group's headers",
+    params(("id" = i64, Path, description = "Group id"), HeaderListQuery),
+    responses(
+        (status = 200, description = "Page of headers with the unpaged total", body = serde_json::Value),
+        (status = 400, description = "The id is not an integer", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_header_list(
     State(state): State<Arc<AppState>>,
     IdPath(group_id): IdPath<i64>,
@@ -372,6 +467,21 @@ impl Drop for FetchInFlight {
 }
 
 /// POST /api/groups/{id}/headers/fetch — Background XOVER fetch.
+#[utoipa::path(
+    post,
+    path = "/api/groups/{id}/headers/fetch",
+    tag = "articles",
+    summary = "Fetch new headers for a group",
+    description = "Scans forward from the group's last scanned article through the browse server and stores the headers. Refused while another fetch for the group is already in flight.",
+    params(("id" = i64, Path, description = "Group id")),
+    responses(
+        (status = 200, description = "Fetch result", body = serde_json::Value),
+        (status = 400, description = "The id is not an integer", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 409, description = "A fetch for this group is already running", body = ApiError),
+        (status = 500, description = "No browse server, or the provider call failed", body = ApiError),
+    ),
+)]
 ///
 /// Returns 409 while a fetch of the same group is already running.
 pub async fn h_header_fetch(
@@ -507,6 +617,19 @@ async fn run_header_fetch(
 
 /// DELETE /api/groups/{id}/headers — Delete a group's stored headers and
 /// reset its scan watermark.
+#[utoipa::path(
+    delete,
+    path = "/api/groups/{id}/headers",
+    tag = "articles",
+    summary = "Clear a group's headers",
+    description = "Deletes every stored header for the group and resets its scan position.",
+    params(("id" = i64, Path, description = "Group id")),
+    responses(
+        (status = 200, description = "Headers cleared", body = serde_json::Value),
+        (status = 400, description = "The id is not an integer", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_header_clear(
     State(state): State<Arc<AppState>>,
     IdPath(group_id): IdPath<i64>,
@@ -528,6 +651,18 @@ pub async fn h_header_clear(
 }
 
 /// GET /api/groups/{id}/threads
+#[utoipa::path(
+    get,
+    path = "/api/groups/{id}/threads",
+    tag = "articles",
+    summary = "List threads in a group",
+    params(("id" = i64, Path, description = "Group id"), HeaderListQuery),
+    responses(
+        (status = 200, description = "Thread roots with their reply counts", body = serde_json::Value),
+        (status = 400, description = "The id is not an integer", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_thread_list(
     State(state): State<Arc<AppState>>,
     IdPath(group_id): IdPath<i64>,
@@ -547,6 +682,22 @@ pub async fn h_thread_list(
 }
 
 /// GET /api/groups/{gid}/threads/{root_msg_id}
+#[utoipa::path(
+    get,
+    path = "/api/groups/{gid}/threads/{root_msg_id}",
+    tag = "articles",
+    summary = "Get one thread",
+    params(
+        ("gid" = i64, Path, description = "Group id"),
+        ("root_msg_id" = String, Path, description = "Message id of the thread root"),
+    ),
+    responses(
+        (status = 200, description = "The thread's headers", body = serde_json::Value),
+        (status = 400, description = "A path parameter is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Thread root not found", body = ApiError),
+    ),
+)]
 pub async fn h_thread_get(
     State(state): State<Arc<AppState>>,
     IdPath((group_id, root_msg_id)): IdPath<(i64, String)>,
@@ -560,6 +711,19 @@ pub async fn h_thread_get(
 }
 
 /// POST /api/groups/{id}/headers/mark-read
+#[utoipa::path(
+    post,
+    path = "/api/groups/{id}/headers/mark-read",
+    tag = "articles",
+    summary = "Mark headers read or unread",
+    params(("id" = i64, Path, description = "Group id")),
+    request_body = nzb_web::nzb_core::models::MarkReadInput,
+    responses(
+        (status = 200, description = "Number of headers updated", body = serde_json::Value),
+        (status = 400, description = "The id or body is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_header_mark_read(
     State(state): State<Arc<AppState>>,
     IdPath(_group_id): IdPath<i64>,
@@ -573,6 +737,18 @@ pub async fn h_header_mark_read(
 }
 
 /// POST /api/groups/{id}/headers/mark-all-read
+#[utoipa::path(
+    post,
+    path = "/api/groups/{id}/headers/mark-all-read",
+    tag = "articles",
+    summary = "Mark every header in a group read",
+    params(("id" = i64, Path, description = "Group id")),
+    responses(
+        (status = 200, description = "Number of headers marked", body = serde_json::Value),
+        (status = 400, description = "The id is not an integer", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_header_mark_all_read(
     State(state): State<Arc<AppState>>,
     IdPath(group_id): IdPath<i64>,
@@ -582,6 +758,19 @@ pub async fn h_header_mark_all_read(
 }
 
 /// GET /api/articles/{message_id} — Fetch from NNTP.
+#[utoipa::path(
+    get,
+    path = "/api/articles/{message_id}",
+    tag = "articles",
+    summary = "Fetch one article",
+    params(("message_id" = String, Path, description = "Article message id")),
+    responses(
+        (status = 200, description = "Decoded article headers and body", body = serde_json::Value),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Article not found", body = ApiError),
+        (status = 502, description = "The provider call failed", body = ApiError),
+    ),
+)]
 pub async fn h_article_get(
     State(state): State<Arc<AppState>>,
     Path(message_id): Path<String>,
@@ -623,6 +812,19 @@ pub async fn h_article_get(
 }
 
 /// POST /api/groups/{id}/headers/download — Download selected as NZB.
+#[utoipa::path(
+    post,
+    path = "/api/groups/{id}/headers/download",
+    tag = "articles",
+    summary = "Download selected headers as an NZB",
+    params(("id" = i64, Path, description = "Group id")),
+    request_body = nzb_web::nzb_core::models::DownloadSelectedInput,
+    responses(
+        (status = 200, description = "Created job", body = serde_json::Value),
+        (status = 400, description = "The id or body is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_header_download(
     State(state): State<Arc<AppState>>,
     IdPath(group_id): IdPath<i64>,

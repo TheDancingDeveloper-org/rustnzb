@@ -8,6 +8,7 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
 
 // ---------------------------------------------------------------------------
 // Shared HTTP client — connection-pooling; created once, reused across requests
@@ -68,13 +69,17 @@ fn priority_from_i32(p: i32) -> Priority {
 // Query parameters
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct QueueQuery {
+    /// Maximum rows to return.
     pub limit: Option<usize>,
+    /// Rows to skip.
     pub offset: Option<usize>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HistoryQuery {
     /// Page size (default 50).
     pub limit: Option<usize>,
@@ -103,32 +108,44 @@ pub struct HistoryQuery {
 /// Largest `days` window `GET /api/history` accepts (about 100 years).
 const MAX_HISTORY_DAYS: u32 = 36_500;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct AddNzbQuery {
+    /// Category to file the job under.
     pub category: Option<String>,
+    /// Priority: 0 low, 1 normal, 2 high, 3 force.
     pub priority: Option<i32>,
+    /// Display name; defaults to the uploaded file's name.
     pub name: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct LogQuery {
+    /// Only entries for this job's persisted log.
     pub job_id: Option<String>,
+    /// Only entries after this sequence number.
     pub after_seq: Option<u64>,
+    /// Minimum level (`error`, `warn`, `info`, `debug`, `trace`).
     pub level: Option<String>,
+    /// Maximum entries to return.
     pub limit: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PauseForQuery {
+    /// How long to pause for, in seconds.
     pub duration_secs: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct MoveJobBody {
+    /// Zero-based position to move the job to.
     pub position: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct SortQueueBody {
     /// Field to sort by: `remaining` (default), `name`, `size`, `age` or
     /// `priority`.
@@ -146,18 +163,21 @@ fn default_sort_ascending() -> bool {
     true
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, ToSchema)]
 pub struct HistoryRetentionBody {
+    /// Entries to keep; null or 0 keeps all.
     pub retention: Option<usize>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, ToSchema)]
 pub struct MaxActiveDownloadsBody {
+    /// Concurrent downloads; 0 means unlimited.
     pub max_active_downloads: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct SetPriorityBody {
+    /// Priority: 0 low, 1 normal, 2 high, 3 force.
     pub priority: i32,
 }
 
@@ -165,7 +185,7 @@ pub struct SetPriorityBody {
 // Response types
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct QueueResponse {
     pub jobs: Vec<QueueJob>,
     pub total: usize,
@@ -177,14 +197,14 @@ pub struct QueueResponse {
 
 /// A queued job plus why it is paused (`manual`, `global`, `disk_space`,
 /// `server`), or null when it is not paused.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct QueueJob {
     #[serde(flatten)]
     pub job: NzbJob,
     pub pause_reason: Option<PauseReason>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HistoryResponse {
     pub entries: Vec<HistoryResponseEntry>,
     /// Number of entries matching the filters (across all pages).
@@ -197,7 +217,7 @@ pub struct HistoryResponse {
     pub stats: HistoryStats,
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, ToSchema)]
 pub struct HistoryStats {
     pub completed: usize,
     pub completed_bytes: u64,
@@ -210,7 +230,7 @@ pub struct HistoryStats {
     pub fail_reasons: Vec<HistoryFailReason>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HistoryFailReason {
     pub reason: String,
     pub count: usize,
@@ -271,7 +291,7 @@ impl HistoryStats {
 /// and that is what the expanded row loads. Both routes share this shape so a
 /// client can parse a list entry and a detail entry with one type; the two
 /// fields are simply empty on list rows.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HistoryResponseEntry {
     pub id: String,
     pub name: String,
@@ -345,13 +365,13 @@ impl From<HistoryEntry> for HistoryResponseEntry {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct AddNzbResponse {
     pub status: bool,
     pub nzo_ids: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct StatusResponse {
     pub version: &'static str,
     pub paused: bool,
@@ -371,7 +391,7 @@ pub struct StatusResponse {
     pub nntp_connections: Vec<NntpConnectionStatus>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct PostProcessingStatus {
     pub active_jobs: usize,
     pub active_repairs: usize,
@@ -384,26 +404,26 @@ pub struct PostProcessingStatus {
     pub max_extractions: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct NntpConnectionStatus {
     pub server_id: String,
     pub connected: usize,
     pub limit: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct SimpleResponse {
     pub status: bool,
 }
 
 /// The credential used by Sonarr, Radarr, Lidarr, and other SABnzbd-compatible
 /// clients to call `/sabnzbd/api`.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct SabApiKeyResponse {
     pub api_key: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct LogResponse {
     pub entries: Vec<LogEntry>,
     pub latest_seq: u64,
@@ -418,6 +438,18 @@ pub struct LogResponse {
 // ---------------------------------------------------------------------------
 
 /// GET /api/queue -- List jobs that are still active in the download queue.
+#[utoipa::path(
+    get,
+    path = "/api/queue",
+    tag = "queue",
+    summary = "List the download queue",
+    params(QueueQuery),
+    responses(
+        (status = 200, description = "Queue page with live speed and pause state", body = QueueResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 500, description = "Queue could not be read", body = ApiError),
+    ),
+)]
 pub async fn h_queue_list(
     State(state): State<Arc<AppState>>,
     Query(q): Query<QueueQuery>,
@@ -617,6 +649,22 @@ fn enqueue_nzb(
 /// `category`/`cat`, `priority`, `name`/`nzbname` and `password` may be sent
 /// as multipart text fields or (except `password`) query parameters; a form
 /// field wins over the query parameter of the same name.
+#[utoipa::path(
+    post,
+    path = "/api/queue/add",
+    tag = "queue",
+    summary = "Add one or more NZBs",
+    description = "Accepts a `multipart/form-data` body. Parts with a file name (or named `file`) are NZB uploads; the text fields `password`, `category` (alias `cat`), `priority` and `name` (alias `nzbname`) set job options. A `GET`-style set of query parameters is accepted as defaults for the text fields. An `Idempotency-Key` header makes the admission repeatable.",
+    params(AddNzbQuery, ("Idempotency-Key" = Option<String>, Header, description = "Opaque key that makes a repeated add resolve to the same admission instead of creating a second job")),
+    request_body(content_type = "multipart/form-data", description = "One or more NZB files plus optional `password`, `category`, `priority` and `name` text fields", content = String),
+    responses(
+        (status = 200, description = "Admission result", body = AddNzbResponse),
+        (status = 400, description = "No NZB supplied or a field is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 409, description = "The NZB duplicates a job under the configured duplicate policy", body = ApiError),
+        (status = 413, description = "The upload exceeds the configured limit", body = ApiError),
+    ),
+)]
 pub async fn h_queue_add(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AddNzbQuery>,
@@ -676,6 +724,19 @@ pub async fn h_queue_add(
 }
 
 /// PUT /api/queue/{id}/priority -- Change job priority.
+#[utoipa::path(
+    put,
+    path = "/api/queue/{id}/priority",
+    tag = "queue",
+    summary = "Set a job's priority",
+    params(("id" = String, Path, description = "Job id")),
+    request_body = SetPriorityBody,
+    responses(
+        (status = 200, description = "Priority updated", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Job not found", body = ApiError),
+    ),
+)]
 pub async fn h_queue_set_priority(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -698,6 +759,18 @@ pub async fn h_queue_set_priority(
 
 /// POST /api/queue/sort -- Stable sort by `sort_by` (default: remaining
 /// work percentage) in `direction` (or the legacy `ascending` flag).
+#[utoipa::path(
+    post,
+    path = "/api/queue/sort",
+    tag = "queue",
+    summary = "Sort the queue",
+    request_body = SortQueueBody,
+    responses(
+        (status = 200, description = "Queue reordered", body = SimpleResponse),
+        (status = 400, description = "Unknown sort field or direction", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_queue_sort(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SortQueueBody>,
@@ -752,11 +825,15 @@ async fn validate_feed_url(state: &AppState, url: &str) -> Result<(), ApiError> 
         .map_err(|e| ApiError::url_rejected(format!("Feed URL rejected: {e}")))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct AddUrlBody {
+    /// URL of the NZB to fetch.
     pub url: String,
+    /// Display name; defaults to the NZB's own name.
     pub name: Option<String>,
+    /// Category to file the job under.
     pub category: Option<String>,
+    /// Priority: 0 low, 1 normal, 2 high, 3 force.
     pub priority: Option<i32>,
     /// Archive password; overrides inline and NZB-embedded passwords.
     #[serde(default)]
@@ -764,6 +841,22 @@ pub struct AddUrlBody {
 }
 
 /// POST /api/queue/add-url -- Add an NZB from a URL.
+#[utoipa::path(
+    post,
+    path = "/api/queue/add-url",
+    tag = "queue",
+    summary = "Add an NZB from a URL",
+    description = "Fetches the NZB through the configured fetch policy (private addresses are refused) and admits it like `POST /api/queue/add`. An `Idempotency-Key` header makes the admission repeatable.",
+    params(("Idempotency-Key" = Option<String>, Header, description = "Opaque key that makes a repeated add resolve to the same admission instead of creating a second job")),
+    request_body = AddUrlBody,
+    responses(
+        (status = 200, description = "Admission result", body = AddNzbResponse),
+        (status = 400, description = "No URL, malformed URL, or the URL is not allowed", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 409, description = "The NZB duplicates a job under the configured duplicate policy", body = ApiError),
+        (status = 502, description = "The URL could not be fetched", body = ApiError),
+    ),
+)]
 pub async fn h_queue_add_url(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AddUrlBody>,
@@ -835,6 +928,18 @@ pub async fn h_queue_add_url(
 }
 
 /// POST /api/queue/{id}/pause -- Pause a job.
+#[utoipa::path(
+    post,
+    path = "/api/queue/{id}/pause",
+    tag = "queue",
+    summary = "Pause one job",
+    params(("id" = String, Path, description = "Job id")),
+    responses(
+        (status = 200, description = "Job paused", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Job not found", body = ApiError),
+    ),
+)]
 pub async fn h_queue_pause(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -844,6 +949,18 @@ pub async fn h_queue_pause(
 }
 
 /// POST /api/queue/{id}/resume -- Resume a paused job.
+#[utoipa::path(
+    post,
+    path = "/api/queue/{id}/resume",
+    tag = "queue",
+    summary = "Resume one job",
+    params(("id" = String, Path, description = "Job id")),
+    responses(
+        (status = 200, description = "Job resumed", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Job not found", body = ApiError),
+    ),
+)]
 pub async fn h_queue_resume(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -862,6 +979,18 @@ pub async fn h_queue_resume(
 }
 
 /// DELETE /api/queue/{id} -- Remove a job from the queue.
+#[utoipa::path(
+    delete,
+    path = "/api/queue/{id}",
+    tag = "queue",
+    summary = "Remove a job from the queue",
+    params(("id" = String, Path, description = "Job id")),
+    responses(
+        (status = 200, description = "Job removed", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Job not found", body = ApiError),
+    ),
+)]
 pub async fn h_queue_delete(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -874,6 +1003,20 @@ pub async fn h_queue_delete(
 }
 
 /// POST /api/queue/{id}/move -- Move a job to a new position.
+#[utoipa::path(
+    post,
+    path = "/api/queue/{id}/move",
+    tag = "queue",
+    summary = "Move a job within the queue",
+    params(("id" = String, Path, description = "Job id")),
+    request_body = MoveJobBody,
+    responses(
+        (status = 200, description = "Job moved", body = SimpleResponse),
+        (status = 400, description = "Position is out of range", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Job not found", body = ApiError),
+    ),
+)]
 pub async fn h_queue_move(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -887,6 +1030,16 @@ pub async fn h_queue_move(
 }
 
 /// POST /api/queue/pause -- Pause all downloads.
+#[utoipa::path(
+    post,
+    path = "/api/queue/pause",
+    tag = "queue",
+    summary = "Pause all downloads",
+    responses(
+        (status = 200, description = "Downloads paused", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_queue_pause_all(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
@@ -895,6 +1048,16 @@ pub async fn h_queue_pause_all(
 }
 
 /// POST /api/queue/resume -- Resume all downloads.
+#[utoipa::path(
+    post,
+    path = "/api/queue/resume",
+    tag = "queue",
+    summary = "Resume all downloads",
+    responses(
+        (status = 200, description = "Downloads resumed", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_queue_resume_all(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
@@ -903,6 +1066,17 @@ pub async fn h_queue_resume_all(
 }
 
 /// POST /api/queue/pause-for -- Pause all downloads for a duration.
+#[utoipa::path(
+    post,
+    path = "/api/queue/pause-for",
+    tag = "queue",
+    summary = "Pause all downloads for a while",
+    params(PauseForQuery),
+    responses(
+        (status = 200, description = "Downloads paused until the deadline", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_queue_pause_for(
     State(state): State<Arc<AppState>>,
     Query(q): Query<PauseForQuery>,
@@ -920,6 +1094,19 @@ pub async fn h_queue_pause_for(
 /// Filtering, paging, the category list and the window stats all run in SQL
 /// on a blocking thread, so neither the history size nor the stored NZB blobs
 /// cost the async runtime anything.
+#[utoipa::path(
+    get,
+    path = "/api/history",
+    tag = "history",
+    summary = "List history entries",
+    description = "Pages over completed and failed jobs. `stages` and `server_stats` are omitted from list rows; fetch `GET /api/history/{id}` for the full row.",
+    params(HistoryQuery),
+    responses(
+        (status = 200, description = "History page, aggregate statistics and known categories", body = HistoryResponse),
+        (status = 400, description = "A filter is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_history_list(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HistoryQuery>,
@@ -1030,6 +1217,18 @@ where
 }
 
 /// GET /api/history/{id} -- Detailed information for one completed/failed job.
+#[utoipa::path(
+    get,
+    path = "/api/history/{id}",
+    tag = "history",
+    summary = "Get one history entry",
+    params(("id" = String, Path, description = "History entry id")),
+    responses(
+        (status = 200, description = "Full entry, including stages and per-server statistics", body = HistoryResponseEntry),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Entry not found", body = ApiError),
+    ),
+)]
 pub async fn h_history_get(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1056,7 +1255,7 @@ pub struct HistoryDeleteQuery {
 /// What a trashed deletion returns: the entries moved into the undo window
 /// and when that window closes. A caller restores them with
 /// `POST /api/history/restore`, so it must keep the ids.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HistoryTrashResponse {
     pub status: bool,
     /// Entries actually trashed, in request order.
@@ -1066,7 +1265,7 @@ pub struct HistoryTrashResponse {
     pub purge_after: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum HistoryDeleteResponse {
     Trashed(HistoryTrashResponse),
@@ -1075,7 +1274,7 @@ pub enum HistoryDeleteResponse {
 
 /// The list-row shape for a trashed entry. It keeps the fields an undo needs
 /// to put the row back in view, without loading its blobs.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct TrashedHistoryEntry {
     pub id: String,
     pub name: String,
@@ -1107,6 +1306,20 @@ fn trash_response(
 ///
 /// `?trash=true` moves it into the undo window instead of deleting it, and
 /// returns its summary plus `purge_after`.
+#[utoipa::path(
+    delete,
+    path = "/api/history/{id}",
+    tag = "history",
+    summary = "Delete one history entry",
+    params(
+        ("id" = String, Path, description = "History entry id"),
+        ("trash" = Option<bool>, Query, description = "Move the entry into the undo window instead of deleting it"),
+    ),
+    responses(
+        (status = 200, description = "Entry deleted, or trashed and restorable until purge_after", body = HistoryDeleteResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_history_delete(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1128,12 +1341,12 @@ pub async fn h_history_delete(
     ))))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct HistoryRestoreBody {
     pub ids: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HistoryRestoreResponse {
     pub status: bool,
     /// Ids brought back, in request order.
@@ -1147,6 +1360,19 @@ pub struct HistoryRestoreResponse {
 ///
 /// Per-id like the bulk action: one id whose window has closed or that is
 /// already visible does not stop the others from coming back.
+#[utoipa::path(
+    post,
+    path = "/api/history/restore",
+    tag = "history",
+    summary = "Restore trashed history entries",
+    description = "Undo `DELETE /api/history/{id}?trash=true` while the undo window is open. One request, one result per id; an id whose window has closed is reported as a per-id failure rather than failing the batch.",
+    request_body = HistoryRestoreBody,
+    responses(
+        (status = 200, description = "Per-id restore results", body = HistoryRestoreResponse),
+        (status = 400, description = "Too many ids in one request", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_history_restore(
     State(state): State<Arc<AppState>>,
     Json(body): Json<HistoryRestoreBody>,
@@ -1180,6 +1406,16 @@ pub async fn h_history_restore(
 }
 
 /// DELETE /api/history -- Clear all history.
+#[utoipa::path(
+    delete,
+    path = "/api/history",
+    tag = "history",
+    summary = "Clear all history",
+    responses(
+        (status = 200, description = "History cleared", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_history_clear(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SimpleResponse>, ApiError> {
@@ -1194,6 +1430,21 @@ pub async fn h_history_clear(
 /// existing job's id in `nzo_ids` (the same replay semantics as an
 /// `Idempotency-Key` queue add). Once that job has left the queue the entry
 /// can be retried again.
+#[utoipa::path(
+    post,
+    path = "/api/history/{id}/retry",
+    tag = "history",
+    summary = "Retry a history entry",
+    description = "Re-admits the entry's NZB with a new job id. Idempotent per entry: repeating the request while the retry is live resolves to the same new job.",
+    params(("id" = String, Path, description = "History entry id")),
+    responses(
+        (status = 200, description = "Retry admitted", body = AddNzbResponse),
+        (status = 400, description = "The entry carries no NZB data", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Entry not found", body = ApiError),
+        (status = 409, description = "The retried NZB duplicates a live job", body = ApiError),
+    ),
+)]
 pub async fn h_history_retry(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1239,7 +1490,7 @@ pub async fn h_history_retry(
 /// hand-written client.
 const MAX_HISTORY_BULK_IDS: usize = 5_000;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct HistoryBulkBody {
     /// `delete` or `retry`.
     pub action: String,
@@ -1268,6 +1519,19 @@ pub struct HistoryBulkBody {
 /// idempotent per id like `DELETE /api/history/{id}`, but a list entry must
 /// still report an unknown id as a failure -- otherwise a selection the
 /// server silently dropped looks like success.
+#[utoipa::path(
+    post,
+    path = "/api/history/bulk",
+    tag = "history",
+    summary = "Delete or retry several history entries",
+    description = "One request, one result per id; a per-id failure is reported rather than failing the batch. With `status` set, `ids` may be empty and the action covers every entry with that status (optionally narrowed by `days`, `category` and `search`).",
+    request_body = HistoryBulkBody,
+    responses(
+        (status = 200, description = "Per-id results; `trashed` is present when the caller asked for the undo window", body = HistoryBulkResponse),
+        (status = 400, description = "Unknown action or too many ids", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_history_bulk(
     State(state): State<Arc<AppState>>,
     Json(body): Json<HistoryBulkBody>,
@@ -1410,6 +1674,17 @@ pub async fn h_history_bulk(
 // ---------------------------------------------------------------------------
 
 /// GET /api/status -- Overall application status.
+#[utoipa::path(
+    get,
+    path = "/api/status",
+    tag = "system",
+    summary = "Engine status",
+    description = "Version, pause state, live speed, disk space, post-processing load and NNTP connection usage.",
+    responses(
+        (status = 200, description = "Current engine status", body = StatusResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_status(
     State(state): State<Arc<AppState>>,
     #[cfg(feature = "webdav")] axum::Extension(dav): axum::Extension<
@@ -1466,6 +1741,19 @@ pub async fn h_status(
 // ---------------------------------------------------------------------------
 
 /// GET /api/logs -- Get log entries.
+#[utoipa::path(
+    get,
+    path = "/api/logs",
+    tag = "logs",
+    summary = "Read the in-memory log buffer",
+    description = "Pages over the live log ring buffer, or over one job's persisted log when `job_id` is given.",
+    params(LogQuery),
+    responses(
+        (status = 200, description = "Matching log entries", body = LogResponse),
+        (status = 400, description = "A filter is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_logs(
     State(state): State<Arc<AppState>>,
     Query(q): Query<LogQuery>,
@@ -1493,6 +1781,17 @@ pub async fn h_logs(
 /// and the `user:pass@` part of server proxy URLs. The stored value is never
 /// returned; an update that sends the mask back keeps it. The dead settings
 /// `general.cache_size` and `general.log_file` are left out of the response.
+#[utoipa::path(
+    get,
+    path = "/api/config",
+    tag = "config",
+    summary = "Read the persisted configuration",
+    description = "Returns the full configuration document as stored. Server and API-key secrets are masked exactly as the settings UI receives them.",
+    responses(
+        (status = 200, description = "Configuration document", body = serde_json::Value),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_config_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1514,7 +1813,7 @@ pub async fn h_config_get(
 /// that a mistaken upload cannot be used to exhaust memory.
 const MAX_BACKUP_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, IntoParams)]
 pub struct BackupExportQuery {
     /// Include real credentials. Off by default: a masked backup is safe to
     /// share, and the file says which it is.
@@ -1526,6 +1825,19 @@ pub struct BackupExportQuery {
 ///
 /// Secrets are masked unless `?secrets=true` is given. The response is marked
 /// `no-store`, because even a masked export describes the install.
+#[utoipa::path(
+    get,
+    path = "/api/config/backup",
+    tag = "config",
+    summary = "Download the configuration as a TOML backup",
+    description = "Returns one TOML document describing the install. Secrets are masked unless `?secrets=true` is given. The response is marked `no-store`.",
+    params(BackupExportQuery),
+    responses(
+        (status = 200, description = "Configuration backup as TOML", body = String, content_type = "application/toml"),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 500, description = "The configuration could not be serialized", body = ApiError),
+    ),
+)]
 pub async fn h_config_backup_export(
     State(state): State<Arc<AppState>>,
     Query(query): Query<BackupExportQuery>,
@@ -1726,6 +2038,20 @@ fn backup_report(
 /// file would keep and the settings that would need a restart. A file that
 /// would be refused is reported as a 400 here too, so the UI can show the
 /// reason before the operator commits to it.
+#[utoipa::path(
+    post,
+    path = "/api/config/backup/preview",
+    tag = "config",
+    summary = "Check a configuration backup without applying it",
+    description = "Parses and validates a TOML backup and returns the same summary a restore would, including secrets a masked file keeps and settings that would need a restart. Nothing is written.",
+    request_body(content_type = "application/toml", description = "A backup file produced by `GET /api/config/backup`", content = String),
+    responses(
+        (status = 200, description = "What the backup holds and what restoring it would do", body = serde_json::Value),
+        (status = 400, description = "The backup is invalid or would be refused", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 413, description = "The backup file is larger than the accepted limit", body = ApiError),
+    ),
+)]
 pub async fn h_config_backup_preview(
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
@@ -1743,6 +2069,20 @@ pub async fn h_config_backup_preview(
 /// already holds; a real one replaces it. Nothing is written unless the whole
 /// document parses, validates and can be saved, and the live queue manager is
 /// updated from the committed configuration afterwards.
+#[utoipa::path(
+    post,
+    path = "/api/config/backup/restore",
+    tag = "config",
+    summary = "Replace the configuration from a backup",
+    description = "Replaces the whole file layer from a TOML backup. A setting absent from the backup returns to its default; a masked secret keeps the value this install already holds. Nothing is written unless the whole document parses, validates and can be saved.",
+    request_body(content_type = "application/toml", description = "A backup file produced by `GET /api/config/backup`", content = String),
+    responses(
+        (status = 200, description = "What the backup held and which settings wait for a restart", body = serde_json::Value),
+        (status = 400, description = "The backup is invalid or would be refused", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 413, description = "The backup file is larger than the accepted limit", body = ApiError),
+    ),
+)]
 pub async fn h_config_backup_restore(
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
@@ -1817,6 +2157,16 @@ fn apply_restored_runtime(state: &Arc<AppState>) {
 /// This route is protected by the native API authentication middleware. The
 /// general config endpoint intentionally remains useful for regular settings,
 /// while this dedicated route makes the sensitive-value access explicit.
+#[utoipa::path(
+    get,
+    path = "/api/config/sabnzbd-api-key",
+    tag = "config",
+    summary = "Read the SABnzbd API key",
+    responses(
+        (status = 200, description = "The configured key, or null when unset", body = SabApiKeyResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_sab_api_key_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SabApiKeyResponse>, ApiError> {
@@ -1827,6 +2177,16 @@ pub async fn h_sab_api_key_get(
 
 /// POST /api/config/sabnzbd-api-key/rotate -- Generate, persist, and return a
 /// replacement SABnzbd API key. The previous key stops working immediately.
+#[utoipa::path(
+    post,
+    path = "/api/config/sabnzbd-api-key/rotate",
+    tag = "config",
+    summary = "Rotate the SABnzbd API key",
+    responses(
+        (status = 200, description = "The newly generated key", body = SabApiKeyResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_sab_api_key_rotate(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SabApiKeyResponse>, ApiError> {
@@ -1848,6 +2208,16 @@ pub async fn h_sab_api_key_rotate(
 /// GET /api/config/servers -- List configured servers.
 ///
 /// Passwords are replaced with `********`.
+#[utoipa::path(
+    get,
+    path = "/api/config/servers",
+    tag = "servers",
+    summary = "List configured NNTP servers",
+    responses(
+        (status = 200, description = "Servers in configuration order, passwords masked", body = Vec<ServerConfig>),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_servers_list(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ServerConfig>>, ApiError> {
@@ -1888,6 +2258,19 @@ fn resolve_secret(
 }
 
 /// POST /api/config/servers -- Add a new server.
+#[utoipa::path(
+    post,
+    path = "/api/config/servers",
+    tag = "servers",
+    summary = "Add an NNTP server",
+    request_body = ServerConfig,
+    responses(
+        (status = 200, description = "Created server, password masked", body = ServerConfig),
+        (status = 400, description = "The server config is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 409, description = "A server with that id already exists", body = ApiError),
+    ),
+)]
 pub async fn h_server_add(
     State(state): State<Arc<AppState>>,
     Json(mut server): Json<ServerConfig>,
@@ -1950,6 +2333,21 @@ fn keep_unchanged_password(server: &mut ServerConfig, existing: &ServerConfig) {
 /// An empty or absent `password`, or the mask `********`, keeps the stored
 /// password; JSON `null` clears it; any other value replaces it. A
 /// `proxy_url` that is the masked form of the stored one keeps the stored URL.
+#[utoipa::path(
+    put,
+    path = "/api/config/servers/{id}",
+    tag = "servers",
+    summary = "Update an NNTP server",
+    description = "Applies a partial patch. A masked or empty password, and an unchanged proxy URL, keep the stored values.",
+    params(("id" = String, Path, description = "Server id")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Server updated", body = SimpleResponse),
+        (status = 400, description = "The patch is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Server not found", body = ApiError),
+    ),
+)]
 pub async fn h_server_update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2007,6 +2405,18 @@ fn merge_server_update(
 }
 
 /// DELETE /api/config/servers/{id} -- Delete a server.
+#[utoipa::path(
+    delete,
+    path = "/api/config/servers/{id}",
+    tag = "servers",
+    summary = "Delete an NNTP server",
+    params(("id" = String, Path, description = "Server id")),
+    responses(
+        (status = 200, description = "Server deleted", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Server not found", body = ApiError),
+    ),
+)]
 pub async fn h_server_delete(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2030,6 +2440,18 @@ pub async fn h_server_delete(
 }
 
 /// POST /api/config/servers/{id}/test -- Test a server connection.
+#[utoipa::path(
+    post,
+    path = "/api/config/servers/{id}/test",
+    tag = "servers",
+    summary = "Test a configured server",
+    params(("id" = String, Path, description = "Server id")),
+    responses(
+        (status = 200, description = "Connection test result", body = ServerTestResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Server not found", body = ApiError),
+    ),
+)]
 pub async fn h_server_test(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2065,7 +2487,7 @@ pub async fn h_server_test(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct ServerTestResponse {
     pub success: bool,
     pub message: String,
@@ -2075,6 +2497,19 @@ pub struct ServerTestResponse {
 ///
 /// When the body names an existing server and carries no new password (empty,
 /// absent or the mask), the stored password is used, matching update.
+#[utoipa::path(
+    post,
+    path = "/api/config/servers/test-config",
+    tag = "servers",
+    summary = "Test a server config without saving it",
+    description = "When the body names an existing server and carries no new password, the stored password is used.",
+    request_body = ServerConfig,
+    responses(
+        (status = 200, description = "Connection test result", body = ServerTestResponse),
+        (status = 400, description = "The server config is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_server_test_inline(
     State(state): State<Arc<AppState>>,
     Json(mut server): Json<ServerConfig>,
@@ -2150,6 +2585,18 @@ async fn test_server_connection(mut server: ServerConfig) -> Result<String, Stri
 }
 
 /// GET /api/history/{id}/logs -- Get persisted logs for a history entry.
+#[utoipa::path(
+    get,
+    path = "/api/history/{id}/logs",
+    tag = "history",
+    summary = "Read a history entry's persisted log",
+    params(("id" = String, Path, description = "History entry id")),
+    responses(
+        (status = 200, description = "Log entries", body = LogResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Entry not found", body = ApiError),
+    ),
+)]
 pub async fn h_history_logs(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2183,6 +2630,16 @@ pub async fn h_history_logs(
 }
 
 /// GET /api/config/categories -- List configured categories.
+#[utoipa::path(
+    get,
+    path = "/api/config/categories",
+    tag = "categories",
+    summary = "List categories",
+    responses(
+        (status = 200, description = "Categories in configuration order", body = Vec<CategoryConfig>),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_categories_list(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<nzb_web::nzb_core::config::CategoryConfig>>, ApiError> {
@@ -2190,6 +2647,19 @@ pub async fn h_categories_list(
 }
 
 /// POST /api/config/categories -- Add a new category.
+#[utoipa::path(
+    post,
+    path = "/api/config/categories",
+    tag = "categories",
+    summary = "Add a category",
+    request_body = CategoryConfig,
+    responses(
+        (status = 200, description = "Category created", body = CategoryConfig),
+        (status = 400, description = "The category is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 409, description = "A category with that name already exists", body = ApiError),
+    ),
+)]
 pub async fn h_category_add(
     State(state): State<Arc<AppState>>,
     Json(cat): Json<CategoryConfig>,
@@ -2212,6 +2682,20 @@ pub async fn h_category_add(
 }
 
 /// PUT /api/config/categories/{name} -- Update a category.
+#[utoipa::path(
+    put,
+    path = "/api/config/categories/{name}",
+    tag = "categories",
+    summary = "Update a category",
+    params(("name" = String, Path, description = "Category name")),
+    request_body = CategoryConfig,
+    responses(
+        (status = 200, description = "Category updated", body = serde_json::Value),
+        (status = 400, description = "The category is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Category not found", body = ApiError),
+    ),
+)]
 pub async fn h_category_update(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -2234,6 +2718,18 @@ pub async fn h_category_update(
 }
 
 /// DELETE /api/config/categories/{name} -- Delete a category.
+#[utoipa::path(
+    delete,
+    path = "/api/config/categories/{name}",
+    tag = "categories",
+    summary = "Delete a category",
+    params(("name" = String, Path, description = "Category name")),
+    responses(
+        (status = 200, description = "Category deleted", body = serde_json::Value),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Category not found", body = ApiError),
+    ),
+)]
 pub async fn h_category_delete(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -2253,6 +2749,18 @@ pub async fn h_category_delete(
 }
 
 /// PUT /api/config/history-retention -- Update history retention setting.
+#[utoipa::path(
+    put,
+    path = "/api/config/history-retention",
+    tag = "config",
+    summary = "Set history retention",
+    request_body = HistoryRetentionBody,
+    responses(
+        (status = 200, description = "Retention updated", body = SimpleResponse),
+        (status = 400, description = "Retention is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_history_retention_set(
     State(state): State<Arc<AppState>>,
     Json(body): Json<HistoryRetentionBody>,
@@ -2269,6 +2777,16 @@ pub async fn h_history_retention_set(
 }
 
 /// GET /api/config/history-retention -- Get history retention setting.
+#[utoipa::path(
+    get,
+    path = "/api/config/history-retention",
+    tag = "config",
+    summary = "Read history retention",
+    responses(
+        (status = 200, description = "Configured retention", body = HistoryRetentionBody),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_history_retention_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<HistoryRetentionBody>, ApiError> {
@@ -2279,6 +2797,18 @@ pub async fn h_history_retention_get(
 }
 
 /// PUT /api/config/max-active-downloads -- Update max concurrent downloads.
+#[utoipa::path(
+    put,
+    path = "/api/config/max-active-downloads",
+    tag = "config",
+    summary = "Set the concurrent download limit",
+    request_body = MaxActiveDownloadsBody,
+    responses(
+        (status = 200, description = "Limit updated", body = SimpleResponse),
+        (status = 400, description = "Limit is out of range", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_max_active_downloads_set(
     State(state): State<Arc<AppState>>,
     Json(body): Json<MaxActiveDownloadsBody>,
@@ -2295,6 +2825,16 @@ pub async fn h_max_active_downloads_set(
 }
 
 /// GET /api/config/max-active-downloads -- Get max concurrent downloads.
+#[utoipa::path(
+    get,
+    path = "/api/config/max-active-downloads",
+    tag = "config",
+    summary = "Read the concurrent download limit",
+    responses(
+        (status = 200, description = "Configured limit", body = MaxActiveDownloadsBody),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_max_active_downloads_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<MaxActiveDownloadsBody>, ApiError> {
@@ -2308,12 +2848,22 @@ pub async fn h_max_active_downloads_get(
 // Speed limit handlers
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct SpeedLimitResponse {
     pub speed_limit_bps: u64,
 }
 
 /// GET /api/config/speed-limit -- Get current speed limit.
+#[utoipa::path(
+    get,
+    path = "/api/config/speed-limit",
+    tag = "config",
+    summary = "Read the speed limit",
+    responses(
+        (status = 200, description = "Configured cap in bytes/sec (0 = unlimited)", body = SpeedLimitResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_get_speed_limit(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SpeedLimitResponse>, ApiError> {
@@ -2322,12 +2872,24 @@ pub async fn h_get_speed_limit(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct SetSpeedLimitBody {
+    /// Cap in bytes/sec; 0 means unlimited.
     pub speed_limit_bps: u64,
 }
 
 /// PUT /api/config/speed-limit -- Set download speed limit.
+#[utoipa::path(
+    put,
+    path = "/api/config/speed-limit",
+    tag = "config",
+    summary = "Set the speed limit",
+    request_body = SetSpeedLimitBody,
+    responses(
+        (status = 200, description = "Limit applied and persisted", body = serde_json::Value),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_set_speed_limit(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SetSpeedLimitBody>,
@@ -2345,7 +2907,7 @@ pub async fn h_set_speed_limit(
 // Download schedule
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct ScheduleResponse {
     /// The saved schedule, with every rule's id filled in.
     pub enabled: bool,
@@ -2364,6 +2926,16 @@ pub struct ScheduleResponse {
 }
 
 /// GET /api/config/schedule -- The schedule and what it is doing now.
+#[utoipa::path(
+    get,
+    path = "/api/config/schedule",
+    tag = "config",
+    summary = "Read the download schedule and what it is doing now",
+    responses(
+        (status = 200, description = "The saved schedule and its current effect", body = ScheduleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_schedule_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ScheduleResponse>, ApiError> {
@@ -2379,7 +2951,7 @@ pub async fn h_schedule_get(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct ScheduleUpdate {
     pub enabled: bool,
     pub rules: Vec<ScheduleRule>,
@@ -2390,6 +2962,19 @@ pub struct ScheduleUpdate {
 /// Every rule is validated before anything is saved, so a bad rule never
 /// half-applies. Rules without an id get one; ids stay stable across edits so
 /// an active window survives a save.
+#[utoipa::path(
+    put,
+    path = "/api/config/schedule",
+    tag = "config",
+    summary = "Replace the download schedule",
+    description = "Validates every rule before saving any of them. Rules without an id are given one; existing ids stay stable so an active window survives a save.",
+    request_body = ScheduleUpdate,
+    responses(
+        (status = 200, description = "The saved schedule and its current effect", body = ScheduleResponse),
+        (status = 400, description = "A rule is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_schedule_update(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ScheduleUpdate>, JsonRejection>,
@@ -2468,13 +3053,25 @@ pub async fn h_schedule_update(
 // Disk guards handlers
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct DiskGuardsBody {
+    /// Pause downloads when free space drops below this.
     pub min_free_space_bytes: u64,
+    /// Abandon a job early when its slice map shows it cannot succeed.
     pub abort_hopeless: bool,
 }
 
 /// GET /api/config/disk-guards -- Get disk guard settings.
+#[utoipa::path(
+    get,
+    path = "/api/config/disk-guards",
+    tag = "config",
+    summary = "Read the disk guard settings",
+    responses(
+        (status = 200, description = "Configured guards", body = DiskGuardsBody),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_disk_guards_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DiskGuardsBody>, ApiError> {
@@ -2486,6 +3083,17 @@ pub async fn h_disk_guards_get(
 }
 
 /// PUT /api/config/disk-guards -- Update disk guard settings.
+#[utoipa::path(
+    put,
+    path = "/api/config/disk-guards",
+    tag = "config",
+    summary = "Set the disk guard settings",
+    request_body = DiskGuardsBody,
+    responses(
+        (status = 200, description = "Guards applied and persisted", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_disk_guards_set(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DiskGuardsBody>,
@@ -2505,8 +3113,9 @@ pub async fn h_disk_guards_set(
 // Debug logging
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct DebugLoggingBody {
+    /// The saved choice.
     pub enabled: bool,
     /// The filter that is actually in effect, which may differ from the saved
     /// choice when `RUST_LOG`, `--log-level` or `RUSTNZB_LOG_LEVEL` overrides it.
@@ -2523,6 +3132,17 @@ pub struct DebugLoggingBody {
 /// Reports the effective state. When `RUST_LOG`, `--log-level` or
 /// `RUSTNZB_LOG_LEVEL` is set it wins over the saved choice, and the response
 /// says so instead of reporting the config value.
+#[utoipa::path(
+    get,
+    path = "/api/config/debug-logging",
+    tag = "config",
+    summary = "Read the debug logging state",
+    description = "Reports the effective state: an environment or command-line log filter wins over the saved choice, and `overridden` says so.",
+    responses(
+        (status = 200, description = "Saved choice and effective state", body = DebugLoggingBody),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_debug_logging_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DebugLoggingBody>, ApiError> {
@@ -2552,6 +3172,18 @@ fn debug_logging_state(saved_level: &str) -> DebugLoggingBody {
 /// remembers the level it replaced; turning it off restores that level. When
 /// an environment or command-line override is active the choice is still
 /// saved, but the live filter is left alone and the response says so.
+#[utoipa::path(
+    put,
+    path = "/api/config/debug-logging",
+    tag = "config",
+    summary = "Turn debug logging on or off",
+    request_body = DebugLoggingBody,
+    responses(
+        (status = 200, description = "Toggle applied", body = DebugLoggingStatus),
+        (status = 400, description = "An environment or command-line override owns the filter", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_debug_logging_set(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DebugLoggingBody>,
@@ -2652,7 +3284,7 @@ mod debug_toggle_tests {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct DebugLoggingStatus {
     pub status: bool,
     #[serde(flatten)]
@@ -2664,6 +3296,16 @@ pub struct DebugLoggingStatus {
 // ---------------------------------------------------------------------------
 
 /// GET /api/config/rss-feeds -- List RSS feeds.
+#[utoipa::path(
+    get,
+    path = "/api/config/rss-feeds",
+    tag = "rss",
+    summary = "List RSS feeds",
+    responses(
+        (status = 200, description = "Configured feeds", body = Vec<RssFeedConfig>),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_rss_feeds_list(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<RssFeedConfig>>, ApiError> {
@@ -2672,6 +3314,19 @@ pub async fn h_rss_feeds_list(
 }
 
 /// POST /api/config/rss-feeds -- Add an RSS feed.
+#[utoipa::path(
+    post,
+    path = "/api/config/rss-feeds",
+    tag = "rss",
+    summary = "Add an RSS feed",
+    request_body = RssFeedConfig,
+    responses(
+        (status = 200, description = "Feed created", body = RssFeedConfig),
+        (status = 400, description = "The feed or its filter regex is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 409, description = "A feed with that name already exists", body = ApiError),
+    ),
+)]
 pub async fn h_rss_feed_add(
     State(state): State<Arc<AppState>>,
     Json(feed): Json<RssFeedConfig>,
@@ -2693,6 +3348,20 @@ pub async fn h_rss_feed_add(
 }
 
 /// PUT /api/config/rss-feeds/{name} -- Update an RSS feed.
+#[utoipa::path(
+    put,
+    path = "/api/config/rss-feeds/{name}",
+    tag = "rss",
+    summary = "Update an RSS feed",
+    params(("name" = String, Path, description = "Feed name")),
+    request_body = RssFeedConfig,
+    responses(
+        (status = 200, description = "Feed updated", body = serde_json::Value),
+        (status = 400, description = "The feed or its filter regex is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Feed not found", body = ApiError),
+    ),
+)]
 pub async fn h_rss_feed_update(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -2714,6 +3383,18 @@ pub async fn h_rss_feed_update(
 }
 
 /// DELETE /api/config/rss-feeds/{name} -- Delete an RSS feed.
+#[utoipa::path(
+    delete,
+    path = "/api/config/rss-feeds/{name}",
+    tag = "rss",
+    summary = "Delete an RSS feed",
+    params(("name" = String, Path, description = "Feed name")),
+    responses(
+        (status = 200, description = "Feed deleted", body = serde_json::Value),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Feed not found", body = ApiError),
+    ),
+)]
 pub async fn h_rss_feed_delete(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -2733,13 +3414,27 @@ pub async fn h_rss_feed_delete(
 // RSS item handlers
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct RssItemsQuery {
+    /// Only items from this feed.
     pub feed: Option<String>,
+    /// Maximum items to return (default 500).
     pub limit: Option<usize>,
 }
 
 /// GET /api/rss/items -- List RSS feed items.
+#[utoipa::path(
+    get,
+    path = "/api/rss/items",
+    tag = "rss",
+    summary = "List discovered RSS items",
+    params(RssItemsQuery),
+    responses(
+        (status = 200, description = "Newest items first", body = Vec<RssItem>),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_rss_items_list(
     State(state): State<Arc<AppState>>,
     Query(q): Query<RssItemsQuery>,
@@ -2753,6 +3448,19 @@ pub async fn h_rss_items_list(
 }
 
 /// POST /api/rss/items/{id}/download -- Download a specific RSS feed item.
+#[utoipa::path(
+    post,
+    path = "/api/rss/items/{id}/download",
+    tag = "rss",
+    summary = "Download a discovered RSS item",
+    params(("id" = String, Path, description = "RSS item id")),
+    responses(
+        (status = 200, description = "Item admitted and marked downloaded", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Item not found", body = ApiError),
+        (status = 409, description = "The item's NZB duplicates a live job", body = ApiError),
+    ),
+)]
 pub async fn h_rss_item_download(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2825,7 +3533,7 @@ pub async fn h_rss_item_download(
 // RSS rule handlers
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct RssRuleBody {
     pub name: String,
     pub feed_names: Vec<String>,
@@ -2869,6 +3577,16 @@ fn compile_rss_regex(pattern: &str) -> Result<regex::Regex, ApiError> {
 }
 
 /// GET /api/rss/rules -- List RSS download rules.
+#[utoipa::path(
+    get,
+    path = "/api/rss/rules",
+    tag = "rss",
+    summary = "List RSS download rules",
+    responses(
+        (status = 200, description = "Configured rules", body = Vec<RssRule>),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_rss_rules_list(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<RssRule>>, ApiError> {
@@ -2912,6 +3630,18 @@ fn rss_rule_saved_response(state: &AppState, rule: &RssRule) -> serde_json::Valu
 }
 
 /// POST /api/rss/rules -- Add an RSS download rule.
+#[utoipa::path(
+    post,
+    path = "/api/rss/rules",
+    tag = "rss",
+    summary = "Add an RSS download rule",
+    request_body = RssRuleBody,
+    responses(
+        (status = 200, description = "Rule created", body = serde_json::Value),
+        (status = 400, description = "The rule or its match regex is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_rss_rule_add(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RssRuleBody>,
@@ -2937,6 +3667,20 @@ pub async fn h_rss_rule_add(
 
 /// PUT /api/rss/rules/{id} -- Update an RSS download rule. 404 if the rule
 /// does not exist.
+#[utoipa::path(
+    put,
+    path = "/api/rss/rules/{id}",
+    tag = "rss",
+    summary = "Update an RSS download rule",
+    params(("id" = String, Path, description = "Rule id")),
+    request_body = RssRuleBody,
+    responses(
+        (status = 200, description = "Rule updated", body = serde_json::Value),
+        (status = 400, description = "The rule or its match regex is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Rule not found", body = ApiError),
+    ),
+)]
 pub async fn h_rss_rule_update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2972,6 +3716,18 @@ pub async fn h_rss_rule_update(
 }
 
 /// DELETE /api/rss/rules/{id} -- Delete an RSS download rule.
+#[utoipa::path(
+    delete,
+    path = "/api/rss/rules/{id}",
+    tag = "rss",
+    summary = "Delete an RSS download rule",
+    params(("id" = String, Path, description = "Rule id")),
+    responses(
+        (status = 200, description = "Rule deleted", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Rule not found", body = ApiError),
+    ),
+)]
 pub async fn h_rss_rule_delete(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2997,7 +3753,7 @@ pub async fn h_rss_rule_delete(
 /// `abort_hopeless` (`/config/disk-guards`). `log_level` is not editable:
 /// the tracing filter is built once at startup from `--log-level` /
 /// `RUSTNZB_LOG_LEVEL` / `RUST_LOG`, so a saved value would have no effect.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateGeneralBody {
     pub incomplete_dir: Option<String>,
@@ -3007,6 +3763,7 @@ pub struct UpdateGeneralBody {
     /// Dead setting: nothing reads it. Accepted so older clients still get a
     /// 200, but never stored (see the warning in `h_general_update`).
     #[serde(default)]
+    #[schema(ignore)]
     pub cache_size: Option<serde::de::IgnoredAny>,
     pub max_active_downloads: Option<usize>,
     pub max_post_processing_jobs: Option<usize>,
@@ -3119,6 +3876,19 @@ fn validate_general_update(body: &UpdateGeneralBody) -> Result<(), ApiError> {
 }
 
 /// PUT /api/config/general -- Update general settings.
+#[utoipa::path(
+    put,
+    path = "/api/config/general",
+    tag = "config",
+    summary = "Update general settings",
+    description = "Applies only the fields present in the body. Settings with their own endpoints (`speed_limit_bps`, `min_free_space_bytes`, `abort_hopeless`) are not accepted here. Changing settings the engine reads at startup is persisted immediately but takes effect on the next process start.",
+    request_body = UpdateGeneralBody,
+    responses(
+        (status = 200, description = "General settings updated", body = SimpleResponse),
+        (status = 400, description = "A field is unknown or out of range", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_general_update(
     State(state): State<Arc<AppState>>,
     body: Result<Json<UpdateGeneralBody>, JsonRejection>,
@@ -3255,7 +4025,7 @@ pub async fn h_general_update(
 // Server health check handler
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct ServerHealthResult {
     pub id: String,
     pub name: String,
@@ -3264,6 +4034,16 @@ pub struct ServerHealthResult {
 }
 
 /// GET /api/config/servers/health -- Test all servers and return health status.
+#[utoipa::path(
+    get,
+    path = "/api/config/servers/health",
+    tag = "servers",
+    summary = "Test every configured server",
+    responses(
+        (status = 200, description = "One result per server, in configuration order", body = Vec<ServerHealthResult>),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_servers_health(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ServerHealthResult>>, ApiError> {
@@ -3326,6 +4106,17 @@ pub async fn h_servers_health(
 }
 
 /// GET /api/config/servers/stats -- Per-server download statistics.
+#[utoipa::path(
+    get,
+    path = "/api/config/servers/stats",
+    tag = "servers",
+    summary = "Per-server article statistics",
+    description = "Lifetime and rolling 24-hour, 7-day and 30-day totals per server.",
+    responses(
+        (status = 200, description = "One row per configured server", body = Vec<nzb_web::ServerStatsData>),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_server_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<nzb_web::ServerStatsData>>, ApiError> {
@@ -3335,6 +4126,16 @@ pub async fn h_server_stats(
 }
 
 /// GET /api/statistics -- Persistent global download and NNTP statistics.
+#[utoipa::path(
+    get,
+    path = "/api/statistics",
+    tag = "statistics",
+    summary = "Lifetime and rolling download statistics",
+    responses(
+        (status = 200, description = "Aggregate statistics", body = nzb_web::GlobalStatisticsData),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_global_statistics(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<nzb_web::GlobalStatisticsData>, ApiError> {
@@ -3393,6 +4194,16 @@ fn get_disk_space(path: &std::path::Path) -> (u64, u64) {
 // Health check
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/api/health",
+    tag = "system",
+    summary = "Liveness probe",
+    description = "Unauthenticated. Returns 200 while the process is serving.",
+    responses(
+        (status = 200, description = "Process is alive", body = serde_json::Value),
+    ),
+)]
 pub async fn h_health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
 }
@@ -3400,6 +4211,17 @@ pub async fn h_health() -> Json<serde_json::Value> {
 /// GET /api/ready -- Readiness probe. The engine is initialised before the
 /// listener binds, so this is 200 whenever the process is serving, and 503
 /// once shutdown has begun, so a load balancer stops routing new requests.
+#[utoipa::path(
+    get,
+    path = "/api/ready",
+    tag = "system",
+    summary = "Readiness probe",
+    description = "Unauthenticated. 200 while the engine is serving; 503 once shutdown has begun, so a load balancer stops routing new requests.",
+    responses(
+        (status = 200, description = "Ready (`{\"status\":\"ready\"}`)", body = serde_json::Value),
+        (status = 503, description = "Shutting down (`{\"status\":\"shutting_down\"}`)", body = serde_json::Value),
+    ),
+)]
 pub async fn h_ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
     if state
         .shutting_down
@@ -3418,12 +4240,14 @@ pub async fn h_ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<se
 // Directory browser
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct BrowseDirectoryQuery {
+    /// Directory to list; defaults to the complete directory.
     pub path: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct BrowseDirectoryResponse {
     pub current: String,
     pub parent: Option<String>,
@@ -3431,6 +4255,19 @@ pub struct BrowseDirectoryResponse {
 }
 
 /// GET /api/browse-directory -- List subdirectories for the directory picker.
+#[utoipa::path(
+    get,
+    path = "/api/browse-directory",
+    tag = "config",
+    summary = "List subdirectories for the directory picker",
+    description = "Only directories below the configured complete directory are returned.",
+    params(BrowseDirectoryQuery),
+    responses(
+        (status = 200, description = "Directory listing", body = BrowseDirectoryResponse),
+        (status = 400, description = "The path is outside the allowed root", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_browse_directory(
     Query(q): Query<BrowseDirectoryQuery>,
 ) -> Result<Json<BrowseDirectoryResponse>, ApiError> {
@@ -3476,12 +4313,26 @@ pub async fn h_browse_directory(
 // Queue category change
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct ChangeCategoryBody {
+    /// Destination category.
     pub category: String,
 }
 
 /// PUT /api/queue/{id}/category -- Change a job's category.
+#[utoipa::path(
+    put,
+    path = "/api/queue/{id}/category",
+    tag = "queue",
+    summary = "Change a job's category",
+    params(("id" = String, Path, description = "Job id")),
+    request_body = ChangeCategoryBody,
+    responses(
+        (status = 200, description = "Category changed", body = SimpleResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Job not found", body = ApiError),
+    ),
+)]
 pub async fn h_queue_change_category(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -3498,15 +4349,16 @@ pub async fn h_queue_change_category(
 // Bulk queue operations
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct BulkActionBody {
+    /// Jobs to act on.
     pub ids: Vec<String>,
     pub action: String,
     /// Optional value for priority (int) or category (string).
     pub value: Option<serde_json::Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct BulkActionResponse {
     pub status: bool,
     pub succeeded: usize,
@@ -3515,7 +4367,7 @@ pub struct BulkActionResponse {
     pub failures: Vec<BulkActionFailure>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct BulkActionFailure {
     pub id: String,
     /// Same shape as an API error body (`error_kind`, `human_readable`,
@@ -3525,7 +4377,7 @@ pub struct BulkActionFailure {
 
 /// Response to `POST /api/history/bulk`. `trashed` is present only when the
 /// caller asked for the undo window.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HistoryBulkResponse {
     pub status: bool,
     pub succeeded: usize,
@@ -3536,6 +4388,19 @@ pub struct HistoryBulkResponse {
 }
 
 /// POST /api/queue/bulk -- Perform an action on multiple jobs.
+#[utoipa::path(
+    post,
+    path = "/api/queue/bulk",
+    tag = "queue",
+    summary = "Act on several queue jobs",
+    description = "One request, one result per id. A per-id failure is reported rather than failing the batch.",
+    request_body = BulkActionBody,
+    responses(
+        (status = 200, description = "Per-id results", body = BulkActionResponse),
+        (status = 400, description = "Unknown action or missing value", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_queue_bulk_action(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BulkActionBody>,
@@ -3589,6 +4454,16 @@ pub async fn h_queue_bulk_action(
 // ---------------------------------------------------------------------------
 
 /// Setup status — tells the frontend whether the import wizard should be shown.
+#[utoipa::path(
+    get,
+    path = "/api/setup/status",
+    tag = "setup",
+    summary = "First-boot setup status",
+    description = "Unauthenticated before credentials are configured, so the setup wizard can decide whether to open.",
+    responses(
+        (status = 200, description = "Whether servers and categories exist", body = serde_json::Value),
+    ),
+)]
 pub async fn h_setup_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let config = state.config();
     Json(serde_json::json!({
@@ -3600,6 +4475,19 @@ pub async fn h_setup_status(State(state): State<Arc<AppState>>) -> impl IntoResp
 }
 
 /// Import SABnzbd INI file (multipart upload) → returns preview JSON.
+#[utoipa::path(
+    post,
+    path = "/api/setup/import-sabnzbd",
+    tag = "setup",
+    summary = "Parse a SABnzbd ini file",
+    description = "Uploads a `sabnzbd.ini` as `multipart/form-data` and returns a preview of what would be imported. Nothing is applied; send the preview to `POST /api/setup/apply`.",
+    request_body(content_type = "multipart/form-data", description = "The SABnzbd ini file", content = String),
+    responses(
+        (status = 200, description = "Import preview", body = sabnzbd_import::SabnzbdImportPreview),
+        (status = 400, description = "No file uploaded or the file is not valid UTF-8", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_import_sabnzbd_ini(mut multipart: Multipart) -> Result<impl IntoResponse, ApiError> {
     let field = multipart
         .next_field()
@@ -3617,12 +4505,28 @@ pub async fn h_import_sabnzbd_ini(mut multipart: Multipart) -> Result<impl IntoR
 }
 
 /// Import from a running SABnzbd instance via API → returns preview JSON.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct ImportApiRequest {
+    /// Base URL of the running SABnzbd instance.
     pub url: String,
+    /// Its API key.
     pub api_key: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/setup/import-sabnzbd-api",
+    tag = "setup",
+    summary = "Import settings from a running SABnzbd",
+    description = "Fetches the configuration from a SABnzbd instance through the configured fetch policy and returns what would be imported. Nothing is applied.",
+    request_body = ImportApiRequest,
+    responses(
+        (status = 200, description = "Import preview", body = sabnzbd_import::SabnzbdImportPreview),
+        (status = 400, description = "The request or URL is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 502, description = "The SABnzbd instance could not be reached", body = ApiError),
+    ),
+)]
 pub async fn h_import_sabnzbd_api(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ImportApiRequest>,
@@ -3685,6 +4589,19 @@ pub async fn h_import_sabnzbd_api(
 }
 
 /// Apply an import preview — writes servers, categories, general settings to config.
+#[utoipa::path(
+    post,
+    path = "/api/setup/apply",
+    tag = "setup",
+    summary = "Apply a SABnzbd import preview",
+    description = "Stores the servers and categories in a preview returned by `POST /api/setup/import-sabnzbd` or `POST /api/setup/import-sabnzbd-api`.",
+    request_body = sabnzbd_import::SabnzbdImportPreview,
+    responses(
+        (status = 200, description = "Import applied", body = serde_json::Value),
+        (status = 400, description = "The preview is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_setup_apply(
     State(state): State<Arc<AppState>>,
     Json(preview): Json<sabnzbd_import::SabnzbdImportPreview>,
@@ -3797,13 +4714,15 @@ pub async fn h_setup_apply(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "webdav")]
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct DavAddQuery {
+    /// NZB id in the DAV pipeline's history.
     pub id: String,
 }
 
 #[cfg(feature = "webdav")]
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct DavAddResponse {
     pub status: bool,
     pub dav_id: String,
@@ -3812,14 +4731,14 @@ pub struct DavAddResponse {
 // ── DAV pipeline status types ──────────────────────────────────────────────
 
 #[cfg(feature = "webdav")]
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct DavQueueEntry {
     pub job_name: String,
     pub queued_at: String,
 }
 
 #[cfg(feature = "webdav")]
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct DavHistoryEntry {
     pub job_name: String,
     pub status: String,
@@ -3828,7 +4747,7 @@ pub struct DavHistoryEntry {
 }
 
 #[cfg(feature = "webdav")]
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct DavStatusResponse {
     pub queue: Vec<DavQueueEntry>,
     pub history: Vec<DavHistoryEntry>,
@@ -3836,6 +4755,18 @@ pub struct DavStatusResponse {
 
 /// GET /api/dav/status — pipeline queue + history for media library status overlay.
 #[cfg(feature = "webdav")]
+#[utoipa::path(
+    get,
+    path = "/api/dav/status",
+    tag = "dav",
+    summary = "WebDAV pipeline status",
+    description = "Queue and recent history of the DAV media library pipeline. Requires a build with the `webdav` feature.",
+    responses(
+        (status = 200, description = "Pipeline queue and history", body = DavStatusResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 500, description = "The WebDAV library is not initialised or the status query failed", body = ApiError),
+    ),
+)]
 pub async fn h_dav_status(
     axum::Extension(dav): axum::Extension<Option<Arc<crate::dav::DavHandle>>>,
 ) -> Result<Json<DavStatusResponse>, ApiError> {
@@ -3880,6 +4811,20 @@ pub async fn h_dav_status(
 /// Feeds a completed download's NZB into the WebDAV streaming pipeline.
 /// The item must exist in history (completed or failed) with NZB data retained.
 #[cfg(feature = "webdav")]
+#[utoipa::path(
+    post,
+    path = "/api/dav/add",
+    tag = "dav",
+    summary = "Send a job to the WebDAV pipeline",
+    description = "Feeds a completed download's NZB into the WebDAV streaming pipeline. Requires a build with the `webdav` feature.",
+    params(DavAddQuery),
+    responses(
+        (status = 200, description = "Job queued in the DAV pipeline", body = DavAddResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Job not found or it has no retained NZB", body = ApiError),
+        (status = 500, description = "The WebDAV library is not initialised", body = ApiError),
+    ),
+)]
 pub async fn h_dav_add(
     State(state): State<Arc<AppState>>,
     axum::Extension(dav): axum::Extension<Option<Arc<crate::dav::DavHandle>>>,
@@ -3922,6 +4867,17 @@ pub async fn h_dav_add(
 ///
 /// `password` and `api_key` are replaced with `********` when set.
 #[cfg(feature = "webdav")]
+#[utoipa::path(
+    get,
+    path = "/api/config/dav",
+    tag = "dav",
+    summary = "Read the DAV pipeline configuration",
+    description = "`password` and `api_key` are masked when set. Requires a build with the `webdav` feature.",
+    responses(
+        (status = 200, description = "DAV configuration", body = DavConfig),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_dav_config_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DavConfig>, ApiError> {
@@ -3937,6 +4893,19 @@ pub async fn h_dav_config_get(
 /// When `auto_send_all` is true the `category_rules` list is cleared — the two
 /// modes are mutually exclusive.
 #[cfg(feature = "webdav")]
+#[utoipa::path(
+    put,
+    path = "/api/config/dav",
+    tag = "dav",
+    summary = "Update the DAV pipeline configuration",
+    description = "Replaces the block as a whole, except for the secrets `password` and `api_key`: absent, empty or masked keeps the stored value, `null` clears it. Requires a build with the `webdav` feature.",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Updated DAV configuration", body = serde_json::Value),
+        (status = 400, description = "The configuration is invalid", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub async fn h_dav_config_set(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,

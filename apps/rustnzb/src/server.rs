@@ -25,9 +25,171 @@ use nzb_web::error::ApiError;
 use nzb_web::sabnzbd_compat;
 use nzb_web::state::AppState;
 
+/// The served OpenAPI document: every native `/api/...` route, grouped by area.
+///
+/// The SABnzbd compatibility layer (`/sabnzbd/api` and `/api?mode=...`) is a
+/// separate contract with its own golden responses and is deliberately not
+/// part of this document.
 #[derive(OpenApi)]
-#[openapi(info(title = "rustnzb API", version = env!("RUSTNZB_BUILD_VERSION")))]
-struct ApiDoc;
+#[openapi(
+    info(
+        title = "rustnzb API",
+        version = env!("RUSTNZB_BUILD_VERSION"),
+        description = "Native REST API of rustnzb. Authentication is a Bearer access token from `POST /api/auth/login`, HTTP Basic credentials, or the configured `X-Api-Key` header."
+    ),
+    paths(
+        // auth
+        auth::h_auth_status,
+        auth::h_auth_login,
+        auth::h_auth_refresh,
+        auth::h_auth_logout,
+        auth::h_auth_setup,
+        auth::h_auth_change_credentials,
+        // system
+        handlers::h_status,
+        handlers::h_health,
+        handlers::h_ready,
+        handlers::h_logs,
+        handlers::h_global_statistics,
+        // setup
+        handlers::h_setup_status,
+        handlers::h_import_sabnzbd_ini,
+        handlers::h_import_sabnzbd_api,
+        handlers::h_setup_apply,
+        // queue
+        handlers::h_queue_list,
+        handlers::h_queue_add,
+        handlers::h_queue_add_url,
+        handlers::h_queue_sort,
+        handlers::h_queue_pause,
+        handlers::h_queue_resume,
+        handlers::h_queue_delete,
+        handlers::h_queue_move,
+        handlers::h_queue_pause_all,
+        handlers::h_queue_resume_all,
+        handlers::h_queue_pause_for,
+        handlers::h_queue_set_priority,
+        handlers::h_queue_change_category,
+        handlers::h_queue_bulk_action,
+        admissions::h_queue_admission_get,
+        // history
+        handlers::h_history_list,
+        handlers::h_history_get,
+        handlers::h_history_delete,
+        handlers::h_history_clear,
+        handlers::h_history_retry,
+        handlers::h_history_bulk,
+        handlers::h_history_restore,
+        handlers::h_history_logs,
+        // config
+        handlers::h_config_get,
+        handlers::h_general_update,
+        handlers::h_config_backup_export,
+        handlers::h_config_backup_preview,
+        handlers::h_config_backup_restore,
+        handlers::h_schedule_get,
+        handlers::h_schedule_update,
+        handlers::h_sab_api_key_get,
+        handlers::h_sab_api_key_rotate,
+        handlers::h_history_retention_get,
+        handlers::h_history_retention_set,
+        handlers::h_max_active_downloads_get,
+        handlers::h_max_active_downloads_set,
+        handlers::h_get_speed_limit,
+        handlers::h_set_speed_limit,
+        handlers::h_disk_guards_get,
+        handlers::h_disk_guards_set,
+        handlers::h_debug_logging_get,
+        handlers::h_debug_logging_set,
+        handlers::h_browse_directory,
+        // servers
+        handlers::h_servers_list,
+        handlers::h_server_add,
+        handlers::h_server_update,
+        handlers::h_server_delete,
+        handlers::h_server_test,
+        handlers::h_server_test_inline,
+        handlers::h_servers_health,
+        handlers::h_server_stats,
+        // categories
+        handlers::h_categories_list,
+        handlers::h_category_add,
+        handlers::h_category_update,
+        handlers::h_category_delete,
+        // rss
+        handlers::h_rss_feeds_list,
+        handlers::h_rss_feed_add,
+        handlers::h_rss_feed_update,
+        handlers::h_rss_feed_delete,
+        handlers::h_rss_items_list,
+        handlers::h_rss_item_download,
+        handlers::h_rss_rules_list,
+        handlers::h_rss_rule_add,
+        handlers::h_rss_rule_update,
+        handlers::h_rss_rule_delete,
+        // groups and articles
+        group_handlers::h_group_list,
+        group_handlers::h_group_refresh,
+        group_handlers::h_group_get,
+        group_handlers::h_group_status,
+        group_handlers::h_group_subscribe,
+        group_handlers::h_group_unsubscribe,
+        group_handlers::h_header_list,
+        group_handlers::h_header_fetch,
+        group_handlers::h_header_clear,
+        group_handlers::h_thread_list,
+        group_handlers::h_thread_get,
+        group_handlers::h_header_mark_read,
+        group_handlers::h_header_mark_all_read,
+        group_handlers::h_header_download,
+        group_handlers::h_article_get,
+        group_observation::h_overview_range,
+        group_observation::h_article_head,
+        group_observation::h_article_body_prefix,
+        group_observation::h_article_availability,
+        group_observation::h_clear_search,
+    ),
+    tags(
+        (name = "auth", description = "Login, token refresh and first-boot credential setup"),
+        (name = "system", description = "Health, readiness, status and log access"),
+        (name = "setup", description = "First-boot setup and SABnzbd import"),
+        (name = "queue", description = "The download queue and its admissions"),
+        (name = "history", description = "Completed and failed jobs"),
+        (name = "statistics", description = "Lifetime and rolling download statistics"),
+        (name = "config", description = "General settings and the directory browser"),
+        (name = "servers", description = "NNTP server configuration, health and statistics"),
+        (name = "categories", description = "Download categories"),
+        (name = "rss", description = "RSS feeds, discovered items and download rules"),
+        (name = "groups", description = "Newsgroup listing and provider observation"),
+        (name = "articles", description = "Stored headers, threads and article bodies"),
+        (name = "dav", description = "WebDAV media library pipeline (builds with the `webdav` feature)"),
+    )
+)]
+struct ApiDocBase;
+
+/// WebDAV paths, compiled only into builds that serve them.
+#[cfg(feature = "webdav")]
+#[derive(OpenApi)]
+#[openapi(paths(
+    handlers::h_dav_status,
+    handlers::h_dav_add,
+    handlers::h_dav_config_get,
+    handlers::h_dav_config_set,
+))]
+struct ApiDocDav;
+
+/// The document served at `/api-docs/openapi.json`.
+pub struct ApiDoc;
+
+impl utoipa::OpenApi for ApiDoc {
+    fn openapi() -> utoipa::openapi::OpenApi {
+        #[allow(unused_mut)]
+        let mut document = ApiDocBase::openapi();
+        #[cfg(feature = "webdav")]
+        document.merge(ApiDocDav::openapi());
+        document
+    }
+}
 
 /// Embed the Angular SPA build at compile time.
 #[derive(Embed)]

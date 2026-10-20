@@ -54,6 +54,20 @@ pub fn payload_digest(payload: &[u8]) -> String {
 }
 
 /// GET /api/queue/admissions/{idempotency_key} -- Resolve one exact admission.
+#[utoipa::path(
+    get,
+    path = "/api/queue/admissions/{idempotency_key}",
+    tag = "queue",
+    summary = "Resolve one queue admission",
+    description = "Looks up the durable admission recorded for an `Idempotency-Key` on `POST /api/queue/add` or `POST /api/queue/add-url`, and reports where the job is now.",
+    params(("idempotency_key" = String, Path, description = "The idempotency key used when the NZB was admitted")),
+    responses(
+        (status = 200, description = "The admission and its current location", body = QueueAdmissionObservation),
+        (status = 400, description = "The key is not a valid idempotency key", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "No admission with that key", body = ApiError),
+    ),
+)]
 pub async fn h_queue_admission_get(
     State(state): State<Arc<AppState>>,
     Path(idempotency_key): Path<String>,

@@ -6,6 +6,19 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
+#[utoipa::path(
+    post,
+    path = "/api/groups/article-body-prefix",
+    tag = "groups",
+    summary = "Observe an article body prefix",
+    description = "Reads a bounded prefix of one article's decoded body. A provider or policy failure is reported in the body as `status: blocked` with a stable `failure_code`, not as an HTTP error.",
+    request_body = ArticleBodyPrefixInput,
+    responses(
+        (status = 200, description = "Observation, or a blocked report", body = serde_json::Value),
+        (status = 400, description = "The request is outside its admitted bounds", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub(crate) async fn h_article_body_prefix(
     State(state): State<Arc<AppState>>,
     Json(input): Json<ArticleBodyPrefixInput>,

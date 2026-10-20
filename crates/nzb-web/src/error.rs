@@ -2,7 +2,10 @@ use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use serde::{Serialize, Serializer};
 
-/// Convenience error type for API handlers.
+/// Error body returned by every native API handler that fails.
+///
+/// Serialized as `{ "error_kind", "human_readable", "status" }`; the HTTP
+/// status carries the same code as `status`.
 #[derive(Debug)]
 pub struct ApiError {
     status: Option<StatusCode>,
@@ -104,6 +107,40 @@ impl ApiError {
 
     pub fn status(&self) -> StatusCode {
         self.status.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+}
+
+impl utoipa::PartialSchema for ApiError {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::ObjectBuilder::new()
+            .property(
+                "error_kind",
+                utoipa::openapi::ObjectBuilder::new()
+                    .schema_type(utoipa::openapi::schema::Type::String)
+                    .description(Some("Stable machine-readable error code.")),
+            )
+            .required("error_kind")
+            .property(
+                "human_readable",
+                utoipa::openapi::ObjectBuilder::new()
+                    .schema_type(utoipa::openapi::schema::Type::String)
+                    .description(Some("Human-readable explanation of the failure.")),
+            )
+            .required("human_readable")
+            .property(
+                "status",
+                utoipa::openapi::ObjectBuilder::new()
+                    .schema_type(utoipa::openapi::schema::Type::Integer)
+                    .description(Some("HTTP status code; matches the response status.")),
+            )
+            .required("status")
+            .into()
+    }
+}
+
+impl utoipa::ToSchema for ApiError {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ApiError")
     }
 }
 

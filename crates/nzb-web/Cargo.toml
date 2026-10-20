@@ -1,6 +1,6 @@
 [package]
 name = "nzb-web"
-version = "0.4.24"
+version = "0.4.25"
 edition = "2024"
 description = "Usenet download engine: queue management, download orchestration, and background services"
 license = "MIT"
@@ -11,14 +11,14 @@ default = []
 groups-db = ["nzb-postproc/groups-db"]
 
 [dependencies]
-nzb-nntp = { version = "0.2.26", path = "../nzb-nntp" }
+nzb-nntp = { version = "0.2.27", path = "../nzb-nntp" }
 nzb-decode = { version = "0.1.8", path = "../nzb-decode" }
 nzb-postproc = { version = "0.2.11", path = "../nzb-postproc" }
 nzb-dispatch = { version = "0.2.11", path = "../nzb-dispatch" }
 axum = { version = "0.8", features = ["multipart"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace"] }
-utoipa = { version = "5", features = ["axum_extras"] }
+utoipa = { workspace = true }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 http = "1"
 tokio = { version = "1", features = ["full"] }
@@ -59,6 +59,6 @@ unused = "warn"
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3.27.0"
 proptest = "1"
-nzb-nntp = { version = "0.2.26", path = "../nzb-nntp", features = ["test-support"] }
+nzb-nntp = { version = "0.2.27", path = "../nzb-nntp", features = ["test-support"] }
 mock-nntp-server = { workspace = true }
 yenc-simd = { version = "0.1" }
