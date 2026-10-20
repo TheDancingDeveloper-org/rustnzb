@@ -81,8 +81,10 @@ pub struct ScheduleDecision {
     pub active_rule_ids: Vec<String>,
     /// Whether downloads should be paused. Any active pause rule pauses.
     pub pause: bool,
-    /// Effective scheduled cap, if any rule caps the speed. `None` means no
-    /// scheduled cap: the configured `general.speed_limit_bps` applies.
+    /// Effective scheduled cap. `None` means no scheduled cap, so the
+    /// configured `general.speed_limit_bps` applies. `Some(0)` means an
+    /// active rule asked for unlimited speed, which overrides both the
+    /// configured limit and any lower cap from another rule.
     pub speed_limit_bps: Option<u64>,
     /// Server ids to take out of rotation, in configuration order and without
     /// duplicates.
@@ -217,9 +219,12 @@ pub fn evaluate(rules: &[ScheduleRule], now: NaiveDateTime) -> ScheduleDecision 
     }
 
     // An active rule that says "unlimited" wins over a cap: it is an explicit
-    // statement about this window, not the absence of one.
+    // statement about this window, not the absence of one. It has to be
+    // `Some(0)`, not `None` -- `None` means "no scheduled cap", which would
+    // let the configured `general.speed_limit_bps` through and run the window
+    // at the user's limit instead of unlimited.
     if saw_unlimited {
-        decision.speed_limit_bps = None;
+        decision.speed_limit_bps = Some(0);
     }
     decision
 }
@@ -333,7 +338,24 @@ mod tests {
         let mut unlimited = rule(&["tue"], "00:00", "24:00", ScheduleAction::SpeedLimit);
         unlimited.id = "unlimited".into();
         let decision = evaluate(&[off_peak, strict, unlimited], at(20, 12, 0));
-        assert_eq!(decision.speed_limit_bps, None);
+        assert_eq!(
+            decision.speed_limit_bps,
+            Some(0),
+            "unlimited is an explicit 0 cap, not the absence of one"
+        );
+    }
+
+    #[test]
+    fn an_unlimited_rule_is_distinct_from_having_no_cap_rule() {
+        let mut unlimited = rule(&["tue"], "00:00", "24:00", ScheduleAction::SpeedLimit);
+        unlimited.id = "unlimited".into();
+        assert_eq!(
+            evaluate(&[unlimited], at(20, 12, 0)).speed_limit_bps,
+            Some(0)
+        );
+        // With no cap rule at all the configured limit must still apply, so
+        // this is the case that has to stay `None`.
+        assert_eq!(evaluate(&[], at(20, 12, 0)).speed_limit_bps, None);
     }
 
     #[test]

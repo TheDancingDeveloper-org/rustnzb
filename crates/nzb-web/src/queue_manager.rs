@@ -1591,6 +1591,10 @@ pub struct QueueManager {
     /// schedule. Like the disk hold, only the schedule may lift it, and only
     /// while it still owns the pause.
     schedule_hold: AtomicBool,
+    /// True while a pause rule is open. The schedule pauses on the rising
+    /// edge of this only: the user may resume inside a window, and that
+    /// resume holds until the window closes and the next one opens.
+    schedule_window: AtomicBool,
     /// Servers the schedule has taken out of rotation, as configured by the
     /// user. The live list is the configured list with these disabled.
     schedule_disabled_servers: Mutex<Vec<String>>,
@@ -1765,6 +1769,7 @@ impl QueueManager {
             globally_paused_jobs: Mutex::new(HashSet::new()),
             disk_space_hold: Mutex::new(None),
             schedule_hold: AtomicBool::new(false),
+            schedule_window: AtomicBool::new(false),
             schedule_disabled_servers: Mutex::new(Vec::new()),
             configured_servers: Mutex::new(configured_servers),
             configured_speed_limit_bps: AtomicU64::new(speed_limit_bps),
@@ -4852,15 +4857,26 @@ impl QueueManager {
     ) {
         let idle = crate::nzb_core::schedule::ScheduleDecision::default();
         let decision = if enabled { decision } else { &idle };
-        // Pause ownership.
-        if decision.pause {
+        // Pause ownership, edge-triggered: a pause rule pauses when its window
+        // opens, not on every tick while it is open. A manual resume inside the
+        // window therefore holds until the next window -- the tick must not
+        // re-pause what the user just resumed. Ownership still decides who may
+        // lift the pause: the schedule lifts only its own.
+        let was_in_window = self.schedule_window.swap(decision.pause, Ordering::SeqCst);
+        if decision.pause && !was_in_window {
             if !self.is_paused() {
                 self.pause_all_as(None, Self::PAUSE_OWNER_SCHEDULE);
-                info!("Schedule is pausing downloads");
+                info!("Schedule window opened, pausing downloads");
             }
-        } else if self.is_paused() && self.schedule_hold.load(Ordering::SeqCst) {
-            self.resume_all();
-            info!("Schedule window ended, resuming downloads");
+        } else if !decision.pause && was_in_window {
+            if self.is_paused() && self.schedule_hold.load(Ordering::SeqCst) {
+                self.resume_all();
+                info!("Schedule window ended, resuming downloads");
+            } else {
+                // A user pause (or a disk hold) took ownership during the
+                // window: the schedule no longer holds anything to lift.
+                self.schedule_hold.store(false, Ordering::SeqCst);
+            }
         }
 
         // Speed cap: only touch the limiter when the value changes, so a
@@ -5991,6 +6007,11 @@ impl QueueManager {
             *self.disk_space_hold.lock() = hold;
             if hold.is_none() && pause_owner == Self::PAUSE_OWNER_SCHEDULE {
                 self.schedule_hold.store(true, Ordering::SeqCst);
+                // Rebuild the window state too: the pause was applied inside a
+                // window, so its end must still be able to lift it. Left
+                // false, the first tick after a restart would report "no
+                // change" and the queue would stay paused indefinitely.
+                self.schedule_window.store(true, Ordering::SeqCst);
             }
             info!(
                 disk_space_hold = hold.is_some(),
@@ -7565,10 +7586,14 @@ mod global_pause_tests {
         restarted.pause_all();
         assert!(!restarted.schedule_pause_active());
         assert_eq!(restarted.global_pause_reason(), Some(PauseReason::Global));
+        // Close and reopen the window: a user pause is not the schedule's to
+        // lift, so reopening must not replace the user's ownership with its
+        // own.
         restarted.apply_schedule(
             &crate::nzb_core::schedule::ScheduleDecision::default(),
             true,
         );
+        restarted.apply_schedule(&decision, true);
         assert!(
             restarted.is_paused(),
             "a user pause is not the schedule's to lift"
@@ -7581,6 +7606,125 @@ mod global_pause_tests {
                 .as_deref(),
             Some("user")
         );
+    }
+
+    #[tokio::test]
+    async fn a_manual_resume_inside_a_window_holds_until_the_window_closes() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            active_rule_ids: vec!["quiet".into()],
+            pause: true,
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true);
+        assert!(manager.is_paused());
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+
+        // The user overrides the schedule for this window.
+        manager.resume_all();
+        assert!(!manager.is_paused());
+        assert!(!manager.schedule_pause_active());
+
+        // Every subsequent tick inside the window sees the same decision. The
+        // pause is edge-triggered, so none of them may re-pause the queue.
+        for _ in 0..5 {
+            manager.apply_schedule(&open, true);
+            assert!(
+                !manager.is_paused(),
+                "a manual resume must survive the rest of the window"
+            );
+        }
+
+        // When the window closes the schedule has nothing to lift, and the
+        // next window opening pauses again.
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert!(!manager.is_paused());
+        manager.apply_schedule(&open, true);
+        assert!(manager.is_paused());
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+    }
+
+    #[tokio::test]
+    async fn a_window_opening_while_the_user_is_paused_leaves_the_user_owner() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        manager.pause_all();
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            pause: true,
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true);
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Global));
+        assert!(!manager.schedule_pause_active());
+
+        // The window ending must not resume a pause the user owns.
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert!(
+            manager.is_paused(),
+            "a user pause outlives the window that opened during it"
+        );
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Global));
+    }
+
+    #[tokio::test]
+    async fn a_restart_inside_a_window_still_lifts_the_pause_when_it_ends() {
+        let (manager, _tempdir) = manager();
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            pause: true,
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true);
+        assert!(manager.schedule_pause_active());
+
+        // A restart restores the schedule-owned pause from the database. The
+        // window must be rebuilt with it, or the end of the window would be
+        // read as "no change" and the queue would stay paused forever.
+        let restarted = Arc::clone(&manager);
+        restarted.restore_from_db().unwrap();
+        assert!(restarted.schedule_pause_active());
+
+        restarted.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert!(
+            !restarted.is_paused(),
+            "the window ending after a restart still resumes the queue"
+        );
+        assert!(!restarted.schedule_pause_active());
+    }
+
+    #[tokio::test]
+    async fn disabling_the_schedule_inside_a_window_lifts_its_pause() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            pause: true,
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true);
+        assert!(manager.is_paused());
+
+        // Turning the schedule off substitutes an idle decision, which is the
+        // window closing from the queue's point of view.
+        manager.apply_schedule(&open, false);
+        assert!(!manager.is_paused());
+        assert!(!manager.schedule_pause_active());
+
+        // And re-enabling it opens a fresh window.
+        manager.apply_schedule(&open, true);
+        assert!(manager.is_paused());
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
     }
 
     #[tokio::test]

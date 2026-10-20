@@ -16,8 +16,8 @@ use nzb_web::nzb_core::schedule::{ScheduleAction, ScheduleRule};
 use nzb_web::queue_manager::PauseReason;
 use nzb_web::state::AppState;
 use rustnzb::handlers::{
-    ScheduleUpdate, SetSpeedLimitBody, h_queue_pause_all, h_schedule_get, h_schedule_update,
-    h_set_speed_limit,
+    ScheduleUpdate, SetSpeedLimitBody, h_queue_pause_all, h_queue_resume_all, h_schedule_get,
+    h_schedule_update, h_set_speed_limit,
 };
 
 const ALL_DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
@@ -256,6 +256,65 @@ async fn a_speed_rule_caps_the_live_limit_without_rewriting_the_configured_one()
 
     update(&state, false, vec![]).await;
     assert_eq!(state.queue_manager.get_speed_limit(), 2_000_000);
+}
+
+#[tokio::test]
+async fn a_manual_resume_inside_a_window_is_not_undone_by_the_next_tick() {
+    let (state, _temp) = test_state();
+    let rules = vec![rule(ScheduleAction::Pause)];
+    update(&state, true, rules.clone()).await;
+    assert!(state.queue_manager.is_paused());
+
+    // The user resumes from the queue view. Saving the same schedule again is
+    // what the monitor does on its next minute tick.
+    let _ = h_queue_resume_all(State(Arc::clone(&state))).await.unwrap();
+    let body = update(&state, true, rules).await;
+
+    assert!(
+        !state.queue_manager.is_paused(),
+        "the schedule re-paused a queue the user resumed"
+    );
+    assert!(
+        !body["paused"].as_bool().unwrap(),
+        "the API still reports a scheduled pause after the user resumed"
+    );
+    // The rule is still active; the user simply overrode it for this window.
+    assert_eq!(body["active_rule_ids"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_unlimited_rule_lifts_the_configured_limit_for_its_window() {
+    let (state, _temp) = test_state();
+    let _ = h_set_speed_limit(
+        State(Arc::clone(&state)),
+        axum::Json(SetSpeedLimitBody {
+            speed_limit_bps: 5_000_000,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.queue_manager.get_speed_limit(), 5_000_000);
+
+    // `speed_limit_bps = 0` on a speed_limit rule means unlimited, and has to
+    // beat the user's configured 5 MB/s rather than fall back to it.
+    let mut unlimited = rule(ScheduleAction::SpeedLimit);
+    unlimited.speed_limit_bps = 0;
+    let body = update(&state, true, vec![unlimited]).await;
+
+    assert_eq!(body["speed_limit_bps"], 0);
+    assert_eq!(
+        state.queue_manager.get_speed_limit(),
+        0,
+        "an unlimited window still ran at the configured limit"
+    );
+    assert_eq!(
+        state.queue_manager.configured_speed_limit(),
+        5_000_000,
+        "the user's configured limit must be kept for after the window"
+    );
+
+    update(&state, false, vec![]).await;
+    assert_eq!(state.queue_manager.get_speed_limit(), 5_000_000);
 }
 
 #[tokio::test]

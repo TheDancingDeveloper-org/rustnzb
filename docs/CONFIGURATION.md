@@ -204,7 +204,15 @@ server's `enabled` flag — the configured values come back when the window
 ends, and the servers page keeps showing what you configured. The same is true
 of pauses: the schedule only resumes a pause it applied, so a manual pause, a
 timed pause or a low-disk hold is never lifted by a window ending. Overlapping
-caps use the lowest non-zero value, and an active `0` cap means unlimited.
+caps use the lowest non-zero value, and an active `0` cap means unlimited,
+overriding both `general.speed_limit_bps` and any lower cap from another rule.
+
+A `pause` rule is **edge-triggered**: it pauses when its window opens, not on
+every minute while the window is open. Resuming downloads by hand inside a
+window therefore holds until that window closes, and the next window opening
+pauses again — the schedule does not fight you back within a minute. A
+`Pause All` pressed inside a window takes ownership of the pause, so the end of
+the window will not resume it.
 
 ## `[par2]`
 
