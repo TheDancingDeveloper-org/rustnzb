@@ -198,6 +198,7 @@ async fn invalid_bulk_requests_are_400s_and_change_nothing() {
         serde_json::json!({"action": "explode", "ids": ["keep"]}),
         serde_json::json!({"action": "delete"}),
         serde_json::json!({"action": "delete", "ids": ["keep"], "status": "bogus"}),
+        serde_json::json!({"action": "delete", "status": "downloading"}),
         serde_json::json!({"action": "retry", "ids": ["keep"], "status": "failed"}),
     ] {
         let response = client

@@ -1117,7 +1117,7 @@ pub struct HistoryBulkBody {
     pub status: Option<String>,
     /// With `status`, narrow the set the same way `GET /api/history` does,
     /// so the action covers what the caller is looking at rather than all of
-    /// history. Ignored when `ids` are given.
+    /// history. Only meaningful alongside `status`.
     pub days: Option<u32>,
     pub category: Option<String>,
     pub search: Option<String>,
@@ -1141,6 +1141,9 @@ pub async fn h_history_bulk(
     if body.ids.len() > MAX_HISTORY_BULK_IDS {
         return Err(ApiError::bad_request("too many ids in one bulk request"));
     }
+    // History rows are terminal, so a status-wide delete only accepts the two
+    // terminal statuses; anything else would match nothing and read as a
+    // successful no-op.
     let status = match body
         .status
         .as_deref()
@@ -1148,9 +1151,13 @@ pub async fn h_history_bulk(
         .filter(|s| !s.is_empty())
     {
         None => None,
-        Some(raw) => Some(parse_history_status(raw).ok_or(ApiError::bad_request(
-            "status must be `completed` or `failed`",
-        ))?),
+        Some(raw) if raw.eq_ignore_ascii_case("completed") => Some(JobStatus::Completed),
+        Some(raw) if raw.eq_ignore_ascii_case("failed") => Some(JobStatus::Failed),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "status must be `completed` or `failed`",
+            ));
+        }
     };
     if status.is_some() && action != "delete" {
         return Err(ApiError::bad_request(
@@ -1186,15 +1193,16 @@ pub async fn h_history_bulk(
     let (succeeded, failures) = qm_blocking(&state, move |qm| {
         // The explicit ids first, then every entry the status names. An id
         // repeated across the two is acted on once.
+        let mut seen = std::collections::HashSet::new();
         let mut targets: Vec<String> = Vec::with_capacity(requested.len());
         for id in requested {
-            if !targets.contains(&id) {
+            if seen.insert(id.clone()) {
                 targets.push(id);
             }
         }
         if filter.status.is_some() {
             for summary in qm.history_summaries(&filter)? {
-                if !targets.contains(&summary.id) {
+                if seen.insert(summary.id.clone()) {
                     targets.push(summary.id);
                 }
             }
