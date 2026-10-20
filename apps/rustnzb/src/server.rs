@@ -279,6 +279,7 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/history/{id}/logs", get(handlers::h_history_logs))
         .route("/history", delete(handlers::h_history_clear))
         .route("/history/bulk", post(handlers::h_history_bulk))
+        .route("/history/restore", post(handlers::h_history_restore))
         .route("/statistics", get(handlers::h_global_statistics))
         // Config
         .route("/config", get(handlers::h_config_get))

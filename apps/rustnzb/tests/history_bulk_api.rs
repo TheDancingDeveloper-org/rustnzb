@@ -263,3 +263,181 @@ async fn delete_by_status_honours_the_window_category_and_search() {
     assert_eq!(response["succeeded"], 0, "{response}");
     assert_eq!(remaining_ids(&app), vec!["old-fail"]);
 }
+
+/// The undo path: a trashed delete disappears from history, then a restore
+/// brings the same row (and its NZB) back. A single delete's response carries
+/// the id the toast needs to undo it.
+#[tokio::test]
+async fn single_delete_with_trash_can_be_restored() {
+    let app = start_test_server(Vec::new()).await;
+    let client = reqwest::Client::new();
+    let access = setup_auth(&client, &app.base_url).await;
+    seed(
+        &app,
+        &[
+            entry("keep", JobStatus::Failed, true),
+            entry("undo", JobStatus::Completed, true),
+        ],
+    );
+
+    let body = client
+        .delete(format!("{}/api/history/undo?trash=true", app.base_url))
+        .bearer_auth(&access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(body.status(), StatusCode::OK);
+    let body = body.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["entries"][0]["id"], "undo", "{body}");
+    assert!(body["purge_after"].as_str().is_some(), "{body}");
+    assert_eq!(remaining_ids(&app), vec!["keep"]);
+
+    let restored = client
+        .post(format!("{}/api/history/restore", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({"ids": ["undo", "missing"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), StatusCode::OK);
+    let restored = restored.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(restored["restored"][0], "undo", "{restored}");
+    assert_eq!(restored["failures"][0]["id"], "missing", "{restored}");
+    assert_eq!(restored["status"], false, "{restored}");
+
+    let mut left = remaining_ids(&app);
+    left.sort();
+    assert_eq!(left, vec!["keep", "undo"]);
+    let nzb = app
+        .state
+        .queue_manager
+        .with_db(|db| db.history_get_nzb_data("undo").unwrap());
+    assert!(nzb.is_some(), "undo must keep the stored NZB");
+
+    // The default delete is still a hard delete, and cannot be undone.
+    let gone = client
+        .delete(format!("{}/api/history/keep", app.base_url))
+        .bearer_auth(&access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), StatusCode::OK);
+    assert_eq!(remaining_ids(&app), vec!["undo"]);
+    let refused = client
+        .post(format!("{}/api/history/restore", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({"ids": ["keep"]}))
+        .send()
+        .await
+        .unwrap();
+    let refused = refused.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(refused["status"], false, "{refused}");
+    assert_eq!(refused["failures"][0]["id"], "keep", "{refused}");
+}
+
+/// A bulk delete with `trash: true` returns every id and deadline, so one
+/// toast can undo a whole selection, and status-wide clears work the same way.
+#[tokio::test]
+async fn bulk_delete_with_trash_returns_ids_that_restore() {
+    let app = start_test_server(Vec::new()).await;
+    let client = reqwest::Client::new();
+    let access = setup_auth(&client, &app.base_url).await;
+    seed(
+        &app,
+        &[
+            entry("a", JobStatus::Completed, false),
+            entry("b", JobStatus::Failed, false),
+            entry("c", JobStatus::Completed, false),
+        ],
+    );
+
+    let body = client
+        .post(format!("{}/api/history/bulk", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({"action": "delete", "ids": ["a", "b"], "trash": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(body.status(), StatusCode::OK);
+    let body = body.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["succeeded"], 2, "{body}");
+    assert!(body["trashed"]["purge_after"].as_str().is_some(), "{body}");
+    let mut ids: Vec<String> = body["trashed"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["a", "b"], "{body}");
+    assert_eq!(remaining_ids(&app), vec!["c"]);
+
+    let restored = client
+        .post(format!("{}/api/history/restore", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({"ids": ids}))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(restored["status"], true, "{restored}");
+    let mut left = remaining_ids(&app);
+    left.sort();
+    assert_eq!(left, vec!["a", "b", "c"]);
+
+    // A status-wide clear is trashable too, and names what to restore.
+    let cleared = client
+        .post(format!("{}/api/history/bulk", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({"action": "delete", "status": "completed", "trash": true}))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        cleared["trashed"]["entries"].as_array().unwrap().len(),
+        2,
+        "{cleared}"
+    );
+    assert_eq!(remaining_ids(&app), vec!["b"]);
+}
+
+/// One id past its undo window fails on its own; another in the same request
+/// still comes back.
+#[tokio::test]
+async fn restore_past_the_deadline_is_a_per_id_failure() {
+    let app = start_test_server(Vec::new()).await;
+    let client = reqwest::Client::new();
+    let access = setup_auth(&client, &app.base_url).await;
+    seed(
+        &app,
+        &[
+            entry("late", JobStatus::Completed, false),
+            entry("live", JobStatus::Completed, false),
+        ],
+    );
+    app.state.queue_manager.with_db(|db| {
+        db.history_trash(&["late".into()], Utc::now() - chrono::Duration::seconds(1))
+            .unwrap();
+        db.history_trash(&["live".into()], Utc::now() + chrono::Duration::seconds(30))
+            .unwrap();
+    });
+
+    let body = client
+        .post(format!("{}/api/history/restore", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({"ids": ["late", "live"]}))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(body["restored"], serde_json::json!(["live"]), "{body}");
+    assert_eq!(body["failures"][0]["id"], "late", "{body}");
+    assert_eq!(remaining_ids(&app), vec!["live"]);
+}

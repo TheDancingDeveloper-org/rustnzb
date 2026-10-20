@@ -25,7 +25,7 @@ function makeApp(postResult = new Subject<unknown>()) {
     navigate: vi.fn(() => Promise.resolve(true)),
   };
   const pauseState = new PauseStateService();
-  const snack = { open: vi.fn() };
+  const snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
   const addNzb = new AddNzbService();
   const app = new App(
     api as never,
@@ -186,7 +186,7 @@ describe('quick speed limit', () => {
     expect(api.put).toHaveBeenCalledWith('/config/speed-limit', { speed_limit_bps: 5 * 1024 * 1024 });
     expect(app.speedLimit()).toBe(5 * 1024 * 1024);
     expect(app.speedMenuOpen).toBe(false);
-    expect(snack.open).toHaveBeenCalledWith('Speed limit set to 5.0 MB/s', 'Close', { duration: 2000 });
+    expect(snack.success).toHaveBeenCalledWith('Speed limit set to 5.0 MB/s');
   });
 
   it('converts a custom MB/s value and ignores empty input', () => {
@@ -380,7 +380,7 @@ describe('drop .nzb files anywhere', () => {
     const { app, prefills, snack } = signedIn();
     app.onWindowDrop(fileDrag('drop', [new File(['x'], 'movie.mkv')]));
     expect(prefills).toEqual([]);
-    expect(snack.open).toHaveBeenCalled();
+    expect(snack.info).toHaveBeenCalled();
     expect(app.announcer.assertive()).toContain('Only .nzb');
   });
 

@@ -5,11 +5,12 @@ import { MatDialogModule, MatDialogRef } from '@angular/material/dialog';
 import { MatButtonModule } from '@angular/material/button';
 import { MatIconModule } from '@angular/material/icon';
 import { MatProgressBarModule } from '@angular/material/progress-bar';
-import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
+import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { GroupService } from '../../core/services/group.service';
 import { GroupRow } from '../../core/models/group.model';
 import { IconComponent } from '../../shared/icon.component';
 import { showHttpError } from '../../core/http/http-error';
+import { ToastService } from '../../core/services/toast.service';
 
 @Component({
   selector: 'app-group-browser-dialog',
@@ -78,7 +79,11 @@ export class GroupBrowserDialogComponent implements OnInit {
   refreshing = signal(false);
   subPendingIds = signal<Set<number>>(new Set());
 
-  constructor(private svc: GroupService, private snack: MatSnackBar, private dialogRef: MatDialogRef<GroupBrowserDialogComponent>) {}
+  constructor(
+    private svc: GroupService,
+    private toast: ToastService,
+    private dialogRef: MatDialogRef<GroupBrowserDialogComponent>,
+  ) {}
 
   ngOnInit(): void { this.loadGroups(); }
 
@@ -99,10 +104,10 @@ export class GroupBrowserDialogComponent implements OnInit {
   refresh(): void {
     this.refreshing.set(true);
     this.svc.refresh().subscribe({
-      next: r => { this.refreshing.set(false); this.snack.open(r.message, 'Close', { duration: 3000 }); this.loadGroups(); },
+      next: r => { this.refreshing.set(false); this.toast.info(r.message); this.loadGroups(); },
       error: (e) => {
         this.refreshing.set(false);
-        showHttpError(this.snack, e, 'Refresh failed');
+        showHttpError(this.toast, e, 'Refresh failed');
       },
     });
   }
@@ -122,16 +127,14 @@ export class GroupBrowserDialogComponent implements OnInit {
       next: () => {
         g.subscribed = !wasSubscribed;
         this.groups.set([...this.groups()]);
-        this.snack.open(
+        this.toast.success(
           wasSubscribed ? `Unsubscribed from ${g.name}` : `Subscribed to ${g.name}`,
-          'Close',
-          { duration: 2000 },
         );
         clearPending();
       },
       error: (err) => {
         showHttpError(
-          this.snack,
+          this.toast,
           err,
           `Failed to ${wasSubscribed ? 'unsubscribe from' : 'subscribe to'} ${g.name}`,
         );

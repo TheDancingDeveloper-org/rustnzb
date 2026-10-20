@@ -1,23 +1,23 @@
 import '@angular/compiler';
 
 import { HttpClient } from '@angular/common/http';
-import { MatSnackBar } from '@angular/material/snack-bar';
 import { TestBed } from '@angular/core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { of, throwError } from 'rxjs';
 
 import { ApiService } from '../../core/services/api.service';
+import { ToastService } from '../../core/services/toast.service';
 import { MediaViewComponent } from './media-view.component';
 
 function makeComponent(status: unknown = { webdav_enabled: false }) {
   const api = { get: vi.fn(() => of(status)) };
   const http = { request: vi.fn(() => of('')) };
-  const snack = { open: vi.fn() };
+  const snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
   TestBed.configureTestingModule({
     providers: [
       { provide: ApiService, useValue: api },
       { provide: HttpClient, useValue: http },
-      { provide: MatSnackBar, useValue: snack },
+      { provide: ToastService, useValue: snack },
     ],
   });
   const component = TestBed.runInInjectionContext(() => new MediaViewComponent());

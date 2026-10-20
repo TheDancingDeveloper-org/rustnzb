@@ -1,13 +1,14 @@
 import { Component, OnDestroy, OnInit, signal, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
+import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { GroupService } from '../../core/services/group.service';
 import { GroupRow, HeaderRow } from '../../core/models/group.model';
 import { GroupBrowserDialogComponent } from './group-browser-dialog.component';
 import { IconComponent } from '../../shared/icon.component';
 import { showHttpError } from '../../core/http/http-error';
+import { ToastService } from '../../core/services/toast.service';
 import { formatBytes } from '../../core/format';
 
 @Component({
@@ -424,7 +425,7 @@ export class GroupsViewComponent implements OnInit, OnDestroy {
 
   constructor(
     private svc: GroupService,
-    private snack: MatSnackBar,
+    private toast: ToastService,
     private dialog: MatDialog,
   ) {}
 
@@ -498,10 +499,10 @@ export class GroupsViewComponent implements OnInit, OnDestroy {
     this.stopFetchPolling();
     this.fetching.set(true);
     this.svc.fetchHeaders(g.id).subscribe({
-      next: () => this.snack.open('Fetching headers…', 'Close', { duration: 2000 }),
+      next: () => this.toast.info('Fetching headers…'),
       error: (err) => {
         this.fetching.set(false);
-        showHttpError(this.snack, err, 'Failed to fetch headers');
+        showHttpError(this.toast, err, 'Failed to fetch headers');
       },
     });
     this.fetchPoll = setInterval(() => {
@@ -522,10 +523,9 @@ export class GroupsViewComponent implements OnInit, OnDestroy {
     this.fetchGiveUp = setTimeout(() => {
       this.stopFetchPolling();
       this.fetching.set(false);
-      this.snack.open(
+      this.toast.info(
         'Header fetch is taking longer than expected — it may still finish in the background. Refresh to check.',
-        'Close',
-        { duration: 6000 },
+        6000,
       );
     }, 120_000);
   }
@@ -544,9 +544,9 @@ export class GroupsViewComponent implements OnInit, OnDestroy {
       next: () => {
         this.loadHeaders();
         this.loadGroups();
-        this.snack.open('All marked read', 'Close', { duration: 2000 });
+        this.toast.success('All marked read');
       },
-      error: (err) => showHttpError(this.snack, err, 'Failed to mark all read'),
+      error: (err) => showHttpError(this.toast, err, 'Failed to mark all read'),
     });
   }
 
@@ -588,10 +588,10 @@ export class GroupsViewComponent implements OnInit, OnDestroy {
     if (!g || !this.selectedIds().length) return;
     this.svc.downloadSelected(g.id, this.selectedIds()).subscribe({
       next: (r) => {
-        this.snack.open(r.message, 'Close', { duration: 3000 });
+        this.toast.info(r.message);
         this.selectedIds.set([]);
       },
-      error: (err) => showHttpError(this.snack, err, 'Download failed'),
+      error: (err) => showHttpError(this.toast, err, 'Download failed'),
     });
   }
 

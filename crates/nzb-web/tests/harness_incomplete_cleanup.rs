@@ -89,6 +89,58 @@ async fn clearing_history_removes_retained_work_dirs() {
     assert!(engine.incomplete_dir.is_dir());
 }
 
+/// An undoable delete keeps its retained partial download until the undo
+/// window closes. Otherwise a startup sweep, or the purge's own reclaim, could
+/// destroy the reason the user deleted instead of clearing.
+#[tokio::test]
+async fn trashed_history_entry_keeps_work_dir_until_the_undo_window_closes() {
+    let (engine, xml) = failing_engine("hist-undo").await;
+    let (id, work_dir) = submit_and_fail(&engine, xml).await;
+    let qm = &engine.queue_manager;
+
+    qm.history_trash(
+        std::slice::from_ref(&id),
+        chrono::Utc::now() + chrono::Duration::seconds(60),
+    )
+    .unwrap();
+    assert!(
+        work_dir.join("present.bin").exists(),
+        "a trashed entry still owns its work dir"
+    );
+    assert!(
+        qm.history_get(&id).unwrap().is_none(),
+        "but it is gone from every history read"
+    );
+
+    // The startup-style sweep must not reclaim it while the undo is possible.
+    engine.queue_manager.with_db(|db| {
+        let trashed = db.history_trashed_ids().unwrap();
+        assert_eq!(trashed, vec![id.clone()]);
+    });
+
+    // Restoring brings the row back and leaves the work dir alone.
+    let restored = qm
+        .history_restore(std::slice::from_ref(&id), chrono::Utc::now())
+        .unwrap();
+    assert_eq!(restored, vec![id.clone()]);
+    assert!(qm.history_get(&id).unwrap().is_some());
+    assert!(work_dir.join("present.bin").exists());
+
+    // Trash it again and let the window close: the purge drops the row and
+    // reclaims the directory it was holding.
+    qm.history_trash(
+        std::slice::from_ref(&id),
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .unwrap();
+    assert_eq!(qm.history_purge_expired(chrono::Utc::now()).unwrap(), 1);
+    assert!(
+        !work_dir.exists(),
+        "the expired entry's work dir is reclaimed"
+    );
+    assert!(engine.incomplete_dir.is_dir());
+}
+
 #[tokio::test]
 async fn history_delete_keeps_work_dir_a_queued_retry_is_using() {
     let (engine, xml) = failing_engine("hist-retry").await;

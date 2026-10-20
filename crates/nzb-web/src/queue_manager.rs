@@ -5459,6 +5459,63 @@ impl QueueManager {
         Ok(())
     }
 
+    /// Move history entries into the undo window instead of deleting them.
+    ///
+    /// Their retained work directories stay put: the row still owns them
+    /// until the undo window closes, so a restore is lossless.
+    pub fn history_trash(
+        &self,
+        ids: &[String],
+        deadline: DateTime<Utc>,
+    ) -> crate::nzb_core::Result<Vec<HistorySummary>> {
+        let trashed = {
+            let db = self.db.lock();
+            db.history_trash(ids, deadline)?
+        };
+        if !trashed.is_empty() {
+            self.history_changed();
+        }
+        Ok(trashed)
+    }
+
+    /// Bring trashed entries back before their deadline.
+    pub fn history_restore(
+        &self,
+        ids: &[String],
+        now: DateTime<Utc>,
+    ) -> crate::nzb_core::Result<Vec<String>> {
+        let restored = {
+            let db = self.db.lock();
+            db.history_restore(ids, now)?
+        };
+        if !restored.is_empty() {
+            self.history_changed();
+        }
+        Ok(restored)
+    }
+
+    /// Purge every trashed entry whose undo window has closed, then reclaim
+    /// the work directories only those rows still referenced.
+    pub fn history_purge_expired(&self, now: DateTime<Utc>) -> crate::nzb_core::Result<usize> {
+        let (purged, retained) = {
+            let db = self.db.lock();
+            let purged = db.history_purge_expired(now)?;
+            let retained: Vec<_> = purged
+                .iter()
+                .flat_map(|entry| self.history_work_dirs(&db, &entry.id, entry.status))
+                .collect();
+            (purged, retained)
+        };
+        if purged.is_empty() {
+            return Ok(0);
+        }
+        self.history_changed();
+        for work_dir in retained {
+            self.remove_unreferenced_work_dir(&work_dir, "trashed history entry expired");
+        }
+        Ok(purged.len())
+    }
+
     /// Clear all history.
     pub fn history_clear(&self) -> crate::nzb_core::Result<()> {
         let retained = {
@@ -5526,7 +5583,11 @@ impl QueueManager {
         {
             let db = self.db.lock();
             paths.extend(db.queue_list()?.into_iter().map(|job| job.work_dir));
-            for entry in db.history_summaries(&HistoryFilter::default())? {
+            let visible = db.history_summaries(&HistoryFilter::default())?;
+            let trashed = db.history_trashed_summaries()?;
+            // A trashed row still owns its directory until its undo window
+            // closes, so it counts as a reference exactly like a visible one.
+            for entry in visible.iter().chain(trashed.iter()) {
                 paths.push(incomplete.join(&entry.id));
                 if entry.status != JobStatus::Failed {
                     continue;
@@ -6223,6 +6284,14 @@ impl QueueManager {
                 }
                 if tick_count.is_multiple_of(30) {
                     qm.enforce_disk_guard();
+                    // Trashed history rows are hard-deleted once their undo
+                    // window closes; that is also when their retained work
+                    // directories become reclaimable.
+                    match qm.history_purge_expired(Utc::now()) {
+                        Ok(0) => {}
+                        Ok(count) => info!(count, "Purged trashed history entries"),
+                        Err(e) => warn!(error = %e, "Failed to purge trashed history entries"),
+                    }
                 }
             }
         });

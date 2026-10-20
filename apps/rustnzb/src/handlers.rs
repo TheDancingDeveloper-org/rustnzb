@@ -84,7 +84,7 @@ pub struct HistoryQuery {
     pub search: Option<String>,
     /// Only entries completed within the last N days. Also bounds `stats`.
     /// Values above [`MAX_HISTORY_DAYS`] are rejected: subtracting the span
-    /// from `Utc::now()` overflows chrono's DateTime range (about
+    /// from `chrono::Utc::now()` overflows chrono's DateTime range (about
     /// ±262 000 years), which panics.
     pub days: Option<u32>,
     /// Include the detail-only `stages` and `server_stats` arrays on every
@@ -1036,13 +1036,143 @@ pub async fn h_history_get(
     Ok(Json(entry.into()))
 }
 
+/// How long a trashed history entry stays restorable. Long enough for the
+/// toast that offers the undo to be read and acted on.
+pub const HISTORY_UNDO_WINDOW: chrono::Duration = chrono::Duration::seconds(10);
+
+/// Query for history deletions. A delete is a hard delete unless the caller
+/// asks for the undo window with `trash=true`; SAB and *arr clients depend on
+/// the old behaviour, and so does `clear all`.
+#[derive(Deserialize, Default)]
+pub struct HistoryDeleteQuery {
+    #[serde(default)]
+    pub trash: bool,
+}
+
+/// What a trashed deletion returns: the entries moved into the undo window
+/// and when that window closes. A caller restores them with
+/// `POST /api/history/restore`, so it must keep the ids.
+#[derive(Serialize)]
+pub struct HistoryTrashResponse {
+    pub status: bool,
+    /// Entries actually trashed, in request order.
+    pub entries: Vec<TrashedHistoryEntry>,
+    /// RFC 3339 instant after which a restore is refused and the next purge
+    /// sweep removes the rows.
+    pub purge_after: String,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum HistoryDeleteResponse {
+    Trashed(HistoryTrashResponse),
+    Removed(SimpleResponse),
+}
+
+/// The list-row shape for a trashed entry. It keeps the fields an undo needs
+/// to put the row back in view, without loading its blobs.
+#[derive(Serialize)]
+pub struct TrashedHistoryEntry {
+    pub id: String,
+    pub name: String,
+    pub status: JobStatus,
+}
+
+impl From<HistorySummary> for TrashedHistoryEntry {
+    fn from(entry: HistorySummary) -> Self {
+        Self {
+            id: entry.id,
+            name: entry.name,
+            status: entry.status,
+        }
+    }
+}
+
+fn trash_response(
+    entries: Vec<HistorySummary>,
+    deadline: chrono::DateTime<chrono::Utc>,
+) -> HistoryTrashResponse {
+    HistoryTrashResponse {
+        status: true,
+        entries: entries.into_iter().map(Into::into).collect(),
+        purge_after: deadline.to_rfc3339(),
+    }
+}
+
 /// DELETE /api/history/{id} -- Remove a history entry.
+///
+/// `?trash=true` moves it into the undo window instead of deleting it, and
+/// returns its summary plus `purge_after`.
 pub async fn h_history_delete(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<SimpleResponse>, ApiError> {
-    qm_blocking(&state, move |qm| qm.history_remove(&id)).await?;
-    Ok(Json(SimpleResponse { status: true }))
+    Query(q): Query<HistoryDeleteQuery>,
+) -> Result<Json<HistoryDeleteResponse>, ApiError> {
+    if !q.trash {
+        qm_blocking(&state, move |qm| qm.history_remove(&id)).await?;
+        return Ok(Json(HistoryDeleteResponse::Removed(SimpleResponse {
+            status: true,
+        })));
+    }
+    let deadline = chrono::Utc::now() + HISTORY_UNDO_WINDOW;
+    let trashed = qm_blocking(&state, move |qm| qm.history_trash(&[id], deadline)).await?;
+    if trashed.is_empty() {
+        return Err(ApiError::not_found("History entry not found"));
+    }
+    Ok(Json(HistoryDeleteResponse::Trashed(trash_response(
+        trashed, deadline,
+    ))))
+}
+
+#[derive(Deserialize)]
+pub struct HistoryRestoreBody {
+    pub ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct HistoryRestoreResponse {
+    pub status: bool,
+    /// Ids brought back, in request order.
+    pub restored: Vec<String>,
+    /// One entry per id that could not be restored: unknown, already visible,
+    /// or past its undo window.
+    pub failures: Vec<BulkActionFailure>,
+}
+
+/// POST /api/history/restore -- Undo trashed history deletions.
+///
+/// Per-id like the bulk action: one id whose window has closed or that is
+/// already visible does not stop the others from coming back.
+pub async fn h_history_restore(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<HistoryRestoreBody>,
+) -> Result<Json<HistoryRestoreResponse>, ApiError> {
+    if body.ids.len() > MAX_HISTORY_BULK_IDS {
+        return Err(ApiError::bad_request("too many ids in one bulk request"));
+    }
+    let ids = body.ids;
+    let (restored, failures) = qm_blocking(&state, move |qm| {
+        let mut restored = Vec::with_capacity(ids.len());
+        let mut failures = Vec::new();
+        for id in ids {
+            match qm.history_restore(std::slice::from_ref(&id), chrono::Utc::now())? {
+                ids if !ids.is_empty() => restored.extend(ids),
+                _ => failures.push(BulkActionFailure {
+                    id,
+                    error: ApiError::not_found(
+                        "History entry is not restorable (unknown, or its undo window has closed)",
+                    ),
+                }),
+            }
+        }
+        Ok((restored, failures))
+    })
+    .await?;
+    Ok(Json(HistoryRestoreResponse {
+        status: failures.is_empty(),
+        restored,
+        failures,
+    }))
 }
 
 /// DELETE /api/history -- Clear all history.
@@ -1121,6 +1251,10 @@ pub struct HistoryBulkBody {
     pub days: Option<u32>,
     pub category: Option<String>,
     pub search: Option<String>,
+    /// With `delete`: move the entries into the undo window instead of
+    /// deleting them, and return their ids and deadline in the response.
+    #[serde(default)]
+    pub trash: bool,
 }
 
 /// POST /api/history/bulk -- Delete or retry several history entries.
@@ -1133,7 +1267,7 @@ pub struct HistoryBulkBody {
 pub async fn h_history_bulk(
     State(state): State<Arc<AppState>>,
     Json(body): Json<HistoryBulkBody>,
-) -> Result<Json<BulkActionResponse>, ApiError> {
+) -> Result<Json<HistoryBulkResponse>, ApiError> {
     let action = body.action.trim().to_ascii_lowercase();
     if !matches!(action.as_str(), "delete" | "retry") {
         return Err(ApiError::bad_request("action must be `delete` or `retry`"));
@@ -1178,6 +1312,8 @@ pub async fn h_history_bulk(
         return Err(ApiError::bad_request("a bulk action needs ids or a status"));
     }
 
+    let trash = body.trash && action == "delete";
+    let deadline = chrono::Utc::now() + HISTORY_UNDO_WINDOW;
     let requested = body.ids;
     let filter = HistoryFilter {
         completed_since: body
@@ -1190,7 +1326,7 @@ pub async fn h_history_bulk(
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty()),
     };
-    let (succeeded, failures) = qm_blocking(&state, move |qm| {
+    let (succeeded, failures, trashed) = qm_blocking(&state, move |qm| {
         // The explicit ids first, then every entry the status names. An id
         // repeated across the two is acted on once.
         let mut seen = std::collections::HashSet::new();
@@ -1210,12 +1346,24 @@ pub async fn h_history_bulk(
 
         let mut succeeded = 0usize;
         let mut failures: Vec<BulkActionFailure> = Vec::new();
+        let mut trashed: Vec<HistorySummary> = Vec::new();
         for id in targets {
             let error = if action == "delete" {
                 // `history_remove` is idempotent, so look the entry up first:
                 // a stale id in a client's selection is a failure to report.
                 match qm.history_get(&id)? {
                     None => Some(ApiError::not_found("History entry not found")),
+                    Some(_) if trash => {
+                        match qm.history_trash(std::slice::from_ref(&id), deadline)? {
+                            moved if moved.is_empty() => {
+                                Some(ApiError::not_found("History entry not found"))
+                            }
+                            moved => {
+                                trashed.extend(moved);
+                                None
+                            }
+                        }
+                    }
                     Some(_) => match qm.history_remove(&id) {
                         Ok(()) => None,
                         Err(e) => Some(ApiError::from(e)),
@@ -1239,15 +1387,17 @@ pub async fn h_history_bulk(
                 Some(error) => failures.push(BulkActionFailure { id, error }),
             }
         }
-        Ok((succeeded, failures))
+        Ok((succeeded, failures, trashed))
     })
     .await?;
 
-    Ok(Json(BulkActionResponse {
+    let trashed = trash.then(|| trash_response(trashed, deadline));
+    Ok(Json(HistoryBulkResponse {
         status: failures.is_empty(),
         succeeded,
         failed: failures.len(),
         failures,
+        trashed,
     }))
 }
 
@@ -2982,6 +3132,18 @@ pub struct BulkActionFailure {
     /// Same shape as an API error body (`error_kind`, `human_readable`,
     /// `status`).
     pub error: ApiError,
+}
+
+/// Response to `POST /api/history/bulk`. `trashed` is present only when the
+/// caller asked for the undo window.
+#[derive(Serialize)]
+pub struct HistoryBulkResponse {
+    pub status: bool,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub failures: Vec<BulkActionFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trashed: Option<HistoryTrashResponse>,
 }
 
 /// POST /api/queue/bulk -- Perform an action on multiple jobs.

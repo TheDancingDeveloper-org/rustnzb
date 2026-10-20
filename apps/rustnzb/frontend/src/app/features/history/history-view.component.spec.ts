@@ -5,8 +5,9 @@ import { firstValueFrom, of, Subject, throwError } from 'rxjs';
 
 import { ApiService, POLL_TIMEOUT_MS } from '../../core/services/api.service';
 import { HistoryEntry } from '../../core/models/queue.model';
-import { HistoryViewComponent } from './history-view.component';
+import { HistoryViewComponent, undoDuration } from './history-view.component';
 import { AnnouncerService } from '../../core/services/announcer.service';
+
 
 function entry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
   return {
@@ -29,7 +30,13 @@ function entry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
 
 describe('HistoryViewComponent', () => {
   let api: { get: ReturnType<typeof vi.fn>; post: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
-  let snack: { open: ReturnType<typeof vi.fn> };
+  let snack: {
+    open: ReturnType<typeof vi.fn>;
+    success: ReturnType<typeof vi.fn>;
+    info: ReturnType<typeof vi.fn>;
+    error: ReturnType<typeof vi.fn>;
+    undo: ReturnType<typeof vi.fn>;
+  };
   let confirm: { confirm: ReturnType<typeof vi.fn> };
   let announcer: AnnouncerService;
   let component: HistoryViewComponent;
@@ -44,7 +51,9 @@ describe('HistoryViewComponent', () => {
       post: vi.fn(() => of({})),
       delete: vi.fn(() => of({})),
     };
-    snack = { open: vi.fn() };
+    // The component talks to ToastService; this mock is that service, so the
+    // undo callback can be captured and run the way a click would.
+    snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
     confirm = { confirm: vi.fn(() => of(true)) };
     announcer = new AnnouncerService();
     component = new HistoryViewComponent(
@@ -239,7 +248,7 @@ describe('HistoryViewComponent', () => {
     component.remove('id two');
     component.addToMedia('id three');
     expect(api.post).toHaveBeenCalledWith('/history/id one/retry');
-    expect(api.delete).toHaveBeenCalledWith('/history/id two');
+    expect(api.delete).toHaveBeenCalledWith('/history/id two', { trash: 'true' });
     expect(api.post).toHaveBeenCalledWith('/dav/add?id=id three');
     expect(load).toHaveBeenCalledTimes(2);
   });
@@ -369,19 +378,99 @@ describe('HistoryViewComponent', () => {
     expect(component.selectedIds().size).toBe(0);
   });
 
-  it('bulk-deletes the selection through one request after confirmation', () => {
+  it('bulk-deletes the selection into the undo window, offering restore', () => {
     const load = vi.spyOn(component, 'load').mockImplementation(() => {});
-    api.post.mockReturnValue(of({ status: true, succeeded: 2, failed: 0, failures: [] }));
+    api.post.mockReturnValue(
+      of({
+        status: true,
+        succeeded: 2,
+        failed: 0,
+        failures: [],
+        trashed: {
+          status: true,
+          entries: [{ id: 'history-1' }, { id: 'history-2' }],
+          purge_after: '2026-07-10T00:00:10Z',
+        },
+      }),
+    );
     component.toggleSelected('history-1');
     component.toggleSelected('history-2');
     component.bulkDelete();
-    expect(confirm.confirm).toHaveBeenCalledWith(expect.objectContaining({ danger: true }));
+    expect(confirm.confirm).not.toHaveBeenCalled();
     expect(api.post).toHaveBeenCalledWith('/history/bulk', {
       action: 'delete',
       ids: ['history-1', 'history-2'],
+      trash: true,
     });
     expect(component.selectedIds().size).toBe(0);
-    expect(snack.open).toHaveBeenCalledWith('Deleted 2 entries', 'Close', { duration: 2000 });
+    expect(snack.undo).toHaveBeenCalledWith('Deleted 2 entries', expect.any(Function), {
+      duration: 10000,
+    });
+    expect(load).toHaveBeenCalled();
+
+    const undo = snack.undo.mock.calls[0][1] as () => void;
+    api.post.mockReturnValue(of({ status: true, restored: ['history-1', 'history-2'], failures: [] }));
+    undo();
+    expect(api.post).toHaveBeenLastCalledWith('/history/restore', {
+      ids: ['history-1', 'history-2'],
+    });
+    expect(snack.success).toHaveBeenCalledWith('Restored 2 entries');
+  });
+
+  it('offers Undo for no longer than the server will honour it', () => {
+    api.get.mockImplementation((path: string) =>
+      of(path === '/history' ? { entries: [entry()], total: 1 } : {}),
+    );
+    component.load();
+    api.delete.mockReturnValue(
+      of({ status: true, entries: [{ id: 'history-1' }], purge_after: '2026-07-10T00:00:06Z' }),
+    );
+
+    component.remove('history-1');
+
+    expect(snack.undo).toHaveBeenCalledWith('Deleted "Release.One"', expect.any(Function), {
+      duration: 6000,
+    });
+  });
+
+  it('never offers a zero-length undo, and ignores an unparseable deadline', () => {
+    expect(undoDuration('2026-07-10T00:00:00Z', Date.parse('2026-07-10T00:00:05Z'))).toBe(1000);
+    expect(undoDuration('not a date')).toBeUndefined();
+    expect(undoDuration(undefined)).toBeUndefined();
+  });
+
+  it('reports an undo whose window has already closed', () => {
+    vi.spyOn(component, 'load').mockImplementation(() => {});
+    api.post.mockReturnValue(
+      of({ status: false, restored: ['history-1'], failures: [{ id: 'history-2' }] }),
+    );
+    component.remove('history-1');
+    const undo = snack.undo.mock.calls[0][1] as () => void;
+    undo();
+    expect(snack.error).toHaveBeenCalledWith('Restored 1, 1 could no longer be undone');
+  });
+
+  it('deletes one row into the undo window and closes its detail pane', () => {
+    api.get.mockImplementation((path: string) =>
+      of(
+        path === '/history'
+          ? { entries: [entry({ id: 'history-1', name: 'Release.One' })], total: 1 }
+          : {},
+      ),
+    );
+    component.load();
+    expect(component.entries()[0]?.name).toBe('Release.One');
+    const load = vi.spyOn(component, 'load').mockImplementation(() => {});
+    api.delete.mockReturnValue(
+      of({ status: true, entries: [{ id: 'history-1' }], purge_after: '2026-07-10T00:00:10Z' }),
+    );
+    component.selectedId.set('history-1');
+    component.remove('history-1');
+    expect(api.delete).toHaveBeenCalledWith('/history/history-1', { trash: 'true' });
+    expect(component.selectedId()).toBeNull();
+    expect(snack.undo).toHaveBeenCalledWith('Deleted "Release.One"', expect.any(Function), {
+      duration: 10000,
+    });
     expect(load).toHaveBeenCalled();
   });
 
@@ -432,7 +521,19 @@ describe('HistoryViewComponent', () => {
     component.filterTime = '30d';
     component.filterCategory = 'tv';
     component.nameFilter = '  release ';
-    api.post.mockReturnValue(of({ status: true, succeeded: 3, failed: 0, failures: [] }));
+    api.post.mockReturnValue(
+      of({
+        status: true,
+        succeeded: 3,
+        failed: 0,
+        failures: [],
+        trashed: {
+          status: true,
+          entries: [{ id: 'f1' }, { id: 'f2' }, { id: 'f3' }],
+          purge_after: '2026-07-10T00:00:10Z',
+        },
+      }),
+    );
     component.clearByStatus('failed');
     expect(confirm.confirm).toHaveBeenCalledWith(
       expect.objectContaining({ title: 'Clear 3 failed entries?', danger: true }),
@@ -444,8 +545,11 @@ describe('HistoryViewComponent', () => {
       days: 30,
       category: 'tv',
       search: 'release',
+      trash: true,
     });
-    expect(snack.open).toHaveBeenCalledWith('Cleared 3 failed entries', 'Close', { duration: 2000 });
+    expect(snack.undo).toHaveBeenCalledWith('Cleared 3 failed entries', expect.any(Function), {
+      duration: 10000,
+    });
     expect(load).toHaveBeenCalled();
     expect(component.clearingStatus()).toBeNull();
   });
@@ -459,6 +563,7 @@ describe('HistoryViewComponent', () => {
       action: 'delete',
       status: 'completed',
       ids: [],
+      trash: true,
     });
     expect(load).toHaveBeenCalled();
   });

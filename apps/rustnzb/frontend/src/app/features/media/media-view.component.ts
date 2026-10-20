@@ -1,8 +1,9 @@
 import { Component, OnInit, OnDestroy, signal, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { HttpClient, HttpHeaders } from '@angular/common/http';
-import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
+import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { ApiService } from '../../core/services/api.service';
+import { ToastService } from '../../core/services/toast.service';
 import { IconComponent } from '../../shared/icon.component';
 
 interface DavFile {
@@ -479,7 +480,7 @@ const AUDIO_EXTS = new Set(['mp3', 'flac', 'aac', 'ogg', 'wav', 'm4a', 'opus']);
 export class MediaViewComponent implements OnInit, OnDestroy {
   private http = inject(HttpClient);
   private api = inject(ApiService);
-  private snack = inject(MatSnackBar);
+  private toast = inject(ToastService);
 
   davBase = `${window.location.origin}/dav`;
   enabled = signal(true);
@@ -649,16 +650,16 @@ export class MediaViewComponent implements OnInit, OnDestroy {
 
   copyBase(): void {
     navigator.clipboard.writeText(this.davBase).then(
-      () => this.snack.open('URL copied', 'Close', { duration: 2000 }),
-      () => this.snack.open(this.davBase, 'Close', { duration: 4000 }),
+      () => this.toast.success('URL copied'),
+      () => this.toast.info(this.davBase, 4000),
     );
   }
 
   copyFileUrl(href: string): void {
     const url = this.fileUrl(href);
     navigator.clipboard.writeText(url).then(
-      () => this.snack.open('Stream URL copied', 'Close', { duration: 2000 }),
-      () => this.snack.open(url, 'Close', { duration: 4000 }),
+      () => this.toast.success('Stream URL copied'),
+      () => this.toast.info(url, 4000),
     );
   }
 }
