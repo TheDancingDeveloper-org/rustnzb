@@ -347,3 +347,32 @@ async fn a_server_rule_disables_servers_in_the_live_list_only() {
     update(&state, false, vec![]).await;
     assert!(state.queue_manager.live_servers().iter().all(|s| s.enabled));
 }
+
+#[tokio::test]
+async fn a_window_opening_during_a_disk_hold_takes_effect_when_the_hold_lifts() {
+    let (state, _temp) = test_state();
+    let manager = &state.queue_manager;
+
+    // The disk guard is holding the queue before the window opens.
+    manager.set_min_free_space(u64::MAX);
+    manager.enforce_disk_guard();
+    assert_eq!(manager.global_pause_reason(), Some(PauseReason::DiskSpace));
+
+    let body = update(&state, true, vec![rule(ScheduleAction::Pause)]).await;
+    assert!(
+        body["paused"].as_bool().unwrap(),
+        "an open window must report paused even while a disk hold overlaps it"
+    );
+
+    // Space frees: the guard drops its own hold, but the window is still
+    // open and downloads must not run through it.
+    manager.set_min_free_space(1);
+    manager.enforce_disk_guard();
+    assert!(
+        manager.is_paused(),
+        "downloads ran through a window that opened during a disk hold"
+    );
+    assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+    let body = h_schedule_get(State(Arc::clone(&state))).await.unwrap().0;
+    assert!(body.paused);
+}

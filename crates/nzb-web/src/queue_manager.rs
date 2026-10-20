@@ -1646,6 +1646,65 @@ pub enum PauseReason {
     Schedule,
 }
 
+/// Every reason the queue is globally paused right now.
+///
+/// Holds are additive rather than a single owner: a disk-space hold can be
+/// open while a schedule window is open, and the queue must stay paused until
+/// *both* are gone. Each holder lifts only its own flag, so one ending never
+/// resumes work the other is still holding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PauseHolds {
+    /// The user pressed Pause All, or a timed pause is running.
+    user: bool,
+    /// The disk-space guard tripped.
+    disk: Option<DateTime<Utc>>,
+    /// A schedule pause window is open *and unpaused by the user*.
+    schedule: bool,
+    /// Which window the schedule hold belongs to, by occurrence: rule ids and
+    /// the date each window started on. Re-evaluating the same open window
+    /// yields the same key, so the schedule only pauses on the rising edge;
+    /// a later window yields a new key, so it pauses again.
+    schedule_window: Option<String>,
+}
+
+impl PauseHolds {
+    fn any(&self) -> bool {
+        self.user || self.disk.is_some() || self.schedule
+    }
+
+    /// The reason to show, most specific first. A pause the user asked for
+    /// outranks every automatic hold, a disk hold outranks a schedule window
+    /// that merely overlapped it, and the schedule is the reason only when it
+    /// is what keeps the queue paused.
+    fn reason(&self) -> Option<PauseReason> {
+        if self.user {
+            Some(PauseReason::Global)
+        } else if self.disk.is_some() {
+            Some(PauseReason::DiskSpace)
+        } else if self.schedule {
+            Some(PauseReason::Schedule)
+        } else {
+            None
+        }
+    }
+
+    /// The owner persisted with the pause, so a restart can rebuild the same
+    /// holds. A disk hold keyed by its timestamp is restored from its own
+    /// setting, and the schedule window from its own setting;
+    /// this value only has to describe the pause once those are gone.
+    fn reason_owner(&self) -> &'static str {
+        if self.user {
+            QueueManager::PAUSE_OWNER_USER
+        } else if self.schedule {
+            QueueManager::PAUSE_OWNER_SCHEDULE
+        } else if self.disk.is_some() {
+            QueueManager::PAUSE_OWNER_DISK
+        } else {
+            ""
+        }
+    }
+}
+
 /// Notification fired immediately when a job is accepted into the queue.
 #[derive(Debug, Clone)]
 pub struct JobAddedEvent {
@@ -1728,18 +1787,12 @@ pub struct QueueManager {
     /// Keeping this separate from ordinary per-job pause state means that
     /// `resume_all` only resumes work stopped by `pause_all`.
     globally_paused_jobs: Mutex<HashSet<String>>,
-    /// Set while the current global pause was applied by the disk-space
-    /// guard rather than the user; holds when the guard tripped. The guard
-    /// lifts only pauses it owns.
-    disk_space_hold: Mutex<Option<DateTime<Utc>>>,
-    /// True while the current global pause was applied by the download
-    /// schedule. Like the disk hold, only the schedule may lift it, and only
-    /// while it still owns the pause.
-    schedule_hold: AtomicBool,
-    /// True while a pause rule is open. The schedule pauses on the rising
-    /// edge of this only: the user may resume inside a window, and that
-    /// resume holds until the window closes and the next one opens.
-    schedule_window: AtomicBool,
+    /// Everything currently holding the queue paused. Holds are additive:
+    /// the queue is paused while any of them is set, and resumes when the
+    /// last one is lifted. A disk-space hold that overlaps a pause window
+    /// therefore does not swallow the window, and the window ending does not
+    /// lift the disk hold.
+    pause_holds: Mutex<PauseHolds>,
     /// Servers the schedule has taken out of rotation, as configured by the
     /// user. The live list is the configured list with these disabled.
     schedule_disabled_servers: Mutex<Vec<String>>,
@@ -1819,6 +1872,9 @@ pub struct QueueManager {
 impl QueueManager {
     const GLOBAL_PAUSED_JOBS_SETTING: &'static str = "globally_paused_job_ids";
     const DISK_SPACE_HOLD_SETTING: &'static str = "disk_space_hold_since";
+    /// The open pause window's occurrence, persisted with the schedule hold
+    /// so a restart resumes an overridden window rather than re-pausing it.
+    const SCHEDULE_WINDOW_SETTING: &'static str = "schedule_pause_window";
     /// Who applied the persisted global pause: empty or `user`, or
     /// `schedule`. A restart must not turn a scheduled pause into a user
     /// pause the schedule can never lift.
@@ -1912,9 +1968,7 @@ impl QueueManager {
             progress_shutdown: watch::channel(false).0,
             pause_transition: Mutex::new(()),
             globally_paused_jobs: Mutex::new(HashSet::new()),
-            disk_space_hold: Mutex::new(None),
-            schedule_hold: AtomicBool::new(false),
-            schedule_window: AtomicBool::new(false),
+            pause_holds: Mutex::new(PauseHolds::default()),
             schedule_disabled_servers: Mutex::new(Vec::new()),
             configured_servers: Mutex::new(configured_servers),
             configured_speed_limit_bps: AtomicU64::new(speed_limit_bps),
@@ -4886,45 +4940,107 @@ impl QueueManager {
     }
 
     /// Pause all downloads globally.
-    pub fn pause_all(&self) {
-        self.pause_all_with_hold(None);
+    pub fn pause_all(self: &Arc<Self>) {
+        self.pause_for_hold(|holds| holds.user = true);
     }
 
-    /// Pause all downloads. `disk_space_hold` marks a pause applied by the
-    /// disk-space guard; `None` is a user pause, which also takes ownership
-    /// of any existing disk hold so the guard will not lift it.
-    fn pause_all_with_hold(&self, disk_space_hold: Option<DateTime<Utc>>) {
-        let owner = if disk_space_hold.is_some() {
-            Self::PAUSE_OWNER_DISK
-        } else {
-            Self::PAUSE_OWNER_USER
-        };
-        self.pause_all_as(disk_space_hold, owner);
+    /// Pause all downloads on behalf of the disk-space guard, which lifts the
+    /// hold itself once space frees up.
+    fn pause_all_with_hold(self: &Arc<Self>, disk_space_hold: Option<DateTime<Utc>>) {
+        self.pause_for_hold(|holds| {
+            if let Some(since) = disk_space_hold {
+                holds.disk = Some(since);
+            }
+        });
     }
 
-    /// Pause everything and record who owns the pause. The owner decides who
-    /// may lift it: the schedule lifts only its own, the disk guard only its
-    /// hold, and a user pause is lifted only by `resume_all`.
-    fn pause_all_as(&self, disk_space_hold: Option<DateTime<Utc>>, owner: &str) {
+    /// Add a hold and pause the queue if it was not already paused.
+    ///
+    /// Holds are additive and each holder lifts only its own, so a pause that
+    /// is already in effect keeps everything else that caused it. `apply`
+    /// mutates the holds while the transition lock is held.
+    fn pause_for_hold(self: &Arc<Self>, apply: impl FnOnce(&mut PauseHolds)) {
         let _transition = self.pause_transition.lock();
-        // Ownership is persisted with the pause, or a restart would hand a
-        // user's pause back to the schedule.
-        self.schedule_hold
-            .store(owner == Self::PAUSE_OWNER_SCHEDULE, Ordering::SeqCst);
-        // Publish the global gate before touching individual jobs. This
-        // prevents every scheduling and per-job resume path from starting
-        // more work while the active contexts are being paused.
-        self.globally_paused.store(true, Ordering::SeqCst);
-        {
-            let db = self.db.lock();
-            db.set_setting("globally_paused", "true");
-            db.set_setting(Self::PAUSE_OWNER_SETTING, owner);
-        }
-        self.set_disk_space_hold(disk_space_hold);
-        // A plain pause is indefinite: cancel any pending timed resume.
-        // `pause_for` sets its deadline after calling this.
+        // Every pause is indefinite unless `pause_for` sets a deadline after
+        // this returns, so drop any pending timed resume whether or not the
+        // queue was already held: a second pause must not inherit the first
+        // one's clock.
         *self.pause_until.lock() = None;
+        let was_paused = {
+            let mut holds = self.pause_holds.lock();
+            apply(&mut holds);
+            let paused = self.globally_paused.load(Ordering::SeqCst);
+            self.publish_holds(&holds);
+            paused
+        };
+        if !was_paused {
+            self.pause_jobs_for_global_hold();
+        }
+    }
 
+    /// Set the schedule's hold from an evaluated window, then pause if the
+    /// hold is new.
+    ///
+    /// `window` identifies the occurrence, so re-applying the same open window
+    /// does not fight a manual resume, while the next window (or a window the
+    /// user re-enabled) does pause again. A user pause keeps the schedule from
+    /// *holding* anything, but the occurrence still moves with the window.
+    fn apply_schedule_hold(self: &Arc<Self>, window: Option<String>, saved: bool) {
+        let _transition = self.pause_transition.lock();
+        let should_pause = {
+            let mut holds = self.pause_holds.lock();
+            let was_held = holds.schedule;
+            // A save re-keys an open window to the saved rules without making
+            // it a new window: the same window stays open through the save.
+            let adopt = saved && window.is_some() && holds.schedule_window.is_some();
+            let rising = !adopt
+                && window
+                    .as_deref()
+                    .is_some_and(|key| holds.schedule_window.as_deref() != Some(key));
+            holds.schedule_window = window;
+            if !adopt {
+                // A window opening while a user pause is in force holds
+                // nothing: their pause already covers it, and the window
+                // ending must not resume a pause they own.
+                holds.schedule = rising && !holds.user;
+            }
+            // On a save that leaves the window open, the hold keeps whatever
+            // state it had: a manual resume inside the window survives the
+            // save, and a hold that is still in force stays in force.
+            let pause_requested = holds.schedule && !was_held;
+            let paused = self.globally_paused.load(Ordering::SeqCst);
+            self.publish_holds(&holds);
+            pause_requested && !paused
+        };
+        if should_pause {
+            self.pause_jobs_for_global_hold();
+        }
+    }
+
+    /// Persist the current holds and publish the global gate.
+    ///
+    /// The gate is set while the holds still say paused, never cleared here:
+    /// only [`Self::resume_hold`] may lift the last hold and resume.
+    fn publish_holds(&self, holds: &PauseHolds) {
+        self.globally_paused.store(holds.any(), Ordering::SeqCst);
+        let db = self.db.lock();
+        db.set_setting(
+            "globally_paused",
+            if holds.any() { "true" } else { "false" },
+        );
+        db.set_setting(Self::PAUSE_OWNER_SETTING, holds.reason_owner());
+        let value = holds.disk.map(|at| at.to_rfc3339()).unwrap_or_default();
+        db.set_setting(Self::DISK_SPACE_HOLD_SETTING, &value);
+        let window = holds.schedule_window.clone().unwrap_or_default();
+        db.set_setting(Self::SCHEDULE_WINDOW_SETTING, &window);
+    }
+
+    /// Pause every active job as part of a global pause.
+    ///
+    /// The caller holds [`Self::pause_transition`] and has already published
+    /// the gate, so no resume path can start work while the contexts are
+    /// being paused.
+    fn pause_jobs_for_global_hold(&self) {
         // Collect ids to pause in the pool, to avoid holding the jobs lock
         // while calling into the worker pool.
         let to_pause: Vec<String> = {
@@ -4953,6 +5069,55 @@ impl QueueManager {
             self.dispatch.pause_job(&id);
         }
         info!("All downloads paused");
+    }
+
+    /// Lift one holder's pause, resuming only when no hold is left.
+    ///
+    /// `apply` mutates the holds while the transition lock is held; if the
+    /// queue is still held afterwards the gate stays put and the reason moves
+    /// to the holder that remains.
+    fn resume_hold(self: &Arc<Self>, apply: impl FnOnce(&mut PauseHolds)) {
+        let _transition = self.pause_transition.lock();
+        let resume = {
+            let mut holds = self.pause_holds.lock();
+            apply(&mut holds);
+            self.publish_holds(&holds);
+            !holds.any()
+        };
+        if resume {
+            self.resume_jobs_after_holds();
+        }
+    }
+
+    /// Mark every globally paused job Queued and start work, once the last
+    /// hold is gone. The caller holds [`Self::pause_transition`].
+    fn resume_jobs_after_holds(self: &Arc<Self>) {
+        *self.pause_until.lock() = None;
+
+        let paused_by_global = std::mem::take(&mut *self.globally_paused_jobs.lock());
+        self.persist_globally_paused_jobs();
+
+        // Mark every globally paused job Queued; start_next_queued then
+        // unpauses a live pool context or re-submits the job, up to the
+        // active download limit.
+        {
+            let mut jobs = self.jobs.lock();
+            for id in paused_by_global {
+                let Some(state) = jobs.get_mut(&id) else {
+                    continue;
+                };
+                if state.job.status == JobStatus::Paused {
+                    state.job.error_message = None;
+                    state.failure_code = None;
+                    state.job.status = JobStatus::Queued;
+                }
+            }
+        }
+
+        // Start queued jobs up to the concurrency limit
+        self.start_next_queued();
+
+        info!("All downloads resumed");
     }
 
     /// Pause all downloads for a specified duration.
@@ -4992,38 +5157,42 @@ impl QueueManager {
 
     /// Apply a schedule decision to the queue.
     ///
-    /// The schedule only owns what it applied: it will not resume a pause the
-    /// user or the disk guard started, and it lifts its own pause only when
-    /// the window ends. Speed caps and server exclusions are overlays — the
+    /// The schedule holds only what it applied: it will not resume a pause the
+    /// user or the disk guard started, and it lifts its own hold only when
+    /// the window ends. Holds are additive, so a window that opens while the
+    /// disk guard already holds the queue still takes effect: the queue keeps
+    /// running paused through the window once the guard lets go, and resumes
+    /// at the end of it. Speed caps and server exclusions are overlays — the
     /// configured values are never rewritten.
+    ///
+    /// `saved` marks a decision applied because the settings were saved, as
+    /// opposed to a monitor tick. A save is applied immediately *and* by the
+    /// next tick, and a save that leaves a window open must not read as a new
+    /// window — otherwise saving settings inside a window would undo a manual
+    /// resume. It adopts the open window instead of opening it again.
     pub fn apply_schedule(
         self: &Arc<Self>,
         decision: &crate::nzb_core::schedule::ScheduleDecision,
         enabled: bool,
+        saved: bool,
     ) {
         let idle = crate::nzb_core::schedule::ScheduleDecision::default();
         let decision = if enabled { decision } else { &idle };
-        // Pause ownership, edge-triggered: a pause rule pauses when its window
-        // opens, not on every tick while it is open. A manual resume inside the
-        // window therefore holds until the next window -- the tick must not
-        // re-pause what the user just resumed. Ownership still decides who may
-        // lift the pause: the schedule lifts only its own.
-        let was_in_window = self.schedule_window.swap(decision.pause, Ordering::SeqCst);
-        if decision.pause && !was_in_window {
-            if !self.is_paused() {
-                self.pause_all_as(None, Self::PAUSE_OWNER_SCHEDULE);
-                info!("Schedule window opened, pausing downloads");
-            }
-        } else if !decision.pause && was_in_window {
-            if self.is_paused() && self.schedule_hold.load(Ordering::SeqCst) {
-                self.resume_all();
-                info!("Schedule window ended, resuming downloads");
-            } else {
-                // A user pause (or a disk hold) took ownership during the
-                // window: the schedule no longer holds anything to lift.
-                self.schedule_hold.store(false, Ordering::SeqCst);
-            }
-        }
+
+        // The window is keyed by occurrence, not just "open": a pause rule
+        // pauses when its window opens, so a manual resume inside it holds
+        // until the next window. The next window for the same rule has a
+        // different start date, so it does pause again.
+        let window = decision.pause.then(|| {
+            // A decision built by hand carries no occurrence. One anonymous
+            // window per open period is enough: closing it clears the key, so
+            // reopening the same decision pauses again.
+            decision
+                .pause_window
+                .clone()
+                .unwrap_or_else(|| "anonymous".to_string())
+        });
+        self.apply_schedule_hold(window, saved);
 
         // Speed cap: only touch the limiter when the value changes, so a
         // running download does not see a needless limiter update each tick.
@@ -5038,9 +5207,13 @@ impl QueueManager {
         }
     }
 
-    /// Whether the schedule currently holds the global pause.
+    /// Whether the schedule is the reason the queue is paused right now.
+    ///
+    /// Its window may be open while a disk hold or a user pause also holds
+    /// the queue; in that case the schedule is not what is keeping it
+    /// paused, and this reports `false`.
     pub fn schedule_pause_active(&self) -> bool {
-        self.schedule_hold.load(Ordering::SeqCst)
+        self.pause_holds.lock().reason() == Some(PauseReason::Schedule)
     }
 
     /// The speed cap the schedule is applying right now, if any.
@@ -5057,43 +5230,17 @@ impl QueueManager {
         })
     }
 
-    /// Resume all downloads globally.
+    /// Resume all downloads: lift every hold, the user's included.
+    ///
+    /// The window's occurrence is left in place, so the rest of that window
+    /// is not treated as newly opened: the tick that follows does not pause
+    /// again. The next window has a different occurrence and does.
     pub fn resume_all(self: &Arc<Self>) {
-        let _transition = self.pause_transition.lock();
-        self.schedule_hold.store(false, Ordering::SeqCst);
-        self.globally_paused.store(false, Ordering::SeqCst);
-        {
-            let db = self.db.lock();
-            db.set_setting("globally_paused", "false");
-            db.set_setting(Self::PAUSE_OWNER_SETTING, "");
-        }
-        self.set_disk_space_hold(None);
-        *self.pause_until.lock() = None;
-
-        let paused_by_global = std::mem::take(&mut *self.globally_paused_jobs.lock());
-        self.persist_globally_paused_jobs();
-
-        // Mark every globally paused job Queued; start_next_queued then
-        // unpauses a live pool context or re-submits the job, up to the
-        // active download limit.
-        {
-            let mut jobs = self.jobs.lock();
-            for id in paused_by_global {
-                let Some(state) = jobs.get_mut(&id) else {
-                    continue;
-                };
-                if state.job.status == JobStatus::Paused {
-                    state.job.error_message = None;
-                    state.failure_code = None;
-                    state.job.status = JobStatus::Queued;
-                }
-            }
-        }
-
-        // Start queued jobs up to the concurrency limit
-        self.start_next_queued();
-
-        info!("All downloads resumed");
+        self.resume_hold(|holds| {
+            holds.user = false;
+            holds.disk = None;
+            holds.schedule = false;
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -5272,26 +5419,17 @@ impl QueueManager {
         if !self.is_paused() {
             return None;
         }
-        Some(if self.disk_space_hold.lock().is_some() {
-            PauseReason::DiskSpace
-        } else if self.schedule_hold.load(Ordering::SeqCst) {
-            PauseReason::Schedule
-        } else {
-            PauseReason::Global
-        })
+        self.pause_holds.lock().reason()
     }
 
     /// When the disk-space guard paused downloads, if it is holding them now.
     pub fn disk_space_hold_since(&self) -> Option<DateTime<Utc>> {
-        *self.disk_space_hold.lock()
+        self.pause_holds.lock().disk
     }
 
-    fn set_disk_space_hold(&self, since: Option<DateTime<Utc>>) {
-        *self.disk_space_hold.lock() = since;
-        let value = since.map(|at| at.to_rfc3339()).unwrap_or_default();
-        self.db
-            .lock()
-            .set_setting(Self::DISK_SPACE_HOLD_SETTING, &value);
+    /// Lift the disk guard's hold, leaving every other hold in place.
+    fn clear_disk_hold(self: &Arc<Self>) {
+        self.resume_hold(|holds| holds.disk = None);
     }
 
     /// Why a queued job is paused, or `None` when it is not paused.
@@ -5328,7 +5466,7 @@ impl QueueManager {
         let paths = self.disk_guard_paths();
         let path_refs: Vec<_> = paths.iter().map(std::path::PathBuf::as_path).collect();
         if !disk_space_available(threshold, &path_refs) {
-            if !self.is_paused() {
+            if self.disk_space_hold_since().is_none() {
                 warn!(
                     free_bytes = paths.first().map_or(0, |path| get_disk_free(path)),
                     min_free_space = threshold,
@@ -5344,9 +5482,11 @@ impl QueueManager {
             return;
         }
 
-        if self.is_paused() && self.disk_space_hold.lock().is_some() {
-            info!("Disk space recovered, resuming downloads paused by the disk guard");
-            self.resume_all();
+        if self.disk_space_hold_since().is_some() {
+            info!("Disk space recovered, lifting the disk guard's hold");
+            // Only the guard's own hold: a pause window that opened during
+            // the hold keeps the queue paused for the rest of the window.
+            self.clear_disk_hold();
         }
         self.resume_storage_held_jobs();
     }
@@ -6128,8 +6268,11 @@ impl QueueManager {
     /// mark already-downloaded articles, so downloads resume where they left off.
     pub fn restore_from_db(self: &Arc<Self>) -> crate::nzb_core::Result<()> {
         prune_damage_ledger(&self.db.lock());
-        // Restore globally_paused from persisted state
-        let (was_paused, persisted_global_ids, pause_owner) = {
+        // Restore globally_paused from persisted state. Every hold that was
+        // persisted comes back as its own flag, so a restart cannot turn a
+        // schedule pause into a user pause the schedule can never lift (or
+        // the other way around).
+        let (was_paused, persisted_global_ids, pause_owner, disk_hold, schedule_window) = {
             let db = self.db.lock();
             let paused = db
                 .get_setting("globally_paused")
@@ -6140,28 +6283,43 @@ impl QueueManager {
             let owner = db
                 .get_setting(Self::PAUSE_OWNER_SETTING)
                 .unwrap_or_default();
-            (paused, ids, owner)
-        };
-        if was_paused {
-            self.globally_paused.store(true, Ordering::SeqCst);
-            let hold = self
-                .db
-                .lock()
+            let disk = db
                 .get_setting(Self::DISK_SPACE_HOLD_SETTING)
                 .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
                 .map(|at| at.with_timezone(&Utc));
-            *self.disk_space_hold.lock() = hold;
-            if hold.is_none() && pause_owner == Self::PAUSE_OWNER_SCHEDULE {
-                self.schedule_hold.store(true, Ordering::SeqCst);
-                // Rebuild the window state too: the pause was applied inside a
-                // window, so its end must still be able to lift it. Left
-                // false, the first tick after a restart would report "no
-                // change" and the queue would stay paused indefinitely.
-                self.schedule_window.store(true, Ordering::SeqCst);
+            let window = db
+                .get_setting(Self::SCHEDULE_WINDOW_SETTING)
+                .filter(|value| !value.is_empty());
+            (paused, ids, owner, disk, window)
+        };
+        if was_paused {
+            // Rebuild the holds the pause recorded. An empty owner with no
+            // automatic hold is a pause written before owners were tracked,
+            // which is a user pause.
+            let holds = PauseHolds {
+                // A record written before holds were tracked names only its
+                // reason. An empty owner is a user pause unless one of the
+                // automatic holds below explains it.
+                user: pause_owner == Self::PAUSE_OWNER_USER
+                    || (pause_owner.is_empty() && disk_hold.is_none() && schedule_window.is_none()),
+                disk: disk_hold,
+                schedule: disk_hold.is_none() && pause_owner == Self::PAUSE_OWNER_SCHEDULE,
+                // Rebuilt too: the pause was applied inside a window, so its
+                // end must still be able to lift it. Without the occurrence a
+                // restart would read the next tick as a new window and either
+                // re-pause a resumed queue or miss the window ending.
+                schedule_window,
+            };
+            {
+                let mut current = self.pause_holds.lock();
+                *current = holds.clone();
             }
+            self.publish_holds(&holds);
+            self.globally_paused.store(true, Ordering::SeqCst);
             info!(
-                disk_space_hold = hold.is_some(),
-                schedule_hold = self.schedule_hold.load(Ordering::SeqCst),
+                disk_space_hold = holds.disk.is_some(),
+                schedule_hold = holds.schedule,
+                user_hold = holds.user,
                 "Restored global pause state from database"
             );
         }
@@ -7840,7 +7998,7 @@ mod global_pause_tests {
             pause: true,
             ..Default::default()
         };
-        manager.apply_schedule(&decision, true);
+        manager.apply_schedule(&decision, true, false);
         assert!(manager.is_paused());
         assert!(manager.schedule_pause_active());
         assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
@@ -7872,8 +8030,9 @@ mod global_pause_tests {
         restarted.apply_schedule(
             &crate::nzb_core::schedule::ScheduleDecision::default(),
             true,
+            false,
         );
-        restarted.apply_schedule(&decision, true);
+        restarted.apply_schedule(&decision, true, false);
         assert!(
             restarted.is_paused(),
             "a user pause is not the schedule's to lift"
@@ -7898,7 +8057,7 @@ mod global_pause_tests {
             pause: true,
             ..Default::default()
         };
-        manager.apply_schedule(&open, true);
+        manager.apply_schedule(&open, true, false);
         assert!(manager.is_paused());
         assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
 
@@ -7910,7 +8069,7 @@ mod global_pause_tests {
         // Every subsequent tick inside the window sees the same decision. The
         // pause is edge-triggered, so none of them may re-pause the queue.
         for _ in 0..5 {
-            manager.apply_schedule(&open, true);
+            manager.apply_schedule(&open, true, false);
             assert!(
                 !manager.is_paused(),
                 "a manual resume must survive the rest of the window"
@@ -7922,9 +8081,10 @@ mod global_pause_tests {
         manager.apply_schedule(
             &crate::nzb_core::schedule::ScheduleDecision::default(),
             true,
+            false,
         );
         assert!(!manager.is_paused());
-        manager.apply_schedule(&open, true);
+        manager.apply_schedule(&open, true, false);
         assert!(manager.is_paused());
         assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
     }
@@ -7939,7 +8099,7 @@ mod global_pause_tests {
             pause: true,
             ..Default::default()
         };
-        manager.apply_schedule(&open, true);
+        manager.apply_schedule(&open, true, false);
         assert_eq!(manager.global_pause_reason(), Some(PauseReason::Global));
         assert!(!manager.schedule_pause_active());
 
@@ -7947,6 +8107,7 @@ mod global_pause_tests {
         manager.apply_schedule(
             &crate::nzb_core::schedule::ScheduleDecision::default(),
             true,
+            false,
         );
         assert!(
             manager.is_paused(),
@@ -7962,7 +8123,7 @@ mod global_pause_tests {
             pause: true,
             ..Default::default()
         };
-        manager.apply_schedule(&open, true);
+        manager.apply_schedule(&open, true, false);
         assert!(manager.schedule_pause_active());
 
         // A restart restores the schedule-owned pause from the database. The
@@ -7975,12 +8136,105 @@ mod global_pause_tests {
         restarted.apply_schedule(
             &crate::nzb_core::schedule::ScheduleDecision::default(),
             true,
+            false,
         );
         assert!(
             !restarted.is_paused(),
             "the window ending after a restart still resumes the queue"
         );
         assert!(!restarted.schedule_pause_active());
+    }
+
+    #[tokio::test]
+    async fn a_window_opening_during_a_disk_hold_keeps_pausing_after_the_hold_lifts() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        // The guard trips first, so its hold is the only one there is.
+        manager.set_min_free_space(u64::MAX);
+        manager.enforce_disk_guard();
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::DiskSpace));
+
+        // A pause window then opens. It must be recorded even though the
+        // queue is already paused, or it would never take effect.
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            pause: true,
+            pause_window: Some("quiet@2026-10-20".into()),
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true, false);
+        assert_eq!(
+            manager.global_pause_reason(),
+            Some(PauseReason::DiskSpace),
+            "the disk hold is still the reason while the window overlaps it"
+        );
+
+        // Space frees up. The guard lifts only its own hold; the window is
+        // still open, so downloads must not run straight through it.
+        manager.set_min_free_space(1);
+        manager.enforce_disk_guard();
+        assert!(
+            manager.is_paused(),
+            "the queue ran through a pause window that opened during a disk hold"
+        );
+        assert!(manager.schedule_pause_active());
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+
+        // And the window ending resumes, as usual.
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+            false,
+        );
+        assert!(!manager.is_paused());
+        assert!(!manager.schedule_pause_active());
+    }
+
+    #[tokio::test]
+    async fn a_manual_resume_inside_a_window_survives_a_restart() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            pause: true,
+            pause_window: Some("quiet@2026-10-20".into()),
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true, false);
+        assert!(manager.is_paused());
+
+        // The user overrides the schedule for this window, then the process
+        // restarts while the window is still open.
+        manager.resume_all();
+        assert!(!manager.is_paused());
+        let restarted = Arc::clone(&manager);
+        restarted.restore_from_db().unwrap();
+        assert!(!restarted.is_paused());
+
+        // The monitor's first tick after the restart re-applies the same open
+        // window. It must not re-pause what the user just resumed.
+        restarted.apply_schedule(&open, true, false);
+        assert!(
+            !restarted.is_paused(),
+            "a restart inside a window undid a manual resume"
+        );
+
+        // Closing the window changes nothing, and the next window pauses.
+        restarted.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+            false,
+        );
+        assert!(!restarted.is_paused());
+        let next = crate::nzb_core::schedule::ScheduleDecision {
+            pause_window: Some("quiet@2026-10-21".into()),
+            ..open.clone()
+        };
+        restarted.apply_schedule(&next, true, false);
+        assert!(
+            restarted.is_paused(),
+            "the next window must pause again after a resume"
+        );
     }
 
     #[tokio::test]
@@ -7992,17 +8246,17 @@ mod global_pause_tests {
             pause: true,
             ..Default::default()
         };
-        manager.apply_schedule(&open, true);
+        manager.apply_schedule(&open, true, false);
         assert!(manager.is_paused());
 
         // Turning the schedule off substitutes an idle decision, which is the
         // window closing from the queue's point of view.
-        manager.apply_schedule(&open, false);
+        manager.apply_schedule(&open, false, false);
         assert!(!manager.is_paused());
         assert!(!manager.schedule_pause_active());
 
         // And re-enabling it opens a fresh window.
-        manager.apply_schedule(&open, true);
+        manager.apply_schedule(&open, true, false);
         assert!(manager.is_paused());
         assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
     }
@@ -8017,7 +8271,7 @@ mod global_pause_tests {
             speed_limit_bps: Some(1_000_000),
             ..Default::default()
         };
-        manager.apply_schedule(&cap, true);
+        manager.apply_schedule(&cap, true, false);
         assert_eq!(manager.scheduled_speed_cap(), Some(1_000_000));
         assert_eq!(manager.configured_speed_limit(), 5_000_000);
         // The limiter the downloader reads is the cap, not the user's value.
@@ -8026,6 +8280,7 @@ mod global_pause_tests {
         manager.apply_schedule(
             &crate::nzb_core::schedule::ScheduleDecision::default(),
             true,
+            false,
         );
         assert_eq!(manager.scheduled_speed_cap(), None);
         assert_eq!(manager.configured_speed_limit(), 5_000_000);
@@ -8042,7 +8297,7 @@ mod global_pause_tests {
             speed_limit_bps: Some(0),
             ..Default::default()
         };
-        manager.apply_schedule(&cap, true);
+        manager.apply_schedule(&cap, true, false);
         assert_eq!(manager.scheduled_speed_cap(), Some(0));
         assert_eq!(
             manager.get_speed_limit(),
@@ -8053,6 +8308,7 @@ mod global_pause_tests {
         manager.apply_schedule(
             &crate::nzb_core::schedule::ScheduleDecision::default(),
             true,
+            false,
         );
         assert_eq!(manager.get_speed_limit(), 5_000_000);
     }
@@ -8068,13 +8324,13 @@ mod global_pause_tests {
             pause: true,
             ..Default::default()
         };
-        manager.apply_schedule(&cap, true);
+        manager.apply_schedule(&cap, true, false);
         assert_eq!(manager.get_speed_limit(), 1_000_000);
         assert!(manager.schedule_pause_active());
 
         // Toggling the schedule off must release everything it applied, even
         // though the decision it is handed still says otherwise.
-        manager.apply_schedule(&cap, false);
+        manager.apply_schedule(&cap, false, false);
         assert_eq!(manager.scheduled_speed_cap(), None);
         assert_eq!(manager.get_speed_limit(), 5_000_000);
         assert!(manager.schedule_disabled_servers().is_empty());
@@ -8097,7 +8353,7 @@ mod global_pause_tests {
             disabled_servers: vec!["backup".into()],
             ..Default::default()
         };
-        manager.apply_schedule(&decision, true);
+        manager.apply_schedule(&decision, true, false);
         assert_eq!(manager.schedule_disabled_servers(), vec!["backup"]);
         assert!(
             manager
@@ -8119,6 +8375,7 @@ mod global_pause_tests {
         manager.apply_schedule(
             &crate::nzb_core::schedule::ScheduleDecision::default(),
             true,
+            false,
         );
         assert!(manager.schedule_disabled_servers().is_empty());
         assert!(manager.live_servers().iter().all(|s| s.enabled));

@@ -274,9 +274,19 @@ overriding both `general.speed_limit_bps` and any lower cap from another rule.
 A `pause` rule is **edge-triggered**: it pauses when its window opens, not on
 every minute while the window is open. Resuming downloads by hand inside a
 window therefore holds until that window closes, and the next window opening
-pauses again — the schedule does not fight you back within a minute. A
-`Pause All` pressed inside a window takes ownership of the pause, so the end of
-the window will not resume it.
+pauses again — the schedule does not fight you back within a minute. The
+resume also survives a restart: the open window is remembered, so the first
+tick after the process starts does not treat it as a newly opened window.
+
+Pause reasons are **additive**. The queue is paused while any of a user pause,
+a low-disk hold or a schedule window is in force, and each lifts only its own:
+
+- A window that opens while the low-disk guard is holding downloads still
+  takes effect. When space frees up the guard drops its hold, and downloads
+  stay paused until the window ends instead of running straight through it.
+- A `Pause All` pressed inside a window takes precedence, so the end of the
+  window will not resume it.
+- The end of a window never lifts a user pause or a disk hold.
 
 ## `[par2]`
 

@@ -57,7 +57,7 @@ impl ScheduleMonitor {
             );
         }
         self.queue_manager
-            .apply_schedule(&decision, config.schedule.enabled);
+            .apply_schedule(&decision, config.schedule.enabled, false);
         self.last = decision.clone();
         decision
     }

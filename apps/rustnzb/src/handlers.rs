@@ -2088,7 +2088,9 @@ pub struct ScheduleResponse {
     pub rules: Vec<ScheduleRule>,
     /// Rules active at the moment of the call. Empty while the schedule is off.
     pub active_rule_ids: Vec<String>,
-    /// True when a schedule rule is holding the queue paused right now.
+    /// True when a schedule rule is holding the queue paused right now. A
+    /// window that is open while the disk guard holds the queue still reports
+    /// `paused`, because the queue will not run until the window ends.
     pub paused: bool,
     /// The cap a rule is applying right now, if any. The configured
     /// `general.speed_limit_bps` applies when this is `null`.
@@ -2107,7 +2109,7 @@ pub async fn h_schedule_get(
         enabled: config.schedule.enabled,
         rules: config.schedule.rules.clone(),
         active_rule_ids: decision.active_rule_ids,
-        paused: state.queue_manager.schedule_pause_active(),
+        paused: decision.pause && state.queue_manager.is_paused(),
         speed_limit_bps: state.queue_manager.scheduled_speed_cap(),
         disabled_servers: state.queue_manager.schedule_disabled_servers(),
     }))
@@ -2192,7 +2194,7 @@ pub async fn h_schedule_update(
     let decision = evaluate_config(&config.schedule, Local::now().naive_local());
     state
         .queue_manager
-        .apply_schedule(&decision, config.schedule.enabled);
+        .apply_schedule(&decision, config.schedule.enabled, true);
     state.schedule_wake.notify_one();
 
     h_schedule_get(State(state)).await

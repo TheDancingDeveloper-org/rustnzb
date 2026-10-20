@@ -322,6 +322,16 @@ describe('SettingsViewComponent', () => {
     expect(component.hasUnsavedChanges()).toBe(false);
   });
 
+  it('shows an unlimited schedule window as unlimited rather than a zero cap', () => {
+    const { component } = makeComponent();
+    // `0` is an explicit unlimited window; `null` means no scheduled cap.
+    // Neither may render as "0 B/s", which reads as a cap that stops
+    // every download.
+    expect(component.formatSpeedValue(0)).toBe('unlimited');
+    expect(component.formatSpeedValue(null)).toBe('unlimited');
+    expect(component.formatSpeedValue(2 * 1024 * 1024)).toBe('2.0 MB/s');
+  });
+
   it('keeps schedule edits dirty when the save fails and blocks saving after a failed load', () => {
     const { component, api } = makeComponent({
       put: vi.fn(() => throwError(() => new Error('offline'))),
