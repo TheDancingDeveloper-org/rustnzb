@@ -8,7 +8,7 @@
 //! behaviour around midnight and at window edges is testable without a clock,
 //! a timer or a running queue.
 
-use chrono::{Datelike, NaiveDateTime, NaiveTime, Timelike, Weekday};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 use serde::{Deserialize, Serialize};
 
 /// What an active rule does to the queue.
@@ -89,12 +89,22 @@ pub struct ScheduleDecision {
     /// Server ids to take out of rotation, in configuration order and without
     /// duplicates.
     pub disabled_servers: Vec<String>,
+    /// Identifies the open window *occurrence*, not just the rules active in
+    /// it: `rule id@the date the window started on` for every active pause
+    /// rule, sorted. Two evaluations a tick apart inside one window share it,
+    /// while the next day's window (or a window the user reopened after a
+    /// manual resume) has a different one. The queue uses it to tell "the same
+    /// window, do not re-pause" from "a new window".
+    pub pause_window: Option<String>,
 }
 
 impl ScheduleDecision {
     /// Nothing to do: no pause, no cap and every server enabled.
     pub fn is_idle(&self) -> bool {
-        !self.pause && self.speed_limit_bps.is_none() && self.disabled_servers.is_empty()
+        !self.pause
+            && self.speed_limit_bps.is_none()
+            && self.disabled_servers.is_empty()
+            && self.pause_window.is_none()
     }
 }
 
@@ -157,29 +167,33 @@ pub fn rule_problem(rule: &ScheduleRule) -> Option<String> {
     None
 }
 
-fn is_active_on(rule: &ScheduleRule, now: NaiveDateTime) -> bool {
-    let (Some(start), Some(end)) = (parse_minutes(&rule.start), parse_minutes(&rule.end)) else {
-        return false;
-    };
+/// The day a rule's window started on, when the rule is active at `now`.
+///
+/// `None` means the rule is not active. For a window that crossed midnight
+/// the tail belongs to the previous day, so this is the date the window
+/// started, not the date being evaluated.
+fn active_window_start(rule: &ScheduleRule, now: NaiveDateTime) -> Option<NaiveDate> {
+    let (start, end) = (parse_minutes(&rule.start)?, parse_minutes(&rule.end)?);
     let days: Vec<Weekday> = rule
         .days
         .iter()
         .filter_map(|day| parse_weekday(day))
         .collect();
-    let time = now.time();
-    let minute = time.hour() * 60 + time.minute();
+    let minute = now.hour() * 60 + now.minute();
 
     if start < end {
-        return days.contains(&now.weekday()) && minute >= start && minute < end;
+        return (days.contains(&now.weekday()) && minute >= start && minute < end)
+            .then_some(now.date());
     }
 
     // The window runs past midnight. The day it belongs to is the start day,
     // so the tail belongs to the previous day's entry.
-    let tail_of_yesterday = now
-        .date()
+    if days.contains(&now.weekday()) && minute >= start {
+        return Some(now.date());
+    }
+    now.date()
         .pred_opt()
-        .is_some_and(|yesterday| days.contains(&yesterday.weekday()));
-    (days.contains(&now.weekday()) && minute >= start) || (tail_of_yesterday && minute < end)
+        .filter(|yesterday| days.contains(&yesterday.weekday()) && minute < end)
 }
 
 /// Evaluate every rule against `now` (local wall-clock time).
@@ -189,14 +203,21 @@ fn is_active_on(rule: &ScheduleRule, now: NaiveDateTime) -> bool {
 pub fn evaluate(rules: &[ScheduleRule], now: NaiveDateTime) -> ScheduleDecision {
     let mut decision = ScheduleDecision::default();
     let mut saw_unlimited = false;
+    let mut pause_windows: Vec<String> = Vec::new();
 
     for rule in rules {
-        if rule_problem(rule).is_some() || !is_active_on(rule, now) {
+        if rule_problem(rule).is_some() {
             continue;
         }
+        let Some(window_start) = active_window_start(rule, now) else {
+            continue;
+        };
         decision.active_rule_ids.push(rule.id.clone());
         match rule.action {
-            ScheduleAction::Pause => decision.pause = true,
+            ScheduleAction::Pause => {
+                decision.pause = true;
+                pause_windows.push(format!("{}@{}", rule.id, window_start));
+            }
             ScheduleAction::SpeedLimit => {
                 if rule.speed_limit_bps == 0 {
                     saw_unlimited = true;
@@ -225,6 +246,12 @@ pub fn evaluate(rules: &[ScheduleRule], now: NaiveDateTime) -> ScheduleDecision 
     // at the user's limit instead of unlimited.
     if saw_unlimited {
         decision.speed_limit_bps = Some(0);
+    }
+    if decision.pause {
+        // Sorted so the occurrence does not depend on config order, which the
+        // settings page may reorder without changing what is open.
+        pause_windows.sort();
+        decision.pause_window = Some(pause_windows.join(","));
     }
     decision
 }
@@ -356,6 +383,58 @@ mod tests {
         // With no cap rule at all the configured limit must still apply, so
         // this is the case that has to stay `None`.
         assert_eq!(evaluate(&[], at(20, 12, 0)).speed_limit_bps, None);
+    }
+
+    #[test]
+    fn a_pause_window_carries_an_occurrence_that_changes_with_the_window() {
+        let rules = [
+            rule(&["mon"], "22:00", "06:00", ScheduleAction::Pause),
+            rule(&["tue"], "22:00", "06:00", ScheduleAction::Pause),
+        ];
+        // Inside Monday's window, before and after midnight: the same
+        // occurrence, because it belongs to the day it started on.
+        let monday_late = evaluate(&rules[..1], at(19, 23, 0)).pause_window;
+        let tuesday_early = evaluate(&rules[..1], at(20, 5, 0)).pause_window;
+        assert_eq!(monday_late, tuesday_early);
+        assert!(
+            monday_late
+                .as_deref()
+                .unwrap_or_default()
+                .contains("2026-10-19"),
+            "{monday_late:?}"
+        );
+
+        // Tuesday's own window is a different occurrence, so the queue sees
+        // it as a new window and pauses again.
+        let tuesday_late = evaluate(&rules[1..], at(20, 23, 0)).pause_window;
+        assert_ne!(monday_late, tuesday_late);
+        assert!(
+            tuesday_late
+                .as_deref()
+                .unwrap_or_default()
+                .contains("2026-10-20"),
+            "{tuesday_late:?}"
+        );
+
+        // Outside every window there is no occurrence at all.
+        assert_eq!(evaluate(&rules, at(20, 12, 0)).pause_window, None);
+        // A cap rule opens no pause window.
+        let mut cap = rule(&["tue"], "00:00", "24:00", ScheduleAction::SpeedLimit);
+        cap.speed_limit_bps = 1_000_000;
+        assert_eq!(evaluate(&[cap], at(20, 12, 0)).pause_window, None);
+    }
+
+    #[test]
+    fn the_window_occurrence_does_not_depend_on_rule_order() {
+        let mut first = rule(&["tue"], "00:00", "24:00", ScheduleAction::Pause);
+        first.id = "a".into();
+        let mut second = rule(&["tue"], "00:00", "24:00", ScheduleAction::Pause);
+        second.id = "b".into();
+        // Reordering the rules in settings must not look like a new window.
+        assert_eq!(
+            evaluate(&[first.clone(), second.clone()], at(20, 12, 0)).pause_window,
+            evaluate(&[second, first], at(20, 12, 0)).pause_window
+        );
     }
 
     #[test]

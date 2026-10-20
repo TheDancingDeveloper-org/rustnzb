@@ -2490,7 +2490,10 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
   }
 
   formatSpeedValue(bps: number | null): string {
-    return bps === null ? 'unlimited' : formatSpeed(bps);
+    // `null` is "no scheduled cap" and `0` is an explicit unlimited window.
+    // Both read as unlimited; rendering 0 through formatSpeed would say
+    // "0 B/s", which looks like a cap that stops every download.
+    return bps === null || bps <= 0 ? 'unlimited' : formatSpeed(bps);
   }
 
   addScheduleRule(): void {

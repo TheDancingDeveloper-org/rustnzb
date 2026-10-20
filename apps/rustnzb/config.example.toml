@@ -117,8 +117,10 @@ script_max_output_bytes = 1048576
 #
 # The schedule is an overlay. It never rewrites the configured speed limit or
 # server list: when a window ends, `speed_limit_bps` and every server's
-# `enabled` flag come back as configured. It only lifts a pause it applied,
-# so a manual pause or a disk-space hold survives.
+# `enabled` flag come back as configured. Pause reasons are additive: it only
+# lifts a pause it applied, so a manual pause or a disk-space hold survives,
+# and a window that opens during a disk hold keeps downloads paused once the
+# hold lifts.
 #
 # [schedule]
 # enabled = false
