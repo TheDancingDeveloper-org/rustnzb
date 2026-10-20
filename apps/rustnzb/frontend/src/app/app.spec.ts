@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { App, MENU_WIDTH, documentTitle, isBareRoute, isDemoPath } from './app';
 import { AddNzbService } from './core/services/add-nzb.service';
 import { PauseStateService } from './core/services/pause-state.service';
+import { AnnouncerService } from './core/services/announcer.service';
 
 function makeApp(postResult = new Subject<unknown>()) {
   const api = {
@@ -36,6 +37,7 @@ function makeApp(postResult = new Subject<unknown>()) {
     pauseState,
     snack as never,
     { observeStatus: vi.fn() } as never,
+    new AnnouncerService(),
   );
   return { app, api, auth, pauseState, postResult, snack, router, addNzb };
 }
@@ -374,11 +376,12 @@ describe('drop .nzb files anywhere', () => {
     expect(prefills).toEqual([]);
   });
 
-  it('tells the user when nothing dropped is an NZB', () => {
+  it('tells the user when nothing dropped is an NZB, and announces it', () => {
     const { app, prefills, snack } = signedIn();
     app.onWindowDrop(fileDrag('drop', [new File(['x'], 'movie.mkv')]));
     expect(prefills).toEqual([]);
     expect(snack.open).toHaveBeenCalled();
+    expect(app.announcer.assertive()).toContain('Only .nzb');
   });
 
   it('does nothing when signed out', () => {

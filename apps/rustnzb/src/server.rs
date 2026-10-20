@@ -180,13 +180,13 @@ pub fn build_router_with_dav(
 ///   needs no `'unsafe-inline'`.
 /// - Angular component styles are emitted as inline `<style>` tags, so
 ///   `style-src` keeps `'unsafe-inline'`.
-/// - The UI loads Inter, JetBrains Mono, and Material Icons from Google
-///   Fonts, so those two origins are the minimum addition to the requested
-///   policy. Without them the shell renders unstyled.
+/// - Inter is bundled at `public/fonts` and served from `'self'`, so the
+///   policy needs no third-party origin: a self-hosted or air-gapped install
+///   makes no font request off the box.
 const CSP: &str = "default-src 'self'; \
     img-src 'self' data:; \
-    style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
-    font-src 'self' https://fonts.gstatic.com; \
+    style-src 'self' 'unsafe-inline'; \
+    font-src 'self'; \
     script-src 'self'; \
     connect-src 'self'; \
     frame-ancestors 'none'";
@@ -640,7 +640,7 @@ mod tests {
     use nzb_web::state::AppState;
     use nzb_web::{LogBuffer, QueueManager};
 
-    use super::build_router;
+    use super::{StaticAssets, build_router};
 
     #[test]
     fn hashed_asset_detection() {
@@ -665,6 +665,18 @@ mod tests {
         );
         assert_eq!(cache_header_for("favicon.ico"), "max-age=3600");
         assert_eq!(cache_header_for("logo.png"), "max-age=3600");
+    }
+
+    #[test]
+    fn bundled_fonts_are_embedded_and_served_as_woff2() {
+        // The CSP allows fonts from 'self' only, so these must ship in the
+        // binary; a path typo would show up as a 404 and unstyled text.
+        for file in ["fonts/inter-latin.woff2", "fonts/inter-latin-ext.woff2"] {
+            assert!(StaticAssets::get(file).is_some(), "{file} is not embedded");
+            let mime = mime_guess::from_path(file).first_or_octet_stream();
+            assert_eq!(mime.as_ref(), "font/woff2");
+            assert_eq!(cache_header_for(file), "max-age=3600");
+        }
     }
 
     #[test]
@@ -727,6 +739,10 @@ mod tests {
         assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
         assert!(csp.contains("script-src 'self'"), "{csp}");
         assert!(!csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
+        // Fonts are bundled, so nothing in the policy may reach a third party.
+        assert!(!csp.contains("fonts.googleapis.com"), "{csp}");
+        assert!(!csp.contains("fonts.gstatic.com"), "{csp}");
+        assert!(csp.contains("font-src 'self';"), "{csp}");
         assert_eq!(headers.get(http::header::X_FRAME_OPTIONS).unwrap(), "DENY");
         assert_eq!(
             headers.get(http::header::X_CONTENT_TYPE_OPTIONS).unwrap(),

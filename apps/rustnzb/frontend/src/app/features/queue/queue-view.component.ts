@@ -6,6 +6,7 @@ import { HttpClient } from '@angular/common/http';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { Observable, Subscription, catchError, finalize, forkJoin, map, of, timeout } from 'rxjs';
 import { ApiService, POLL_TIMEOUT_MS, pageHidden } from '../../core/services/api.service';
+import { AnnouncerService } from '../../core/services/announcer.service';
 import { AddNzbService } from '../../core/services/add-nzb.service';
 import { PauseStateService } from '../../core/services/pause-state.service';
 import { NzbJob, PauseReason, QueueResponse, StatusResponse } from '../../core/models/queue.model';
@@ -1207,6 +1208,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     private router: Router,
     private confirmSvc: ConfirmService,
     pauseState: PauseStateService,
+    private announcer: AnnouncerService,
   ) {
     this.paused = pauseState.paused;
   }
@@ -1530,9 +1532,9 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     this.http.post(`/api/queue/add${qs}`, formData, { headers }).subscribe({
       next: () => {
         const count = this.selectedFiles.length;
-        this.snackBar.open(`${count} NZB${count > 1 ? 's' : ''} added to queue`, 'Close', {
-          duration: 3000,
-        });
+        const message = `${count} NZB${count > 1 ? 's' : ''} added to queue`;
+        this.snackBar.open(message, 'Close', { duration: 3000 });
+        this.announcer.announce(message);
         this.selectedFiles = [];
         this.uploading = false;
         this.showAddPanel = false;
@@ -1542,6 +1544,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
         this.uploading = false;
         const fallback = err?.status === 413 ? 'Upload too large' : 'Upload failed';
         showHttpError(this.snackBar, err, fallback);
+        this.announcer.announceError(httpErrorMessage(err, fallback));
       },
     });
   }
@@ -1555,6 +1558,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     this.api.post('/queue/add-url', body).subscribe({
       next: () => {
         this.snackBar.open('NZB added from URL', 'Close', { duration: 3000 });
+        this.announcer.announce('NZB added from URL');
         this.addUrl = '';
         this.uploading = false;
         this.showAddPanel = false;
@@ -1563,6 +1567,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       error: (err) => {
         this.uploading = false;
         showHttpError(this.snackBar, err, 'Failed to add NZB from URL');
+        this.announcer.announceError(httpErrorMessage(err, 'Failed to add NZB from URL'));
       },
     });
   }
@@ -1597,11 +1602,13 @@ export class QueueViewComponent implements OnInit, OnDestroy {
         next: () => {
           if (successMessage) {
             this.snackBar.open(successMessage, 'Close', { duration: 2500 });
+            this.announcer.announce(successMessage);
           }
           this.loadQueue();
         },
         error: (err) => {
           showHttpError(this.snackBar, err, failureMessage);
+          this.announcer.announceError(httpErrorMessage(err, failureMessage));
           this.loadQueue();
         },
       });
@@ -1764,9 +1771,18 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     if (next.has(id)) next.delete(id);
     else next.add(id);
     this.selectedIds.set(next);
+    this.announceSelection();
   }
+
+  /** Spoken count; the visible chip is also a live region with the same text. */
+  private announceSelection(): void {
+    const count = this.selectedIds().size;
+    this.announcer.announce(count === 0 ? 'Selection cleared' : `${count} selected`);
+  }
+
   clearSelection(): void {
     this.selectedIds.set(new Set());
+    this.announceSelection();
   }
   allFilteredSelected(): boolean {
     const f = this.filteredJobs();
@@ -1777,6 +1793,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   toggleSelectAll(ev: Event): void {
     if ((ev.target as HTMLInputElement).checked) {
       this.selectedIds.set(new Set(this.filteredJobs().map((j) => j.id)));
+      this.announceSelection();
     } else {
       this.clearSelection();
     }
@@ -1803,11 +1820,12 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     ).subscribe((results) => {
       const failures = results.filter((r) => r !== null && !isAuthHandledError(r));
       if (failures.length > 0) {
-        showHttpError(
-          this.snackBar,
-          failures[0],
-          `Failed to ${verb} ${failures.length} of ${ids.length} job(s)`,
-        );
+        const message = `Failed to ${verb} ${failures.length} of ${ids.length} job(s)`;
+        showHttpError(this.snackBar, failures[0], message);
+        this.announcer.announceError(httpErrorMessage(failures[0], message));
+      } else {
+        const past = verb === 'remove' ? 'Removed' : verb === 'resume' ? 'Started' : 'Paused';
+        this.announcer.announce(`${past} ${ids.length} job${ids.length > 1 ? 's' : ''}`);
       }
       this.loadQueue();
     });

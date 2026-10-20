@@ -29,6 +29,7 @@ import { WidthModeService } from './core/services/width-mode.service';
 import { PauseStateService } from './core/services/pause-state.service';
 import { BrowserNotificationsService } from './core/services/browser-notifications.service';
 import { ThemeService } from './core/services/theme.service';
+import { AnnouncerService } from './core/services/announcer.service';
 import { IconComponent } from './shared/icon.component';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { showHttpError } from './core/http/http-error';
@@ -290,6 +291,14 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
           <div class="drop-overlay-box">Drop .nzb files to add them</div>
         </div>
       }
+      <!-- Results that arrive without a focus change are spoken here. The
+           regions stay mounted so the text change itself is the announcement. -->
+      <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {{ announcer.polite() }}
+      </div>
+      <div class="sr-only" role="alert" aria-live="assertive" aria-atomic="true">
+        {{ announcer.assertive() }}
+      </div>
     }
   `,
   styles: [
@@ -678,6 +687,7 @@ export class App implements OnInit, OnDestroy {
     pauseState: PauseStateService,
     private snack: MatSnackBar,
     private notifications: BrowserNotificationsService,
+    readonly announcer: AnnouncerService,
   ) {
     this.paused = pauseState.paused;
     this.authenticated = authService.authenticated;
@@ -857,6 +867,7 @@ export class App implements OnInit, OnDestroy {
       this.snack.open('Only .nzb (or .zip/.rar/.7z/.gz) files can be added', 'Close', {
         duration: 3000,
       });
+      this.announcer.announceError('Only .nzb (or .zip/.rar/.7z/.gz) files can be added');
       return;
     }
     this.openAddPanelWith({ files });

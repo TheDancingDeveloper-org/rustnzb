@@ -136,7 +136,7 @@ interface ImportPreview {
           </div>
 
           @if (connectError()) {
-            <div class="error-box">{{ connectError() }}</div>
+            <div class="error-box" role="alert">{{ connectError() }}</div>
           }
 
           <div class="btn-row">
@@ -244,7 +244,7 @@ interface ImportPreview {
           }
 
           @if (applyError()) {
-            <div class="error-box">{{ applyError() }}</div>
+            <div class="error-box" role="alert">{{ applyError() }}</div>
           }
 
           <div class="btn-row">

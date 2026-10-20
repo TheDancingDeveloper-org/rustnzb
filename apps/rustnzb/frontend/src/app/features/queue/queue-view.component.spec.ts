@@ -7,6 +7,7 @@ import { convertToParamMap, ParamMap } from '@angular/router';
 
 import { AddNzbService } from '../../core/services/add-nzb.service';
 import { PauseStateService } from '../../core/services/pause-state.service';
+import { AnnouncerService } from '../../core/services/announcer.service';
 import { ApiService } from '../../core/services/api.service';
 import { NzbJob } from '../../core/models/queue.model';
 import { QueueViewComponent } from './queue-view.component';
@@ -58,6 +59,7 @@ function makeComponent(
   snackBar: SnackBarStub;
   route: RouteStub;
   router: RouterStub;
+  announcer: AnnouncerService;
 } {
   const api: ApiStub = {
     get: vi.fn(() => of({})),
@@ -80,6 +82,7 @@ function makeComponent(
   const confirmSvc: ConfirmStub = {
     confirm: vi.fn(() => of(true)),
   };
+  const announcer = new AnnouncerService();
   const component = new QueueViewComponent(
     api as unknown as ApiService,
     http as unknown as import('@angular/common/http').HttpClient,
@@ -89,9 +92,10 @@ function makeComponent(
     router as never,
     confirmSvc as never,
     new PauseStateService(),
+    announcer,
   );
 
-  return { component, api, http, snackBar: snackbarStub, route, router };
+  return { component, api, http, snackBar: snackbarStub, route, router, announcer };
 }
 
 function makeJob(overrides: Partial<NzbJob> = {}): NzbJob {
@@ -482,6 +486,57 @@ describe('QueueViewComponent', () => {
     component.toggleHistory();
     expect(component.historyCollapsed()).toBe(false);
     expect(localStorage.getItem(component.HISTORY_KEY)).toBe('false');
+  });
+
+  it('announces a bulk action failure assertively, with the server message', () => {
+    const notFound = new HttpErrorResponse({
+      status: 404,
+      error: { error_kind: 'job_not_found', human_readable: 'Job not found: job-2', status: 404 },
+    });
+    const { component, announcer } = makeComponent({
+      post: vi.fn((path: string) => (path.includes('job-2') ? throwError(() => notFound) : of({}))),
+    });
+    vi.spyOn(component, 'loadQueue').mockImplementation(() => {});
+    component.selectedIds.set(new Set(['job-1', 'job-2']));
+
+    component.bulkPause();
+
+    expect(announcer.assertive()).toContain('Failed to pause 1 of 2 job(s)');
+    expect(announcer.assertive()).toContain('Job not found: job-2');
+  });
+
+  it('announces a successful bulk action politely', () => {
+    const { component, announcer } = makeComponent();
+    vi.spyOn(component, 'loadQueue').mockImplementation(() => {});
+    component.selectedIds.set(new Set(['job-1', 'job-2']));
+
+    component.bulkResume();
+
+    expect(announcer.polite()).toContain('Started 2 jobs');
+    expect(announcer.assertive()).toBe('');
+  });
+
+  it('announces the selection count as it changes', () => {
+    const { component, announcer } = makeComponent();
+    component.selectedIds.set(new Set(['job-1']));
+
+    component.toggleSelected('job-2');
+    expect(announcer.polite()).toContain('2 selected');
+
+    component.clearSelection();
+    expect(announcer.polite()).toContain('Selection cleared');
+  });
+
+  it('announces an upload failure with the server explanation', () => {
+    const tooLarge = new HttpErrorResponse({ status: 413 });
+    const { component, announcer } = makeComponent();
+    const http = (component as unknown as { http: HttpStub }).http;
+    http.post.mockReturnValue(throwError(() => tooLarge));
+    component.selectedFiles = [new File(['x'], 'a.nzb')];
+
+    component.uploadFiles();
+
+    expect(announcer.assertive()).toContain('Upload too large');
   });
 
   it('reports bulk action failures once with the server message', () => {
