@@ -99,9 +99,10 @@ nzb-core = { version = "0.2.19", path = "crates/nzb-core", features = ["groups-d
 nzb-decode = { version = "0.1.6", path = "crates/nzb-decode" }
 nzb-news = { version = "0.1.15", path = "crates/nzb-news" }
 nzb-dispatch = { version = "0.2.9", path = "crates/nzb-dispatch" }
-nzb-postproc = { version = "0.2.9", path = "crates/nzb-postproc" }
+nzb-postproc = { version = "0.2.11", path = "crates/nzb-postproc" }
 mock-nntp-server = { path = "crates/mock-nntp-server" }
 rust-par2 = { version = "0.1.3" }
+md-5 = "0.11"
 yenc-simd = { version = "0.1.1" }
 
 [patch.crates-io]
