@@ -5109,7 +5109,12 @@ impl QueueManager {
             // pause had never covered them.
             holds.user_paused_over.clear();
             holds.schedule = !holds.held_occurrences(&holds.open_windows).is_empty() && !holds.user;
-            let pause_requested = holds.schedule && !was_held;
+            // The user's pause was holding the queue, so a window opening
+            // under it only changes which hold explains the pause. Pausing
+            // jobs again would be a no-op, but keeping the guard makes this
+            // path behave exactly like `apply_schedule_hold`.
+            let paused = self.globally_paused.load(Ordering::SeqCst);
+            let pause_requested = holds.schedule && !was_held && !paused;
             let resume_requested = !holds.any();
             self.publish_holds(&holds);
             (pause_requested, resume_requested)
@@ -6467,22 +6472,41 @@ impl QueueManager {
             };
             (paused, ids, holds)
         };
-        let (was_paused, persisted_global_ids, holds) = restored;
-        if was_paused {
-            {
-                let mut current = self.pause_holds.lock();
-                *current = holds.clone();
-            }
-            self.publish_holds(&holds);
-            self.globally_paused.store(true, Ordering::SeqCst);
-            info!(
-                disk_space_hold = holds.disk.is_some(),
-                schedule_hold = holds.schedule,
-                user_hold = holds.user,
-                open_windows = ?holds.open_windows,
-                "Restored global pause state from database"
-            );
+        let (was_paused, persisted_global_ids, persisted_holds) = restored;
+        // The holds themselves only come back when the queue was paused: a
+        // record that says it was not paused has no live hold to restore.
+        //
+        // The window bookkeeping is different, and is restored either way. A
+        // manual resume inside a window leaves `globally_paused` false while
+        // the occurrence it overrode is still open; dropping `triggered_windows`
+        // and `resumed_windows` with it would make the first tick after a
+        // restart read that window as newly opened and pause the queue again.
+        let holds = PauseHolds {
+            user: was_paused && persisted_holds.user,
+            disk: if was_paused {
+                persisted_holds.disk
+            } else {
+                None
+            },
+            schedule: was_paused && persisted_holds.schedule,
+            open_windows: persisted_holds.open_windows,
+            triggered_windows: persisted_holds.triggered_windows,
+            resumed_windows: persisted_holds.resumed_windows,
+            user_paused_over: persisted_holds.user_paused_over,
+        };
+        {
+            let mut current = self.pause_holds.lock();
+            *current = holds.clone();
         }
+        self.publish_holds(&holds);
+        info!(
+            was_paused,
+            disk_space_hold = holds.disk.is_some(),
+            schedule_hold = holds.schedule,
+            user_hold = holds.user,
+            open_windows = ?holds.open_windows,
+            "Restored global pause state from database"
+        );
 
         let complete_action = self
             .db
@@ -7196,11 +7220,25 @@ mod global_pause_tests {
     fn manager() -> (Arc<QueueManager>, tempfile::TempDir) {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db = Database::open_memory().expect("database");
-        let manager = QueueManager::new(
+        let manager = build_manager(db, tempdir.path());
+        (manager, tempdir)
+    }
+
+    /// A manager over a database file in `dir`, so a second one built over the
+    /// same path sees what the first persisted. In-memory handles are shared
+    /// by clone, which cannot model a restart: restoring into one still reads
+    /// the same live state it already had.
+    fn file_manager(dir: &std::path::Path) -> Arc<QueueManager> {
+        let db = Database::open(&dir.join("restart").with_extension("db")).expect("database");
+        build_manager(db, dir)
+    }
+
+    fn build_manager(db: Database, dir: &std::path::Path) -> Arc<QueueManager> {
+        QueueManager::new(
             Vec::new(),
             db,
-            tempdir.path().join("incomplete"),
-            tempdir.path().join("complete"),
+            dir.join("incomplete"),
+            dir.join("complete"),
             LogBuffer::default(),
             1,
             Vec::new(),
@@ -7212,8 +7250,7 @@ mod global_pause_tests {
             false,
             100.0,
             30,
-        );
-        (manager, tempdir)
+        )
     }
 
     fn insert_job(manager: &QueueManager, job: NzbJob) {
@@ -8150,7 +8187,8 @@ mod global_pause_tests {
 
     #[tokio::test]
     async fn schedule_pause_ownership_survives_a_restart() {
-        let (manager, tempdir) = manager();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = file_manager(tempdir.path());
         insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
 
         let decision = crate::nzb_core::schedule::ScheduleDecision {
@@ -8173,7 +8211,8 @@ mod global_pause_tests {
 
         // A restart rebuilds the pause from the database. The schedule must
         // still own it, or the window ending could never resume the queue.
-        let restarted = Arc::clone(&manager);
+        drop(manager);
+        let restarted = file_manager(tempdir.path());
         restarted.restore_from_db().unwrap();
         assert!(restarted.is_paused());
         assert!(restarted.schedule_pause_active());
@@ -8275,7 +8314,8 @@ mod global_pause_tests {
 
     #[tokio::test]
     async fn a_restart_inside_a_window_still_lifts_the_pause_when_it_ends() {
-        let (manager, _tempdir) = manager();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = file_manager(tempdir.path());
         let open = crate::nzb_core::schedule::ScheduleDecision {
             pause: true,
             ..Default::default()
@@ -8286,7 +8326,8 @@ mod global_pause_tests {
         // A restart restores the schedule-owned pause from the database. The
         // window must be rebuilt with it, or the end of the window would be
         // read as "no change" and the queue would stay paused forever.
-        let restarted = Arc::clone(&manager);
+        drop(manager);
+        let restarted = file_manager(tempdir.path());
         restarted.restore_from_db().unwrap();
         assert!(restarted.schedule_pause_active());
 
@@ -8347,7 +8388,8 @@ mod global_pause_tests {
 
     #[tokio::test]
     async fn a_manual_resume_inside_a_window_survives_a_restart() {
-        let (manager, tempdir) = manager();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = file_manager(tempdir.path());
         insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
 
         let open = crate::nzb_core::schedule::ScheduleDecision {
@@ -8362,7 +8404,8 @@ mod global_pause_tests {
         // restarts while the window is still open.
         manager.resume_all();
         assert!(!manager.is_paused());
-        let restarted = Arc::clone(&manager);
+        drop(manager);
+        let restarted = file_manager(tempdir.path());
         restarted.restore_from_db().unwrap();
         assert!(!restarted.is_paused());
 
@@ -8393,7 +8436,8 @@ mod global_pause_tests {
 
     #[tokio::test]
     async fn a_restart_during_a_disk_hold_keeps_the_overlapping_window() {
-        let (manager, tempdir) = manager();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = file_manager(tempdir.path());
         insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
 
         // The disk guard holds the queue, then a pause window opens on top of
@@ -8413,7 +8457,8 @@ mod global_pause_tests {
         // A restart rebuilds both holds. Recording a single ranked owner lost
         // the schedule hold here, so the guard lifting its own hold later
         // resumed downloads straight through the rest of the window.
-        let restarted = Arc::clone(&manager);
+        drop(manager);
+        let restarted = file_manager(tempdir.path());
         restarted.restore_from_db().unwrap();
         assert!(restarted.is_paused());
         assert_eq!(
