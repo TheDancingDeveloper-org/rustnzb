@@ -418,12 +418,23 @@ pub async fn initialize(
     // checked promptly instead of after the monitor's current sleep.
     let data_dir_for_rss = shared_config.load().general.data_dir.clone();
     let monitor = crate::rss_monitor::RssMonitor::new(
-        shared_config,
+        Arc::clone(&shared_config),
         Arc::clone(&queue_manager),
         data_dir_for_rss,
     )
     .with_wake(Arc::clone(&state.rss_monitor_wake));
     tokio::spawn(async move { monitor.run().await });
+
+    // Apply the schedule once before serving, then keep it up to date. The
+    // monitor owns its own config handle so a rule edit is picked up on the
+    // next tick even if the wake is missed.
+    let schedule_config = shared_config.clone();
+    let schedule_monitor = crate::schedule_monitor::ScheduleMonitor::new(
+        schedule_config,
+        Arc::clone(&state.queue_manager),
+    )
+    .with_wake(Arc::clone(&state.schedule_wake));
+    tokio::spawn(async move { schedule_monitor.run().await });
 
     Ok(StartupResult {
         state,

@@ -20,6 +20,7 @@ static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::
         .expect("Failed to build shared HTTP client")
 });
 
+use chrono::Local;
 use nzb_web::nzb_core::NzbError;
 #[cfg(feature = "webdav")]
 use nzb_web::nzb_core::config::DavConfig;
@@ -30,6 +31,7 @@ use nzb_web::nzb_core::config::{
 use nzb_web::nzb_core::models::*;
 use nzb_web::nzb_core::nzb_parser;
 use nzb_web::nzb_core::sabnzbd_import;
+use nzb_web::nzb_core::schedule::{ScheduleRule, evaluate_config};
 use nzb_web::nzb_core::{HistoryFilter, HistorySummary};
 use nzb_web::queue_manager::PauseReason;
 
@@ -2073,6 +2075,127 @@ pub async fn h_set_speed_limit(
         Ok::<_, ApiError>(())
     })?;
     Ok(Json(serde_json::json!({"status": true})))
+}
+
+// ---------------------------------------------------------------------------
+// Download schedule
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct ScheduleResponse {
+    /// The saved schedule, with every rule's id filled in.
+    pub enabled: bool,
+    pub rules: Vec<ScheduleRule>,
+    /// Rules active at the moment of the call. Empty while the schedule is off.
+    pub active_rule_ids: Vec<String>,
+    /// True when a schedule rule is holding the queue paused right now.
+    pub paused: bool,
+    /// The cap a rule is applying right now, if any. The configured
+    /// `general.speed_limit_bps` applies when this is `null`.
+    pub speed_limit_bps: Option<u64>,
+    /// Servers a rule has out of rotation right now.
+    pub disabled_servers: Vec<String>,
+}
+
+/// GET /api/config/schedule -- The schedule and what it is doing now.
+pub async fn h_schedule_get(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ScheduleResponse>, ApiError> {
+    let config = state.config();
+    let decision = evaluate_config(&config.schedule, Local::now().naive_local());
+    Ok(Json(ScheduleResponse {
+        enabled: config.schedule.enabled,
+        rules: config.schedule.rules.clone(),
+        active_rule_ids: decision.active_rule_ids,
+        paused: state.queue_manager.schedule_pause_active(),
+        speed_limit_bps: state.queue_manager.scheduled_speed_cap(),
+        disabled_servers: state.queue_manager.schedule_disabled_servers(),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct ScheduleUpdate {
+    pub enabled: bool,
+    pub rules: Vec<ScheduleRule>,
+}
+
+/// PUT /api/config/schedule -- Replace the schedule.
+///
+/// Every rule is validated before anything is saved, so a bad rule never
+/// half-applies. Rules without an id get one; ids stay stable across edits so
+/// an active window survives a save.
+pub async fn h_schedule_update(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ScheduleUpdate>, JsonRejection>,
+) -> Result<Json<ScheduleResponse>, ApiError> {
+    let Json(body) =
+        body.map_err(|rejection| ApiError::from((StatusCode::BAD_REQUEST, rejection.body_text())))?;
+
+    let mut seen = std::collections::HashSet::new();
+    for (i, rule) in body.rules.iter().enumerate() {
+        if let Some(problem) = nzb_web::nzb_core::schedule::rule_problem(rule) {
+            return Err(ApiError::from((
+                StatusCode::BAD_REQUEST,
+                format!("invalid `schedule.rules[{i}]`: {problem}"),
+            )));
+        }
+        if !rule.id.trim().is_empty() && !seen.insert(rule.id.clone()) {
+            return Err(ApiError::from((
+                StatusCode::BAD_REQUEST,
+                format!("invalid `schedule.rules[{i}]`: duplicate id `{}`", rule.id),
+            )));
+        }
+    }
+    let known_servers: std::collections::HashSet<String> = state
+        .config()
+        .servers
+        .iter()
+        .map(|server| server.id.clone())
+        .collect();
+    for (i, rule) in body.rules.iter().enumerate() {
+        if let Some(unknown) = rule
+            .servers
+            .iter()
+            .find(|server| !known_servers.contains(*server))
+        {
+            return Err(ApiError::from((
+                StatusCode::BAD_REQUEST,
+                format!("invalid `schedule.rules[{i}].servers`: unknown server `{unknown}`"),
+            )));
+        }
+    }
+
+    let mut rules = body.rules;
+    for rule in &mut rules {
+        if rule.id.trim().is_empty() {
+            rule.id = uuid::Uuid::new_v4().to_string();
+        }
+        rule.name = rule.name.trim().to_string();
+        rule.days = rule
+            .days
+            .iter()
+            .map(|day| day.trim().to_ascii_lowercase())
+            .collect();
+        rule.start = rule.start.trim().to_string();
+        rule.end = rule.end.trim().to_string();
+    }
+
+    state.update_config_with(|config| {
+        config.schedule.enabled = body.enabled;
+        config.schedule.rules = rules.clone();
+        Ok::<_, ApiError>(())
+    })?;
+
+    // Applying now, rather than waiting for the monitor's next tick, makes a
+    // save feel immediate and keeps the response truthful.
+    let config = state.config();
+    let decision = evaluate_config(&config.schedule, Local::now().naive_local());
+    state
+        .queue_manager
+        .apply_schedule(&decision, config.schedule.enabled);
+    state.schedule_wake.notify_one();
+
+    h_schedule_get(State(state)).await
 }
 
 // ---------------------------------------------------------------------------

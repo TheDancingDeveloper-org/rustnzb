@@ -1496,6 +1496,9 @@ pub enum PauseReason {
     DiskSpace,
     /// The job was paused after a news-server error.
     Server,
+    /// A time-of-day schedule rule is pausing downloads. The pause lifts
+    /// automatically when the window ends.
+    Schedule,
 }
 
 /// Notification fired immediately when a job is accepted into the queue.
@@ -1584,6 +1587,22 @@ pub struct QueueManager {
     /// guard rather than the user; holds when the guard tripped. The guard
     /// lifts only pauses it owns.
     disk_space_hold: Mutex<Option<DateTime<Utc>>>,
+    /// True while the current global pause was applied by the download
+    /// schedule. Like the disk hold, only the schedule may lift it, and only
+    /// while it still owns the pause.
+    schedule_hold: AtomicBool,
+    /// Servers the schedule has taken out of rotation, as configured by the
+    /// user. The live list is the configured list with these disabled.
+    schedule_disabled_servers: Mutex<Vec<String>>,
+    /// The configured server list, before the schedule's overlay. Held so the
+    /// overlay can be recomputed whenever either side changes.
+    configured_servers: Mutex<Vec<ServerConfig>>,
+    /// The user's configured speed limit, which the schedule's cap overlays.
+    /// Zero means unlimited.
+    configured_speed_limit_bps: AtomicU64,
+    /// The cap the schedule currently imposes, if any. Overlays the
+    /// configured limit; `None` means the configured limit applies.
+    scheduled_speed_cap: Mutex<Option<u64>>,
     /// Global speed tracker.
     speed: SpeedTracker,
     /// Database for persistence.
@@ -1651,6 +1670,13 @@ pub struct QueueManager {
 impl QueueManager {
     const GLOBAL_PAUSED_JOBS_SETTING: &'static str = "globally_paused_job_ids";
     const DISK_SPACE_HOLD_SETTING: &'static str = "disk_space_hold_since";
+    /// Who applied the persisted global pause: empty or `user`, or
+    /// `schedule`. A restart must not turn a scheduled pause into a user
+    /// pause the schedule can never lift.
+    const PAUSE_OWNER_SETTING: &'static str = "global_pause_owner";
+    const PAUSE_OWNER_USER: &'static str = "user";
+    const PAUSE_OWNER_DISK: &'static str = "disk_space";
+    const PAUSE_OWNER_SCHEDULE: &'static str = "schedule";
     const QUEUE_COMPLETE_ACTION_SETTING: &'static str = "queue_complete_action";
 
     /// Create a new queue manager.
@@ -1718,6 +1744,7 @@ impl QueueManager {
         let download_bps = NonZeroU32::new(u32::try_from(speed_limit_bps).unwrap_or(u32::MAX));
         let bandwidth = Arc::new(BandwidthLimiter::new(BandwidthConfig { download_bps }));
 
+        let configured_servers = servers.clone();
         let servers_arc = Arc::new(Mutex::new(servers));
         let dispatch: Arc<dyn DispatchEngine> = Arc::new(DispatchHandle::new(
             Arc::clone(&servers_arc),
@@ -1737,6 +1764,11 @@ impl QueueManager {
             pause_transition: Mutex::new(()),
             globally_paused_jobs: Mutex::new(HashSet::new()),
             disk_space_hold: Mutex::new(None),
+            schedule_hold: AtomicBool::new(false),
+            schedule_disabled_servers: Mutex::new(Vec::new()),
+            configured_servers: Mutex::new(configured_servers),
+            configured_speed_limit_bps: AtomicU64::new(speed_limit_bps),
+            scheduled_speed_cap: Mutex::new(None),
             speed: SpeedTracker::new(),
             db: Mutex::new(db),
             incomplete_dir: Mutex::new(incomplete_dir),
@@ -2167,11 +2199,35 @@ impl QueueManager {
         self.postproc_resources.snapshot()
     }
 
-    /// Set the download speed limit in bytes per second (0 = unlimited).
+    /// Set the configured download speed limit in bytes per second
+    /// (0 = unlimited).
+    ///
+    /// This is the user's value. An active schedule cap overrides it until
+    /// the window ends, at which point this value comes back.
     pub fn set_speed_limit(&self, bps: u64) {
+        self.configured_speed_limit_bps.store(bps, Ordering::SeqCst);
+        self.apply_effective_speed_limit();
+    }
+
+    /// The user's configured speed limit, before any schedule cap.
+    pub fn configured_speed_limit(&self) -> u64 {
+        self.configured_speed_limit_bps.load(Ordering::SeqCst)
+    }
+
+    /// Apply the schedule's cap over the configured limit. `None` lifts it.
+    fn set_scheduled_speed_cap(&self, cap: Option<u64>) {
+        *self.scheduled_speed_cap.lock() = cap;
+        self.apply_effective_speed_limit();
+    }
+
+    fn apply_effective_speed_limit(&self) {
         use std::num::NonZeroU32;
+        let effective = self
+            .scheduled_speed_cap
+            .lock()
+            .unwrap_or(self.configured_speed_limit());
         // Saturate rather than wrap: `as u32` turns 4 GiB/s + 1 into 1 B/s.
-        let limit = NonZeroU32::new(u32::try_from(bps).unwrap_or(u32::MAX));
+        let limit = NonZeroU32::new(u32::try_from(effective).unwrap_or(u32::MAX));
         self.bandwidth.set_download_bps(limit);
     }
 
@@ -4687,12 +4743,32 @@ impl QueueManager {
     /// disk-space guard; `None` is a user pause, which also takes ownership
     /// of any existing disk hold so the guard will not lift it.
     fn pause_all_with_hold(&self, disk_space_hold: Option<DateTime<Utc>>) {
+        let owner = if disk_space_hold.is_some() {
+            Self::PAUSE_OWNER_DISK
+        } else {
+            Self::PAUSE_OWNER_USER
+        };
+        self.pause_all_as(disk_space_hold, owner);
+    }
+
+    /// Pause everything and record who owns the pause. The owner decides who
+    /// may lift it: the schedule lifts only its own, the disk guard only its
+    /// hold, and a user pause is lifted only by `resume_all`.
+    fn pause_all_as(&self, disk_space_hold: Option<DateTime<Utc>>, owner: &str) {
         let _transition = self.pause_transition.lock();
+        // Ownership is persisted with the pause, or a restart would hand a
+        // user's pause back to the schedule.
+        self.schedule_hold
+            .store(owner == Self::PAUSE_OWNER_SCHEDULE, Ordering::SeqCst);
         // Publish the global gate before touching individual jobs. This
         // prevents every scheduling and per-job resume path from starting
         // more work while the active contexts are being paused.
         self.globally_paused.store(true, Ordering::SeqCst);
-        self.db.lock().set_setting("globally_paused", "true");
+        {
+            let db = self.db.lock();
+            db.set_setting("globally_paused", "true");
+            db.set_setting(Self::PAUSE_OWNER_SETTING, owner);
+        }
         self.set_disk_space_hold(disk_space_hold);
         // A plain pause is indefinite: cancel any pending timed resume.
         // `pause_for` sets its deadline after calling this.
@@ -4763,6 +4839,53 @@ impl QueueManager {
         info!(duration_secs, "Paused for duration");
     }
 
+    /// Apply a schedule decision to the queue.
+    ///
+    /// The schedule only owns what it applied: it will not resume a pause the
+    /// user or the disk guard started, and it lifts its own pause only when
+    /// the window ends. Speed caps and server exclusions are overlays — the
+    /// configured values are never rewritten.
+    pub fn apply_schedule(
+        self: &Arc<Self>,
+        decision: &crate::nzb_core::schedule::ScheduleDecision,
+        enabled: bool,
+    ) {
+        let idle = crate::nzb_core::schedule::ScheduleDecision::default();
+        let decision = if enabled { decision } else { &idle };
+        // Pause ownership.
+        if decision.pause {
+            if !self.is_paused() {
+                self.pause_all_as(None, Self::PAUSE_OWNER_SCHEDULE);
+                info!("Schedule is pausing downloads");
+            }
+        } else if self.is_paused() && self.schedule_hold.load(Ordering::SeqCst) {
+            self.resume_all();
+            info!("Schedule window ended, resuming downloads");
+        }
+
+        // Speed cap: only touch the limiter when the value changes, so a
+        // running download does not see a needless limiter update each tick.
+        if self.scheduled_speed_cap.lock().as_ref() != decision.speed_limit_bps.as_ref() {
+            self.set_scheduled_speed_cap(decision.speed_limit_bps);
+        }
+
+        // Server exclusions.
+        if *self.schedule_disabled_servers.lock() != decision.disabled_servers {
+            *self.schedule_disabled_servers.lock() = decision.disabled_servers.clone();
+            self.apply_server_overlay();
+        }
+    }
+
+    /// Whether the schedule currently holds the global pause.
+    pub fn schedule_pause_active(&self) -> bool {
+        self.schedule_hold.load(Ordering::SeqCst)
+    }
+
+    /// The speed cap the schedule is applying right now, if any.
+    pub fn scheduled_speed_cap(&self) -> Option<u64> {
+        *self.scheduled_speed_cap.lock()
+    }
+
     /// Get remaining pause time in seconds (None if not timed).
     pub fn pause_remaining_secs(&self) -> Option<i64> {
         let until = self.pause_until.lock();
@@ -4775,8 +4898,13 @@ impl QueueManager {
     /// Resume all downloads globally.
     pub fn resume_all(self: &Arc<Self>) {
         let _transition = self.pause_transition.lock();
+        self.schedule_hold.store(false, Ordering::SeqCst);
         self.globally_paused.store(false, Ordering::SeqCst);
-        self.db.lock().set_setting("globally_paused", "false");
+        {
+            let db = self.db.lock();
+            db.set_setting("globally_paused", "false");
+            db.set_setting(Self::PAUSE_OWNER_SETTING, "");
+        }
         self.set_disk_space_hold(None);
         *self.pause_until.lock() = None;
 
@@ -4816,12 +4944,34 @@ impl QueueManager {
     /// server errors (e.g. auth failure / service unavailable) are
     /// automatically resumed.
     pub fn update_servers(self: &Arc<Self>, servers: Vec<ServerConfig>) {
-        let enabled = servers.iter().filter(|s| s.enabled).count();
-        info!(total = servers.len(), enabled, "Updating server list");
+        info!(total = servers.len(), "Updating server list");
+        *self.configured_servers.lock() = servers;
+        self.apply_server_overlay();
+    }
 
-        self.dispatch.update_servers(servers);
+    /// Push the configured list, with the schedule's exclusions disabled, to
+    /// the dispatcher.
+    fn apply_server_overlay(self: &Arc<Self>) {
+        let disabled = self.schedule_disabled_servers.lock().clone();
+        let effective: Vec<ServerConfig> = {
+            let configured = self.configured_servers.lock();
+            configured
+                .iter()
+                .map(|server| {
+                    let mut server = server.clone();
+                    if disabled.iter().any(|id| id == &server.id) {
+                        server.enabled = false;
+                    }
+                    server
+                })
+                .collect()
+        };
+        let enabled = effective.iter().filter(|s| s.enabled).count();
+        info!(total = effective.len(), enabled, "Applying server list");
 
-        // Auto-resume jobs paused by server errors now that config changed
+        self.dispatch.update_servers(effective);
+
+        // Auto-resume jobs paused by server errors now that servers are back.
         if enabled > 0 {
             self.resume_server_paused_jobs();
         }
@@ -4861,9 +5011,20 @@ impl QueueManager {
         }
     }
 
-    /// Get current server configs.
+    /// Get the configured server list, before the schedule's overlay.
     pub fn get_servers(&self) -> Vec<ServerConfig> {
+        self.configured_servers.lock().clone()
+    }
+
+    /// The server list as the dispatcher sees it: configured servers with
+    /// the schedule's exclusions disabled.
+    pub fn live_servers(&self) -> Vec<ServerConfig> {
         self.servers.lock().clone()
+    }
+
+    /// Servers the schedule currently has out of rotation.
+    pub fn schedule_disabled_servers(&self) -> Vec<String> {
+        self.schedule_disabled_servers.lock().clone()
     }
 
     // -----------------------------------------------------------------------
@@ -4951,6 +5112,8 @@ impl QueueManager {
         }
         Some(if self.disk_space_hold.lock().is_some() {
             PauseReason::DiskSpace
+        } else if self.schedule_hold.load(Ordering::SeqCst) {
+            PauseReason::Schedule
         } else {
             PauseReason::Global
         })
@@ -5804,7 +5967,7 @@ impl QueueManager {
     pub fn restore_from_db(self: &Arc<Self>) -> crate::nzb_core::Result<()> {
         prune_damage_ledger(&self.db.lock());
         // Restore globally_paused from persisted state
-        let (was_paused, persisted_global_ids) = {
+        let (was_paused, persisted_global_ids, pause_owner) = {
             let db = self.db.lock();
             let paused = db
                 .get_setting("globally_paused")
@@ -5812,7 +5975,10 @@ impl QueueManager {
             let ids = db
                 .get_setting(Self::GLOBAL_PAUSED_JOBS_SETTING)
                 .and_then(|value| serde_json::from_str::<HashSet<String>>(&value).ok());
-            (paused, ids)
+            let owner = db
+                .get_setting(Self::PAUSE_OWNER_SETTING)
+                .unwrap_or_default();
+            (paused, ids, owner)
         };
         if was_paused {
             self.globally_paused.store(true, Ordering::SeqCst);
@@ -5823,8 +5989,12 @@ impl QueueManager {
                 .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
                 .map(|at| at.with_timezone(&Utc));
             *self.disk_space_hold.lock() = hold;
+            if hold.is_none() && pause_owner == Self::PAUSE_OWNER_SCHEDULE {
+                self.schedule_hold.store(true, Ordering::SeqCst);
+            }
             info!(
                 disk_space_hold = hold.is_some(),
+                schedule_hold = self.schedule_hold.load(Ordering::SeqCst),
                 "Restored global pause state from database"
             );
         }
@@ -7357,6 +7527,124 @@ mod global_pause_tests {
         manager.set_min_free_space(1);
         manager.enforce_disk_guard();
         assert!(manager.is_paused());
+    }
+
+    #[tokio::test]
+    async fn schedule_pause_ownership_survives_a_restart() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        let decision = crate::nzb_core::schedule::ScheduleDecision {
+            active_rule_ids: vec!["quiet".into()],
+            pause: true,
+            ..Default::default()
+        };
+        manager.apply_schedule(&decision, true);
+        assert!(manager.is_paused());
+        assert!(manager.schedule_pause_active());
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+        assert_eq!(
+            manager
+                .db
+                .lock()
+                .get_setting("global_pause_owner")
+                .as_deref(),
+            Some("schedule")
+        );
+
+        // A restart rebuilds the pause from the database. The schedule must
+        // still own it, or the window ending could never resume the queue.
+        let restarted = Arc::clone(&manager);
+        restarted.restore_from_db().unwrap();
+        assert!(restarted.is_paused());
+        assert!(restarted.schedule_pause_active());
+        assert_eq!(restarted.global_pause_reason(), Some(PauseReason::Schedule));
+
+        // A user Pause All during the window takes ownership, so the window
+        // ending leaves their pause alone.
+        restarted.pause_all();
+        assert!(!restarted.schedule_pause_active());
+        assert_eq!(restarted.global_pause_reason(), Some(PauseReason::Global));
+        restarted.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert!(
+            restarted.is_paused(),
+            "a user pause is not the schedule's to lift"
+        );
+        assert_eq!(
+            restarted
+                .db
+                .lock()
+                .get_setting("global_pause_owner")
+                .as_deref(),
+            Some("user")
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_speed_cap_overlays_the_configured_limit_without_rewriting_it() {
+        let (manager, _tempdir) = manager();
+        manager.set_speed_limit(5_000_000);
+        assert_eq!(manager.configured_speed_limit(), 5_000_000);
+
+        let cap = crate::nzb_core::schedule::ScheduleDecision {
+            speed_limit_bps: Some(1_000_000),
+            ..Default::default()
+        };
+        manager.apply_schedule(&cap, true);
+        assert_eq!(manager.scheduled_speed_cap(), Some(1_000_000));
+        assert_eq!(manager.configured_speed_limit(), 5_000_000);
+
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert_eq!(manager.scheduled_speed_cap(), None);
+        assert_eq!(manager.configured_speed_limit(), 5_000_000);
+    }
+
+    #[tokio::test]
+    async fn schedule_server_exclusions_leave_the_configured_list_alone() {
+        let (manager, _tempdir) = manager();
+        let server = |id: &str| {
+            let mut config = ServerConfig::new(id, format!("{id}.example.com"));
+            config.enabled = true;
+            config
+        };
+        manager.update_servers(vec![server("primary"), server("backup")]);
+        assert!(manager.get_servers().iter().all(|s| s.enabled));
+
+        let decision = crate::nzb_core::schedule::ScheduleDecision {
+            disabled_servers: vec!["backup".into()],
+            ..Default::default()
+        };
+        manager.apply_schedule(&decision, true);
+        assert_eq!(manager.schedule_disabled_servers(), vec!["backup"]);
+        assert!(
+            manager
+                .get_servers()
+                .iter()
+                .find(|s| s.id == "backup")
+                .is_some_and(|s| s.enabled),
+            "the configured list keeps its own enabled flags"
+        );
+        assert!(
+            manager
+                .live_servers()
+                .iter()
+                .find(|s| s.id == "backup")
+                .is_some_and(|s| !s.enabled),
+            "the dispatcher sees the exclusion"
+        );
+
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert!(manager.schedule_disabled_servers().is_empty());
+        assert!(manager.live_servers().iter().all(|s| s.enabled));
     }
 
     #[tokio::test]

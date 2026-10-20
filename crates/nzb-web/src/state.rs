@@ -40,6 +40,10 @@ pub struct AppState {
     /// re-reads its feeds at once instead of finishing its current sleep.
     /// Single consumer: `notify_one` stores a permit if the monitor is busy.
     pub rss_monitor_wake: Arc<tokio::sync::Notify>,
+    /// Signalled after a committed change to the download schedule, so the
+    /// schedule monitor applies it at once instead of at the next minute
+    /// boundary.
+    pub schedule_wake: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -64,6 +68,7 @@ impl AppState {
             file: Mutex::new(file),
             overrides: OverrideSet::default(),
             rss_monitor_wake: Arc::new(tokio::sync::Notify::new()),
+            schedule_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 

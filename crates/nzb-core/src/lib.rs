@@ -11,6 +11,7 @@ pub mod overrides;
 pub mod par2_match;
 pub mod path;
 pub mod sabnzbd_import;
+pub mod schedule;
 
 pub use config::AppConfig;
 pub use damage_ledger::{

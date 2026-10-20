@@ -174,6 +174,38 @@ A fresh config has one category, `Default`.
 | `auto_download` | `false` | Queue every item that passes `filter_regex`, without a rule. |
 | `max_age_days` | unset | Ignore items older than this. |
 
+## `[schedule]`
+
+Time-of-day rules for pausing downloads, capping the speed and taking news
+servers out of rotation. Edit it in Settings → Scheduler or write it here.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Evaluate the rules. Turning it off lifts only a pause the schedule applied. |
+| `rules` | `[]` | One table per window. |
+
+Each `[[schedule.rules]]` entry:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `id` | assigned by the API | Stable identifier. The UI leaves it blank on a new rule and the API fills it in. |
+| `name` | `""` | Label shown in the settings page and the queue. |
+| `days` | — | Weekdays the window **starts** on: `mon`..`sun`, or full names. Required. |
+| `start`, `end` | `"00:00"`, `"24:00"` | `HH:MM`, 24-hour clock. `end` earlier than `start` runs overnight; `24:00` ends the day. |
+| `action` | `"pause"` | `pause`, `speed_limit` or `disable_servers`. |
+| `speed_limit_bps` | `0` | Cap for `speed_limit`, in bytes/sec. `0` means unlimited and overrides a lower cap from another active rule. |
+| `servers` | `[]` | Server ids taken out of rotation for `disable_servers`. |
+
+Rules are evaluated against the process's **local** wall clock: inside a
+container, set `TZ` to have windows follow your timezone.
+
+The schedule is an overlay. It never rewrites `general.speed_limit_bps` or a
+server's `enabled` flag — the configured values come back when the window
+ends, and the servers page keeps showing what you configured. The same is true
+of pauses: the schedule only resumes a pause it applied, so a manual pause, a
+timed pause or a low-disk hold is never lifted by a window ending. Overlapping
+caps use the lowest non-zero value, and an active `0` cap means unlimited.
+
 ## `[par2]`
 
 | Key | Default | Description |

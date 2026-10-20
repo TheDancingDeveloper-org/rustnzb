@@ -17,6 +17,14 @@ function makeComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {})
         '/config/max-active-downloads': { max_active_downloads: 4 },
         '/config/history-retention': { retention: 14 },
         '/config/disk-guards': { min_free_space_bytes: 2 * 1024 ** 3, abort_hopeless: false },
+        '/config/schedule': {
+          enabled: false,
+          rules: [],
+          active_rule_ids: [],
+          paused: false,
+          speed_limit_bps: null,
+          disabled_servers: [],
+        },
         '/config/debug-logging': { enabled: false, effective: 'info', overridden: false },
         '/config/sabnzbd-api-key': { api_key: 'key' },
         '/status': { webdav_available: false, webdav_enabled: false },
@@ -114,12 +122,14 @@ describe('SettingsViewComponent', () => {
     component.saveCategory();
     component.saveServer();
     component.saveDavConfig();
+    component.saveSchedule();
     component.rotateSabApiKey();
 
     expect(api.put).not.toHaveBeenCalled();
     expect(api.post).not.toHaveBeenCalled();
     expect(confirm.confirm).not.toHaveBeenCalled();
     expect(component.canSave('speedLimit')).toBe(false);
+    expect(component.canSave('schedule')).toBe(false);
     expect(component.loadFailure('speedLimit')).toBeNull();
   });
 
@@ -179,6 +189,156 @@ describe('SettingsViewComponent', () => {
     expect(component.loadFailure('dav')).toBe('Failed to load Media Library settings');
     component.saveDavConfig();
     expect(api.put).not.toHaveBeenCalledWith('/config/dav', expect.anything());
+  });
+
+  it('loads the schedule and shows which rules are active now', () => {
+    const { component, api } = makeComponent({
+      get: vi.fn((path: string) => {
+        if (path === '/config/schedule') {
+          return of({
+            enabled: true,
+            rules: [
+              {
+                id: 'quiet',
+                name: 'Quiet hours',
+                days: ['mon', 'monday', 'tue'],
+                start: '22:00',
+                end: '06:00',
+                action: 'pause',
+                speed_limit_bps: 0,
+                servers: [],
+              },
+            ],
+            active_rule_ids: ['quiet'],
+            paused: true,
+            speed_limit_bps: null,
+            disabled_servers: [],
+          });
+        }
+        if (path === '/config/servers') return of([]);
+        if (path === '/config/categories' || path === '/config/servers/stats') return of([]);
+        if (path === '/status') return of({ webdav_available: false, webdav_enabled: false });
+        if (path === '/config') return of({ general: {} });
+        return of({});
+      }),
+    });
+    component.ngOnInit();
+
+    expect(api.get).toHaveBeenCalledWith('/config/schedule');
+    expect(component.schedule.rules[0].days).toEqual(['mon', 'tue']);
+    expect(component.scheduleActiveNow()).toBe(true);
+    expect(component.activeScheduleRules().map((rule) => rule.name)).toEqual(['Quiet hours']);
+    expect(component.actionLabel('pause')).toBe('pause');
+    expect(component.unsavedSections()).toEqual([]);
+  });
+
+  it('validates a draft schedule rule before saving and names the offending row', () => {
+    const { component, api, snack } = makeComponent();
+    component.ngOnInit();
+
+    component.addScheduleRule();
+    expect(component.canSave('schedule')).toBe(true);
+    expect(component.schedule.rules[0].days).toEqual(['mon', 'tue', 'wed', 'thu', 'fri']);
+    expect(component.scheduleProblem()).toBeNull();
+
+    component.schedule.rules[0].start = '25:00';
+    expect(component.ruleProblem(component.schedule.rules[0])).toContain('Start must be HH:MM');
+    expect(component.scheduleProblem()).toBe('Rule 1: Start must be HH:MM (00:00 to 23:59).');
+    component.saveSchedule();
+    expect(api.put).not.toHaveBeenCalledWith('/config/schedule', expect.anything());
+    expect(snack.open).toHaveBeenCalledWith(
+      'Rule 1: Start must be HH:MM (00:00 to 23:59).',
+      'Close',
+      { duration: 4000 },
+    );
+
+    component.schedule.rules[0].start = '22:00';
+    component.schedule.rules[0].end = '22:00';
+    expect(component.ruleProblem(component.schedule.rules[0])).toContain('must differ');
+
+    component.schedule.rules[0].action = 'disable_servers';
+    component.schedule.rules[0].end = '06:00';
+    expect(component.ruleProblem(component.schedule.rules[0])).toContain('at least one server');
+    component.toggleScheduleServer(component.schedule.rules[0], 'primary', {
+      target: { checked: true },
+    } as unknown as Event);
+    expect(component.scheduleProblem()).toBeNull();
+  });
+
+  it('saves the schedule and takes the ids and live status from the response', () => {
+    const put = vi.fn(() =>
+      of({
+        enabled: true,
+        rules: [
+          {
+            id: 'assigned',
+            name: 'Off peak',
+            days: ['sat', 'sun'],
+            start: '00:00',
+            end: '24:00',
+            action: 'speed_limit',
+            speed_limit_bps: 1_000_000,
+            servers: [],
+          },
+        ],
+        active_rule_ids: ['assigned'],
+        paused: false,
+        speed_limit_bps: 1_000_000,
+        disabled_servers: [],
+      }),
+    );
+    const { component, api, snack } = makeComponent({ put });
+    component.ngOnInit();
+
+    component.schedule.enabled = true;
+    component.addScheduleRule();
+    component.schedule.rules[0].name = '  Off peak  ';
+    component.schedule.rules[0].days = ['sat', 'sun'];
+    component.schedule.rules[0].start = '00:00';
+    component.schedule.rules[0].end = '24:00';
+    component.schedule.rules[0].action = 'speed_limit';
+    component.schedule.rules[0].speed_limit_bps = 1_000_000;
+    component.saveSchedule();
+
+    expect(api.put).toHaveBeenCalledWith('/config/schedule', {
+      enabled: true,
+      rules: [
+        {
+          id: '',
+          name: 'Off peak',
+          days: ['sat', 'sun'],
+          start: '00:00',
+          end: '24:00',
+          action: 'speed_limit',
+          speed_limit_bps: 1_000_000,
+          servers: [],
+        },
+      ],
+    });
+    expect(component.schedule.rules[0].id).toBe('assigned');
+    expect(component.scheduleActiveNow()).toBe(true);
+    expect(component.formatSpeedValue(component.schedule.speed_limit_bps)).toContain('/s');
+    expect(snack.open).toHaveBeenCalledWith('Schedule saved', 'Close', { duration: 2000 });
+    expect(component.hasUnsavedChanges()).toBe(false);
+  });
+
+  it('keeps schedule edits dirty when the save fails and blocks saving after a failed load', () => {
+    const { component, api } = makeComponent({
+      put: vi.fn(() => throwError(() => new Error('offline'))),
+    });
+    component.ngOnInit();
+    component.addScheduleRule();
+    component.schedule.rules[0].start = '23:00';
+    expect(component.unsavedSections()).toEqual(['schedule']);
+    component.saveSchedule();
+    expect(component.unsavedSections()).toEqual(['schedule']);
+
+    const { component: blocked, api: blockedApi } = makeComponent();
+    failGet(blockedApi, '/config/schedule');
+    blocked.ngOnInit();
+    expect(blocked.loadFailure('schedule')).toBe('Failed to load the schedule');
+    blocked.saveSchedule();
+    expect(blockedApi.put).not.toHaveBeenCalledWith('/config/schedule', expect.anything());
   });
 
   it('surfaces a failed status load as a toast', () => {
