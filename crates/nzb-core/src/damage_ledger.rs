@@ -413,6 +413,36 @@ impl Database {
         Ok(out)
     }
 
+    /// Drop ledger rows nothing can use any more, and return how many went.
+    ///
+    /// In this database a `scope_id` is a job id. A job in the queue keeps
+    /// every row. Otherwise rows go when the job is in neither the queue nor
+    /// history (removed, or aged out), and confirmed holes past `expires_at`
+    /// go even while the job is still in history, since a re-probe would
+    /// ignore them anyway. A retry runs under a new job id, so it never
+    /// depends on the rows of the history entry it came from.
+    pub fn ledger_prune(&self, now: DateTime<Utc>) -> Result<usize, NzbError> {
+        Ok(self.conn.execute(
+            "DELETE FROM damage_ledger
+             WHERE scope_id NOT IN (SELECT id FROM queue)
+               AND (scope_id NOT IN (SELECT id FROM history)
+                    OR (state = 'confirmed_missing'
+                        AND expires_at IS NOT NULL
+                        AND julianday(expires_at) <= julianday(?1)))",
+            params![now.to_rfc3339()],
+        )?)
+    }
+
+    /// Drop the rows of jobs that are in neither the queue nor history.
+    pub(crate) fn ledger_drop_orphans(&self) -> Result<usize, NzbError> {
+        Ok(self.conn.execute(
+            "DELETE FROM damage_ledger
+             WHERE scope_id NOT IN (SELECT id FROM queue)
+               AND scope_id NOT IN (SELECT id FROM history)",
+            [],
+        )?)
+    }
+
     fn ledger_get(&self, key: &ArticleKey) -> Result<Option<LedgerRecord>, NzbError> {
         let result = self.conn.query_row(
             "SELECT message_id, state, evidence, first_refused_at,
