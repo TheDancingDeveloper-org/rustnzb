@@ -12,7 +12,7 @@ function createComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {
     get: vi.fn(() => of([])), post: vi.fn(() => of({})), put: vi.fn(() => of({})), delete: vi.fn(() => of({})),
     ...overrides,
   };
-  const snack = { open: vi.fn() };
+  const snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
   const confirm = { confirm: vi.fn(() => of(true)) };
   return { component: new RssViewComponent(api as unknown as ApiService, snack as never, confirm as never), api, snack, confirm };
 }
@@ -60,7 +60,7 @@ describe('RssViewComponent', () => {
     component.showAddFeed();
     component.saveFeed();
     expect(api.post).not.toHaveBeenCalled();
-    expect(snack.open).toHaveBeenCalledWith('Name and URL are required', 'Close', { duration: 3000 });
+    expect(snack.info).toHaveBeenCalledWith('Name and URL are required');
 
     component.feedForm = { ...component.feedForm, name: 'daily', url: 'https://example.test' };
     component.saveFeed();

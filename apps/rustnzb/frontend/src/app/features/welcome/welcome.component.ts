@@ -3,7 +3,7 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import { ApiService } from '../../core/services/api.service';
-import { MatSnackBar } from '@angular/material/snack-bar';
+import { ToastService } from '../../core/services/toast.service';
 import { httpErrorDetail, showHttpError } from '../../core/http/http-error';
 
 type Step = 'landing' | 'connect' | 'preview' | 'applying';
@@ -418,7 +418,7 @@ export class WelcomeComponent implements OnInit {
   constructor(
     private api: ApiService,
     private router: Router,
-    private snack: MatSnackBar,
+    private toast: ToastService,
   ) {}
 
   ngOnInit(): void {
@@ -428,7 +428,7 @@ export class WelcomeComponent implements OnInit {
           this.router.navigate(['/downloads']);
         }
       },
-      error: (err) => showHttpError(this.snack, err, "Couldn't check setup status"),
+      error: (err) => showHttpError(this.toast, err, "Couldn't check setup status"),
     });
   }
 

@@ -656,6 +656,75 @@ impl Database {
             applied = 19;
         }
 
+        if version < 20 {
+            info!("Applying database migration v20: restorable history deletions");
+            // A history delete the UI offers to undo marks the row instead of
+            // dropping it: `trash = 1` hides it from every history read, and
+            // `trash_deadline` says when it stops being restorable. The row
+            // keeps its NZB and retry blobs, so an undo is lossless; a purge
+            // drops the row and its ledger entries exactly like a hard delete.
+            let has_history: bool = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'history'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if has_history {
+                add_column_if_missing(&tx, "history", "trash", "INTEGER NOT NULL DEFAULT 0")?;
+                add_column_if_missing(&tx, "history", "trash_deadline", "TEXT")?;
+                // `trash` is added after `nzb_data`, so reading it from
+                // `history` walks the blob's overflow chain (v18's reason for
+                // the narrow copy). List queries filter the copy instead.
+                let has_meta: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM sqlite_master
+                         WHERE type = 'table' AND name = 'history_list_meta'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+                if has_meta {
+                    add_column_if_missing(&tx, "history_list_meta", "trash", "INTEGER")?;
+                    tx.execute_batch(
+                        "DROP TRIGGER IF EXISTS history_list_meta_insert;
+                        DROP TRIGGER IF EXISTS history_list_meta_update;
+                        DROP TRIGGER IF EXISTS history_list_meta_delete;
+                        CREATE TRIGGER history_list_meta_insert AFTER INSERT ON history BEGIN
+                            INSERT OR REPLACE INTO history_list_meta (
+                                id, download_time_secs, server_stats, failure_code,
+                                post_processing, delete_archives, par2_volumes_fetched,
+                                par2_volumes_available, trash)
+                            VALUES (
+                                NEW.id, NEW.download_time_secs, NEW.server_stats,
+                                NEW.failure_code, NEW.post_processing, NEW.delete_archives,
+                                NEW.par2_volumes_fetched, NEW.par2_volumes_available,
+                                NEW.trash);
+                        END;
+                        CREATE TRIGGER history_list_meta_update AFTER UPDATE ON history BEGIN
+                            DELETE FROM history_list_meta WHERE id = OLD.id;
+                            INSERT OR REPLACE INTO history_list_meta (
+                                id, download_time_secs, server_stats, failure_code,
+                                post_processing, delete_archives, par2_volumes_fetched,
+                                par2_volumes_available, trash)
+                            VALUES (
+                                NEW.id, NEW.download_time_secs, NEW.server_stats,
+                                NEW.failure_code, NEW.post_processing, NEW.delete_archives,
+                                NEW.par2_volumes_fetched, NEW.par2_volumes_available,
+                                NEW.trash);
+                        END;
+                        CREATE TRIGGER history_list_meta_delete AFTER DELETE ON history BEGIN
+                            DELETE FROM history_list_meta WHERE id = OLD.id;
+                        END;
+                        UPDATE history_list_meta SET trash = COALESCE(
+                            (SELECT trash FROM history h WHERE h.id = history_list_meta.id), 0);",
+                    )?;
+                }
+            }
+            applied = 20;
+        }
+
         if applied > version {
             stamp_schema_version(&tx, applied)?;
             tx.commit()?;
@@ -1040,7 +1109,8 @@ impl Database {
              UNION ALL
              SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'history'
              FROM history
-             WHERE LOWER(name) = LOWER(?1) OR (?2 IS NOT NULL AND nzb_digest = ?2)",
+             WHERE trash = 0
+               AND (LOWER(name) = LOWER(?1) OR (?2 IS NOT NULL AND nzb_digest = ?2))",
         )?;
         let matches = stmt
             .query_map(params![name, digest], |row| {
@@ -1179,7 +1249,8 @@ impl Database {
     /// List history entries, most recent first.
     pub fn history_list(&self, limit: usize) -> Result<Vec<HistoryEntry>, NzbError> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {HISTORY_LIST_COLUMNS} FROM {HISTORY_LIST_FROM} ORDER BY h.completed_at DESC LIMIT ?1"
+            "SELECT {HISTORY_LIST_COLUMNS} FROM {HISTORY_LIST_FROM}
+             WHERE COALESCE(m.trash, 0) = 0 ORDER BY h.completed_at DESC LIMIT ?1"
         ))?;
         let entries = stmt
             .query_map(params![limit as i64], history_list_row)?
@@ -1198,7 +1269,10 @@ impl Database {
     ) -> Result<(Vec<HistoryEntry>, usize), NzbError> {
         let (where_sql, args) = filter.to_sql();
         let total: i64 = self.conn.query_row(
-            &format!("SELECT COUNT(*) FROM history{where_sql}"),
+            &format!(
+                "SELECT COUNT(*) FROM {HISTORY_LIST_FROM}{}",
+                with_condition(&where_sql, "COALESCE(m.trash, 0) = 0")
+            ),
             rusqlite::params_from_iter(args.iter()),
             |row| row.get(0),
         )?;
@@ -1219,9 +1293,11 @@ impl Database {
 
     /// Distinct non-empty history categories, sorted.
     pub fn history_categories(&self) -> Result<Vec<String>, NzbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT category FROM history WHERE category <> '' ORDER BY category",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT h.category FROM {HISTORY_LIST_FROM}
+             WHERE COALESCE(m.trash, 0) = 0 AND h.category <> ''
+             ORDER BY h.category"
+        ))?;
         let categories = stmt
             .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1237,9 +1313,10 @@ impl Database {
     ) -> Result<Vec<HistorySummary>, NzbError> {
         let (where_sql, args) = filter.to_sql();
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT id, name, category, status, total_bytes, downloaded_bytes, added_at,
-             completed_at, output_dir, error_message
-             FROM history{where_sql} ORDER BY completed_at DESC"
+            "SELECT h.id, h.name, h.category, h.status, h.total_bytes, h.downloaded_bytes,
+             h.added_at, h.completed_at, h.output_dir, h.error_message
+             FROM {HISTORY_LIST_FROM}{} ORDER BY h.completed_at DESC",
+            with_condition(&where_sql, "COALESCE(m.trash, 0) = 0")
         ))?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(args.iter()), |row| {
@@ -1264,7 +1341,8 @@ impl Database {
     /// are skipped. Like [`Database::history_list`], blobs are not loaded.
     pub fn history_get_listed(&self, ids: &[String]) -> Result<Vec<HistoryEntry>, NzbError> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {HISTORY_LIST_COLUMNS} FROM {HISTORY_LIST_FROM} WHERE h.id = ?1"
+            "SELECT {HISTORY_LIST_COLUMNS} FROM {HISTORY_LIST_FROM}
+             WHERE h.id = ?1 AND COALESCE(m.trash, 0) = 0"
         ))?;
         let mut entries = Vec::with_capacity(ids.len());
         for id in ids {
@@ -1310,18 +1388,163 @@ impl Database {
     /// `LIMIT 0` subquery would otherwise match nothing and delete every
     /// row (GH #136). Callers normalize zero away already; this is the last
     /// line of defence.
+    ///
+    /// Trashed entries are not part of the limit: they are already gone from
+    /// the user's view, and retention must not silently consume an undo
+    /// window that the purge deadline owns.
     pub fn history_enforce_retention(&self, max_entries: usize) -> Result<(), NzbError> {
         if max_entries == 0 {
             return Ok(());
         }
         self.conn.execute(
-            "DELETE FROM history WHERE id NOT IN (
-                SELECT id FROM history ORDER BY completed_at DESC LIMIT ?1
+            "DELETE FROM history WHERE trash = 0 AND id NOT IN (
+                SELECT id FROM history WHERE trash = 0
+                ORDER BY completed_at DESC LIMIT ?1
             )",
             params![max_entries as i64],
         )?;
         self.ledger_drop_orphans()?;
         Ok(())
+    }
+
+    /// Move history rows into the undo window instead of deleting them.
+    ///
+    /// Each row keeps its NZB and retry blobs, so [`Self::history_restore`] is
+    /// lossless. Returns the summaries of the rows actually trashed, in the
+    /// order given; an id that is unknown or already trashed is skipped, since
+    /// the caller reports that as a per-id failure.
+    pub fn history_trash(
+        &self,
+        ids: &[String],
+        deadline: chrono::DateTime<Utc>,
+    ) -> Result<Vec<HistorySummary>, NzbError> {
+        let mut trashed = Vec::with_capacity(ids.len());
+        let tx = self.conn.unchecked_transaction()?;
+        for id in ids {
+            let changed = tx.execute(
+                "UPDATE history SET trash = 1, trash_deadline = ?2
+                 WHERE id = ?1 AND trash = 0",
+                params![id, deadline.to_rfc3339()],
+            )?;
+            if changed == 0 {
+                continue;
+            }
+            if let Some(summary) = history_summary_by_id(&tx, id)? {
+                trashed.push(summary);
+            }
+        }
+        tx.commit()?;
+        Ok(trashed)
+    }
+
+    /// Bring trashed rows back before their deadline. Returns the ids that
+    /// were restored, in the order given; an unknown id, or one whose window
+    /// has closed, is skipped.
+    pub fn history_restore(
+        &self,
+        ids: &[String],
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<String>, NzbError> {
+        let mut restored = Vec::with_capacity(ids.len());
+        let tx = self.conn.unchecked_transaction()?;
+        for id in ids {
+            let changed = tx.execute(
+                "UPDATE history SET trash = 0, trash_deadline = NULL
+                 WHERE id = ?1 AND trash = 1
+                   AND (trash_deadline IS NULL OR trash_deadline >= ?2)",
+                params![id, now.to_rfc3339()],
+            )?;
+            if changed > 0 {
+                restored.push(id.clone());
+            }
+        }
+        tx.commit()?;
+        Ok(restored)
+    }
+
+    /// Delete every trashed row whose deadline has passed, and the ledger rows
+    /// of those jobs. Returns the summaries that were purged so the caller can
+    /// reclaim their retained work directories.
+    pub fn history_purge_expired(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<HistorySummary>, NzbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut purged = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, name, category, status, total_bytes, downloaded_bytes, added_at,
+                 completed_at, output_dir, error_message
+                 FROM history
+                 WHERE trash = 1 AND (trash_deadline IS NULL OR trash_deadline < ?1)",
+            )?;
+            let rows = stmt.query_map(params![now.to_rfc3339()], |row| {
+                Ok(HistorySummary {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    category: row.get(2)?,
+                    status: parse_status(&row.get::<_, String>(3)?),
+                    total_bytes: row.get::<_, i64>(4)? as u64,
+                    downloaded_bytes: row.get::<_, i64>(5)? as u64,
+                    added_at: parse_datetime(&row.get::<_, String>(6)?),
+                    completed_at: parse_datetime(&row.get::<_, String>(7)?),
+                    output_dir: row.get::<_, String>(8)?.into(),
+                    error_message: row.get(9)?,
+                })
+            })?;
+            for row in rows {
+                purged.push(row?);
+            }
+        }
+        tx.execute(
+            "DELETE FROM history
+             WHERE trash = 1 AND (trash_deadline IS NULL OR trash_deadline < ?1)",
+            params![now.to_rfc3339()],
+        )?;
+        tx.commit()?;
+        self.ledger_drop_orphans()?;
+        Ok(purged)
+    }
+
+    /// Every trashed row, regardless of deadline. Used to keep a trashed
+    /// row's retained work directories out of the orphan sweep while its
+    /// undo window is open.
+    pub fn history_trashed_summaries(&self) -> Result<Vec<HistorySummary>, NzbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, category, status, total_bytes, downloaded_bytes, added_at,
+             completed_at, output_dir, error_message
+             FROM history WHERE trash = 1",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(HistorySummary {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    category: row.get(2)?,
+                    status: parse_status(&row.get::<_, String>(3)?),
+                    total_bytes: row.get::<_, i64>(4)? as u64,
+                    downloaded_bytes: row.get::<_, i64>(5)? as u64,
+                    added_at: parse_datetime(&row.get::<_, String>(6)?),
+                    completed_at: parse_datetime(&row.get::<_, String>(7)?),
+                    output_dir: row.get::<_, String>(8)?.into(),
+                    error_message: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Ids of every trashed row, regardless of deadline. Used to keep their
+    /// retained work directories out of the orphan sweep while an undo is
+    /// still possible.
+    pub fn history_trashed_ids(&self) -> Result<Vec<String>, NzbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM history WHERE trash = 1")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
     }
 
     /// Get a single history entry by ID.
@@ -1331,7 +1554,8 @@ impl Database {
              h.added_at, h.completed_at, m.download_time_secs, h.output_dir, h.stages,
              h.error_message, m.server_stats, m.failure_code, m.post_processing, m.delete_archives,
              m.par2_volumes_fetched, m.par2_volumes_available
-             FROM history h LEFT JOIN history_list_meta m ON m.id = h.id WHERE h.id = ?1",
+             FROM history h LEFT JOIN history_list_meta m ON m.id = h.id
+             WHERE h.id = ?1 AND COALESCE(m.trash, 0) = 0",
         )?;
 
         let result = stmt.query_row(params![id], |row| {
@@ -1415,9 +1639,11 @@ impl Database {
 
     /// Count history entries.
     pub fn history_count(&self) -> Result<usize, NzbError> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
+        let count: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM {HISTORY_LIST_FROM} WHERE COALESCE(m.trash, 0) = 0"),
+            [],
+            |row| row.get(0),
+        )?;
         Ok(count as usize)
     }
 
@@ -1727,13 +1953,49 @@ const HISTORY_LIST_COLUMNS: &str = "h.id, h.name, h.category, h.status, h.total_
 /// Source of [`HISTORY_LIST_COLUMNS`].
 const HISTORY_LIST_FROM: &str = "history h LEFT JOIN history_list_meta m ON m.id = h.id";
 
+/// Append `condition` to a filter's ` WHERE ...` clause (or start one).
+fn with_condition(where_sql: &str, condition: &str) -> String {
+    match where_sql.strip_prefix(" WHERE ") {
+        Some(rest) => format!(" WHERE {condition} AND {rest}"),
+        None => format!(" WHERE {condition}"),
+    }
+}
+
 fn history_page_sql(where_sql: &str, arg_count: usize) -> String {
+    // `trash = 0` is part of the page, not the caller's filter, so a paged
+    // request can never see a row that is inside its undo window.
     format!(
-        "SELECT {HISTORY_LIST_COLUMNS} FROM {HISTORY_LIST_FROM}{where_sql}
+        "SELECT {HISTORY_LIST_COLUMNS} FROM {HISTORY_LIST_FROM}{}
          ORDER BY h.completed_at DESC LIMIT ?{} OFFSET ?{}",
+        with_condition(where_sql, "COALESCE(m.trash, 0) = 0"),
         arg_count + 1,
         arg_count + 2
     )
+}
+
+/// One [`HistorySummary`] by id, read inside an open transaction.
+fn history_summary_by_id(conn: &Connection, id: &str) -> Result<Option<HistorySummary>, NzbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, category, status, total_bytes, downloaded_bytes, added_at,
+         completed_at, output_dir, error_message
+         FROM history WHERE id = ?1",
+    )?;
+    Ok(stmt
+        .query_row(params![id], |row| {
+            Ok(HistorySummary {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                category: row.get(2)?,
+                status: parse_status(&row.get::<_, String>(3)?),
+                total_bytes: row.get::<_, i64>(4)? as u64,
+                downloaded_bytes: row.get::<_, i64>(5)? as u64,
+                added_at: parse_datetime(&row.get::<_, String>(6)?),
+                completed_at: parse_datetime(&row.get::<_, String>(7)?),
+                output_dir: row.get::<_, String>(8)?.into(),
+                error_message: row.get(9)?,
+            })
+        })
+        .optional()?)
 }
 
 fn history_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
@@ -2639,6 +2901,161 @@ mod tests {
         );
     }
 
+    /// A trashed row disappears from every history read, keeps its blobs for
+    /// the undo, and comes back unchanged when it is restored.
+    #[test]
+    fn history_trash_hides_the_row_and_restore_brings_it_back() {
+        let db = Database::open_memory().unwrap();
+        let mut entry = make_history("undo-1", "Undo.Me");
+        entry.nzb_data = Some(b"<nzb/>".to_vec());
+        entry.retry_data = Some(b"retry".to_vec());
+        db.history_insert(&entry).unwrap();
+        db.history_insert(&make_history("other", "Other")).unwrap();
+
+        let now = Utc::now();
+        let trashed = db
+            .history_trash(
+                &["undo-1".into(), "missing".into()],
+                now + chrono::Duration::seconds(10),
+            )
+            .unwrap();
+        assert_eq!(trashed.len(), 1, "only the existing row is reported");
+        assert_eq!(trashed[0].id, "undo-1");
+        assert_eq!(db.history_count().unwrap(), 1);
+
+        assert!(db.history_get("undo-1").unwrap().is_none());
+        assert!(
+            db.history_get_listed(&["undo-1".into()])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.history_list(10)
+                .unwrap()
+                .iter()
+                .all(|e| e.id != "undo-1")
+        );
+        let (page, total) = db.history_page(&HistoryFilter::default(), 0, 50).unwrap();
+        assert_eq!(total, 1);
+        assert!(page.iter().all(|e| e.id != "undo-1"));
+        assert!(
+            !db.history_categories().unwrap().is_empty(),
+            "another row still supplies the category"
+        );
+        assert!(
+            db.history_summaries(&HistoryFilter::default())
+                .unwrap()
+                .iter()
+                .all(|e| e.id != "undo-1")
+        );
+        assert!(
+            db.find_duplicate_candidates("Undo.Me", None)
+                .unwrap()
+                .is_empty(),
+            "a trashed row must not block a re-add"
+        );
+
+        // The blobs survive the trash, which is what makes undo lossless.
+        assert_eq!(
+            db.history_get_nzb_data("undo-1").unwrap().as_deref(),
+            Some(&b"<nzb/>"[..])
+        );
+        assert_eq!(
+            db.history_get_retry_data("undo-1").unwrap().as_deref(),
+            Some(&b"retry"[..])
+        );
+        assert_eq!(db.history_trashed_ids().unwrap(), vec!["undo-1"]);
+
+        let restored = db
+            .history_restore(&["undo-1".into(), "missing".into()], now)
+            .unwrap();
+        assert_eq!(restored, vec!["undo-1"]);
+        assert_eq!(db.history_count().unwrap(), 2);
+        let got = db.history_get("undo-1").unwrap().unwrap();
+        assert_eq!(got.name, "Undo.Me");
+        assert_eq!(
+            db.find_duplicate_candidates("Undo.Me", None).unwrap().len(),
+            1
+        );
+        assert!(db.history_trashed_ids().unwrap().is_empty());
+    }
+
+    /// The deadline is the whole contract: a restore is accepted up to it and
+    /// refused after it, and only a purge removes the expired row.
+    #[test]
+    fn history_restore_is_refused_after_the_deadline_until_a_purge() {
+        let db = Database::open_memory().unwrap();
+        db.history_insert(&make_history("expiring", "Expiring"))
+            .unwrap();
+        let trashed_at = Utc::now();
+        let deadline = trashed_at + chrono::Duration::seconds(10);
+        db.history_trash(&["expiring".into()], deadline).unwrap();
+
+        let after = deadline + chrono::Duration::seconds(1);
+        assert!(
+            db.history_restore(&["expiring".into()], after)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.history_count().unwrap(), 0, "still hidden from reads");
+
+        // Not yet expired, and not purged by a sweep that runs before the
+        // deadline, so the row is still physically there.
+        assert!(db.history_purge_expired(trashed_at).unwrap().is_empty());
+        assert_eq!(db.history_trashed_ids().unwrap(), vec!["expiring"]);
+
+        let purged = db.history_purge_expired(after).unwrap();
+        assert_eq!(purged.len(), 1);
+        assert_eq!(purged[0].id, "expiring");
+        assert!(db.history_get_nzb_data("expiring").unwrap().is_none());
+        assert!(db.history_trashed_ids().unwrap().is_empty());
+    }
+
+    /// Expired rows are purged even when the deadline is already in the past
+    /// when the sweep runs, and the job's ledger rows go with them.
+    #[test]
+    fn history_purge_removes_the_row_and_its_ledger_entries() {
+        let db = Database::open_memory().unwrap();
+        db.history_insert(&make_history("trash-ledger", "Ledger"))
+            .unwrap();
+        note_present(&db, "trash-ledger", 0);
+        db.history_trash(
+            &["trash-ledger".into()],
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+        assert_eq!(db.history_purge_expired(Utc::now()).unwrap().len(), 1);
+        assert_eq!(ledger_rows(&db, "trash-ledger"), 0);
+    }
+
+    /// Retention counts only visible rows: a trashed row must not consume a
+    /// slot, and must not be deleted by the retention pass either.
+    #[test]
+    fn history_enforce_retention_ignores_trashed_rows() {
+        let db = Database::open_memory().unwrap();
+        for i in 0..3 {
+            db.history_insert(&make_history(&format!("keep-{i}"), &format!("Keep {i}")))
+                .unwrap();
+        }
+        db.history_insert(&make_history("trashed", "Trashed"))
+            .unwrap();
+        let future = Utc::now() + chrono::Duration::seconds(10);
+        db.history_trash(&["trashed".into()], future).unwrap();
+
+        db.history_enforce_retention(3).unwrap();
+        assert_eq!(db.history_count().unwrap(), 3);
+        assert_eq!(
+            db.history_trashed_ids().unwrap(),
+            vec!["trashed"],
+            "retention must leave the undo window to the purge deadline"
+        );
+
+        // Restoring after a retention pass still works while the window is open.
+        db.history_restore(&["trashed".into()], Utc::now()).unwrap();
+        assert_eq!(db.history_count().unwrap(), 4);
+    }
+
     /// Applying the schema is one transaction, not one per migration.
     ///
     /// Each migration used to commit separately, and every commit is an fsync.
@@ -2658,7 +3075,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert!(version >= 19, "schema should reach v19, got {version}");
+        assert!(version >= 20, "schema should reach v20, got {version}");
 
         // Every migration's objects are present, which is only true if the
         // single batch ran to the end before stamping the version.

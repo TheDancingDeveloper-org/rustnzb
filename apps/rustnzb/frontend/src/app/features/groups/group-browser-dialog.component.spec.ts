@@ -2,7 +2,7 @@ import '@angular/compiler';
 
 import { TestBed } from '@angular/core/testing';
 import { MatDialogRef } from '@angular/material/dialog';
-import { MatSnackBar } from '@angular/material/snack-bar';
+import { ToastService } from '../../core/services/toast.service';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { of, throwError } from 'rxjs';
 
@@ -27,7 +27,13 @@ describe('GroupBrowserDialogComponent', () => {
     subscribe: ReturnType<typeof vi.fn>;
     unsubscribe: ReturnType<typeof vi.fn>;
   };
-  let snack: { open: ReturnType<typeof vi.fn> };
+  let snack: {
+    open: ReturnType<typeof vi.fn>;
+    success: ReturnType<typeof vi.fn>;
+    info: ReturnType<typeof vi.fn>;
+    error: ReturnType<typeof vi.fn>;
+    undo: ReturnType<typeof vi.fn>;
+  };
   let dialogRef: { close: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
@@ -37,11 +43,11 @@ describe('GroupBrowserDialogComponent', () => {
       subscribe: vi.fn(() => of({})),
       unsubscribe: vi.fn(() => of({})),
     };
-    snack = { open: vi.fn() };
+    snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
     dialogRef = { close: vi.fn() };
-    // The component imports MatSnackBarModule, which supplies its own MatSnackBar,
-    // so overrideProvider is needed to replace it (a plain provider is shadowed).
-    TestBed.overrideProvider(MatSnackBar, { useValue: snack });
+    // ToastService is providedIn: 'root', so overrideProvider is needed to
+    // replace it (a plain provider is shadowed).
+    TestBed.overrideProvider(ToastService, { useValue: snack });
     TestBed.configureTestingModule({
       imports: [GroupBrowserDialogComponent],
       providers: [
@@ -99,7 +105,7 @@ describe('GroupBrowserDialogComponent', () => {
     component.refresh();
 
     expect(groupService.refresh).toHaveBeenCalledOnce();
-    expect(snack.open).toHaveBeenCalledWith('Refreshed 2 groups', 'Close', { duration: 3000 });
+    expect(snack.info).toHaveBeenCalledWith('Refreshed 2 groups');
     expect(groupService.list).toHaveBeenCalledOnce();
     expect(component.refreshing()).toBe(false);
   });
@@ -125,9 +131,7 @@ describe('GroupBrowserDialogComponent', () => {
     expect(groupService.subscribe).toHaveBeenCalledWith(1);
     expect(groupService.unsubscribe).not.toHaveBeenCalled();
     expect(row.subscribed).toBe(true);
-    expect(snack.open).toHaveBeenCalledWith('Subscribed to alt.test.1', 'Close', {
-      duration: 2000,
-    });
+    expect(snack.success).toHaveBeenCalledWith('Subscribed to alt.test.1');
     expect(component.subPendingIds().has(1)).toBe(false);
   });
 
@@ -140,9 +144,7 @@ describe('GroupBrowserDialogComponent', () => {
 
     expect(groupService.unsubscribe).toHaveBeenCalledWith(3);
     expect(row.subscribed).toBe(false);
-    expect(snack.open).toHaveBeenCalledWith('Unsubscribed from alt.test.3', 'Close', {
-      duration: 2000,
-    });
+    expect(snack.success).toHaveBeenCalledWith('Unsubscribed from alt.test.3');
   });
 
   it('keeps the star unchanged and clears the pending flag when a toggle fails', () => {

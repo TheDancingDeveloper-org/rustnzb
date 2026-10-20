@@ -2,7 +2,7 @@ import { Component, HostListener, OnInit, signal, computed } from '@angular/core
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { RouterModule } from '@angular/router';
-import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
+import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { ApiService } from '../../core/services/api.service';
 import { formatBytes } from '../../core/format';
 import { StatusResponse } from '../../core/models/queue.model';
@@ -11,6 +11,7 @@ import { IconComponent } from '../../shared/icon.component';
 import { AppTheme, ThemeService } from '../../core/services/theme.service';
 import { BrowserNotificationsService } from '../../core/services/browser-notifications.service';
 import { httpErrorMessage, showHttpError } from '../../core/http/http-error';
+import { ToastService } from '../../core/services/toast.service';
 import { HasUnsavedChanges } from '../../core/guards/unsaved-changes.guard';
 
 interface ServerConfig {
@@ -1619,7 +1620,7 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
 
   constructor(
     private api: ApiService,
-    private snack: MatSnackBar,
+    private toast: ToastService,
     private confirmSvc: ConfirmService,
     public readonly theme: ThemeService,
     public readonly notifications: BrowserNotificationsService,
@@ -1687,9 +1688,9 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     this.api.put(path, body).subscribe({
       next: () => {
         this.baselines[key] = sent;
-        this.snack.open(saved, 'Close', { duration: 2000 });
+        this.toast.success(saved);
       },
-      error: (err) => showHttpError(this.snack, err, fallback),
+      error: (err) => showHttpError(this.toast, err, fallback),
     });
   }
 
@@ -1716,14 +1717,14 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
         this.status.set(s);
         if (s.webdav_available) this.loadDavConfig();
       },
-      error: (err) => showHttpError(this.snack, err, 'Failed to load server status'),
+      error: (err) => showHttpError(this.toast, err, 'Failed to load server status'),
     });
   }
 
   loadDirs(): void {
     this.api.get<{ general: GeneralDirs }>('/config').subscribe({
       next: (cfg) => this.dirs.set(cfg.general),
-      error: (err) => showHttpError(this.snack, err, 'Failed to load directory paths'),
+      error: (err) => showHttpError(this.toast, err, 'Failed to load directory paths'),
     });
   }
 
@@ -1743,7 +1744,7 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
         for (const s of r) map[s.server_id] = s;
         this.serverStats.set(map);
       },
-      error: (err) => showHttpError(this.snack, err, 'Failed to load server stats'),
+      error: (err) => showHttpError(this.toast, err, 'Failed to load server stats'),
     });
   }
 
@@ -1793,7 +1794,7 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     if (!this.editingServer || !this.canSave('servers')) return;
     const server = { ...this.editingServer };
     if (!server.host.trim()) {
-      this.snack.open('Host is required', 'Close', { duration: 3000 });
+      this.toast.info('Host is required');
       return;
     }
     if (!server.username) server.username = null;
@@ -1806,29 +1807,29 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     if (this.editingServerId) {
       this.api.put(`/config/servers/${this.editingServerId}`, server).subscribe({
         next: () => {
-          this.snack.open('Server updated', 'Close', { duration: 2000 });
+          this.toast.success('Server updated');
           this.cancelServerEdit();
           this.loadServers();
         },
-        error: (err) => showHttpError(this.snack, err, 'Failed to update server'),
+        error: (err) => showHttpError(this.toast, err, 'Failed to update server'),
       });
     } else {
       server.id = '';
       this.api.post('/config/servers', server).subscribe({
         next: () => {
-          this.snack.open('Server added', 'Close', { duration: 2000 });
+          this.toast.success('Server added');
           this.cancelServerEdit();
           this.loadServers();
         },
-        error: (err) => showHttpError(this.snack, err, 'Failed to add server'),
+        error: (err) => showHttpError(this.toast, err, 'Failed to add server'),
       });
     }
   }
 
   testServer(id: string): void {
     this.api.post<{ success: boolean; message: string }>(`/config/servers/${id}/test`).subscribe({
-      next: (r) => this.snack.open(r.message, 'Close', { duration: 3000 }),
-      error: (err) => showHttpError(this.snack, err, 'Test failed'),
+      next: (r) => this.toast.info(r.message),
+      error: (err) => showHttpError(this.toast, err, 'Test failed'),
     });
   }
 
@@ -1840,12 +1841,12 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     if (!body.username) body.username = null;
     if (this.editingServerId && !body.password) body.password = '********';
     else if (!body.password) body.password = null;
-    this.snack.open('Testing…', '', { duration: 1500 });
+    this.toast.open('Testing…', '', { duration: 1500 });
     this.api
       .post<{ success: boolean; message: string }>(`/config/servers/test-config`, body)
       .subscribe({
-        next: (r) => this.snack.open(r.message, 'Close', { duration: 4000 }),
-        error: (err) => showHttpError(this.snack, err, 'Test failed'),
+        next: (r) => this.toast.info(r.message, 4000),
+        error: (err) => showHttpError(this.toast, err, 'Test failed'),
       });
   }
 
@@ -1856,11 +1857,9 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     this.api.put(`/config/servers/${s.id}`, updated).subscribe({
       next: () => {
         this.loadServers();
-        this.snack.open(updated.enabled ? 'Server enabled' : 'Server disabled', 'Close', {
-          duration: 2000,
-        });
+        this.toast.success(updated.enabled ? 'Server enabled' : 'Server disabled');
       },
-      error: (err) => showHttpError(this.snack, err, 'Failed to update server'),
+      error: (err) => showHttpError(this.toast, err, 'Failed to update server'),
     });
   }
 
@@ -1877,9 +1876,9 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
         this.api.delete(`/config/servers/${id}`).subscribe({
           next: () => {
             this.loadServers();
-            this.snack.open('Server removed', 'Close', { duration: 2000 });
+            this.toast.success('Server removed');
           },
-          error: (err) => showHttpError(this.snack, err, 'Failed to delete server'),
+          error: (err) => showHttpError(this.toast, err, 'Failed to delete server'),
         });
       });
   }
@@ -1916,20 +1915,20 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
       const encoded = encodeURIComponent(this.editingCategoryOriginalName);
       this.api.put(`/config/categories/${encoded}`, cat).subscribe({
         next: () => {
-          this.snack.open('Category updated', 'Close', { duration: 2000 });
+          this.toast.success('Category updated');
           this.cancelCategoryEdit();
           this.loadCategories();
         },
-        error: (err) => showHttpError(this.snack, err, 'Failed to update category'),
+        error: (err) => showHttpError(this.toast, err, 'Failed to update category'),
       });
     } else {
       this.api.post('/config/categories', cat).subscribe({
         next: () => {
-          this.snack.open('Category added', 'Close', { duration: 2000 });
+          this.toast.success('Category added');
           this.cancelCategoryEdit();
           this.loadCategories();
         },
-        error: (err) => showHttpError(this.snack, err, 'Failed to add category'),
+        error: (err) => showHttpError(this.toast, err, 'Failed to add category'),
       });
     }
   }
@@ -1948,9 +1947,9 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
         this.api.delete(`/config/categories/${encoded}`).subscribe({
           next: () => {
             this.loadCategories();
-            this.snack.open('Category removed', 'Close', { duration: 2000 });
+            this.toast.success('Category removed');
           },
-          error: (err) => showHttpError(this.snack, err, 'Failed to delete category'),
+          error: (err) => showHttpError(this.toast, err, 'Failed to delete category'),
         });
       });
   }
@@ -1977,7 +1976,7 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     const on = await this.notifications.setEnabled(input.checked);
     if (input.checked && !on) {
       input.checked = false;
-      this.snack.open(
+      this.toast.open(
         this.notifications.supported
           ? 'Notifications are blocked. Allow them for this site in the browser settings.'
           : 'This browser does not support notifications.',
@@ -2059,9 +2058,9 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
           next: (response) => {
             this.sabApiKey = response.api_key;
             this.showSabApiKey = true;
-            this.snack.open(`SABnzbd API key ${action.toLowerCase()}d`, 'Close', { duration: 2500 });
+            this.toast.success(`SABnzbd API key ${action.toLowerCase()}d`, 2500);
           },
-          error: (err) => showHttpError(this.snack, err, `Failed to ${action.toLowerCase()} SABnzbd API key`),
+          error: (err) => showHttpError(this.toast, err, `Failed to ${action.toLowerCase()} SABnzbd API key`),
         });
       });
   }
@@ -2099,13 +2098,9 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
       .subscribe({
         next: (r) => {
           this.applyDebugLogging(r);
-          this.snack.open(
-            this.debugLogging ? 'Debug logging on' : 'Debug logging off',
-            'Close',
-            { duration: 2000 },
-          );
+          this.toast.success(this.debugLogging ? 'Debug logging on' : 'Debug logging off');
         },
-        error: (err) => showHttpError(this.snack, err, 'Failed to change debug logging'),
+        error: (err) => showHttpError(this.toast, err, 'Failed to change debug logging'),
       });
   }
 
@@ -2168,15 +2163,14 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     this.api.put('/config/dav', payload).subscribe({
       next: () => {
         this.baselines.dav = sent;
-        this.snack.open(
+        this.toast.success(
           restartRequired
             ? 'Media Library settings saved. Restart required.'
             : 'Media Library settings saved',
-          'Close',
-          { duration: 2500 },
+          2500,
         );
       },
-      error: (err) => showHttpError(this.snack, err, 'Failed to save Media Library settings'),
+      error: (err) => showHttpError(this.toast, err, 'Failed to save Media Library settings'),
     });
   }
 
@@ -2221,8 +2215,8 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
 
   copy(text: string): void {
     navigator.clipboard.writeText(text).then(
-      () => this.snack.open('Copied', 'Close', { duration: 1500 }),
-      () => this.snack.open('Copy failed', 'Close', { duration: 2000 }),
+      () => this.toast.success('Copied', 1500),
+      () => this.toast.error('Copy failed'),
     );
   }
 }

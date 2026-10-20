@@ -29,7 +29,7 @@ function makeComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {})
     delete: vi.fn(() => of({})),
     ...overrides,
   };
-  const snack = { open: vi.fn() };
+  const snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
   const confirm = { confirm: vi.fn(() => of(true)) };
   const theme = { set: vi.fn() };
   const notifications = { enabled: vi.fn(() => false), supported: true, permission: vi.fn(() => 'default'), setEnabled: vi.fn() };
@@ -62,7 +62,7 @@ describe('SettingsViewComponent', () => {
     component.addServer();
     component.saveServer();
     expect(api.post).not.toHaveBeenCalled();
-    expect(snack.open).toHaveBeenCalledWith('Host is required', 'Close', { duration: 3000 });
+    expect(snack.info).toHaveBeenCalledWith('Host is required');
 
     component.editingServer = { ...component.editingServer!, host: 'news.example', username: '', password: '' };
     component.saveServer();

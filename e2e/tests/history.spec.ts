@@ -159,6 +159,33 @@ test.describe('5. Download History', () => {
 
   // ── 5.5 Delete history entry ───────────────────────────────────────────────
 
+  test('5.5a deleting a history entry can be undone from the toast', async ({ page }) => {
+    await openAllHistory(page);
+
+    const name = 'Good.Podcast.EP100.mp3';
+    const row = page.locator('tr, .row', { hasText: name }).first();
+    await expect(row).toBeVisible();
+
+    await row.getByRole('button', { name: 'Delete' }).click();
+    await expect(page.locator('tr, .row', { hasText: name }).first()).not.toBeVisible({
+      timeout: 5000,
+    });
+
+    const snack = page.locator('.cdk-overlay-container .mdc-snackbar__label', {
+      hasText: `Deleted "${name}"`,
+    });
+    await expect(snack).toBeVisible();
+    await page.locator('.cdk-overlay-container .mdc-snackbar__action').click();
+
+    // The row is back, and the undo is reported as such.
+    await expect(page.locator('tr, .row', { hasText: name }).first()).toBeVisible({
+      timeout: 5000,
+    });
+    await expect(
+      page.locator('.cdk-overlay-container .mdc-snackbar__label', { hasText: 'Restored' }),
+    ).toBeVisible();
+  });
+
   test('5.5 deleting a history entry removes it from the list', async ({ page }) => {
     await openAllHistory(page);
 

@@ -2,13 +2,14 @@ import { Component, OnInit, OnDestroy, signal, computed } from '@angular/core';
 import { EMPTY, Observable, expand, map, reduce, timeout } from 'rxjs';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
+import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { ApiService, POLL_TIMEOUT_MS, pageHidden } from '../../core/services/api.service';
 import { HistoryEntry, StatusResponse } from '../../core/models/queue.model';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
 import { httpErrorMessage, showHttpError } from '../../core/http/http-error';
 import { AnnouncerService } from '../../core/services/announcer.service';
+import { ToastService } from '../../core/services/toast.service';
 
 type StatusFilter = 'all' | 'completed' | 'failed';
 type TimeFilter = '7d' | '30d' | 'all';
@@ -37,14 +38,45 @@ interface BulkFailure {
   error?: { status?: number; error_kind?: string; human_readable?: string };
 }
 
+/** One entry moved into the undo window by a trashed delete. */
+interface TrashedEntry {
+  id: string;
+  name?: string;
+  status?: string;
+}
+
+interface TrashResult {
+  status: boolean;
+  entries: TrashedEntry[];
+  purge_after: string;
+}
+
 interface BulkResult {
   status: boolean;
   succeeded: number;
   failed: number;
   failures?: BulkFailure[];
+  trashed?: TrashResult;
+}
+
+interface RestoreResult {
+  status: boolean;
+  restored: string[];
+  failures?: BulkFailure[];
 }
 
 const PAGE_SIZE = 50;
+
+/**
+ * Keep the Undo action on screen no longer than the server will honour it.
+ * A missing or unparseable deadline falls back to the toast's own window.
+ */
+export function undoDuration(purgeAfter: string | undefined, now = Date.now()): number | undefined {
+  if (!purgeAfter) return undefined;
+  const deadline = Date.parse(purgeAfter);
+  if (Number.isNaN(deadline)) return undefined;
+  return Math.max(1_000, deadline - now);
+}
 const EXPORT_PAGE_SIZE = 200;
 
 @Component({
@@ -420,7 +452,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
 
   constructor(
     private api: ApiService,
-    private snack: MatSnackBar,
+    private toast: ToastService,
     private confirmSvc: ConfirmService,
     private announcer: AnnouncerService,
   ) {}
@@ -429,7 +461,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
     this.load();
     this.api.get<StatusResponse>('/status').subscribe({
       next: s => this.webdavEnabled.set(!!s.webdav_enabled),
-      error: err => showHttpError(this.snack, err, 'Failed to load WebDAV status'),
+      error: err => showHttpError(this.toast, err, 'Failed to load WebDAV status'),
     });
     this.pollTimer = setInterval(() => this.poll(), 5000);
   }
@@ -550,7 +582,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
       },
       error: err => {
         this.detailLoading.set(false);
-        showHttpError(this.snack, err, 'Failed to load download details');
+        showHttpError(this.toast, err, 'Failed to load download details');
       },
     });
   }
@@ -665,18 +697,23 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
         const failed = result?.failed ?? 0;
         if (failed > 0) {
           const message = `Failed to ${verb} ${failed} of ${count} entr${count === 1 ? 'y' : 'ies'}`;
-          showHttpError(this.snack, this.bulkFailure(result), message);
+          showHttpError(this.toast, this.bulkFailure(result), message);
           this.announcer.announceError(httpErrorMessage(this.bulkFailure(result), message));
         } else {
           const done = this.bulkPast(verb, result?.succeeded ?? count);
-          this.snack.open(done, 'Close', { duration: 2000 });
-          this.announcer.announce(done);
+          const trashed = result?.trashed?.entries?.map((e) => e.id) ?? [];
+          if (trashed.length > 0) {
+            this.offerUndo(done, trashed, result?.trashed?.purge_after);
+          } else {
+            this.toast.success(done);
+            this.announcer.announce(done);
+          }
         }
         this.load();
       },
       error: (err) => {
         this.bulkBusy.set(false);
-        showHttpError(this.snack, err, `Failed to ${verb} history entries`);
+        showHttpError(this.toast, err, `Failed to ${verb} history entries`);
       },
     });
   }
@@ -708,23 +745,15 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
   bulkDelete(): void {
     const ids = Array.from(this.selectedIds());
     if (ids.length === 0 || this.bulkBusy()) return;
-    this.confirmSvc
-      .confirm({
-        title: `Delete ${ids.length} history entr${ids.length === 1 ? 'y' : 'ies'}?`,
-        message: 'This removes the history entries. Downloaded files are kept.',
-        confirmLabel: 'Delete',
-        danger: true,
-      })
-      .subscribe((ok) => {
-        if (!ok) return;
-        this.runBulk({ action: 'delete', ids }, 'delete', ids.length);
-      });
+    // Undo is the confirmation: the rows are hidden, not destroyed, until the
+    // window closes, so an accidental click costs one click to reverse.
+    this.runBulk({ action: 'delete', ids, trash: true }, 'delete', ids.length);
   }
 
   /**
    * "Clear failed/completed": every entry of that status matching the
-   * current filters (not just the page). The server reports how many it
-   * removed; the button label carries the count the stat cards show.
+   * current filters (not just the page). The action is undoable, but it spans
+   * rows the user cannot see, so it still asks first.
    */
   clearByStatus(status: 'completed' | 'failed'): void {
     if (this.clearingStatus() !== null) return;
@@ -734,14 +763,19 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
         title: `Clear ${count} ${status} entr${count === 1 ? 'y' : 'ies'}?`,
         message: `Every ${status} entry in the current time range${
           this.narrowingFilters() ? ' and filter' : ''
-        } is removed. Downloaded files are kept.`,
+        } is removed. Downloaded files are kept; you can undo this for a few seconds.`,
         confirmLabel: `Clear ${status}`,
         danger: true,
       })
       .subscribe((ok) => {
         if (!ok) return;
         this.clearingStatus.set(status);
-        const body: Record<string, unknown> = { action: 'delete', status, ids: [] };
+        const body: Record<string, unknown> = {
+          action: 'delete',
+          status,
+          ids: [],
+          trash: true,
+        };
         if (this.filterTime !== 'all') body['days'] = this.filterTime === '7d' ? 7 : 30;
         if (this.filterCategory) body['category'] = this.filterCategory;
         const search = this.nameFilter.trim();
@@ -751,13 +785,17 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
             this.clearingStatus.set(null);
             const removed = result?.succeeded ?? 0;
             const done = `Cleared ${removed} ${status} entr${removed === 1 ? 'y' : 'ies'}`;
-            this.snack.open(done, 'Close', { duration: 2000 });
-            this.announcer.announce(done);
+            const trashed = result?.trashed?.entries?.map((e) => e.id) ?? [];
+            if (trashed.length > 0) this.offerUndo(done, trashed, result?.trashed?.purge_after);
+            else {
+              this.toast.success(done);
+              this.announcer.announce(done);
+            }
             this.load();
           },
           error: (err) => {
             this.clearingStatus.set(null);
-            showHttpError(this.snack, err, `Failed to clear ${status} history`);
+            showHttpError(this.toast, err, `Failed to clear ${status} history`);
           },
         });
       });
@@ -767,23 +805,61 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
     this.api.post(`/history/${id}/retry`).subscribe({
       next: () => {
         this.load();
-        this.snack.open('Retrying…', 'Close', { duration: 2000 });
+        this.toast.success('Retrying…');
       },
-      error: (err) => showHttpError(this.snack, err, 'Failed to retry job'),
+      error: (err) => showHttpError(this.toast, err, 'Failed to retry job'),
     });
   }
 
   addToMedia(id: string): void {
     this.api.post(`/dav/add?id=${id}`).subscribe({
-      next: () => this.snack.open('Queued for Media Library', 'Close', { duration: 3000 }),
-      error: (err) => showHttpError(this.snack, err, 'Failed to add to Media Library'),
+      next: () => this.toast.success('Queued for Media Library', 3000),
+      error: (err) => showHttpError(this.toast, err, 'Failed to add to Media Library'),
     });
   }
 
+  /** Delete one row into the undo window, with a toast that can bring it back. */
   remove(id: string): void {
-    this.api.delete(`/history/${id}`).subscribe({
-      next: () => this.load(),
-      error: (err) => showHttpError(this.snack, err, 'Failed to delete history entry'),
+    const name = this.entries().find((e) => e.id === id)?.name ?? 'entry';
+    this.api.delete<TrashResult>(`/history/${id}`, { trash: 'true' }).subscribe({
+      next: (result) => {
+        if (this.selectedId() === id) this.closeDetails();
+        this.load();
+        this.offerUndo(`Deleted "${name}"`, [id], result?.purge_after);
+      },
+      error: (err) => showHttpError(this.toast, err, 'Failed to delete history entry'),
+    });
+  }
+
+  /**
+   * Show an undoable delete. Undo restores every id the server trashed; a
+   * partial restore (its window closed between delete and click) is reported
+   * rather than silently swallowed.
+   */
+  private offerUndo(message: string, ids: string[], purgeAfter?: string): void {
+    this.announcer.announce(`${message}. Undo available.`);
+    const duration = undoDuration(purgeAfter);
+    if (duration === undefined) this.toast.undo(message, () => this.restore(ids));
+    else this.toast.undo(message, () => this.restore(ids), { duration });
+  }
+
+  private restore(ids: string[]): void {
+    this.api.post<RestoreResult>('/history/restore', { ids }).subscribe({
+      next: (result) => {
+        this.load();
+        const restored = result?.restored?.length ?? 0;
+        const failed = result?.failures?.length ?? 0;
+        if (failed > 0) {
+          const message = `Restored ${restored}, ${failed} could no longer be undone`;
+          this.toast.error(message);
+          this.announcer.announceError(message);
+        } else {
+          const done = `Restored ${restored} entr${restored === 1 ? 'y' : 'ies'}`;
+          this.toast.success(done);
+          this.announcer.announce(done);
+        }
+      },
+      error: (err) => showHttpError(this.toast, err, 'Failed to undo history delete'),
     });
   }
 
@@ -800,16 +876,16 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
         this.api.delete('/history').subscribe({
           next: () => {
             this.load();
-            this.snack.open('History cleared', 'Close', { duration: 2000 });
+            this.toast.success('History cleared');
           },
-          error: (err) => showHttpError(this.snack, err, 'Failed to clear history'),
+          error: (err) => showHttpError(this.toast, err, 'Failed to clear history'),
         });
       });
   }
 
   openOutput(e: HistoryEntry): void {
     // No server endpoint for "reveal in file manager"; surface the path.
-    this.snack.open(e.output_dir || '(no output path recorded)', 'Close', { duration: 5000 });
+    this.toast.info(e.output_dir || '(no output path recorded)', 5000);
   }
 
   /** Every entry matching the current filters, fetched page by page. */
@@ -838,7 +914,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
       },
       error: () => {
         this.exporting.set(false);
-        this.snack.open('Failed to export history', 'Close', { duration: 3000 });
+        this.toast.error('Failed to export history', 3000);
       },
     });
   }

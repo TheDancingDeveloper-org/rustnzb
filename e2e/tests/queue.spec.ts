@@ -132,15 +132,19 @@ test('4.7 selecting jobs shows bulk selection count', async ({ page }) => {
   const rows = page.locator('.data tbody tr');
   await rows.nth(0).locator('input[type="checkbox"]').check();
 
-  // Bulk action UI or selection count must appear
-  const selectionCount = page.getByText(/1 selected/i).or(page.locator('.bulk-actions'));
+  // Bulk action UI or selection count must appear. Scope to the bulk bar: the
+  // count is also mirrored into the always-mounted sr-only live region, which
+  // makes a page-wide text match ambiguous.
+  const bulkCount = page.locator('.filter-bar .bulk-count');
+  const selectionCount = bulkCount.or(page.locator('.bulk-actions'));
   await expect(selectionCount.first()).toBeVisible();
+  await expect(bulkCount).toHaveText(/1 selected/i);
 
   // Check the second row too
   await rows.nth(1).locator('input[type="checkbox"]').check();
 
   // Count shows 2
-  await expect(page.getByText(/2 selected/i)).toBeVisible();
+  await expect(bulkCount).toHaveText(/2 selected/i);
 });
 
 // ── 4.1 Queue page loads with stat cards ─────────────────────────────────────

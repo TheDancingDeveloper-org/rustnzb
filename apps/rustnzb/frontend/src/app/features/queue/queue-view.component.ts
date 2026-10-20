@@ -3,7 +3,7 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router, RouterModule } from '@angular/router';
 import { HttpClient } from '@angular/common/http';
-import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
+import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { Observable, Subscription, catchError, finalize, forkJoin, map, of, timeout } from 'rxjs';
 import { ApiService, POLL_TIMEOUT_MS, pageHidden } from '../../core/services/api.service';
 import { AnnouncerService } from '../../core/services/announcer.service';
@@ -15,6 +15,7 @@ import { HistoryViewComponent } from '../history/history-view.component';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
 import { httpErrorMessage, isAuthHandledError, showHttpError } from '../../core/http/http-error';
+import { ToastService } from '../../core/services/toast.service';
 
 interface CategoryConfig {
   name: string;
@@ -1202,7 +1203,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   constructor(
     private api: ApiService,
     private http: HttpClient,
-    private snackBar: MatSnackBar,
+    private toast: ToastService,
     private addNzbService: AddNzbService,
     private route: ActivatedRoute,
     private router: Router,
@@ -1309,7 +1310,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   loadCategories(): void {
     this.api.get<CategoryConfig[]>('/config/categories').subscribe({
       next: (cats) => this.categories.set(cats),
-      error: (err) => showHttpError(this.snackBar, err, 'Failed to load categories'),
+      error: (err) => showHttpError(this.toast, err, 'Failed to load categories'),
     });
   }
 
@@ -1319,7 +1320,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
         this.servers.set(srvs);
         this.serversLoaded.set(true);
       },
-      error: (err) => showHttpError(this.snackBar, err, 'Failed to load servers'),
+      error: (err) => showHttpError(this.toast, err, 'Failed to load servers'),
     });
   }
 
@@ -1533,7 +1534,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       next: () => {
         const count = this.selectedFiles.length;
         const message = `${count} NZB${count > 1 ? 's' : ''} added to queue`;
-        this.snackBar.open(message, 'Close', { duration: 3000 });
+        this.toast.info(message, 3000);
         this.announcer.announce(message);
         this.selectedFiles = [];
         this.uploading = false;
@@ -1543,7 +1544,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       error: (err) => {
         this.uploading = false;
         const fallback = err?.status === 413 ? 'Upload too large' : 'Upload failed';
-        showHttpError(this.snackBar, err, fallback);
+        showHttpError(this.toast, err, fallback);
         this.announcer.announceError(httpErrorMessage(err, fallback));
       },
     });
@@ -1557,7 +1558,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     if (this.addPriority !== 1) body.priority = this.addPriority;
     this.api.post('/queue/add-url', body).subscribe({
       next: () => {
-        this.snackBar.open('NZB added from URL', 'Close', { duration: 3000 });
+        this.toast.info('NZB added from URL', 3000);
         this.announcer.announce('NZB added from URL');
         this.addUrl = '';
         this.uploading = false;
@@ -1566,7 +1567,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       },
       error: (err) => {
         this.uploading = false;
-        showHttpError(this.snackBar, err, 'Failed to add NZB from URL');
+        showHttpError(this.toast, err, 'Failed to add NZB from URL');
         this.announcer.announceError(httpErrorMessage(err, 'Failed to add NZB from URL'));
       },
     });
@@ -1601,13 +1602,13 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       .subscribe({
         next: () => {
           if (successMessage) {
-            this.snackBar.open(successMessage, 'Close', { duration: 2500 });
+            this.toast.success(successMessage, 2500);
             this.announcer.announce(successMessage);
           }
           this.loadQueue();
         },
         error: (err) => {
-          showHttpError(this.snackBar, err, failureMessage);
+          showHttpError(this.toast, err, failureMessage);
           this.announcer.announceError(httpErrorMessage(err, failureMessage));
           this.loadQueue();
         },
@@ -1640,7 +1641,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     this.api.put(`/queue/${job.id}/priority`, { priority }).subscribe({
       next: () => this.loadQueue(),
       error: (err) => {
-        showHttpError(this.snackBar, err, 'Failed to change priority');
+        showHttpError(this.toast, err, 'Failed to change priority');
         this.loadQueue();
       },
     });
@@ -1734,7 +1735,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       error: (err) => {
         this.reorderPending.set(false);
         this.jobs.set(previousJobs);
-        showHttpError(this.snackBar, err, 'Unable to reorder queue');
+        showHttpError(this.toast, err, 'Unable to reorder queue');
       },
     });
   }
@@ -1821,7 +1822,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       const failures = results.filter((r) => r !== null && !isAuthHandledError(r));
       if (failures.length > 0) {
         const message = `Failed to ${verb} ${failures.length} of ${ids.length} job(s)`;
-        showHttpError(this.snackBar, failures[0], message);
+        showHttpError(this.toast, failures[0], message);
         this.announcer.announceError(httpErrorMessage(failures[0], message));
       } else {
         const past = verb === 'remove' ? 'Removed' : verb === 'resume' ? 'Started' : 'Paused';

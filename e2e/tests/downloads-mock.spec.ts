@@ -18,9 +18,13 @@ test.describe("Mock-backed downloads", () => {
       .getByRole("button", { name: "Upload", exact: true })
       .click();
 
-    await expect(page.getByText(/added to queue/i)).toBeVisible({
-      timeout: 10000,
-    });
+    // Scope to the snackbar: the message is mirrored into the sr-only live
+    // region, so a page-wide text match is ambiguous.
+    await expect(
+      page.locator('.cdk-overlay-container .mdc-snackbar__label', {
+        hasText: /added to queue/i,
+      }),
+    ).toBeVisible({ timeout: 10000 });
 
     const history = page.locator(".history-toggle");
     await expect(history).toHaveAttribute("aria-expanded", "true");

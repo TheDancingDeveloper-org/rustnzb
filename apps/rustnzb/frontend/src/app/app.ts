@@ -31,8 +31,8 @@ import { BrowserNotificationsService } from './core/services/browser-notificatio
 import { ThemeService } from './core/services/theme.service';
 import { AnnouncerService } from './core/services/announcer.service';
 import { IconComponent } from './shared/icon.component';
-import { MatSnackBar } from '@angular/material/snack-bar';
 import { showHttpError } from './core/http/http-error';
+import { ToastService } from './core/services/toast.service';
 
 export function isDemoPath(pathname: string): boolean {
   return pathname === '/demo' || pathname.startsWith('/demo/');
@@ -685,7 +685,7 @@ export class App implements OnInit, OnDestroy {
     public widthMode: WidthModeService,
     readonly theme: ThemeService,
     pauseState: PauseStateService,
-    private snack: MatSnackBar,
+    private toast: ToastService,
     private notifications: BrowserNotificationsService,
     readonly announcer: AnnouncerService,
   ) {
@@ -801,12 +801,12 @@ export class App implements OnInit, OnDestroy {
       next: () => {
         this.speedLimit.set(bps);
         this.speedMenuOpen = false;
-        this.snack.open(bps > 0 ? `Speed limit set to ${formatSpeed(bps)}` : 'Speed limit off', 'Close', {
-          duration: 2000,
-        });
+        this.toast.success(
+          bps > 0 ? `Speed limit set to ${formatSpeed(bps)}` : 'Speed limit off',
+        );
         this.pollStatus();
       },
-      error: (err) => showHttpError(this.snack, err, 'Failed to set speed limit'),
+      error: (err) => showHttpError(this.toast, err, 'Failed to set speed limit'),
     });
   }
 
@@ -864,9 +864,7 @@ export class App implements OnInit, OnDestroy {
     e.preventDefault();
     const files = nzbUploadFiles(e.dataTransfer?.files);
     if (files.length === 0) {
-      this.snack.open('Only .nzb (or .zip/.rar/.7z/.gz) files can be added', 'Close', {
-        duration: 3000,
-      });
+      this.toast.info('Only .nzb (or .zip/.rar/.7z/.gz) files can be added');
       this.announcer.announceError('Only .nzb (or .zip/.rar/.7z/.gz) files can be added');
       return;
     }
@@ -910,7 +908,7 @@ export class App implements OnInit, OnDestroy {
         this.paused.set(wasPaused);
         this.pollStatus();
         showHttpError(
-          this.snack,
+          this.toast,
           err,
           wasPaused ? 'Failed to resume downloads' : 'Failed to pause downloads',
         );
@@ -928,7 +926,7 @@ export class App implements OnInit, OnDestroy {
   pauseFor(secs: number): void {
     this.api.post(`/queue/pause-for?duration_secs=${secs}`).subscribe({
       next: () => this.pollStatus(),
-      error: (err) => showHttpError(this.snack, err, 'Failed to pause downloads'),
+      error: (err) => showHttpError(this.toast, err, 'Failed to pause downloads'),
     });
     this.pauseMenuOpen = false;
   }

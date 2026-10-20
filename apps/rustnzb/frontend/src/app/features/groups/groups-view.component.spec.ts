@@ -27,7 +27,7 @@ function makeComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {})
     markAllRead: vi.fn(() => of({ marked: 1 })),
     ...overrides,
   };
-  const snack = { open: vi.fn() };
+  const snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
   const dialog = { open: vi.fn() };
   return { component: new GroupsViewComponent(service as unknown as GroupService, snack as never, dialog as never), service, snack };
 }

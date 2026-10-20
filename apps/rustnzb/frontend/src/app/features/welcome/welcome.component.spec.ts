@@ -9,7 +9,7 @@ import { WelcomeComponent } from './welcome.component';
 function makeComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {}) {
   const api = { get: vi.fn(() => of({ has_servers: false })), post: vi.fn(() => of({})), postForm: vi.fn(() => of({})), ...overrides };
   const router = { navigate: vi.fn(() => Promise.resolve(true)) };
-  const snack = { open: vi.fn() };
+  const snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
   return { component: new WelcomeComponent(api as unknown as ApiService, router as never, snack as never), api, router, snack };
 }
 

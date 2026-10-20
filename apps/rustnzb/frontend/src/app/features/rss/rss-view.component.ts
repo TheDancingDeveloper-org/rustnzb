@@ -2,10 +2,11 @@ import { Component, OnInit, signal, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { formatBytes } from '../../core/format';
-import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
+import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { ApiService } from '../../core/services/api.service';
 import { ConfirmService } from '../../shared/confirm.service';
 import { httpErrorMessage, isAuthHandledError, showHttpError } from '../../core/http/http-error';
+import { ToastService } from '../../core/services/toast.service';
 
 interface RssFeed {
   name: string; url: string; poll_interval_secs: number; category: string | null;
@@ -325,7 +326,7 @@ export class RssViewComponent implements OnInit {
 
   constructor(
     private api: ApiService,
-    private snack: MatSnackBar,
+    private toast: ToastService,
     private confirmSvc: ConfirmService,
   ) {}
 
@@ -334,15 +335,15 @@ export class RssViewComponent implements OnInit {
   loadAll(): void {
     this.api.get<RssFeed[]>('/config/rss-feeds').subscribe({
       next: feeds => this.feeds.set(feeds),
-      error: err => showHttpError(this.snack, err, 'Failed to load RSS feeds'),
+      error: err => showHttpError(this.toast, err, 'Failed to load RSS feeds'),
     });
     this.api.get<RssRule[]>('/rss/rules').subscribe({
       next: rules => this.rules.set(rules),
-      error: err => showHttpError(this.snack, err, 'Failed to load RSS rules'),
+      error: err => showHttpError(this.toast, err, 'Failed to load RSS rules'),
     });
     this.api.get<RssItem[]>('/rss/items').subscribe({
       next: items => this.items.set(items),
-      error: err => showHttpError(this.snack, err, 'Failed to load RSS items'),
+      error: err => showHttpError(this.toast, err, 'Failed to load RSS items'),
     });
   }
 
@@ -387,7 +388,7 @@ export class RssViewComponent implements OnInit {
       auto_download: this.feedForm.auto_download,
     };
     if (!body.name || !body.url) {
-      this.snack.open('Name and URL are required', 'Close', { duration: 3000 });
+      this.toast.info('Name and URL are required');
       return;
     }
     const editing = this.editingFeedName();
@@ -396,13 +397,13 @@ export class RssViewComponent implements OnInit {
       : this.api.post('/config/rss-feeds', body);
     req.subscribe({
       next: () => {
-        this.snack.open(editing ? 'Feed updated' : 'Feed added', 'Close', { duration: 2000 });
+        this.toast.success(editing ? 'Feed updated' : 'Feed added');
         this.cancelFeedForm();
         this.loadAll();
       },
       error: (err) => {
         if (!isAuthHandledError(err)) this.feedError.set(httpErrorMessage(err, 'Failed to save feed'));
-        showHttpError(this.snack, err, 'Failed to save feed');
+        showHttpError(this.toast, err, 'Failed to save feed');
       },
     });
   }
@@ -419,10 +420,10 @@ export class RssViewComponent implements OnInit {
         if (!ok) return;
         this.api.delete(`/config/rss-feeds/${encodeURIComponent(name)}`).subscribe({
           next: () => {
-            this.snack.open('Feed deleted', 'Close', { duration: 2000 });
+            this.toast.success('Feed deleted');
             this.loadAll();
           },
-          error: (err) => showHttpError(this.snack, err, 'Failed to delete feed'),
+          error: (err) => showHttpError(this.toast, err, 'Failed to delete feed'),
         });
       });
   }
@@ -470,7 +471,7 @@ export class RssViewComponent implements OnInit {
       feed_names: feedNames,
     };
     if (!body.name || !body.match_regex) {
-      this.snack.open('Name and regex are required', 'Close', { duration: 3000 });
+      this.toast.info('Name and regex are required');
       return;
     }
     const editing = this.editingRuleId();
@@ -479,13 +480,13 @@ export class RssViewComponent implements OnInit {
       : this.api.post('/rss/rules', body);
     req.subscribe({
       next: () => {
-        this.snack.open(editing ? 'Rule updated' : 'Rule added', 'Close', { duration: 2000 });
+        this.toast.success(editing ? 'Rule updated' : 'Rule added');
         this.cancelRuleForm();
         this.loadAll();
       },
       error: (err) => {
         if (!isAuthHandledError(err)) this.ruleError.set(httpErrorMessage(err, 'Failed to save rule'));
-        showHttpError(this.snack, err, 'Failed to save rule');
+        showHttpError(this.toast, err, 'Failed to save rule');
       },
     });
   }
@@ -502,10 +503,10 @@ export class RssViewComponent implements OnInit {
         if (!ok) return;
         this.api.delete(`/rss/rules/${id}`).subscribe({
           next: () => {
-            this.snack.open('Rule deleted', 'Close', { duration: 2000 });
+            this.toast.success('Rule deleted');
             this.loadAll();
           },
-          error: (err) => showHttpError(this.snack, err, 'Failed to delete rule'),
+          error: (err) => showHttpError(this.toast, err, 'Failed to delete rule'),
         });
       });
   }
@@ -515,10 +516,10 @@ export class RssViewComponent implements OnInit {
   downloadItem(id: string): void {
     this.api.post(`/rss/items/${id}/download`).subscribe({
       next: () => {
-        this.snack.open('Added to queue', 'Close', { duration: 2000 });
+        this.toast.success('Added to queue');
         this.loadAll();
       },
-      error: (err) => showHttpError(this.snack, err, 'Download failed'),
+      error: (err) => showHttpError(this.toast, err, 'Download failed'),
     });
   }
 

@@ -19,7 +19,13 @@ type ApiStub = {
   delete: ReturnType<typeof vi.fn>;
 };
 type HttpStub = { post: ReturnType<typeof vi.fn> };
-type SnackBarStub = { open: ReturnType<typeof vi.fn> };
+type SnackBarStub = {
+  open: ReturnType<typeof vi.fn>;
+  success: ReturnType<typeof vi.fn>;
+  info: ReturnType<typeof vi.fn>;
+  error: ReturnType<typeof vi.fn>;
+  undo: ReturnType<typeof vi.fn>;
+};
 type ConfirmStub = { confirm: ReturnType<typeof vi.fn> };
 type RouteStub = { data: Observable<Record<string, unknown>>; queryParamMap: Observable<ParamMap> };
 type RouterStub = { navigate: ReturnType<typeof vi.fn> };
@@ -71,7 +77,8 @@ function makeComponent(
   const http: HttpStub = {
     post: vi.fn(() => of({})),
   };
-  const snackbarStub = snackBar ?? { open: vi.fn() };
+  const snackbarStub =
+    snackBar ?? { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
   const route: RouteStub = {
     data: of({}),
     queryParamMap: of(convertToParamMap({})),
@@ -266,7 +273,7 @@ describe('QueueViewComponent', () => {
     component.pauseJob('job-1');
 
     expect(loadQueue).toHaveBeenCalledTimes(1);
-    expect(snackBar.open).toHaveBeenCalledWith('Job paused', 'Close', { duration: 2500 });
+    expect(snackBar.success).toHaveBeenCalledWith('Job paused', 2500);
   });
 
   it('shows a failed status poll inline and clears it on the next success', () => {
