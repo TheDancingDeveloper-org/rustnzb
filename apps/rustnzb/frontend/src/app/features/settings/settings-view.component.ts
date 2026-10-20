@@ -1,4 +1,4 @@
-import { Component, OnInit, signal, computed } from '@angular/core';
+import { Component, HostListener, OnInit, signal, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { RouterModule } from '@angular/router';
@@ -11,6 +11,7 @@ import { IconComponent } from '../../shared/icon.component';
 import { AppTheme, ThemeService } from '../../core/services/theme.service';
 import { BrowserNotificationsService } from '../../core/services/browser-notifications.service';
 import { httpErrorMessage, showHttpError } from '../../core/http/http-error';
+import { HasUnsavedChanges } from '../../core/guards/unsaved-changes.guard';
 
 interface ServerConfig {
   id: string;
@@ -131,6 +132,15 @@ type SettingsKey =
   | 'debugLogging'
   | 'dav'
   | 'sabApiKey';
+
+/** Settings edited in place and written by their own Save button. Toggles that save on change are not here. */
+type FormKey = 'speedLimit' | 'maxActive' | 'historyRetention' | 'diskGuards' | 'dav';
+
+const FORM_KEYS: readonly FormKey[] = ['speedLimit', 'maxActive', 'historyRetention', 'diskGuards', 'dav'];
+
+function isFormKey(key: SettingsKey): key is FormKey {
+  return (FORM_KEYS as readonly string[]).includes(key);
+}
 
 type LoadState = { status: 'loading' } | { status: 'loaded' } | { status: 'failed'; message: string };
 
@@ -1520,7 +1530,7 @@ function emptyCategory(): CategoryConfig {
     `,
   ],
 })
-export class SettingsViewComponent implements OnInit {
+export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
   tab: Tab = 'servers';
 
   readonly sabnzbdModes = [
@@ -1579,6 +1589,9 @@ export class SettingsViewComponent implements OnInit {
   // so Save stays blocked until then; otherwise it would write those defaults over the real config.
   loads = signal<Record<SettingsKey, LoadState>>(allLoading());
 
+  // What each form held when it was last loaded or saved; a form differing from it has unsaved edits.
+  private baselines: Partial<Record<FormKey, string>> = {};
+
   constructor(
     private api: ApiService,
     private snack: MatSnackBar,
@@ -1605,6 +1618,56 @@ export class SettingsViewComponent implements OnInit {
     return state.status === 'failed' ? state.message : null;
   }
 
+  private formSnapshot(key: FormKey): string {
+    switch (key) {
+      case 'speedLimit':
+        return JSON.stringify(this.speedLimit);
+      case 'maxActive':
+        return JSON.stringify(this.maxActiveDownloads);
+      case 'historyRetention':
+        return JSON.stringify(this.historyRetention);
+      case 'diskGuards':
+        return JSON.stringify([this.minFreeSpaceGB, this.abortHopeless]);
+      case 'dav':
+        return JSON.stringify(this.davConfig);
+    }
+  }
+
+  /** Names of the sections with edits that have not been saved, in page order. */
+  unsavedSections(): string[] {
+    const out: string[] = [];
+    if (this.editingServer) out.push('server');
+    if (this.editingCategory) out.push('category');
+    for (const key of FORM_KEYS) {
+      const base = this.baselines[key];
+      if (base !== undefined && base !== this.formSnapshot(key)) out.push(key);
+    }
+    return out;
+  }
+
+  hasUnsavedChanges(): boolean {
+    return this.unsavedSections().length > 0;
+  }
+
+  // Covers reloads and closing the tab, which the router guard can't see.
+  @HostListener('window:beforeunload', ['$event'])
+  onBeforeUnload(event: BeforeUnloadEvent): void {
+    if (this.hasUnsavedChanges()) event.preventDefault();
+  }
+
+  /** PUT one form, and on success make what was sent its new baseline (later edits stay unsaved). */
+  private saveForm(key: FormKey, path: string, body: unknown, saved: string, fallback: string): void {
+    if (!this.canSave(key)) return;
+    const sent = this.formSnapshot(key);
+    this.api.put(path, body).subscribe({
+      next: () => {
+        this.baselines[key] = sent;
+        this.snack.open(saved, 'Close', { duration: 2000 });
+      },
+      error: (err) => showHttpError(this.snack, err, fallback),
+    });
+  }
+
   private setLoad(key: SettingsKey, state: LoadState): void {
     this.loads.update((all) => ({ ...all, [key]: state }));
   }
@@ -1615,6 +1678,7 @@ export class SettingsViewComponent implements OnInit {
     this.api.get<T>(path).subscribe({
       next: (r) => {
         apply(r);
+        if (isFormKey(key)) this.baselines[key] = this.formSnapshot(key);
         this.setLoad(key, { status: 'loaded' });
       },
       error: (err) => this.setLoad(key, { status: 'failed', message: httpErrorMessage(err, fallback) }),
@@ -1975,24 +2039,23 @@ export class SettingsViewComponent implements OnInit {
   }
 
   saveDiskGuards(): void {
-    if (!this.canSave('diskGuards')) return;
-    this.api
-      .put('/config/disk-guards', {
-        min_free_space_bytes: Math.round(this.minFreeSpaceGB * 1024 ** 3),
-        abort_hopeless: this.abortHopeless,
-      })
-      .subscribe({
-        next: () => this.snack.open('Disk guards saved', 'Close', { duration: 2000 }),
-        error: (err) => showHttpError(this.snack, err, 'Failed to save disk guards'),
-      });
+    this.saveForm(
+      'diskGuards',
+      '/config/disk-guards',
+      { min_free_space_bytes: Math.round(this.minFreeSpaceGB * 1024 ** 3), abort_hopeless: this.abortHopeless },
+      'Disk guards saved',
+      'Failed to save disk guards',
+    );
   }
 
   saveSpeedLimit(): void {
-    if (!this.canSave('speedLimit')) return;
-    this.api.put('/config/speed-limit', { speed_limit_bps: this.speedLimit }).subscribe({
-      next: () => this.snack.open('Speed limit saved', 'Close', { duration: 2000 }),
-      error: (err) => showHttpError(this.snack, err, 'Failed to save speed limit'),
-    });
+    this.saveForm(
+      'speedLimit',
+      '/config/speed-limit',
+      { speed_limit_bps: this.speedLimit },
+      'Speed limit saved',
+      'Failed to save speed limit',
+    );
   }
 
   private applyDebugLogging(r: DebugLoggingState): void {
@@ -2019,21 +2082,23 @@ export class SettingsViewComponent implements OnInit {
   }
 
   saveMaxActive(): void {
-    if (!this.canSave('maxActive')) return;
-    this.api
-      .put('/config/max-active-downloads', { max_active_downloads: this.maxActiveDownloads })
-      .subscribe({
-        next: () => this.snack.open('Max downloads saved', 'Close', { duration: 2000 }),
-        error: (err) => showHttpError(this.snack, err, 'Failed to save max downloads'),
-      });
+    this.saveForm(
+      'maxActive',
+      '/config/max-active-downloads',
+      { max_active_downloads: this.maxActiveDownloads },
+      'Max downloads saved',
+      'Failed to save max downloads',
+    );
   }
 
   saveRetention(): void {
-    if (!this.canSave('historyRetention')) return;
-    this.api.put('/config/history-retention', { retention: this.historyRetention }).subscribe({
-      next: () => this.snack.open('History retention saved', 'Close', { duration: 2000 }),
-      error: (err) => showHttpError(this.snack, err, 'Failed to save retention'),
-    });
+    this.saveForm(
+      'historyRetention',
+      '/config/history-retention',
+      { retention: this.historyRetention },
+      'History retention saved',
+      'Failed to save retention',
+    );
   }
 
   // ======================== DAV CONFIG ========================
@@ -2071,15 +2136,18 @@ export class SettingsViewComponent implements OnInit {
       api_key: this.davConfig.api_key?.trim() || null,
     };
     const restartRequired = payload.enabled !== this.davRuntimeEnabled();
+    const sent = this.formSnapshot('dav');
     this.api.put('/config/dav', payload).subscribe({
-      next: () =>
+      next: () => {
+        this.baselines.dav = sent;
         this.snack.open(
           restartRequired
             ? 'Media Library settings saved. Restart required.'
             : 'Media Library settings saved',
           'Close',
           { duration: 2500 },
-        ),
+        );
+      },
       error: (err) => showHttpError(this.snack, err, 'Failed to save Media Library settings'),
     });
   }
