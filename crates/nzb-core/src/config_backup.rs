@@ -663,22 +663,21 @@ mod tests {
     }
 
     fn assert_no_canary(text: &str) {
-        for secret in [
-            API_KEY,
-            SERVER_PASSWORD,
-            DAV_PASSWORD,
-            DAV_KEY,
-            PROXY_SECRET,
-            WEBHOOK,
-            NTFY,
-            NTFY_TOPIC,
-            RSS_KEY,
-            OTEL_SECRET,
+        // Name the field that leaked, never the value: a failing assertion must
+        // not put a credential in the test log.
+        for (field, secret) in [
+            ("api_key", API_KEY),
+            ("server_password", SERVER_PASSWORD),
+            ("dav_password", DAV_PASSWORD),
+            ("dav_api_key", DAV_KEY),
+            ("proxy_secret", PROXY_SECRET),
+            ("webhook_url", WEBHOOK),
+            ("ntfy_token", NTFY),
+            ("ntfy_topic", NTFY_TOPIC),
+            ("rss_key", RSS_KEY),
+            ("otel_secret", OTEL_SECRET),
         ] {
-            assert!(
-                !text.contains(secret),
-                "a masked backup leaked {secret}: {text}"
-            );
+            assert!(!text.contains(secret), "a masked backup leaked {field}");
         }
     }
 

@@ -108,15 +108,17 @@ async fn export(client: &reqwest::Client, base_url: &str, token: &str, secrets: 
 }
 
 fn assert_no_secret(text: &str) {
-    for secret in [
-        API_KEY,
-        SERVER_PASSWORD,
-        PROXY_SECRET,
-        RSS_KEY,
-        NTFY_TOPIC,
-        OTEL_SECRET,
+    // Name the field that leaked, never the value: a failing assertion must
+    // not put a credential in the test log.
+    for (field, secret) in [
+        ("api_key", API_KEY),
+        ("server_password", SERVER_PASSWORD),
+        ("proxy_secret", PROXY_SECRET),
+        ("rss_key", RSS_KEY),
+        ("ntfy_topic", NTFY_TOPIC),
+        ("otel_secret", OTEL_SECRET),
     ] {
-        assert!(!text.contains(secret), "a masked export leaked {secret}");
+        assert!(!text.contains(secret), "a masked export leaked {field}");
     }
 }
 
