@@ -18,7 +18,13 @@ import { ApiService, POLL_TIMEOUT_MS, pageHidden } from './core/services/api.ser
 import { AuthService } from './core/services/auth.service';
 import { StatusResponse } from './core/models/queue.model';
 import { formatBytes, formatSpeed } from './core/format';
-import { AddNzbService } from './core/services/add-nzb.service';
+import {
+  AddNzbPrefill,
+  AddNzbService,
+  isEditableTarget,
+  nzbUploadFiles,
+  pastedNzbUrl,
+} from './core/services/add-nzb.service';
 import { WidthModeService } from './core/services/width-mode.service';
 import { PauseStateService } from './core/services/pause-state.service';
 import { BrowserNotificationsService } from './core/services/browser-notifications.service';
@@ -279,10 +285,36 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
           </div>
         </main>
       </div>
+      @if (fileDragActive()) {
+        <div class="drop-overlay" aria-hidden="true">
+          <div class="drop-overlay-box">Drop .nzb files to add them</div>
+        </div>
+      }
     }
   `,
   styles: [
     `
+      /* Pointer-transparent so the drop reaches the element underneath
+         (the Add NZB dropzone handles its own). */
+      .drop-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 1000;
+        pointer-events: none;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: color-mix(in srgb, var(--bg) 70%, transparent);
+      }
+      .drop-overlay-box {
+        padding: 32px 48px;
+        border: 2px dashed var(--accent);
+        border-radius: 12px;
+        background: var(--bg);
+        color: var(--accent);
+        font-size: 18px;
+        font-weight: 600;
+      }
       :host {
         display: block;
         height: 100vh;
@@ -780,6 +812,71 @@ export class App implements OnInit, OnDestroy {
       complete: () => this.router.navigate(['/login']),
       error: () => this.router.navigate(['/login']),
     });
+  }
+
+  // ---- Drop .nzb files / paste a URL anywhere ----
+
+  // dragenter/dragleave fire for every child crossed, so count them.
+  private dragDepth = 0;
+  readonly fileDragActive = signal(false);
+
+  private dragHasFiles(e: DragEvent): boolean {
+    return !!e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files');
+  }
+
+  @HostListener('window:dragenter', ['$event'])
+  onWindowDragEnter(e: DragEvent): void {
+    if (!this.showChrome() || !this.dragHasFiles(e)) return;
+    this.dragDepth++;
+    this.fileDragActive.set(true);
+  }
+
+  @HostListener('window:dragover', ['$event'])
+  onWindowDragOver(e: DragEvent): void {
+    if (!this.showChrome() || !this.dragHasFiles(e)) return;
+    // Without this the browser opens the dropped file instead of firing drop.
+    e.preventDefault();
+  }
+
+  @HostListener('window:dragleave', ['$event'])
+  onWindowDragLeave(e: DragEvent): void {
+    if (!this.fileDragActive() || !this.dragHasFiles(e)) return;
+    this.dragDepth = Math.max(0, this.dragDepth - 1);
+    if (this.dragDepth === 0) this.fileDragActive.set(false);
+  }
+
+  @HostListener('window:drop', ['$event'])
+  onWindowDrop(e: DragEvent): void {
+    this.dragDepth = 0;
+    this.fileDragActive.set(false);
+    // defaultPrevented: the Add NZB panel's own dropzone already took them.
+    if (!this.showChrome() || !this.dragHasFiles(e) || e.defaultPrevented) return;
+    e.preventDefault();
+    const files = nzbUploadFiles(e.dataTransfer?.files);
+    if (files.length === 0) {
+      this.snack.open('Only .nzb (or .zip/.rar/.7z/.gz) files can be added', 'Close', {
+        duration: 3000,
+      });
+      return;
+    }
+    this.openAddPanelWith({ files });
+  }
+
+  @HostListener('window:paste', ['$event'])
+  onWindowPaste(e: ClipboardEvent): void {
+    if (!this.showChrome() || isEditableTarget(e.target)) return;
+    const url = pastedNzbUrl(e.clipboardData?.getData('text'));
+    if (!url) return;
+    e.preventDefault();
+    this.openAddPanelWith({ url });
+  }
+
+  private openAddPanelWith(prefill: AddNzbPrefill): void {
+    if (!this.router.url.startsWith('/downloads')) {
+      this.router.navigate(['/downloads']).then(() => this.addNzbService.prefill(prefill));
+    } else {
+      this.addNzbService.prefill(prefill);
+    }
   }
 
   onAddNzb(): void {

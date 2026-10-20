@@ -1196,6 +1196,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   uploading = false;
   isDragging = false;
   private toggleSub: Subscription | null = null;
+  private prefillSub: Subscription | null = null;
 
   constructor(
     private api: ApiService,
@@ -1228,6 +1229,17 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     this.toggleSub = this.addNzbService.panelToggle$.subscribe(() => {
       this.showAddPanel = !this.showAddPanel;
     });
+    // Files dropped or a URL pasted anywhere in the app (see App).
+    this.prefillSub = this.addNzbService.prefill$.subscribe((p) => {
+      this.showAddPanel = true;
+      if ('files' in p) {
+        this.addMode = 'file';
+        this.selectedFiles = [...this.selectedFiles, ...p.files];
+      } else {
+        this.addMode = 'url';
+        this.addUrl = p.url;
+      }
+    });
   }
 
   ngOnDestroy(): void {
@@ -1235,6 +1247,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     if (this.connectionHoldTimer) clearTimeout(this.connectionHoldTimer);
     this.routeSub?.unsubscribe();
     this.toggleSub?.unsubscribe();
+    this.prefillSub?.unsubscribe();
   }
 
   private loadAll(): void {

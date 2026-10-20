@@ -25,18 +25,19 @@ function makeApp(postResult = new Subject<unknown>()) {
   };
   const pauseState = new PauseStateService();
   const snack = { open: vi.fn() };
+  const addNzb = new AddNzbService();
   const app = new App(
     api as never,
     auth as never,
     router as never,
-    new AddNzbService(),
+    addNzb,
     {} as never,
     {} as never,
     pauseState,
     snack as never,
     { observeStatus: vi.fn() } as never,
   );
-  return { app, api, auth, pauseState, postResult, snack };
+  return { app, api, auth, pauseState, postResult, snack, router, addNzb };
 }
 
 describe('App global pause control', () => {
@@ -305,5 +306,119 @@ describe('bare route detection', () => {
     const { app } = makeApp();
     expect(app.formatBytes(1.1 * 1024 ** 5)).toBe('1.1 PB');
     expect(app.formatSpeed(2 * 1024 ** 4)).toBe('2.0 TB/s');
+  });
+});
+
+function fileDrag(type: string, files: File[] = [], defaultPrevented = false) {
+  return {
+    dataTransfer: { types: ['Files'], files, dropEffect: 'none' },
+    defaultPrevented,
+    preventDefault: vi.fn(),
+    target: document.body,
+  } as unknown as DragEvent & { preventDefault: ReturnType<typeof vi.fn>; type: string };
+}
+
+describe('drop .nzb files anywhere', () => {
+  function signedIn() {
+    const ctx = makeApp();
+    ctx.auth.authenticated.set(true);
+    const prefills: unknown[] = [];
+    ctx.addNzb.prefill$.subscribe((p) => prefills.push(p));
+    return { ...ctx, prefills };
+  }
+
+  it('shows the overlay while files are dragged over the window, through child elements', () => {
+    const { app } = signedIn();
+    app.onWindowDragEnter(fileDrag('dragenter'));
+    app.onWindowDragEnter(fileDrag('dragenter'));
+    app.onWindowDragLeave(fileDrag('dragleave'));
+    expect(app.fileDragActive()).toBe(true);
+    app.onWindowDragLeave(fileDrag('dragleave'));
+    expect(app.fileDragActive()).toBe(false);
+  });
+
+  it('ignores drags that carry no files (queue row reordering)', () => {
+    const { app } = signedIn();
+    const e = { dataTransfer: { types: ['text/plain'] }, preventDefault: vi.fn() } as never;
+    app.onWindowDragEnter(e);
+    app.onWindowDragOver(e);
+    expect(app.fileDragActive()).toBe(false);
+    expect(
+      (e as { preventDefault: ReturnType<typeof vi.fn> }).preventDefault,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('hands dropped .nzb files to the Add NZB panel', () => {
+    const { app, prefills } = signedIn();
+    const nzb = new File(['x'], 'a.nzb');
+    app.onWindowDragEnter(fileDrag('dragenter'));
+    const drop = fileDrag('drop', [nzb, new File(['y'], 'notes.txt')]);
+    app.onWindowDrop(drop);
+    expect(drop.preventDefault).toHaveBeenCalled();
+    expect(app.fileDragActive()).toBe(false);
+    expect(prefills).toEqual([{ files: [nzb] }]);
+  });
+
+  it('navigates to downloads first when elsewhere', async () => {
+    const { app, router, prefills } = signedIn();
+    router.url = '/settings';
+    app.onWindowDrop(fileDrag('drop', [new File(['x'], 'a.nzb')]));
+    expect(router.navigate).toHaveBeenCalledWith(['/downloads']);
+    await Promise.resolve();
+    expect(prefills).toHaveLength(1);
+  });
+
+  it('leaves drops the panel dropzone already handled', () => {
+    const { app, prefills } = signedIn();
+    app.onWindowDrop(fileDrag('drop', [new File(['x'], 'a.nzb')], true));
+    expect(prefills).toEqual([]);
+  });
+
+  it('tells the user when nothing dropped is an NZB', () => {
+    const { app, prefills, snack } = signedIn();
+    app.onWindowDrop(fileDrag('drop', [new File(['x'], 'movie.mkv')]));
+    expect(prefills).toEqual([]);
+    expect(snack.open).toHaveBeenCalled();
+  });
+
+  it('does nothing when signed out', () => {
+    const { app, auth, prefills } = signedIn();
+    auth.authenticated.set(false);
+    app.onWindowDragEnter(fileDrag('dragenter'));
+    app.onWindowDrop(fileDrag('drop', [new File(['x'], 'a.nzb')]));
+    expect(app.fileDragActive()).toBe(false);
+    expect(prefills).toEqual([]);
+  });
+});
+
+describe('paste a URL anywhere', () => {
+  function paste(text: string, target: EventTarget = document.body) {
+    return {
+      clipboardData: { getData: () => text },
+      target,
+      preventDefault: vi.fn(),
+    } as unknown as ClipboardEvent & { preventDefault: ReturnType<typeof vi.fn> };
+  }
+  function signedIn() {
+    const ctx = makeApp();
+    ctx.auth.authenticated.set(true);
+    const prefills: unknown[] = [];
+    ctx.addNzb.prefill$.subscribe((p) => prefills.push(p));
+    return { ...ctx, prefills };
+  }
+
+  it('opens the panel with a pasted URL', () => {
+    const { app, prefills } = signedIn();
+    const e = paste(' https://idx.example/get/1 ');
+    app.onWindowPaste(e);
+    expect(e.preventDefault).toHaveBeenCalled();
+    expect(prefills).toEqual([{ url: 'https://idx.example/get/1' }]);
+  });
+
+  it('leaves pastes into form fields and non-URL text alone', () => {
+    const { app, prefills } = signedIn();
+    app.onWindowPaste(paste('https://idx.example/get/1', document.createElement('input')));
+    app.onWindowPaste(paste('just some words'));
+    expect(prefills).toEqual([]);
   });
 });
