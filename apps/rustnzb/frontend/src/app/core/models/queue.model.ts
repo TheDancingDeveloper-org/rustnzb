@@ -6,8 +6,8 @@ export interface ServerArticleStats {
   bytes_downloaded: number;
 }
 
-/** Why a job or the whole queue is paused; `disk_space` lifts automatically. */
-export type PauseReason = 'manual' | 'global' | 'disk_space' | 'server';
+/** Why a job or the whole queue is paused; `disk_space` and `schedule` lift automatically. */
+export type PauseReason = 'manual' | 'global' | 'disk_space' | 'server' | 'schedule';
 
 export interface NzbJob {
   id: string;

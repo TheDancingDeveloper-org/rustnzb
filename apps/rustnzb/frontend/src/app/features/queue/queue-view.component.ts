@@ -446,11 +446,7 @@ interface PipelineStep {
                   <span
                     class="status-pill"
                     [class]="statusClass(effectiveStatus(job.status))"
-                    [attr.title]="
-                      isDiskSpaceHold(job)
-                        ? 'Waiting for free disk space; resumes automatically'
-                        : null
-                    "
+                    [attr.title]="pauseHoldTitle(job)"
                     >{{ statusLabel(job) }}</span
                   >
                 </td>
@@ -1328,9 +1324,16 @@ export class QueueViewComponent implements OnInit, OnDestroy {
 
   speedValue = computed(() => formatBytesParts(this.status()?.speed_bps).value);
   speedUnit = computed(() => `${formatBytesParts(this.status()?.speed_bps).unit}/s`);
-  pausedLabel = computed(() =>
-    this.pauseReason() === 'disk_space' ? 'Paused · low disk space' : 'Paused',
-  );
+  pausedLabel = computed(() => {
+    switch (this.pauseReason()) {
+      case 'disk_space':
+        return 'Paused · low disk space';
+      case 'schedule':
+        return 'Paused · schedule';
+      default:
+        return 'Paused';
+    }
+  });
   /** Sub-line of the speed card: pause state, else the configured limit (0 = off). */
   speedLimitLabel = computed(() => {
     if (this.paused()) return this.pausedLabel();
@@ -1918,16 +1921,38 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     return 's-q';
   }
 
+  /** Why a paused job is holding, when the hold lifts without the user. */
+  private automaticPauseReason(job: NzbJob): PauseReason | null {
+    if (this.effectiveStatus(job.status) !== 'paused') return null;
+    const reason = job.pause_reason ?? (this.paused() ? this.pauseReason() : null);
+    return reason === 'disk_space' || reason === 'schedule' ? reason : null;
+  }
+
   /** Whether this job is paused by the disk-space guard. */
   isDiskSpaceHold(job: NzbJob): boolean {
-    if (this.effectiveStatus(job.status) !== 'paused') return false;
-    const reason = job.pause_reason ?? (this.paused() ? this.pauseReason() : null);
-    return reason === 'disk_space';
+    return this.automaticPauseReason(job) === 'disk_space';
+  }
+
+  pauseHoldTitle(job: NzbJob): string | null {
+    switch (this.automaticPauseReason(job)) {
+      case 'disk_space':
+        return 'Waiting for free disk space; resumes automatically';
+      case 'schedule':
+        return 'Paused by the download schedule; resumes automatically';
+      default:
+        return null;
+    }
   }
 
   statusLabel(job: NzbJob): string {
-    if (this.isDiskSpaceHold(job)) return 'paused · low disk';
-    return this.displayStatus(this.effectiveStatus(job.status));
+    switch (this.automaticPauseReason(job)) {
+      case 'disk_space':
+        return 'paused · low disk';
+      case 'schedule':
+        return 'paused · schedule';
+      default:
+        return this.displayStatus(this.effectiveStatus(job.status));
+    }
   }
 
   effectiveStatus(status: string): string {
