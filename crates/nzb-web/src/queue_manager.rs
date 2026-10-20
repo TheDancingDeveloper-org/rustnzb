@@ -164,6 +164,17 @@ fn claim_output_dir_fields(job_id: &str, output_dir: &mut std::path::PathBuf, cl
 /// (an interrupted post-processing run, or a direct unpack before a pause),
 /// provided it is still a real directory named `<base>` or `<base>.<n>`
 /// beside the job's derived target.
+/// Sweep damage-ledger rows that no queued or listed job can use (WI-1868).
+/// Runs when a job leaves the queue and at startup, so expired holes and the
+/// rows of removed jobs don't pile up.
+fn prune_damage_ledger(db: &Database) {
+    match db.ledger_prune(Utc::now()) {
+        Ok(0) => {}
+        Ok(n) => debug!(rows = n, "Pruned damage-ledger rows"),
+        Err(e) => warn!("Failed to prune the damage ledger: {e}"),
+    }
+}
+
 fn restore_claimed_output_dir(job: &mut NzbJob, checkpoint: &JobCheckpoint) -> bool {
     let Some(claimed) = checkpoint.output_dir.as_ref() else {
         return false;
@@ -4004,6 +4015,7 @@ impl QueueManager {
         if let Err(e) = db.queue_remove(&state.job.id) {
             error!(job_id = %state.job.id, "Failed to remove from queue: {e}");
         }
+        prune_damage_ledger(&db);
 
         // Enforce retention
         if let Some(max) = *self.history_retention.lock()
@@ -4557,6 +4569,7 @@ impl QueueManager {
 
             // Remove from DB
             let _ = db.queue_remove(id);
+            prune_damage_ledger(&db);
             drop(db);
 
             // Remove from order
@@ -5705,6 +5718,7 @@ impl QueueManager {
     /// Re-parses NZB data for each job and applies any saved checkpoint to
     /// mark already-downloaded articles, so downloads resume where they left off.
     pub fn restore_from_db(self: &Arc<Self>) -> crate::nzb_core::Result<()> {
+        prune_damage_ledger(&self.db.lock());
         // Restore globally_paused from persisted state
         let (was_paused, persisted_global_ids) = {
             let db = self.db.lock();

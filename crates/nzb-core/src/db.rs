@@ -1294,7 +1294,8 @@ impl Database {
         }
     }
 
-    /// Enforce history retention limit by deleting oldest entries.
+    /// Enforce history retention limit by deleting oldest entries, and the
+    /// ledger rows of jobs now gone.
     ///
     /// A limit of `0` is treated as "keep all" and is a no-op: the
     /// `LIMIT 0` subquery would otherwise match nothing and delete every
@@ -1310,6 +1311,7 @@ impl Database {
             )",
             params![max_entries as i64],
         )?;
+        self.ledger_drop_orphans()?;
         Ok(())
     }
 
@@ -1410,16 +1412,18 @@ impl Database {
         Ok(count as usize)
     }
 
-    /// Remove a history entry.
+    /// Remove a history entry, and the ledger rows of a job now gone.
     pub fn history_remove(&self, id: &str) -> Result<(), NzbError> {
         self.conn
             .execute("DELETE FROM history WHERE id=?1", params![id])?;
+        self.ledger_drop_orphans()?;
         Ok(())
     }
 
-    /// Clear all history.
+    /// Clear all history, and the ledger rows of jobs now gone.
     pub fn history_clear(&self) -> Result<(), NzbError> {
         self.conn.execute("DELETE FROM history", [])?;
+        self.ledger_drop_orphans()?;
         Ok(())
     }
 
@@ -3077,5 +3081,137 @@ mod tests {
         assert_eq!(meta_count(&db), 2);
         db.history_clear().unwrap();
         assert_eq!(meta_count(&db), 0);
+    }
+
+    // --- Damage-ledger pruning (WI-1868) ---
+
+    use crate::damage_ledger::{ArticleKey, Outcome};
+
+    fn ledger_t(secs: i64) -> chrono::DateTime<Utc> {
+        chrono::DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()
+    }
+
+    /// Record a confirmed hole for `scope`, confirmed at `ledger_t(2)`, so it
+    /// expires at `ledger_t(2) + HOLE_TTL_SECS`.
+    fn note_hole(db: &Database, scope: &str, segment: u32) {
+        let key = ArticleKey::new(scope, 0, segment);
+        let srv = vec!["a".to_string()];
+        let refused = Outcome::Refused { server: "a".into() };
+        db.ledger_note(&key, "<m>", &refused, &srv, ledger_t(0))
+            .unwrap();
+        db.ledger_note(&key, "<m>", &refused, &srv, ledger_t(2))
+            .unwrap();
+    }
+
+    fn note_present(db: &Database, scope: &str, segment: u32) {
+        let key = ArticleKey::new(scope, 0, segment);
+        db.ledger_note(
+            &key,
+            "<m>",
+            &Outcome::Present,
+            &["a".to_string()],
+            ledger_t(0),
+        )
+        .unwrap();
+    }
+
+    fn ledger_rows(db: &Database, scope: &str) -> usize {
+        db.ledger_load_file(scope, 0).unwrap().len()
+    }
+
+    #[test]
+    fn history_remove_drops_the_jobs_ledger_rows() {
+        let db = Database::open_memory().unwrap();
+        db.history_insert(&make_history("done-1", "A")).unwrap();
+        db.history_insert(&make_history("done-2", "B")).unwrap();
+        note_present(&db, "done-1", 0);
+        note_hole(&db, "done-1", 1);
+        note_present(&db, "done-2", 0);
+
+        db.history_remove("done-1").unwrap();
+
+        assert_eq!(ledger_rows(&db, "done-1"), 0);
+        assert_eq!(ledger_rows(&db, "done-2"), 1, "other jobs keep their rows");
+    }
+
+    #[test]
+    fn rows_of_a_retried_job_survive_deleting_its_history_entry() {
+        let db = Database::open_memory().unwrap();
+        // The failed original sits in history; its retry runs under a new id.
+        db.history_insert(&make_history("orig", "Release")).unwrap();
+        db.queue_insert(&make_job("retry", "Release")).unwrap();
+        note_hole(&db, "orig", 0);
+        note_hole(&db, "retry", 0);
+        note_present(&db, "retry", 1);
+
+        db.history_remove("orig").unwrap();
+
+        assert_eq!(ledger_rows(&db, "orig"), 0);
+        assert_eq!(ledger_rows(&db, "retry"), 2);
+    }
+
+    #[test]
+    fn a_job_still_queued_keeps_its_rows_when_its_history_row_goes() {
+        // A failed job can be in history and the queue at once until the
+        // queue view is removed.
+        let db = Database::open_memory().unwrap();
+        db.queue_insert(&make_job("both", "R")).unwrap();
+        db.history_insert(&make_history("both", "R")).unwrap();
+        note_hole(&db, "both", 0);
+
+        db.history_remove("both").unwrap();
+        assert_eq!(ledger_rows(&db, "both"), 1);
+
+        db.queue_remove("both").unwrap();
+        assert_eq!(db.ledger_prune(ledger_t(3)).unwrap(), 1);
+        assert_eq!(ledger_rows(&db, "both"), 0);
+    }
+
+    #[test]
+    fn history_clear_and_retention_drop_ledger_rows() {
+        let db = Database::open_memory().unwrap();
+        let mut old = make_history("old", "Old");
+        old.completed_at = Utc::now() - chrono::Duration::days(2);
+        db.history_insert(&old).unwrap();
+        db.history_insert(&make_history("new", "New")).unwrap();
+        db.queue_insert(&make_job("live", "Live")).unwrap();
+        for scope in ["old", "new", "live"] {
+            note_present(&db, scope, 0);
+        }
+
+        db.history_enforce_retention(1).unwrap();
+        assert_eq!(ledger_rows(&db, "old"), 0, "aged out with its history row");
+        assert_eq!(ledger_rows(&db, "new"), 1);
+
+        db.history_clear().unwrap();
+        assert_eq!(ledger_rows(&db, "new"), 0);
+        assert_eq!(ledger_rows(&db, "live"), 1, "queued jobs are untouched");
+    }
+
+    #[test]
+    fn prune_drops_expired_holes_only_for_jobs_no_longer_queued() {
+        let db = Database::open_memory().unwrap();
+        db.history_insert(&make_history("hist", "H")).unwrap();
+        db.queue_insert(&make_job("live", "L")).unwrap();
+        note_hole(&db, "hist", 0);
+        note_present(&db, "hist", 1);
+        note_hole(&db, "live", 0);
+        // A late ledger write for a job already removed everywhere.
+        note_present(&db, "gone", 0);
+
+        // Before the TTL: only the orphan goes.
+        let before_expiry = ledger_t(2 + crate::damage_ledger::HOLE_TTL_SECS - 1);
+        assert_eq!(db.ledger_prune(before_expiry).unwrap(), 1);
+        assert_eq!(ledger_rows(&db, "gone"), 0);
+        assert_eq!(ledger_rows(&db, "hist"), 2);
+
+        // At the TTL: the history job's expired hole goes; its present row and
+        // the queued job's hole stay.
+        let at_expiry = ledger_t(2 + crate::damage_ledger::HOLE_TTL_SECS);
+        assert_eq!(db.ledger_prune(at_expiry).unwrap(), 1);
+        let left = db.ledger_load_file("hist", 0).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].key.segment_number, 1);
+        assert_eq!(ledger_rows(&db, "live"), 1);
     }
 }
