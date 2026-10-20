@@ -38,6 +38,9 @@ also carries generated release notes with the merged pull requests.
 
 - **history:** Read list columns from a side table, not past the NZB blob
 - **ui:** Skip history polls while hidden or still loading
+- **http:** Compress API and SPA responses, and leave detail-only fields out of
+  history list rows (a 50-row history page drops from 67 KB to 5.2 KB on the
+  wire)
 
 ## [1.7.0-beta.1] - 2026-10-18
 

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use chrono::{Duration, Utc};
 use nzb_web::auth::{CredentialStore, TokenStore};
 use nzb_web::nzb_core::config::AppConfig;
@@ -212,4 +212,73 @@ async fn status_filter_is_case_insensitive_and_unknown_status_matches_nothing() 
 
     let combined = list(&state, "status=completed&category=old&search=RELEASE.11").await;
     assert_eq!(ids(&combined), vec!["h115", "h116", "h117", "h118", "h119"]);
+}
+
+#[tokio::test]
+async fn list_rows_omit_detail_only_fields_and_the_detail_route_keeps_them() {
+    let (state, _dir) = state_with_history();
+    let db = state.queue_manager.clone();
+    let mut detailed = history(500, JobStatus::Completed, "tv", 0);
+    detailed.server_stats = vec![nzb_web::nzb_core::models::ServerArticleStats {
+        server_id: "primary".into(),
+        server_name: "Primary".into(),
+        articles_downloaded: 9,
+        articles_failed: 1,
+        bytes_downloaded: 4096,
+    }];
+    db.with_db(|database| database.history_insert(&detailed))
+        .expect("insert detailed history");
+
+    // The table renders neither array, so a list row must not pay for them.
+    let listed = list(&state, "search=release.500").await;
+    let row = &listed["entries"][0];
+    assert_eq!(row["id"], "h500");
+    assert_eq!(row["stages"], serde_json::json!([]));
+    assert_eq!(row["server_stats"], serde_json::json!([]));
+    // The totals they used to be summed from still arrive.
+    assert_eq!(row["articles_served"], 9);
+    assert_eq!(row["articles_missing"], 1);
+
+    // The expanded row fetches this one and gets the breakdown.
+    let detail = rustnzb::handlers::h_history_get(State(state.clone()), Path("h500".to_string()))
+        .await
+        .expect("detail")
+        .0;
+    let detail = serde_json::to_value(detail).expect("json");
+    assert_eq!(detail["server_stats"][0]["server_id"], "primary");
+    assert_eq!(detail["articles_served"], 9);
+}
+
+#[tokio::test]
+async fn detail_true_still_carries_the_full_row() {
+    let (state, _dir) = state_with_history();
+    let mut detailed = history(501, JobStatus::Completed, "tv", 0);
+    detailed.server_stats = vec![nzb_web::nzb_core::models::ServerArticleStats {
+        server_id: "primary".into(),
+        server_name: "Primary".into(),
+        articles_downloaded: 4,
+        articles_failed: 0,
+        bytes_downloaded: 1000,
+    }];
+    detailed.stages = vec![nzb_web::nzb_core::models::StageResult {
+        name: "Verify".into(),
+        status: nzb_web::nzb_core::models::StageStatus::Success,
+        message: None,
+        duration_secs: 1.5,
+    }];
+    state
+        .queue_manager
+        .with_db(|db| db.history_insert(&detailed))
+        .expect("insert detailed history");
+
+    let listed = list(&state, "search=release.501&detail=true").await;
+    let row = &listed["entries"][0];
+    assert_eq!(row["server_stats"][0]["server_id"], "primary");
+    assert_eq!(row["stages"][0]["name"], "Verify");
+    assert_eq!(row["articles_served"], 4);
+
+    // Without the flag the same entry is a slim row (the list default).
+    let slim = list(&state, "search=release.501").await;
+    assert_eq!(slim["entries"][0]["stages"], serde_json::json!([]));
+    assert_eq!(slim["entries"][0]["server_stats"], serde_json::json!([]));
 }

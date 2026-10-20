@@ -87,6 +87,13 @@ pub struct HistoryQuery {
     /// from `Utc::now()` overflows chrono's DateTime range (about
     /// ±262 000 years), which panics.
     pub days: Option<u32>,
+    /// Include the detail-only `stages` and `server_stats` arrays on every
+    /// row. Off by default: they are most of the bytes on a page, the history
+    /// table never renders them, and the expanded row fetches them from
+    /// `GET /api/history/{id}`. Tools that summarise a run in one request can
+    /// ask for them here.
+    #[serde(default)]
+    pub detail: bool,
 }
 
 /// Largest `days` window `GET /api/history` accepts (about 100 years).
@@ -252,6 +259,14 @@ impl HistoryStats {
     }
 }
 
+/// One history row.
+///
+/// A list response (`GET /api/history`) omits the detail-only `stages` and
+/// `server_stats` arrays: between them they are most of the bytes on a page
+/// and the table never renders either. `GET /api/history/{id}` returns them,
+/// and that is what the expanded row loads. Both routes share this shape so a
+/// client can parse a list entry and a detail entry with one type; the two
+/// fields are simply empty on list rows.
 #[derive(Serialize)]
 pub struct HistoryResponseEntry {
     pub id: String,
@@ -270,11 +285,27 @@ pub struct HistoryResponseEntry {
     pub has_nzb_data: bool,
     pub duration_secs: f64,
     pub average_speed_bps: u64,
+    /// Every article the entry's server stats account for. Computed when the
+    /// row is built, so a list row can report availability without shipping
+    /// the per-server breakdown.
     pub articles_served: usize,
     pub articles_missing: usize,
 }
 
+impl HistoryResponseEntry {
+    /// A list row: the table's columns plus the precomputed article totals,
+    /// without the per-server and per-stage detail only the expanded row
+    /// shows. Those are dropped after the conversion, which is what sums them.
+    fn list_row(e: HistoryEntry) -> Self {
+        let mut row = Self::from(e);
+        row.stages = Vec::new();
+        row.server_stats = Vec::new();
+        row
+    }
+}
+
 impl From<HistoryEntry> for HistoryResponseEntry {
+    /// The full row, including detail-only fields: `GET /api/history/{id}`.
     fn from(e: HistoryEntry) -> Self {
         let has_nzb = e.nzb_data.is_some();
         let duration_secs = e.download_time_secs.unwrap_or_else(|| {
@@ -932,7 +963,16 @@ pub async fn h_history_list(
     .await?;
 
     Ok(Json(HistoryResponse {
-        entries: entries.into_iter().map(Into::into).collect(),
+        entries: entries
+            .into_iter()
+            .map(|entry| {
+                if q.detail {
+                    entry.into()
+                } else {
+                    HistoryResponseEntry::list_row(entry)
+                }
+            })
+            .collect(),
         total,
         offset,
         limit,

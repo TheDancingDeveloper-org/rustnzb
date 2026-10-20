@@ -12,6 +12,7 @@ use base64::Engine;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use rust_embed::Embed;
 use tokio::net::TcpListener;
+use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
@@ -518,6 +519,15 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         // SPA fallback — serve Angular for all unmatched routes
         .fallback(h_spa_fallback)
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024)) // 200 MB for multi-file NZB uploads
+        // The API sends JSON lists (history, queue, groups) and the SPA ships
+        // several hundred KB of JS/CSS. Measured on a production-sized history
+        // (1726 rows): the 50-row page is 30.7 KB uncompressed and 5.2 KB
+        // gzipped, and the Angular chunks drop about 3.5x. That transfer is
+        // most of the client-perceived history load, so compressing here is
+        // worth more than any remaining server-side work. tower-http keeps gzip
+        // for clients that do not offer brotli and skips bodies that do not
+        // benefit (below 32 bytes, images, SSE, gRPC).
+        .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
