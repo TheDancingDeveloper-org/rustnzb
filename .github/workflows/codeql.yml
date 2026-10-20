@@ -1,24 +1,18 @@
 name: CodeQL
 
 # Static analysis (code scanning) for the Rust workspace and the Angular
-# frontend. Findings surface under the repository's Security > Code scanning
-# tab and as PR annotations.
+# frontend, run on release builds only. Findings surface under the repository's
+# Security > Code scanning tab.
 #
 # Runners: matches the rest of CI on the self-hosted fleet so the runner-policy
 # gate passes. Both languages use buildless extraction (build-mode: none), so
 # no compiler/toolchain step is needed; a single label set covers both.
 
 on:
-  # A PR analyses only the languages its diff touches; the other language's
-  # required `Analyze (...)` context still posts, with its steps skipped. The
-  # merge queue and the weekly schedule analyse everything. There is no push
-  # trigger: the queue already analysed the tree a merge lands on main, and the
-  # weekly schedule keeps the default-branch baseline current.
-  pull_request:
-  merge_group:
-  schedule:
-    # Weekly, so advisories that appear after a quiet period are still caught.
-    - cron: "27 4 * * 1"
+  # Runs only when a release build is cut: release.yml calls this workflow for
+  # every `v*` tag (dev, beta and prod builds alike). Never on pull requests,
+  # the merge queue, pushes to main or a schedule. See docs/ci.md.
+  workflow_call:
   workflow_dispatch:
 
 permissions:

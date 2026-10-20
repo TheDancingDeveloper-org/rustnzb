@@ -9,27 +9,36 @@ and run it all again.
 
 | Event | `ci.yml` | `codeql.yml` | `policy` / `runner-policy` | `dependency review` |
 |---|---|---|---|---|
-| `pull_request` | only the areas the diff touches (below) | only the languages the diff touches | full | reviews the PR's dependency changes |
-| `merge_group` (the queue) | **everything** | both languages | full | posts the context; the review already ran on the PR |
-| `push` to `main` | — (no trigger) | — (no trigger) | full | — |
-| weekly schedule (`codeql.yml`) | — | both languages | — | — |
+| `pull_request` | only the areas the diff touches (below) | **not run** | full | reviews the PR's dependency changes |
+| `merge_group` (the queue) | **everything** | **not run** | full | posts the context; the review already ran on the PR |
+| `push` to `main` | — (no trigger) | **not run** | full | — |
+| `v*` tag push (`release.yml`) | — | **both languages**, via `workflow_call` | — | — |
+| `workflow_dispatch` | everything | both languages | — | — |
 
 ### No run on push to `main`
 
-`ci.yml` and `codeql.yml` have no `push` trigger. A rebase merge from the queue
-lands the exact tree that the `merge_group` run already tested, so a push run
-on `main` would repeat the full suite with the same result. Nothing in these
-workflows publishes or fills a cache on push (the image is pushed only when
-`RUSTNZB_PUSH=true`, which no workflow sets), so no job needs the trigger.
+`ci.yml` has no `push` trigger. A rebase merge from the queue lands the exact
+tree that the `merge_group` run already tested, so a push run on `main` would
+repeat the full suite with the same result. Nothing in these workflows publishes
+or fills a cache on push (the image is pushed only when `RUSTNZB_PUSH=true`,
+which no workflow sets), so no job needs the trigger.
 
-CodeQL still refreshes its default-branch baseline on a weekly schedule
-(`27 4 * * 1`), so advisories that appear after a quiet period are still
-caught. Required-check names are unchanged.
+### CodeQL runs only when a release is cut
 
-A commit that reaches `main` without the queue (a direct push, or a merge with
-the queue turned off) is not analysed by `ci.yml` or CodeQL until the next
-queue run or the weekly schedule. Use `workflow_dispatch` on either workflow
-to run it on demand.
+CodeQL does not run on pull requests, the merge queue, pushes to `main` or a
+schedule. `codeql.yml` triggers on `workflow_call` and `workflow_dispatch`
+only. `release.yml` calls it as its `codeql` job on every `v*` tag push, so dev,
+beta and prod builds each analyse the tagged tree. The job does not gate the
+release build; it runs in parallel with `verify-release-ref` and the image build.
+
+Findings from a release build land under Security > Code scanning, and the
+default-branch baseline is whatever the last release analysed. To analyse a
+commit without cutting a release, run `workflow_dispatch` on `codeql.yml`.
+
+Because CodeQL no longer runs on PRs or the queue, its `Analyze (rust)` and
+`Analyze (javascript-typescript)` contexts never post there. Any ruleset or
+classic protection that still requires them will block merges. Remove them from
+the required checks before relying on this trigger set (see below).
 
 ### Path scoping on a pull request
 
@@ -47,9 +56,9 @@ Workflows no longer use `paths-ignore`. A required check that never starts
 leaves a PR or queue entry waiting forever; a skipped job reports success.
 
 CodeQL classifies `*.rs` plus `Cargo.*` as Rust, and JS/TS/HTML sources plus
-`package*.json` as `javascript-typescript`. A language with no change still
-posts its `Analyze (<language>)` context, with its steps skipped. A change to
-`codeql.yml` or `.github/codeql/` analyses both.
+`package*.json` as `javascript-typescript`. Its release run analyses both
+languages in full; the per-language scope check applies only to `pull_request`,
+which CodeQL no longer triggers on.
 
 ### Concurrency
 
@@ -84,6 +93,8 @@ checks. The ruleset (`POST repos/TheDancingDeveloper-org/rustnzb/rulesets`):
    "check_response_timeout_minutes":60}}]}
 ```
 
-Keep the classic protection's required checks (`policy`, `rust`,
-`Analyze (rust)`, `Analyze (javascript-typescript)`); all of them post on
-`merge_group`.
+Keep the classic protection's required checks `policy` and `rust`; both post on
+`merge_group`. Do not require `Analyze (rust)` or
+`Analyze (javascript-typescript)`: CodeQL no longer runs on `pull_request` or
+`merge_group`, so a required `Analyze` context never posts and the PR or queue
+entry waits forever.
