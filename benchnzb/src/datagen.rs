@@ -58,16 +58,29 @@ pub async fn prepare_data(scenarios: &[Scenario], data_dir: &Path) -> Result<()>
 
                 // Mark some data articles as missing (evenly spaced)
                 let total_parts = sc.total_size.div_ceil(ARTICLE_SIZE) as u32;
-                let missing_count = (total_parts as f64 * sc.missing_pct / 100.0) as u32;
-                if missing_count > 0 {
-                    let step = total_parts / missing_count;
-                    for i in 0..missing_count {
-                        let part = i * step + step / 2 + 1;
-                        if part <= total_parts {
-                            all_missing.push(format!("{data_prefix}-p{part:05}@{MSG_ID_DOMAIN}"));
-                        }
+                let missing_count = sc
+                    .missing_articles
+                    .unwrap_or((total_parts as f64 * sc.missing_pct / 100.0) as u32)
+                    .min(total_parts);
+                let mut missing = Vec::new();
+                let step = total_parts / missing_count.max(1);
+                for i in 0..missing_count {
+                    let part = i * step + step / 2 + 1;
+                    if part <= total_parts {
+                        missing.push(format!("{data_prefix}-p{part:05}@{MSG_ID_DOMAIN}"));
                     }
                 }
+                // An absolute count (the `damaged` group) must be exact even
+                // when the spacing above collides; top up from the front.
+                let mut part = 1;
+                while (missing.len() as u32) < missing_count && part <= total_parts {
+                    let mid = format!("{data_prefix}-p{part:05}@{MSG_ID_DOMAIN}");
+                    if !missing.contains(&mid) {
+                        missing.push(mid);
+                    }
+                    part += 1;
+                }
+                all_missing.extend(missing);
 
                 let mut nzb_files = vec![NzbFile {
                     filename: format!("bench_{label}.bin"),

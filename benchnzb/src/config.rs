@@ -36,6 +36,11 @@ pub struct Scenario {
     pub total_size: u64,
     pub test_type: TestType,
     pub missing_pct: f64,
+    /// Missing articles as an absolute count. When set it wins over
+    /// `missing_pct`, so the same damage `D` can be held constant while the
+    /// set size changes (the `damaged` group).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_articles: Option<u32>,
     pub redundancy_pct: f64,
     pub timeout_secs: u64,
 }
@@ -88,6 +93,7 @@ fn make_scenario(size: u64, test_type: TestType) -> Scenario {
         total_size: size,
         test_type,
         missing_pct,
+        missing_articles: None,
         redundancy_pct,
         timeout_secs,
     }
@@ -117,6 +123,7 @@ fn verification_scenario() -> Scenario {
         total_size: size,
         test_type: TestType::Unpack,
         missing_pct: 0.0,
+        missing_articles: None,
         redundancy_pct: 8.0,
         timeout_secs: 300,
     }
@@ -133,8 +140,34 @@ fn verification_fault_scenario() -> Scenario {
         total_size: size,
         test_type: TestType::Par2,
         missing_pct: 3.0,
+        missing_articles: None,
         redundancy_pct: 8.0,
         timeout_secs: 300,
+    }
+}
+
+/// Missing articles in every `damaged` scenario. Held constant so the par2
+/// stage's cost can be read against the damage `D` rather than the set size.
+pub const DAMAGED_ARTICLES: u32 = 3;
+
+/// A damaged job for the in-flight repair fold (WI-1237): one PAR2 set with
+/// a fixed number of missing articles. Running it at several sizes separates
+/// the repair's cost (D × slice size) from the set's size, which only the
+/// download and the disk fallback touch.
+fn damaged_scenario(size: u64) -> Scenario {
+    let label = size_label(size);
+    Scenario {
+        name: format!("damaged_{label}_par2"),
+        description: format!(
+            "{} generated payload, {DAMAGED_ARTICLES} articles missing, PAR2 repaired from the in-flight fold",
+            format_size(size)
+        ),
+        total_size: size,
+        test_type: TestType::Par2,
+        missing_pct: 0.0,
+        missing_articles: Some(DAMAGED_ARTICLES),
+        redundancy_pct: 8.0,
+        timeout_secs: 600,
     }
 }
 
@@ -249,6 +282,8 @@ pub fn resolve_scenarios(selector: &str) -> Vec<Scenario> {
         "all" | "full" => all,
         "verify" => vec![verification_scenario()],
         "verify-fault" => vec![verification_fault_scenario()],
+        // WI-1237: the same damage at growing set sizes.
+        "damaged" => vec![GB, 4 * GB].into_iter().map(damaged_scenario).collect(),
         "quick" => all
             .iter()
             .filter(|s| s.name == "sz5gb_raw")
@@ -274,7 +309,7 @@ pub fn resolve_scenarios(selector: &str) -> Vec<Scenario> {
             if matched.is_empty() {
                 tracing::error!("No scenarios matched: {selector}");
                 tracing::info!(
-                    "Groups: verify, verify-fault, quick, medium, speed, postproc, full"
+                    "Groups: verify, verify-fault, damaged, quick, medium, speed, postproc, full"
                 );
             }
             matched
@@ -326,6 +361,24 @@ mod tests {
         assert!(fault[0].missing_pct > 0.0);
         assert!(resolve_scenarios("missing").is_empty());
         assert_eq!(resolve_scenarios("verify,verify-fault").len(), 2);
+    }
+
+    /// WI-1237: the damaged group holds the damage count fixed while the set
+    /// size grows, so a run's par2 stage can be read against D, not set size.
+    #[test]
+    fn damaged_group_pins_the_damage_count_across_sizes() {
+        let scenarios = resolve_scenarios("damaged");
+        assert_eq!(scenarios.len(), 2);
+        assert!(scenarios[0].total_size < scenarios[1].total_size);
+        for scenario in &scenarios {
+            assert_eq!(scenario.test_type, TestType::Par2);
+            assert_eq!(scenario.missing_articles, Some(DAMAGED_ARTICLES));
+            assert_eq!(scenario.missing_pct, 0.0);
+            assert!(scenario.redundancy_pct > 0.0, "repair must be possible");
+            assert!(scenario.name.contains("damaged"));
+        }
+        assert_eq!(scenarios[0].name, "damaged_1gb_par2");
+        assert_eq!(scenarios[1].name, "damaged_4gb_par2");
     }
 
     #[test]
