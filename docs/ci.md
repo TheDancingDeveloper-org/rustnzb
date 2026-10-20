@@ -11,7 +11,25 @@ and run it all again.
 |---|---|---|---|---|
 | `pull_request` | only the areas the diff touches (below) | only the languages the diff touches | full | reviews the PR's dependency changes |
 | `merge_group` (the queue) | **everything** | both languages | full | posts the context; the review already ran on the PR |
-| `push` to `main` | everything | both languages | full | — |
+| `push` to `main` | — (no trigger) | — (no trigger) | full | — |
+| weekly schedule (`codeql.yml`) | — | both languages | — | — |
+
+### No run on push to `main`
+
+`ci.yml` and `codeql.yml` have no `push` trigger. A rebase merge from the queue
+lands the exact tree that the `merge_group` run already tested, so a push run
+on `main` would repeat the full suite with the same result. Nothing in these
+workflows publishes or fills a cache on push (the image is pushed only when
+`RUSTNZB_PUSH=true`, which no workflow sets), so no job needs the trigger.
+
+CodeQL still refreshes its default-branch baseline on a weekly schedule
+(`27 4 * * 1`), so advisories that appear after a quiet period are still
+caught. Required-check names are unchanged.
+
+A commit that reaches `main` without the queue (a direct push, or a merge with
+the queue turned off) is not analysed by `ci.yml` or CodeQL until the next
+queue run or the weekly schedule. Use `workflow_dispatch` on either workflow
+to run it on demand.
 
 ### Path scoping on a pull request
 
