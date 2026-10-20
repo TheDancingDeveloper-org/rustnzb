@@ -1097,6 +1097,128 @@ pub async fn h_history_retry(
 }
 
 // ---------------------------------------------------------------------------
+// History bulk actions
+// ---------------------------------------------------------------------------
+
+/// Most ids one bulk request may name. The UI's "select all" is per page
+/// (50); status-wide actions name no ids at all, so this only bounds a
+/// hand-written client.
+const MAX_HISTORY_BULK_IDS: usize = 5_000;
+
+#[derive(Deserialize)]
+pub struct HistoryBulkBody {
+    /// `delete` or `retry`.
+    pub action: String,
+    /// Entries to act on. May be empty when `status` names the set.
+    #[serde(default)]
+    pub ids: Vec<String>,
+    /// For `delete` only: also delete every entry with this status
+    /// (`completed` or `failed`). This is "clear completed/failed", and it is
+    /// not narrowed by the caller's UI filters -- the response reports how
+    /// many entries it deleted so the UI can confirm the count first.
+    pub status: Option<String>,
+}
+
+/// POST /api/history/bulk -- Delete or retry several history entries.
+///
+/// Mirrors `POST /api/queue/bulk`: one request, one result per id, and a
+/// per-id failure rather than failing the whole batch. Deleting is
+/// idempotent per id like `DELETE /api/history/{id}`, but a list entry must
+/// still report an unknown id as a failure -- otherwise a selection the
+/// server silently dropped looks like success.
+pub async fn h_history_bulk(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<HistoryBulkBody>,
+) -> Result<Json<BulkActionResponse>, ApiError> {
+    let action = body.action.trim().to_ascii_lowercase();
+    if !matches!(action.as_str(), "delete" | "retry") {
+        return Err(ApiError::bad_request("action must be `delete` or `retry`"));
+    }
+    if body.ids.len() > MAX_HISTORY_BULK_IDS {
+        return Err(ApiError::bad_request("too many ids in one bulk request"));
+    }
+    let status = match body
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(raw) => Some(parse_history_status(raw).ok_or(ApiError::bad_request(
+            "status must be `completed` or `failed`",
+        ))?),
+    };
+    if status.is_some() && action != "delete" {
+        return Err(ApiError::bad_request(
+            "status is only valid with the `delete` action",
+        ));
+    }
+    if status.is_none() && body.ids.is_empty() {
+        return Err(ApiError::bad_request("a bulk action needs ids or a status"));
+    }
+
+    let requested = body.ids;
+    let (succeeded, failures) = qm_blocking(&state, move |qm| {
+        // The explicit ids first, then every entry the status names. An id
+        // repeated across the two is acted on once.
+        let mut targets: Vec<String> = Vec::with_capacity(requested.len());
+        for id in requested {
+            if !targets.contains(&id) {
+                targets.push(id);
+            }
+        }
+        if let Some(status) = status {
+            for summary in qm.history_summaries(&HistoryFilter::default())? {
+                if summary.status == status && !targets.contains(&summary.id) {
+                    targets.push(summary.id);
+                }
+            }
+        }
+
+        let mut succeeded = 0usize;
+        let mut failures: Vec<BulkActionFailure> = Vec::new();
+        for id in targets {
+            let error = if action == "delete" {
+                // `history_remove` is idempotent, so look the entry up first:
+                // a stale id in a client's selection is a failure to report.
+                match qm.history_get(&id)? {
+                    None => Some(ApiError::not_found("History entry not found")),
+                    Some(_) => match qm.history_remove(&id) {
+                        Ok(()) => None,
+                        Err(e) => Some(ApiError::from(e)),
+                    },
+                }
+            } else {
+                match qm.history_get(&id)? {
+                    None => Some(ApiError::not_found("History entry not found")),
+                    Some(entry) => match qm.retry_history_entry(&entry)? {
+                        HistoryRetryOutcome::Started(_) | HistoryRetryOutcome::InProgress(_) => {
+                            None
+                        }
+                        HistoryRetryOutcome::NoNzbData => {
+                            Some(ApiError::conflict("No NZB data stored for this entry"))
+                        }
+                    },
+                }
+            };
+            match error {
+                None => succeeded += 1,
+                Some(error) => failures.push(BulkActionFailure { id, error }),
+            }
+        }
+        Ok((succeeded, failures))
+    })
+    .await?;
+
+    Ok(Json(BulkActionResponse {
+        status: failures.is_empty(),
+        succeeded,
+        failed: failures.len(),
+        failures,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Status handler
 // ---------------------------------------------------------------------------
 
