@@ -61,6 +61,11 @@ export interface NntpConnectionStatus {
   limit: number;
 }
 
+/**
+ * A history row. `/history` list responses omit `stages` and `server_stats`
+ * (they are the bulk of a page and the table never renders them);
+ * `/history/{id}` — which the expanded row loads — carries both.
+ */
 export interface HistoryEntry {
   id: string;
   name: string;
@@ -77,6 +82,7 @@ export interface HistoryEntry {
   has_nzb_data: boolean;
   duration_secs?: number;
   average_speed_bps?: number;
+  /** Article totals, sent on list rows so availability needs no breakdown. */
   articles_served?: number;
   articles_missing?: number;
 }

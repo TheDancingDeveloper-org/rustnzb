@@ -209,8 +209,10 @@ impl RustnzbClient {
     }
 
     pub async fn get_stage_timing(&self) -> Result<StageTiming> {
+        // `detail=true`: the list route omits stages and server stats, which
+        // are what this call is for (WI-1294).
         let history: serde_json::Value = self
-            .get(format!("{}/api/history", self.url))
+            .get(format!("{}/api/history?detail=true", self.url))
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?
@@ -256,8 +258,9 @@ impl RustnzbClient {
 
     /// Fetch internal metrics from the history API after job completion.
     pub async fn get_internal_metrics(&self) -> Result<crate::runner::InternalMetrics> {
+        // `detail=true` for the per-server and per-stage breakdown (WI-1294).
         let history: serde_json::Value = self
-            .get(format!("{}/api/history", self.url))
+            .get(format!("{}/api/history?detail=true", self.url))
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?
