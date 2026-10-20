@@ -12,7 +12,7 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  --scenarios GROUP   verify|verify-fault|quick|medium|speed|postproc|full"
+    echo "  --scenarios GROUP   verify|verify-fault|damaged|quick|medium|speed|postproc|full"
     echo "  --no-cleanup        Keep containers after run"
     echo "  --help              Show this help"
     echo ""
@@ -21,6 +21,7 @@ usage() {
     echo "  medium   - 5+10 GB, all test types (~30 min)"
     echo "  speed    - 5+10+50 GB raw download (~60 min)"
     echo "  postproc - 5+10 GB par2+unpack (~45 min)"
+    echo "  damaged  - 1+4 GB par2 with 3 articles missing (~10 min)"
     echo "  full     - All 9 scenarios (5/10/50 x raw/par2/unpack)"
     exit 0
 }

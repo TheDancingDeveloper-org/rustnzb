@@ -56,6 +56,17 @@ fixture with deterministic injected 430 responses. Its `fixture_metrics`
 record proves it is a fault/repair path; do not compare its bytes or duration
 with the healthy `verify` result.
 
+Run `./run.sh --scenarios damaged` for the in-flight repair fixture: the same
+generated payload at 1 GB and 4 GB, with exactly three articles missing from
+each set (`missing_articles`, an absolute count so the repair demand stays
+fixed as the set grows). Both jobs run with `par2.defer_volumes` and
+`par2.trust_inflight_verify` at their defaults, so repair is solved from the
+in-flight fold rather than a disk re-read. The 1 GB and 4 GB results differ
+only in set size, which is what shows the post-download PAR2 stage scaling
+with D x slice size rather than with set size. Read the stage timing and the
+`[repair: fold, N slices read, Xs]` tag from the container log; N is the bytes
+the stage had to re-read from disk.
+
 For comparison runs, the mock NNTP server records decoded payload bytes,
 yEnc-body bytes, article requests (including repeats), successful article
 responses, and injected 430 responses.
