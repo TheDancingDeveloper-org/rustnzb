@@ -97,6 +97,9 @@ pub struct RepairFold {
     disk_rereads: usize,
     /// Bytes read back from disk to be folded, total.
     disk_read_bytes: u64,
+    /// This fold's own row limit, below the global budget. Tests use it to
+    /// force a growth past the budget.
+    max_rows: usize,
 }
 
 impl fmt::Debug for RepairFold {
@@ -166,6 +169,7 @@ impl RepairFold {
             disk_reads: 0,
             disk_rereads: 0,
             disk_read_bytes: 0,
+            max_rows: max_rows(slice_size),
             growth: None,
             generation: 0,
         })
@@ -173,6 +177,14 @@ impl RepairFold {
 
     pub fn slice_size(&self) -> u64 {
         self.slice_size as u64
+    }
+    /// Cap this fold at `rows` rows, below the global budget. A growth past
+    /// the cap fails with [`FoldError::NoRows`], which the caller turns into
+    /// a disk repair — the same path a host with a tighter memory budget
+    /// takes. Never raises the global limit.
+    pub fn with_row_limit(mut self, rows: usize) -> Self {
+        self.max_rows = rows.min(max_rows(self.slice_size as u64));
+        self
     }
     pub fn total_slices(&self) -> usize {
         self.fed.len()
@@ -226,6 +238,10 @@ impl RepairFold {
     }
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+    /// Rows this fold may hold: its own limit, never above the global budget.
+    fn row_limit(&self) -> usize {
+        self.max_rows.min(max_rows(self.slice_size as u64))
     }
     /// Bytes held by the rows.
     pub fn row_bytes(&self) -> u64 {
@@ -293,7 +309,7 @@ impl RepairFold {
         if new.is_empty() {
             return Ok(0);
         }
-        if self.rows.len() + new.len() > max_rows(self.slice_size as u64) {
+        if self.rows.len() + new.len() > self.row_limit() {
             return Err(FoldError::NoRows);
         }
         let start = self.rows.len();
@@ -339,7 +355,7 @@ impl RepairFold {
         if new.is_empty() {
             return Ok(None);
         }
-        if self.rows.len() + new.len() > max_rows(self.slice_size as u64) {
+        if self.rows.len() + new.len() > self.row_limit() {
             return Err(FoldError::NoRows);
         }
         let start = self.rows.len();
@@ -751,6 +767,25 @@ mod tests {
         assert_eq!(out[0].0, 4);
         assert_eq!(&out[0].1[..], &d[4][..]);
         assert_eq!(&out[1].1[..], &d[1][..]);
+    }
+
+    /// WI-1237: a caller-tightened row cap stops a growth, which is what
+    /// makes post-processing fall back to the disk repair.
+    #[test]
+    fn a_caller_row_cap_stops_growth() {
+        let (n, slice) = (8, 16);
+        let mut fold = RepairFold::new(n, slice as u64, &[0]).unwrap().with_row_limit(2);
+        assert_eq!(fold.extend_rows(&[1], &mut |_| unreachable!()).unwrap(), 1);
+        assert_eq!(
+            fold.extend_rows(&[2], &mut |_| unreachable!()),
+            Err(FoldError::NoRows)
+        );
+        assert_eq!(fold.rows(), 2, "a refused growth leaves the fold as it was");
+        // The cap can only tighten: a large value keeps the global budget.
+        let unbounded = RepairFold::new(4, slice as u64, &[0])
+            .unwrap()
+            .with_row_limit(usize::MAX);
+        assert_eq!(unbounded.row_limit(), max_rows(slice as u64));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use mock_nntp_server::damage::DamageRelease;
+use mock_nntp_server::damage::{DamageRelease, DamageScenario, ScenarioFixture};
 use nzb_core::models::{SliceMapSummary, SliceVerdict, StageStatus};
 use nzb_decode::{RepairFold, SharedFold};
 use nzb_postproc::{PostProcConfig, PostProcResult, run_repair_pipeline};
@@ -188,4 +188,180 @@ async fn fold_of_another_set_falls_back_to_disk() {
     let (fold_dir, folded) = run(&case, Some(Arc::new(Mutex::new(other)))).await;
     assert!(repair_message(&folded).contains("[repair: disk,"));
     assert_identical(&case, disk_dir.path(), fold_dir.path());
+}
+
+// ---------------------------------------------------------------------------
+// WI-1237: the fold path over the deterministic damage fixtures
+// ---------------------------------------------------------------------------
+
+/// A fixture written the way the download leaves it: the damaged bytes on
+/// disk, plus the slice map the download would have produced. Slices the
+/// fixture calls unestablished stay `Unknown`, like a resumed or late-index
+/// job, so the verify pass reads that file from disk.
+fn damage_case(scenario: DamageScenario) -> (ScenarioFixture, SliceMapSummary, Vec<usize>) {
+    let fixture = scenario.fixture();
+    let release = &fixture.release;
+    let total = release.par2.total_slices() as usize;
+    let mut states = vec![SliceVerdict::Verified; total];
+    for gi in &fixture.expect.damaged_slices {
+        states[*gi as usize] = SliceVerdict::Damaged;
+    }
+    for gi in &fixture.expect.unknown_slices {
+        states[*gi as usize] = SliceVerdict::Unknown;
+    }
+    let mut damaged: Vec<usize> = fixture
+        .expect
+        .damaged_slices
+        .iter()
+        .chain(&fixture.expect.unknown_slices)
+        .map(|g| *g as usize)
+        .collect();
+    damaged.sort_unstable();
+    let map = SliceMapSummary {
+        damaged: fixture.expect.damaged_slices.len(),
+        unknown: fixture.expect.unknown_slices.len(),
+        recovery_block_count: fixture.expect.recovery_blocks,
+        states,
+    };
+    (fixture, map, damaged)
+}
+
+fn scenario_config(fixture: &ScenarioFixture, map: SliceMapSummary, fold: Option<SharedFold>) -> PostProcConfig {
+    let expect = &fixture.expect;
+    let failed = expect.missing_articles.len()
+        + expect.corrupt_articles.len()
+        + expect.unestablished_articles.len()
+        + expect.files_absent_from_nzb.len();
+    PostProcConfig {
+        articles_failed: failed,
+        content_articles_failed: failed,
+        slice_map: Some(map),
+        trust_inflight_verify: true,
+        repair_fold: fold,
+        ..Default::default()
+    }
+}
+
+/// Run one scenario's job twice — repair from the fold, repair from disk —
+/// and assert both write the seeded payload, byte for byte.
+async fn assert_fold_matches_disk(scenario: DamageScenario) {
+    let (fixture, map, damaged) = damage_case(scenario);
+    let slug = scenario.slug();
+    let release = &fixture.release;
+
+    let all = slices(release);
+    assert!(all.len() == map.states.len(), "{slug}: slice count");
+    let mut fold = RepairFold::new(
+        all.len(),
+        release.par2.slice_size(),
+        &(0..fixture.expect.recovery_blocks).collect::<Vec<u32>>(),
+    )
+    .unwrap();
+    for (gi, bytes) in all.iter().enumerate() {
+        if !damaged.contains(&gi) {
+            fold.feed(gi, bytes).unwrap();
+        }
+    }
+    let shared: SharedFold = Arc::new(Mutex::new(fold));
+
+    let fold_dir = tempfile::tempdir().unwrap();
+    fixture.write_received(fold_dir.path());
+    let folded = run_repair_pipeline(
+        fold_dir.path(),
+        &scenario_config(&fixture, map.clone(), Some(shared)),
+        None,
+    )
+    .await;
+    assert!(
+        folded.success,
+        "{slug}: fold path failed: {:?} {:?}",
+        folded.error, folded.stages
+    );
+    let msg = repair_message(&folded);
+    assert!(msg.contains("[repair: fold, 0 slices read,"), "{slug}: {msg}");
+
+    let disk_dir = tempfile::tempdir().unwrap();
+    fixture.write_received(disk_dir.path());
+    let disk = run_repair_pipeline(
+        disk_dir.path(),
+        &scenario_config(&fixture, map, None),
+        None,
+    )
+    .await;
+    assert!(
+        disk.success,
+        "{slug}: disk path failed: {:?} {:?}",
+        disk.error, disk.stages
+    );
+    assert!(
+        repair_message(&disk).contains("[repair: disk,"),
+        "{slug}: {}",
+        repair_message(&disk)
+    );
+
+    for file in &release.data_files {
+        let from_fold = std::fs::read(fold_dir.path().join(&file.filename)).unwrap();
+        let from_disk = std::fs::read(disk_dir.path().join(&file.filename)).unwrap();
+        assert!(
+            from_fold == from_disk,
+            "{slug}: {} differs between the fold and disk repairs",
+            file.filename
+        );
+        assert!(
+            from_fold == file.payload,
+            "{slug}: {} not byte-identical to the seeded payload",
+            file.filename
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_repairable_damage_scenario_is_byte_identical_from_the_fold() {
+    let mut repairable = 0;
+    for scenario in DamageScenario::ALL {
+        let expect = scenario.fixture().expect;
+        // `BusyProvider` is repairable because nothing is damaged: the retry
+        // fetches it, so there is no repair to compare.
+        let at_risk = expect.damaged_slices.len() + expect.unknown_slices.len();
+        if !expect.repairable || at_risk == 0 {
+            continue;
+        }
+        repairable += 1;
+        assert_fold_matches_disk(scenario).await;
+    }
+    // The matrix must actually exercise the repair path.
+    assert!(repairable >= 4, "only {repairable} repairable scenarios");
+}
+
+/// A fold whose rows stop short of the damage, and whose budget refuses the
+/// extra rows, must not fail the job: the disk path repairs it.
+#[tokio::test]
+async fn budget_exhaustion_falls_back_to_disk_and_still_repairs() {
+    let case = case(16);
+    let data = slices(&case.release);
+    // One row, and no room to grow: three damaged slices need three.
+    let mut fold = RepairFold::new(
+        data.len(),
+        case.release.par2.slice_size(),
+        &[0],
+    )
+    .unwrap()
+    .with_row_limit(1);
+    for (gi, bytes) in data.iter().enumerate() {
+        if !case.damaged.contains(&gi) {
+            fold.feed(gi, bytes).unwrap();
+        }
+    }
+    let shared: SharedFold = Arc::new(Mutex::new(fold));
+    let (dir, result) = run(&case, Some(shared)).await;
+    let msg = repair_message(&result);
+    assert!(msg.contains("[repair: disk,"), "{msg}");
+    assert!(
+        msg.contains("fold refused: no recovery rows fit the memory budget"),
+        "{msg}"
+    );
+    for file in &case.release.data_files {
+        let bytes = std::fs::read(dir.path().join(&file.filename)).unwrap();
+        assert!(bytes == file.payload, "{} not repaired", file.filename);
+    }
 }
