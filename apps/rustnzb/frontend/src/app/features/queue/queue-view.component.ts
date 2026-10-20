@@ -1696,12 +1696,15 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   }
 
   onRowDrop(event: DragEvent, targetJobId: string): void {
-    event.preventDefault();
-
     const draggedId = this.draggingJobId();
     const dropAfter = this.dropAfterTarget();
     this.dragOverJobId.set(null);
     this.dropAfterTarget.set(false);
+
+    // Not a row reorder (e.g. an .nzb file from the desktop): leave the event
+    // un-prevented so the page-wide drop handler in App adds the file.
+    if (!draggedId) return;
+    event.preventDefault();
 
     if (!draggedId || draggedId === targetJobId || !this.canReorderRows() || this.reorderPending()) {
       return;

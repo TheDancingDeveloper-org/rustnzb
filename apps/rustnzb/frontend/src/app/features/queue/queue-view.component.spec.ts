@@ -426,6 +426,17 @@ describe('QueueViewComponent', () => {
     ).toEqual(['job-2', 'job-3', 'job-1']);
   });
 
+  it('lets a file dropped on a row through to the page-wide drop handler', () => {
+    const { component, api } = makeComponent({ post: vi.fn(() => of({ ok: true })) });
+    component.jobs.set([makeJob({ id: 'job-1', name: 'One' })]);
+    const event = { preventDefault: vi.fn() } as unknown as DragEvent;
+
+    component.onRowDrop(event, 'job-1');
+
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(api.post).not.toHaveBeenCalled();
+  });
+
   it('optimistically reorders rows and persists the new position', () => {
     const { component, api } = makeComponent({
       post: vi.fn(() => of({ ok: true })),
