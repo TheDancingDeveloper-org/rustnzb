@@ -246,30 +246,75 @@ fn scenario_config(
     }
 }
 
+/// How a scenario's fold is opened and fed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sizing {
+    /// One row per recovery block: the widest fold the set allows.
+    EveryExponent,
+    /// Exactly the D rows the engine opens for the damage it knows about.
+    DamageRows,
+}
+
+impl Sizing {
+    fn exponents(self, recovery_blocks: u32, damaged: usize) -> Vec<u32> {
+        let rows = match self {
+            Sizing::EveryExponent => recovery_blocks as usize,
+            Sizing::DamageRows => damaged,
+        };
+        (0..rows as u32).collect()
+    }
+}
+
 /// Run one scenario's job twice — repair from the fold, repair from disk —
 /// and assert both write the seeded payload, byte for byte.
-async fn assert_fold_matches_disk(scenario: DamageScenario) {
+///
+/// `feed_from_disk`: feed the fold from the bytes the fixture wrote to disk
+/// instead of from the pristine payload. A `Verified` slice's bytes on disk are
+/// meant to be the payload, so this also proves the on-disk fixture agrees with
+/// the slice map the verifier trusts.
+async fn assert_fold_matches_disk(scenario: DamageScenario, sizing: Sizing, feed_from_disk: bool) {
     let (fixture, map, damaged) = damage_case(scenario);
     let slug = scenario.slug();
     let release = &fixture.release;
 
     let all = slices(release);
     assert!(all.len() == map.states.len(), "{slug}: slice count");
+
+    let fold_dir = tempfile::tempdir().unwrap();
+    fixture.write_received(fold_dir.path());
+    let on_disk: Option<Vec<Vec<u8>>> = feed_from_disk.then(|| {
+        let slice = release.par2.slice_size() as usize;
+        let mut out = vec![Vec::new(); all.len()];
+        for file in &release.data_files {
+            let Some(first) = release.par2.first_global_slice(&file.filename) else {
+                continue;
+            };
+            let path = fold_dir.path().join(&file.filename);
+            let Ok(bytes) = std::fs::read(&path) else {
+                // A file absent from the NZB was never written; its slices stay
+                // unfed, exactly as they would for a late index or a resume.
+                continue;
+            };
+            for (i, chunk) in bytes.chunks(slice).enumerate() {
+                out[first as usize + i] = chunk.to_vec();
+            }
+        }
+        out
+    });
+    let source = on_disk.as_deref().unwrap_or(&all);
+
     let mut fold = RepairFold::new(
         all.len(),
         release.par2.slice_size(),
-        &(0..fixture.expect.recovery_blocks).collect::<Vec<u32>>(),
+        &sizing.exponents(fixture.expect.recovery_blocks, damaged.len()),
     )
     .unwrap();
-    for (gi, bytes) in all.iter().enumerate() {
+    for (gi, bytes) in source.iter().enumerate() {
         if !damaged.contains(&gi) {
             fold.feed(gi, bytes).unwrap();
         }
     }
     let shared: SharedFold = Arc::new(Mutex::new(fold));
-
-    let fold_dir = tempfile::tempdir().unwrap();
-    fixture.write_received(fold_dir.path());
     let folded = run_repair_pipeline(
         fold_dir.path(),
         &scenario_config(&fixture, map.clone(), Some(shared)),
@@ -330,10 +375,29 @@ async fn every_repairable_damage_scenario_is_byte_identical_from_the_fold() {
             continue;
         }
         repairable += 1;
-        assert_fold_matches_disk(scenario).await;
+        assert_fold_matches_disk(scenario, Sizing::EveryExponent, false).await;
     }
     // The matrix must actually exercise the repair path.
     assert!(repairable >= 4, "only {repairable} repairable scenarios");
+}
+
+/// The same identity, with the fold opened at the row count production uses
+/// (D, not every exponent) and fed from the bytes on disk rather than from the
+/// payload. This covers the engine's sizing and shows the written fixture
+/// agrees with the slice map the verifier trusts.
+#[tokio::test]
+async fn damage_sized_fold_fed_from_disk_is_byte_identical_to_disk_repair() {
+    let mut covered = 0;
+    for scenario in DamageScenario::ALL {
+        let expect = scenario.fixture().expect;
+        let at_risk = expect.damaged_slices.len() + expect.unknown_slices.len();
+        if !expect.repairable || at_risk == 0 {
+            continue;
+        }
+        covered += 1;
+        assert_fold_matches_disk(scenario, Sizing::DamageRows, true).await;
+    }
+    assert!(covered >= 4, "only {covered} repairable scenarios");
 }
 
 /// A fold whose rows stop short of the damage, and whose budget refuses the
