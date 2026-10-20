@@ -119,8 +119,10 @@ The header is checked exactly like `apikey` and wins when both are present.
 These have no SABnzbd import, or work differently:
 
 - **Post-processing scripts:** copy your scripts into `scripts_dir` and set
-  `script_success` / `script_failure`. They get SABnzbd's arguments and
-  environment, so most work unchanged.
+  `script_success` / `script_failure`. They get SABnzbd's arguments and the
+  full `SAB_*` environment, plus NZBGet's `NZBPP_*` names, so most work
+  unchanged. The variable list is in
+  [CONFIGURATION.md](CONFIGURATION.md#script-environment).
 - **Notifications:** set a webhook, Apprise or ntfy target under
   `[notifications]`. See [NOTIFICATIONS.md](NOTIFICATIONS.md).
 - **Indexers on your LAN:** rustnzb refuses to fetch NZB URLs from private

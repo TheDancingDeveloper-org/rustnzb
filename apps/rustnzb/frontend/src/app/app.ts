@@ -671,6 +671,15 @@ export class App implements OnInit, OnDestroy {
   readonly noServers = computed(() => this.serverCount() === 0);
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private statusInFlight = false;
+  /** Permission can be revoked while the page is open; re-read it on return. */
+  private onVisibilityChange = () => {
+    if (!pageHidden()) {
+      this.notifications.refreshPermission();
+      // Poll at once rather than waiting out the interval, so a job that
+      // finished while the tab was hidden shows the moment it is opened.
+      if (!this.statusInFlight) this.pollStatus();
+    }
+  };
   private docClickHandler = (e: MouseEvent) => {
     const target = e.target as HTMLElement;
     if (this.pauseMenuOpen && !target.closest('.pause-group')) this.pauseMenuOpen = false;
@@ -705,8 +714,15 @@ export class App implements OnInit, OnDestroy {
   ngOnInit(): void {
     this.pollStatus();
     this.loadServerCount();
+    document.addEventListener('visibilitychange', this.onVisibilityChange);
     this.pollTimer = setInterval(() => {
-      if (!pageHidden() && !this.statusInFlight) this.pollStatus();
+      // A background tab polls only to feed browser notifications. Alerts
+      // are for a user looking at another tab, so skipping the poll while
+      // hidden would mean they never fire; with alerts off the old skip
+      // still applies and a hidden tab makes no requests.
+      if (this.statusInFlight) return;
+      if (pageHidden() && !this.notifications.enabled()) return;
+      this.pollStatus();
     }, 2000);
     document.addEventListener('click', this.docClickHandler);
   }
@@ -714,6 +730,7 @@ export class App implements OnInit, OnDestroy {
   ngOnDestroy(): void {
     if (this.pollTimer) clearInterval(this.pollTimer);
     document.removeEventListener('click', this.docClickHandler);
+    document.removeEventListener('visibilitychange', this.onVisibilityChange);
   }
 
   pollStatus(): void {
