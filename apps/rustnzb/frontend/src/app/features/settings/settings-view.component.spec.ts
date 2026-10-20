@@ -1,10 +1,28 @@
 import '@angular/compiler';
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Observable, of, throwError } from 'rxjs';
+import { HttpHeaders, HttpResponse } from '@angular/common/http';
 
 import { ApiService } from '../../core/services/api.service';
-import { SettingsViewComponent } from './settings-view.component';
+import {
+  MAX_BACKUP_BYTES,
+  SettingsViewComponent,
+  filenameFromDisposition,
+} from './settings-view.component';
+
+const BACKUP_REPORT = {
+  status: true,
+  restored: false,
+  backup: {
+    backup_version: 1,
+    created_at: '2026-10-20T09:00:00Z',
+    app_version: '1.7.0',
+    secrets_included: false,
+  },
+  summary: { server_count: 1, category_count: 2, rss_feed_count: 0, secrets_kept: 3, warnings: [] },
+  restart_required: [],
+};
 
 function makeComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {}) {
   const api = {
@@ -27,6 +45,17 @@ function makeComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {})
     post: vi.fn(() => of({ api_key: 'rotated' })),
     put: vi.fn(() => of({})),
     delete: vi.fn(() => of({})),
+    getText: vi.fn(() =>
+      of(
+        new HttpResponse({
+          body: 'masked = true',
+          headers: new HttpHeaders({
+            'Content-Disposition': 'attachment; filename="rustnzb-backup-20261020T090000Z.toml"',
+          }),
+        }),
+      ),
+    ),
+    postText: vi.fn(() => of(BACKUP_REPORT)),
     ...overrides,
   };
   const snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
@@ -282,5 +311,193 @@ describe('SettingsViewComponent unsaved changes', () => {
     const dirty = { preventDefault: vi.fn() } as unknown as BeforeUnloadEvent;
     component.onBeforeUnload(dirty);
     expect(dirty.preventDefault).toHaveBeenCalled();
+  });
+});
+
+describe('SettingsViewComponent backup & restore', () => {
+  let saved: { filename: string; text: string } | null;
+  let click: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    saved = null;
+    click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      saved = { filename: this.download, text: String((this as unknown as { __text?: string }).__text ?? '') };
+    });
+    URL.createObjectURL = vi.fn(() => 'blob:backup');
+    URL.revokeObjectURL = vi.fn();
+  });
+
+  afterEach(() => {
+    click.mockRestore();
+  });
+
+  it('downloads a masked backup by default and never asks for secrets', () => {
+    const { component, api, snack } = makeComponent();
+    component.ngOnInit();
+
+    component.downloadBackup();
+
+    expect(api.getText).toHaveBeenCalledWith('/config/backup', undefined);
+    expect(snack.open).toHaveBeenCalledWith('Backup downloaded', 'Close', { duration: 3000 });
+    // The name comes from the server, not from a guess on the client.
+    expect(saved?.filename).toBe('rustnzb-backup-20261020T090000Z.toml');
+  });
+
+  it('asks for secrets only when the operator opts in', () => {
+    const { component, api } = makeComponent();
+    component.ngOnInit();
+    component.backupIncludeSecrets = true;
+
+    component.downloadBackup();
+
+    expect(api.getText).toHaveBeenCalledWith('/config/backup', { secrets: 'true' });
+  });
+
+  it('surfaces a failed download', () => {
+    const { component, snack } = makeComponent({
+      getText: vi.fn(() => throwError(() => new Error('offline'))),
+    });
+    component.ngOnInit();
+
+    component.downloadBackup();
+
+    expect(snack.open).toHaveBeenCalledWith('Failed to download backup', 'Close', { duration: 5000 });
+    expect(component.backupBusy).toBe(false);
+  });
+
+  it('will not enable Restore until a preview of the current file has succeeded', () => {
+    const { component } = makeComponent();
+    component.ngOnInit();
+    expect(component.backupPreviewMatchesFile).toBe(false);
+
+    component.backupText = '[backup]\nbackup_version = 1\n[config]\n';
+    expect(component.backupPreviewMatchesFile).toBe(false);
+
+    component.previewBackup();
+    expect(component.backupPreviewMatchesFile).toBe(true);
+    expect(component.backupPreview?.summary.secrets_kept).toBe(3);
+
+    // A different file invalidates the preview, so a stale one cannot be restored.
+    component.backupText = '[backup]\nbackup_version = 1\n[config]\n# edited\n';
+    expect(component.backupPreviewMatchesFile).toBe(false);
+  });
+
+  it('reports the server’s refusal without enabling restore', () => {
+    const { component, api, snack } = makeComponent({
+      postText: vi.fn(() =>
+        throwError(() => ({
+          status: 400,
+          error: { human_readable: 'general.port must be 1-65535' },
+        })),
+      ),
+    });
+    component.ngOnInit();
+    component.backupText = '[backup]\nbackup_version = 1\n[config]\n';
+
+    component.previewBackup();
+
+    expect(component.backupPreview).toBeNull();
+    expect(component.backupPreviewMatchesFile).toBe(false);
+    expect(component.backupError).toBe('This backup was refused: general.port must be 1-65535');
+    expect(snack.open).toHaveBeenCalledWith(
+      'This backup was refused: general.port must be 1-65535',
+      'Close',
+      { duration: 5000 },
+    );
+  });
+
+  it('restores only after confirmation, then refetches the settings it replaced', () => {
+    const restored = {
+      ...BACKUP_REPORT,
+      restored: true,
+      restart_required: ['general.port'],
+    };
+    const { component, api, confirm, snack } = makeComponent({
+      postText: vi.fn((path: string) => of(path.endsWith('/restore') ? restored : BACKUP_REPORT)),
+    });
+    component.ngOnInit();
+    component.backupText = '[backup]\nbackup_version = 1\n[config]\n';
+    component.previewBackup();
+    const getsBefore = api.get.mock.calls.length;
+
+    component.restoreBackup();
+
+    expect(confirm.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Restore this configuration?', danger: true }),
+    );
+    expect(api.postText).toHaveBeenCalledWith('/config/backup/restore', component.backupText);
+    expect(api.get.mock.calls.length).toBeGreaterThan(getsBefore);
+    expect(snack.open).toHaveBeenCalledWith(
+      'Configuration restored. Restart to apply: general.port',
+      'Close',
+      { duration: 6000 },
+    );
+  });
+
+  it('does not restore when the confirmation is declined', () => {
+    const { component, api, confirm } = makeComponent({
+      postText: vi.fn(() => of(BACKUP_REPORT)),
+    });
+    confirm.confirm = vi.fn(() => of(false));
+    component.ngOnInit();
+    component.backupText = '[backup]\nbackup_version = 1\n[config]\n';
+    component.previewBackup();
+
+    component.restoreBackup();
+
+    expect(api.postText).toHaveBeenCalledTimes(1);
+    expect(api.postText).toHaveBeenCalledWith('/config/backup/preview', component.backupText);
+  });
+
+  it('does not restore a file it has not previewed', () => {
+    const { component, api, confirm } = makeComponent();
+    component.ngOnInit();
+    component.backupText = '[backup]\nbackup_version = 1\n';
+
+    component.restoreBackup();
+
+    expect(confirm.confirm).not.toHaveBeenCalled();
+    expect(api.postText).not.toHaveBeenCalled();
+  });
+
+  it('refuses an oversized file before sending it', () => {
+    const { component, api } = makeComponent();
+    component.ngOnInit();
+    const file = new File(['x'], 'huge.toml');
+    Object.defineProperty(file, 'size', { value: MAX_BACKUP_BYTES + 1 });
+
+    component.chooseBackupFile({ target: { files: [file] } } as unknown as Event);
+
+    expect(component.backupError).toContain('larger than');
+    expect(component.backupText).toBe('');
+    expect(api.postText).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a failed restore and keeps the preview so it can be retried', () => {
+    const { component, snack } = makeComponent({
+      postText: vi.fn((path: string) =>
+        path.endsWith('/restore') ? throwError(() => new Error('offline')) : of(BACKUP_REPORT),
+      ),
+    });
+    component.ngOnInit();
+    component.backupText = '[backup]\nbackup_version = 1\n[config]\n';
+    component.previewBackup();
+
+    component.restoreBackup();
+
+    expect(component.backupPreview).not.toBeNull();
+    expect(component.backupError).toBe('Restore failed');
+    expect(snack.open).toHaveBeenCalledWith('Restore failed', 'Close', { duration: 5000 });
+  });
+});
+
+describe('filenameFromDisposition', () => {
+  it('reads quoted and bare names', () => {
+    expect(filenameFromDisposition('attachment; filename="backup.toml"')).toBe('backup.toml');
+    expect(filenameFromDisposition('attachment; filename=backup.toml')).toBe('backup.toml');
+    expect(filenameFromDisposition(null)).toBeNull();
+    expect(filenameFromDisposition('inline')).toBeNull();
   });
 });

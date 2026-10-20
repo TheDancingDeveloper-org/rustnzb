@@ -4,6 +4,7 @@ use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::HeaderMap;
+use axum::http::header;
 use axum::response::IntoResponse;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,7 @@ use nzb_web::nzb_core::config::{
     CategoryConfig, RssFeedConfig, ServerConfig, normalize_history_retention,
     normalize_rss_expiry_days,
 };
+use nzb_web::nzb_core::config_backup::{self, mask_proxy_userinfo};
 use nzb_web::nzb_core::models::*;
 use nzb_web::nzb_core::nzb_parser;
 use nzb_web::nzb_core::sabnzbd_import;
@@ -1501,6 +1503,313 @@ pub async fn h_config_get(
     Ok(Json(value))
 }
 
+// ---------------------------------------------------------------------------
+// Config backup and restore
+// ---------------------------------------------------------------------------
+
+/// Largest backup file accepted. A full `config.toml` is a few kilobytes; the
+/// cap is generous enough for a large feed and category list and small enough
+/// that a mistaken upload cannot be used to exhaust memory.
+const MAX_BACKUP_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Deserialize, Default)]
+pub struct BackupExportQuery {
+    /// Include real credentials. Off by default: a masked backup is safe to
+    /// share, and the file says which it is.
+    #[serde(default)]
+    pub secrets: bool,
+}
+
+/// GET /api/config/backup -- Download the configuration as one TOML file.
+///
+/// Secrets are masked unless `?secrets=true` is given. The response is marked
+/// `no-store`, because even a masked export describes the install.
+pub async fn h_config_backup_export(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BackupExportQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let body = config_backup::export(
+        &state.config(),
+        env!("RUSTNZB_BUILD_VERSION"),
+        &created_at,
+        query.secrets,
+    )
+    .map_err(ApiError::from)?;
+    let file_stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let disposition = format!("attachment; filename=\"rustnzb-backup-{file_stamp}.toml\"");
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/toml; charset=utf-8".to_string(),
+            ),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        body,
+    ))
+}
+
+/// A backup document read from a request body, decoded once for both the
+/// preview and the restore.
+struct ParsedBackup {
+    document: config_backup::BackupDocument,
+    config: nzb_web::nzb_core::config::AppConfig,
+    summary: config_backup::RestoreSummary,
+}
+
+/// Parse and check a backup body, resolve its masks against the install and
+/// validate the result. Nothing is written here, so a preview and a restore
+/// take exactly the same path up to the commit.
+fn parse_and_prepare(
+    body: &[u8],
+    stored: &nzb_web::nzb_core::config::AppConfig,
+) -> Result<ParsedBackup, ApiError> {
+    if body.len() > MAX_BACKUP_BYTES {
+        return Err(ApiError::from((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("backup file is larger than {MAX_BACKUP_BYTES} bytes"),
+        )));
+    }
+    let text = std::str::from_utf8(body)
+        .map_err(|_| ApiError::bad_request("backup file must be UTF-8 text"))?;
+    let document =
+        config_backup::parse(text).map_err(|e| ApiError::from((StatusCode::BAD_REQUEST, e)))?;
+    let mut config = document.config.clone();
+    config_backup::normalize(&mut config);
+    let mut summary = config_backup::summarize(&config, Vec::new());
+    config_backup::merge_secrets(&mut config, stored, &mut summary);
+    let mut problems = config_backup::validate(&config);
+    if let Err(problem) = config_backup::check_categories(&config.categories) {
+        problems.push(problem);
+    }
+    if !problems.is_empty() {
+        return Err(ApiError::from((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the backup was refused and nothing was changed: {}",
+                problems.join("; ")
+            ),
+        )));
+    }
+    Ok(ParsedBackup {
+        document,
+        config,
+        summary,
+    })
+}
+
+/// Settings a restore persists but this process reads only at start-up, so the
+/// operator knows a restart is needed for them to take effect. The live
+/// settings — servers, categories, speed limit, disk guard, retention,
+/// concurrency, notifications and post-processing scripts — are applied at once
+/// and are not listed.
+fn restart_required(
+    previous: &nzb_web::nzb_core::config::AppConfig,
+    next: &nzb_web::nzb_core::config::AppConfig,
+) -> Vec<String> {
+    let (a, b) = (&previous.general, &next.general);
+    let mut keys = Vec::new();
+    let mut check = |key: &str, changed: bool| {
+        if changed {
+            keys.push(key.to_string());
+        }
+    };
+    check("general.listen_addr", a.listen_addr != b.listen_addr);
+    check("general.port", a.port != b.port);
+    check("general.data_dir", a.data_dir != b.data_dir);
+    check(
+        "general.incomplete_dir",
+        a.incomplete_dir != b.incomplete_dir,
+    );
+    check("general.complete_dir", a.complete_dir != b.complete_dir);
+    check("general.watch_dir", a.watch_dir != b.watch_dir);
+    check("general.log_level", a.log_level != b.log_level);
+    check(
+        "general.max_post_processing_jobs",
+        a.max_post_processing_jobs != b.max_post_processing_jobs,
+    );
+    check(
+        "general.max_repair_workers",
+        a.max_repair_workers != b.max_repair_workers,
+    );
+    check(
+        "general.max_extract_workers",
+        a.max_extract_workers != b.max_extract_workers,
+    );
+    check("general.direct_unpack", a.direct_unpack != b.direct_unpack);
+    check(
+        "general.early_failure_check",
+        a.early_failure_check != b.early_failure_check,
+    );
+    check(
+        "general.required_completion_pct",
+        a.required_completion_pct != b.required_completion_pct,
+    );
+    check(
+        "general.article_timeout_secs",
+        a.article_timeout_secs != b.article_timeout_secs,
+    );
+    check(
+        "general.max_nested_archive_depth",
+        a.max_nested_archive_depth != b.max_nested_archive_depth,
+    );
+    check(
+        "general.local_import_dir",
+        a.local_import_dir != b.local_import_dir,
+    );
+    check(
+        "general.fetch_allow_private",
+        a.fetch_allow_private != b.fetch_allow_private,
+    );
+    check(
+        "general.fetch_allowed_hosts",
+        a.fetch_allowed_hosts != b.fetch_allowed_hosts,
+    );
+    check(
+        "general.group_max_headers",
+        a.group_max_headers != b.group_max_headers,
+    );
+    check(
+        "general.shutdown_timeout_secs",
+        a.shutdown_timeout_secs != b.shutdown_timeout_secs,
+    );
+    let (a, b) = (&previous.otel, &next.otel);
+    check("otel.enabled", a.enabled != b.enabled);
+    check("otel.endpoint", a.endpoint != b.endpoint);
+    check("otel.logs_enabled", a.logs_enabled != b.logs_enabled);
+    check("otel.logs_endpoint", a.logs_endpoint != b.logs_endpoint);
+    check(
+        "otel.metrics_enabled",
+        a.metrics_enabled != b.metrics_enabled,
+    );
+    check(
+        "otel.metrics_endpoint",
+        a.metrics_endpoint != b.metrics_endpoint,
+    );
+    check("otel.service_name", a.service_name != b.service_name);
+    check(
+        "config_version",
+        previous.config_version != next.config_version,
+    );
+    keys
+}
+
+/// The JSON both routes return: what the file holds, what restoring it did or
+/// would do, and which settings wait for a restart.
+fn backup_report(
+    parsed: &ParsedBackup,
+    restart_keys: Vec<String>,
+    restored: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": true,
+        "restored": restored,
+        "backup": {
+            "backup_version": parsed.document.backup.backup_version,
+            "created_at": parsed.document.backup.created_at,
+            "app_version": parsed.document.backup.app_version,
+            "secrets_included": parsed.document.backup.secrets_included,
+        },
+        "summary": parsed.summary,
+        "restart_required": restart_keys,
+    })
+}
+
+/// POST /api/config/backup/preview -- Check a backup without applying it.
+///
+/// Returns the same summary a restore would, including the secrets a masked
+/// file would keep and the settings that would need a restart. A file that
+/// would be refused is reported as a 400 here too, so the UI can show the
+/// reason before the operator commits to it.
+pub async fn h_config_backup_preview(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let stored = state.config();
+    let parsed = parse_and_prepare(&body, &stored)?;
+    let restart_keys = restart_required(&stored, &parsed.config);
+    Ok(Json(backup_report(&parsed, restart_keys, false)))
+}
+
+/// POST /api/config/backup/restore -- Replace the configuration from a backup.
+///
+/// The whole file layer is replaced, so a setting absent from the backup
+/// returns to its default. A masked secret keeps the value this install
+/// already holds; a real one replaces it. Nothing is written unless the whole
+/// document parses, validates and can be saved, and the live queue manager is
+/// updated from the committed configuration afterwards.
+pub async fn h_config_backup_restore(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let stored = state.config();
+    let parsed = parse_and_prepare(&body, &stored)?;
+    let mut restart_keys = Vec::new();
+    state.update_config_with(|config| {
+        restart_keys = restart_required(config, &parsed.config);
+        *config = parsed.config.clone();
+        Ok::<_, ApiError>(())
+    })?;
+    apply_restored_runtime(&state);
+    tracing::info!(
+        servers = parsed.summary.server_count,
+        categories = parsed.summary.category_count,
+        rss_feeds = parsed.summary.rss_feed_count,
+        secrets_kept = parsed.summary.secrets_kept,
+        restart_keys = restart_keys.len(),
+        "configuration restored from a backup"
+    );
+    Ok(Json(backup_report(&parsed, restart_keys, true)))
+}
+
+/// Push a restored configuration into the running queue manager, using the
+/// same setters the individual settings routes use.
+fn apply_restored_runtime(state: &Arc<AppState>) {
+    let config = state.config();
+    state.queue_manager.update_servers(config.servers.clone());
+    state
+        .queue_manager
+        .set_categories(config.categories.clone());
+    state
+        .queue_manager
+        .set_max_active_downloads(config.general.max_active_downloads);
+    state
+        .queue_manager
+        .set_history_retention(config.general.history_retention);
+    state
+        .queue_manager
+        .set_speed_limit(config.general.speed_limit_bps);
+    state
+        .queue_manager
+        .set_min_free_space(config.general.min_free_space_bytes);
+    state
+        .queue_manager
+        .set_auto_sort_remaining_pct(config.general.auto_sort_remaining_pct);
+    state
+        .queue_manager
+        .set_duplicate_policy(config.general.duplicate_policy);
+    state.queue_manager.set_postproc_scripts(
+        config.general.scripts_dir.clone(),
+        config.general.script_success.clone(),
+        config.general.script_failure.clone(),
+        config.general.script_timeout_secs,
+        config.general.script_max_output_bytes,
+    );
+    state.queue_manager.set_notifications(&config.notifications);
+    state
+        .queue_manager
+        .set_queue_complete_persist(config.general.queue_complete_pers);
+    state
+        .queue_manager
+        .set_defer_par2_volumes(config.par2.defer_volumes);
+    state
+        .queue_manager
+        .set_trust_inflight_verify(config.par2.trust_inflight_verify);
+}
+
 /// GET /api/config/sabnzbd-api-key -- Return the current SABnzbd API key.
 ///
 /// This route is protected by the native API authentication middleware. The
@@ -1546,52 +1855,7 @@ pub async fn h_servers_list(
 fn masked_config(
     config: &nzb_web::nzb_core::config::AppConfig,
 ) -> nzb_web::nzb_core::config::AppConfig {
-    let mut config = config.clone();
-    if config.general.api_key.is_some() {
-        config.general.api_key = Some(PASSWORD_MASK.to_string());
-    }
-    if config.dav.password.is_some() {
-        config.dav.password = Some(PASSWORD_MASK.to_string());
-    }
-    if config.dav.api_key.is_some() {
-        config.dav.api_key = Some(PASSWORD_MASK.to_string());
-    }
-    for server in &mut config.servers {
-        if server.password.is_some() {
-            server.password = Some(PASSWORD_MASK.to_string());
-        }
-        if let Some(url) = server.proxy_url.as_deref() {
-            server.proxy_url = Some(mask_proxy_userinfo(url));
-        }
-    }
-    // Notification URLs often carry a secret in their path or query, and the
-    // ntfy token is a credential. Mask any that are set.
-    let notifications = &mut config.notifications;
-    for secret in [
-        &mut notifications.webhook_url,
-        &mut notifications.apprise_api_url,
-        &mut notifications.apprise_urls,
-        &mut notifications.ntfy_token,
-    ] {
-        if !secret.is_empty() {
-            *secret = PASSWORD_MASK.to_string();
-        }
-    }
-    config
-}
-
-/// Replace the `user:pass@` part of a proxy URL with the mask. A URL without
-/// userinfo is returned unchanged.
-fn mask_proxy_userinfo(url: &str) -> String {
-    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
-        return url.to_string();
-    };
-    let rest = &url[scheme_end..];
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let Some(at) = rest[..authority_end].rfind('@') else {
-        return url.to_string();
-    };
-    format!("{}{PASSWORD_MASK}@{}", &url[..scheme_end], &rest[at + 1..])
+    config_backup::mask_secrets(config)
 }
 
 /// Whether a submitted proxy URL is the masked form of the stored one, which
@@ -1664,7 +1928,7 @@ pub async fn h_server_add(
 /// Placeholder the API uses in place of a stored server password. A client
 /// that sends it back (or sends an empty/absent password) on update means
 /// "leave the password unchanged".
-pub const PASSWORD_MASK: &str = "********";
+pub const PASSWORD_MASK: &str = nzb_web::nzb_core::config_backup::SECRET_MASK;
 
 /// Whether a submitted password means "keep the stored one".
 fn password_unchanged(password: Option<&str>) -> bool {
@@ -3575,7 +3839,7 @@ mod tests {
     #[cfg(feature = "webdav")]
     use super::resolve_secret;
     use super::{
-        MAX_RSS_REGEX_LEN, compile_rss_regex, mask_proxy_userinfo, proxy_url_unchanged,
+        MAX_RSS_REGEX_LEN, compile_rss_regex, proxy_url_unchanged, restart_required,
         sanitize_server_config,
     };
 
@@ -3597,23 +3861,6 @@ mod tests {
         let pattern = "a".repeat(MAX_RSS_REGEX_LEN + 1);
         let err = compile_rss_regex(&pattern).unwrap_err();
         assert!(err.to_string().contains("too long"));
-    }
-
-    #[test]
-    fn mask_proxy_userinfo_hides_credentials_only() {
-        assert_eq!(
-            mask_proxy_userinfo("socks5://user:pass@proxy.example.net:1080"),
-            "socks5://********@proxy.example.net:1080"
-        );
-        assert_eq!(
-            mask_proxy_userinfo("http://u@host:3128/path@x"),
-            "http://********@host:3128/path@x"
-        );
-        assert_eq!(
-            mask_proxy_userinfo("socks5://proxy.example.net:1080"),
-            "socks5://proxy.example.net:1080"
-        );
-        assert_eq!(mask_proxy_userinfo("not a url"), "not a url");
     }
 
     #[test]
@@ -3679,5 +3926,24 @@ mod tests {
         assert_eq!(server.password.as_deref(), Some("pass"));
         assert_eq!(server.proxy_url.as_deref(), Some("socks5://proxy"));
         assert_eq!(server.trusted_fingerprint.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn restart_required_names_only_settings_read_at_startup() {
+        let mut previous = nzb_web::nzb_core::config::AppConfig::default();
+        let mut next = previous.clone();
+        // Boot-only settings.
+        next.general.port = 9191;
+        next.otel.enabled = true;
+        // A live setting, which the restore applies without a restart.
+        next.general.speed_limit_bps = 42;
+        assert_eq!(
+            restart_required(&previous, &next),
+            vec!["general.port", "otel.enabled"]
+        );
+
+        // The same config twice needs no restart at all.
+        previous = next.clone();
+        assert!(restart_required(&previous, &next).is_empty());
     }
 }

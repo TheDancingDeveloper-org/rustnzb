@@ -69,6 +69,7 @@ type Tab =
   | 'general'
   | 'api'
   | 'telemetry'
+  | 'backup'
   | 'about';
 
 interface DavConfig {
@@ -122,6 +123,28 @@ interface DebugLoggingState {
   overridden: boolean;
 }
 
+/** What `GET /api/config/backup` and the preview/restore routes report. */
+interface BackupSummary {
+  server_count: number;
+  category_count: number;
+  rss_feed_count: number;
+  secrets_kept: number;
+  warnings: string[];
+}
+
+interface BackupReport {
+  status: boolean;
+  restored: boolean;
+  backup: {
+    backup_version: number;
+    created_at: string;
+    app_version: string;
+    secrets_included: boolean;
+  };
+  summary: BackupSummary;
+  restart_required: string[];
+}
+
 /** Each setting that Save writes back. Save stays blocked until its own GET succeeds. */
 type SettingsKey =
   | 'servers'
@@ -141,6 +164,37 @@ const FORM_KEYS: readonly FormKey[] = ['speedLimit', 'maxActive', 'historyRetent
 
 function isFormKey(key: SettingsKey): key is FormKey {
   return (FORM_KEYS as readonly string[]).includes(key);
+}
+
+/** Mirrors the API's cap: a backup is a few kilobytes, not a disk image. */
+export const MAX_BACKUP_BYTES = 4 * 1024 * 1024;
+
+/** The server's `attachment; filename="..."` name, or null when it sent none. */
+export function filenameFromDisposition(disposition: string | null): string | null {
+  if (!disposition) return null;
+  const quoted = /filename="([^"]+)"/i.exec(disposition);
+  if (quoted) return quoted[1];
+  const bare = /filename=([^;]+)/i.exec(disposition);
+  return bare ? bare[1].trim() : null;
+}
+
+/** Save `text` as a download. Does nothing where the browser cannot (jsdom). */
+export function saveText(filename: string, text: string): void {
+  if (
+    typeof document === 'undefined' ||
+    typeof URL === 'undefined' ||
+    typeof URL.createObjectURL !== 'function'
+  ) {
+    return;
+  }
+  const url = URL.createObjectURL(new Blob([text], { type: 'application/toml' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 type LoadState = { status: 'loading' } | { status: 'loaded' } | { status: 'failed'; message: string };
@@ -194,6 +248,9 @@ function emptyCategory(): CategoryConfig {
         </button>
         <button [class.active]="tab === 'telemetry'" (click)="tab = 'telemetry'">
           Logging &amp; telemetry
+        </button>
+        <button [class.active]="tab === 'backup'" (click)="tab = 'backup'">
+          Backup &amp; restore
         </button>
         <button [class.active]="tab === 'about'" (click)="tab = 'about'">About</button>
       </aside>
@@ -1175,6 +1232,143 @@ function emptyCategory(): CategoryConfig {
         }
 
         <!-- =========== ABOUT =========== -->
+        <!-- =========== BACKUP & RESTORE =========== -->
+        @if (tab === 'backup') {
+          <div class="section-head">
+            <div>
+              <h2>Backup &amp; restore</h2>
+              <div class="sub">
+                Export every setting as one TOML file, or restore one onto this install.
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3>
+              Export
+              <span class="hint">a file you can keep, or share</span>
+            </h3>
+            <div class="body">
+              <div class="form">
+                <label for="backup-secrets">Include secrets</label>
+                <div class="inline">
+                  <input
+                    id="backup-secrets"
+                    type="checkbox"
+                    [(ngModel)]="backupIncludeSecrets"
+                  />
+                  <span>
+                    Write real credentials into the file. Leave this off unless you are
+                    moving the install: a masked file is safe to attach to an issue.
+                  </span>
+                </div>
+              </div>
+              @if (backupIncludeSecrets) {
+                <div class="dav-warn" role="alert">
+                  This file will contain your API key, news-server passwords, proxy
+                  credentials and notification URLs in clear text. Store it like a password
+                  and delete it once the move is done.
+                </div>
+              }
+              <div class="form-actions">
+                <button class="btn primary" [disabled]="backupBusy" (click)="downloadBackup()">
+                  Download backup
+                </button>
+                <span class="dim">
+                  {{ backupIncludeSecrets ? 'Includes secrets.' : 'Secrets are masked.' }}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3>
+              Restore
+              <span class="hint">checked before anything is written</span>
+            </h3>
+            <div class="body">
+              <div class="form">
+                <label for="backup-file">Backup file</label>
+                <div class="inline">
+                  <input
+                    id="backup-file"
+                    type="file"
+                    accept=".toml,application/toml,text/plain"
+                    (change)="chooseBackupFile($event)"
+                  />
+                  <span class="dim">{{ backupFileName || 'No file chosen' }}</span>
+                </div>
+              </div>
+              <div class="form-actions">
+                <button
+                  class="btn"
+                  [disabled]="backupBusy || !backupText"
+                  (click)="previewBackup()"
+                >
+                  Preview
+                </button>
+                <button
+                  class="btn primary"
+                  [disabled]="backupBusy || !backupPreviewMatchesFile"
+                  (click)="restoreBackup()"
+                >
+                  Restore
+                </button>
+              </div>
+
+              @if (backupError) {
+                <div class="load-error" role="alert">{{ backupError }}</div>
+              }
+
+              @if (backupPreview; as report) {
+                <div class="backup-summary">
+                  <div class="backup-line">
+                    <b>{{ report.backup.app_version || 'unknown build' }}</b>
+                    @if (report.backup.created_at) {
+                      <span class="dim">exported {{ report.backup.created_at }}</span>
+                    }
+                    @if (report.backup.secrets_included) {
+                      <span class="pill warn">includes secrets</span>
+                    } @else {
+                      <span class="pill ok">masked</span>
+                    }
+                  </div>
+                  <div class="backup-line">
+                    {{ report.summary.server_count }} server(s) ·
+                    {{ report.summary.category_count }} category(ies) ·
+                    {{ report.summary.rss_feed_count }} feed(s) ·
+                    {{ report.summary.secrets_kept }} secret(s) kept from this install
+                  </div>
+                  @if (report.summary.warnings.length) {
+                    <div class="dav-warn" role="alert">
+                      <b>Some masked secrets have nothing to keep here.</b>
+                      <ul>
+                        @for (warning of report.summary.warnings; track warning) {
+                          <li>{{ warning }}</li>
+                        }
+                      </ul>
+                    </div>
+                  }
+                  @if (report.restart_required.length) {
+                    <div class="backup-line">
+                      Takes effect after a restart:
+                      @for (key of report.restart_required; track key) {
+                        <code>{{ key }}</code>
+                      }
+                    </div>
+                  } @else {
+                    <div class="dim">Every changed setting applies immediately.</div>
+                  }
+                  <div class="dim">
+                    Restoring replaces the saved configuration: a setting missing from the
+                    file returns to its default. Jobs, history and the database are not touched.
+                  </div>
+                </div>
+              }
+            </div>
+          </div>
+        }
+
         @if (tab === 'about') {
           <div class="section-head">
             <div>
@@ -1406,6 +1600,34 @@ function emptyCategory(): CategoryConfig {
         opacity: 0.5;
         cursor: not-allowed;
       }
+      .backup-summary {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-top: 14px;
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+        font-size: 13px;
+      }
+      .backup-line {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+      }
+      .backup-summary code {
+        background: var(--panel2);
+        padding: 1px 5px;
+        border-radius: 3px;
+        font-size: 12px;
+      }
+      .backup-summary ul {
+        margin: 6px 0 0;
+        padding-left: 18px;
+      }
+      .backup-summary .dav-warn {
+        margin-bottom: 0;
+      }
       .load-error {
         display: flex;
         flex-wrap: wrap;
@@ -1610,6 +1832,16 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
 
   // Directory paths (from /api/config)
   dirs = signal<GeneralDirs | null>(null);
+
+  // Backup & restore
+  backupIncludeSecrets = false;
+  backupBusy = false;
+  backupFileName = '';
+  backupText = '';
+  backupPreview: BackupReport | null = null;
+  /** The exact text the current preview checked, so a stale preview cannot be restored. */
+  private backupPreviewText = '';
+  backupError = '';
 
   // Load state per setting. A form's values are only defaults until its GET succeeds,
   // so Save stays blocked until then; otherwise it would write those defaults over the real config.
@@ -2211,6 +2443,158 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
       .subscribe((ok) => {
         if (ok) doGenerate();
       });
+  }
+
+  // -------------------------------------------------------------------------
+  // Backup & restore
+  // -------------------------------------------------------------------------
+
+  /** A preview only permits the Restore button while it describes this exact file. */
+  get backupPreviewMatchesFile(): boolean {
+    return !!this.backupPreview && this.backupPreviewText === this.backupText;
+  }
+
+  async downloadBackup(): Promise<void> {
+    if (this.backupBusy) return;
+    this.backupBusy = true;
+    this.backupError = '';
+    const includeSecrets = this.backupIncludeSecrets;
+    this.api
+      .getText(
+        '/config/backup',
+        includeSecrets ? { secrets: 'true' } : undefined,
+      )
+      .subscribe({
+        next: (response) => {
+          this.backupBusy = false;
+          const body = response.body ?? '';
+          const filename =
+            filenameFromDisposition(response.headers.get('Content-Disposition')) ||
+            `rustnzb-backup-${new Date().toISOString().slice(0, 10)}.toml`;
+          saveText(filename, body);
+          this.snack.open(
+            includeSecrets ? 'Backup downloaded — it contains secrets' : 'Backup downloaded',
+            'Close',
+            { duration: 3000 },
+          );
+        },
+        error: (err) => {
+          this.backupBusy = false;
+          showHttpError(this.snack, err, 'Failed to download backup');
+        },
+      });
+  }
+
+  /** Read the chosen file once; a new file invalidates any preview of the old one. */
+  chooseBackupFile(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    this.backupPreview = null;
+    this.backupPreviewText = '';
+    this.backupError = '';
+    this.backupText = '';
+    this.backupFileName = file?.name ?? '';
+    if (!file) return;
+    if (file.size > MAX_BACKUP_BYTES) {
+      this.backupError = `That file is larger than ${MAX_BACKUP_BYTES / (1024 * 1024)} MiB; it is not a rustnzb backup.`;
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => {
+      this.backupError = 'Could not read that file.';
+    };
+    reader.onload = () => {
+      const text = typeof reader.result === 'string' ? reader.result : '';
+      if (!text.trim()) {
+        this.backupError = 'That file is empty.';
+        return;
+      }
+      this.backupText = text;
+    };
+    reader.readAsText(file);
+  }
+
+  previewBackup(): void {
+    if (this.backupBusy || !this.backupText) return;
+    const text = this.backupText;
+    this.backupBusy = true;
+    this.backupError = '';
+    this.api.postText<BackupReport>('/config/backup/preview', text).subscribe({
+      next: (report) => {
+        this.backupBusy = false;
+        this.backupPreview = report;
+        this.backupPreviewText = text;
+      },
+      error: (err) => {
+        this.backupBusy = false;
+        this.backupPreview = null;
+        this.backupPreviewText = '';
+        this.backupError = httpErrorMessage(err, 'This backup was refused');
+        showHttpError(this.snack, err, 'This backup was refused');
+      },
+    });
+  }
+
+  restoreBackup(): void {
+    if (this.backupBusy || !this.backupPreviewMatchesFile) return;
+    const report = this.backupPreview!;
+    const text = this.backupText;
+    const consequences = [
+      'Every saved setting is replaced; anything missing from the file returns to its default.',
+      report.summary.warnings.length
+        ? `${report.summary.warnings.length} masked secret(s) have nothing to keep on this install and will be left unset.`
+        : '',
+      report.restart_required.length
+        ? `A restart is needed for: ${report.restart_required.join(', ')}.`
+        : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+
+    this.confirmSvc
+      .confirm({
+        title: 'Restore this configuration?',
+        message: consequences,
+        confirmLabel: report.backup.secrets_included
+          ? 'Restore, including secrets'
+          : 'Restore settings',
+        danger: true,
+      })
+      .subscribe((ok) => {
+        if (!ok) return;
+        this.backupBusy = true;
+        this.backupError = '';
+        this.api.postText<BackupReport>('/config/backup/restore', text).subscribe({
+          next: (restored) => {
+            this.backupBusy = false;
+            this.backupPreview = restored;
+            this.backupPreviewText = text;
+            this.reloadAfterRestore();
+            this.snack.open(
+              restored.restart_required.length
+                ? 'Configuration restored. Restart to apply: ' +
+                    restored.restart_required.join(', ')
+                : 'Configuration restored',
+              'Close',
+              { duration: restored.restart_required.length ? 6000 : 3000 },
+            );
+          },
+          error: (err) => {
+            this.backupBusy = false;
+            this.backupError = httpErrorMessage(err, 'Restore failed');
+            showHttpError(this.snack, err, 'Restore failed');
+          },
+        });
+      });
+  }
+
+  /** Refetch every form from the settings the restore just wrote. */
+  private reloadAfterRestore(): void {
+    this.loadServers();
+    this.loadCategories();
+    this.loadGeneralSettings();
+    this.loadSabApiKey();
+    this.loadDirs();
   }
 
   copy(text: string): void {

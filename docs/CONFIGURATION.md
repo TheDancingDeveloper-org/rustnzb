@@ -293,3 +293,82 @@ OpenTelemetry export over OTLP gRPC. See [OBSERVABILITY.md](OBSERVABILITY.md).
 
 `config_version` at the top of the file is the schema version. rustnzb writes
 it on every save and migrates older files on load. Don't edit it.
+
+## Backup and restore
+
+Settings can be exported to one TOML file and restored onto another install,
+from **Settings → Backup & restore** or the API. A backup carries the settings
+only: jobs, history, the database and the download directories are not part of
+it.
+
+| Route | Method | What it does |
+|-------|--------|--------------|
+| `/api/config/backup` | `GET` | Download the configuration as `application/toml` |
+| `/api/config/backup?secrets=true` | `GET` | The same file with real credentials |
+| `/api/config/backup/preview` | `POST` | Validate a backup and report what a restore would do; writes nothing |
+| `/api/config/backup/restore` | `POST` | Validate, save and apply a backup |
+
+All four are protected by the native API authentication and return
+`Cache-Control: no-store`. The file is capped at 4 MiB.
+
+### The file
+
+```toml
+[backup]
+backup_version = 1
+created_at = "2026-10-20T09:00:00Z"
+app_version = "1.7.0"
+secrets_included = false
+
+[config]
+config_version = 1
+
+[config.general]
+...
+```
+
+`backup_version` is the envelope schema and is independent of the config's own
+`config_version`. A file from a newer build is refused, and so is `config_version`
+newer than this build understands. Unknown keys are refused rather than
+dropped, exactly as they are for `config.toml`.
+
+### Secrets
+
+The default export **masks** every stored secret as `********` and writes
+`secrets_included = false`; that file is safe to share. `?secrets=true` writes
+the real values and sets `secrets_included = true`; the UI warns before it does.
+
+On restore the mask is a *keep token*: a masked secret keeps the value the
+target install already holds, and `secrets_kept` in the response counts them.
+A mask with nothing to keep — restoring a masked backup onto a fresh install —
+leaves that secret unset and is reported in `warnings`; the literal `********`
+is never written as a value. A secret **absent** from a backup is cleared,
+because a restore replaces the file layer.
+
+The secrets covered are the SABnzbd API key, the DAV password and API key,
+news-server passwords, the `user:pass@` part of server proxy URLs, and the
+notification webhook, Apprise and ntfy values.
+
+### What a restore does
+
+- The whole saved configuration is replaced: a setting missing from the file
+  returns to its default.
+- Nothing is written unless the document parses, normalizes and validates;
+  a refusal returns `400` with the reasons and leaves the config and the file
+  untouched.
+- Live settings — servers, categories, speed limit, disk guards, retention,
+  concurrency, notifications and post-processing scripts — are applied at
+  once.
+- Settings read only at start-up are listed in `restart_required`:
+  `general.listen_addr`, `general.port`, the data, incomplete, complete and
+  watch directories, `general.log_level`, the post-processing and repair
+  worker counts, `direct_unpack`, `early_failure_check`,
+  `required_completion_pct`, `article_timeout_secs`,
+  `max_nested_archive_depth`, `local_import_dir`, `fetch_allow_private`,
+  `fetch_allowed_hosts`, `group_max_headers`, `shutdown_timeout_secs` and the
+  `[otel]` settings.
+- `general.log_level_before_debug` is process-local and is not exported.
+
+Settings supplied by a CLI flag or environment variable are not replaced by a
+restore: the override still wins until it is removed, and the file keeps the
+value the backup wrote underneath it.

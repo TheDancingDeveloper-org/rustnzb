@@ -284,6 +284,15 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         // Config
         .route("/config", get(handlers::h_config_get))
         .route("/config/general", put(handlers::h_general_update))
+        .route("/config/backup", get(handlers::h_config_backup_export))
+        .route(
+            "/config/backup/preview",
+            post(handlers::h_config_backup_preview),
+        )
+        .route(
+            "/config/backup/restore",
+            post(handlers::h_config_backup_restore),
+        )
         .route("/config/sabnzbd-api-key", get(handlers::h_sab_api_key_get))
         .route(
             "/config/sabnzbd-api-key/rotate",
