@@ -236,6 +236,27 @@ describe('QueueViewComponent', () => {
     expect(component.statusLabel(makeJob({ status: 'queued' }))).toBe('paused · low disk');
   });
 
+  it('labels a job paused by the schedule and explains the automatic hold', () => {
+    const { component } = makeComponent({
+      get: vi.fn((url: string) =>
+        url === '/queue'
+          ? of({ jobs: [], total: 0, speed_bps: 0, paused: true, pause_reason: 'schedule' })
+          : of({}),
+      ),
+    });
+
+    component.loadQueue();
+
+    expect(component.pausedLabel()).toBe('Paused · schedule');
+    const held = makeJob({ status: 'paused', pause_reason: 'schedule' });
+    expect(component.statusLabel(held)).toBe('paused · schedule');
+    expect(component.pauseHoldTitle(held)).toContain('resumes automatically');
+    expect(component.isDiskSpaceHold(held)).toBe(false);
+    expect(
+      component.pauseHoldTitle(makeJob({ status: 'paused', pause_reason: 'manual' })),
+    ).toBeNull();
+  });
+
   it('keeps the plain paused label for a user pause', () => {
     const { component } = makeComponent({
       get: vi.fn((url: string) =>

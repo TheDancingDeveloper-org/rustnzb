@@ -120,3 +120,60 @@ test.describe('8. Settings — General', () => {
     await page.locator('label:has-text("Concurrent jobs") + .inline button').click();
   });
 });
+
+test.describe('8a. Settings — Scheduler', () => {
+  test('8a.1 adds, saves, reloads and removes a rule', async ({ page }) => {
+    await page.goto('/settings');
+    await page.getByRole('button', { name: 'Scheduler' }).click();
+
+    await expect(page.locator('h2', { hasText: 'Scheduler' })).toBeVisible();
+
+    // Clear anything a previous run left behind, so the journey is repeatable.
+    while ((await page.getByRole('button', { name: 'Remove' }).count()) > 0) {
+      await page.getByRole('button', { name: 'Remove' }).first().click();
+      await page.getByRole('button', { name: 'Save schedule' }).click();
+      await expect(page.getByText('Schedule saved')).toBeVisible();
+    }
+    await expect(page.getByText('No rules yet')).toBeVisible();
+
+    await page.getByRole('button', { name: '+ Add rule' }).click();
+    const name = page.locator('label:has-text("Name") + .inline input[type="text"]').first();
+    await name.fill('E2E quiet hours');
+
+    // Friday is selected by default; the window is 01:00-06:00.
+    await expect(page.locator('.schedule-day', { hasText: 'Fri' }).locator('input')).toBeChecked();
+
+    await page.getByRole('button', { name: 'Save schedule' }).click();
+    await expect(page.getByText('Schedule saved')).toBeVisible();
+
+    // A reload comes back from the API with the server-assigned id and the
+    // saved name and times.
+    await page.reload();
+    await page.getByRole('button', { name: 'Scheduler' }).click();
+    await expect(page.locator('.panel h3', { hasText: 'E2E quiet hours' })).toBeVisible();
+    const start = page.locator('input[aria-label="Start time"]').first();
+    await expect(start).toHaveValue('01:00');
+    await expect(page.locator('input[aria-label="End time"]').first()).toHaveValue('06:00');
+
+    await page.getByRole('button', { name: 'Remove' }).first().click();
+    await page.getByRole('button', { name: 'Save schedule' }).click();
+    await expect(page.getByText('Schedule saved')).toBeVisible();
+    await expect(page.getByText('No rules yet')).toBeVisible();
+  });
+
+  test('8a.2 refuses a malformed window instead of saving it', async ({ page }) => {
+    await page.goto('/settings');
+    await page.getByRole('button', { name: 'Scheduler' }).click();
+    await page.getByRole('button', { name: '+ Add rule' }).click();
+
+    const start = page.locator('input[aria-label="Start time"]').first();
+    await start.fill('25:00');
+    await expect(page.getByText('Start must be HH:MM')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Save schedule' })).toBeDisabled();
+
+    await start.fill('01:00');
+    await expect(page.getByRole('button', { name: 'Save schedule' })).toBeEnabled();
+    await page.getByRole('button', { name: 'Discard changes' }).click();
+    await expect(page.getByText('No rules yet')).toBeVisible();
+  });
+});

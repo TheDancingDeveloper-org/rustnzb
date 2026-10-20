@@ -111,6 +111,44 @@ script_max_output_bytes = 1048576
 # pipelining = 4
 # optional = true
 
+# Time-of-day download schedule. Rules are evaluated against the process's
+# local wall clock; set TZ in the container environment to control it.
+# Windows may cross midnight: a window belongs to the day it starts on, and
+# end < start means it runs into the next morning. `24:00` ends the day.
+# Actions: pause | speed_limit | disable_servers.
+#
+# The schedule is an overlay. It never rewrites the configured speed limit or
+# server list: when a window ends, `speed_limit_bps` and every server's
+# `enabled` flag come back as configured. It only lifts a pause it applied,
+# so a manual pause or a disk-space hold survives.
+#
+# [schedule]
+# enabled = false
+#
+# [[schedule.rules]]
+# id = "quiet-hours"          # omitted in the UI; the API assigns one
+# name = "Quiet hours"
+# days = ["mon", "tue", "wed", "thu", "fri"]
+# start = "01:00"
+# end = "06:00"
+# action = "pause"
+#
+# [[schedule.rules]]
+# name = "Saturday peak cap"
+# days = ["sat", "sun"]
+# start = "00:00"
+# end = "24:00"
+# action = "speed_limit"
+# speed_limit_bps = 2000000  # 0 = unlimited, and overrides other active caps
+#
+# [[schedule.rules]]
+# name = "Backup server maintenance"
+# days = ["sun"]
+# start = "03:00"
+# end = "05:00"
+# action = "disable_servers"
+# servers = ["backup"]       # ids from [[servers]]
+
 # Download categories
 [[categories]]
 name = "Default"

@@ -27,6 +27,8 @@ pub struct AppConfig {
     pub notifications: NotificationConfig,
     #[serde(default)]
     pub par2: Par2Config,
+    #[serde(default)]
+    pub schedule: crate::schedule::ScheduleConfig,
 }
 
 impl Default for AppConfig {
@@ -41,6 +43,7 @@ impl Default for AppConfig {
             dav: DavConfig::default(),
             notifications: NotificationConfig::default(),
             par2: Par2Config::default(),
+            schedule: crate::schedule::ScheduleConfig::default(),
         }
     }
 }
@@ -636,6 +639,11 @@ impl AppConfig {
                 problems.push(format!("{label}: duplicate server id"));
             }
         }
+        for (i, rule) in self.schedule.rules.iter().enumerate() {
+            if let Some(problem) = crate::schedule::rule_problem(rule) {
+                problems.push(format!("schedule.rules[{i}] ({}): {problem}", rule.id));
+            }
+        }
         for (i, feed) in self.rss_feeds.iter().enumerate() {
             if let Some(pattern) = feed.filter_regex.as_deref()
                 && let Err(e) = regex::Regex::new(pattern)
@@ -1166,6 +1174,24 @@ ssl = false
                 "missing {expected:?} in {problems:?}"
             );
         }
+    }
+
+    #[test]
+    fn validate_names_a_bad_schedule_rule_by_index_and_id() {
+        let mut cfg = AppConfig::default();
+        cfg.schedule.rules.push(crate::schedule::ScheduleRule {
+            id: "quiet".into(),
+            days: vec!["funday".into()],
+            ..Default::default()
+        });
+
+        let problems = cfg.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.starts_with("schedule.rules[0] (quiet):") && p.contains("funday")),
+            "{problems:?}"
+        );
     }
 
     #[test]

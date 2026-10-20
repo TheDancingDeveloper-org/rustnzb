@@ -16,6 +16,7 @@ pub mod nzb_archive;
 pub mod queue_manager;
 pub mod rss_monitor;
 pub mod sabnzbd_compat;
+pub mod schedule_monitor;
 pub mod startup;
 pub mod state;
 pub mod util;

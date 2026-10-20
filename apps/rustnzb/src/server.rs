@@ -345,6 +345,8 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         )
         .route("/config/speed-limit", get(handlers::h_get_speed_limit))
         .route("/config/speed-limit", put(handlers::h_set_speed_limit))
+        .route("/config/schedule", get(handlers::h_schedule_get))
+        .route("/config/schedule", put(handlers::h_schedule_update))
         .route("/config/disk-guards", get(handlers::h_disk_guards_get))
         .route("/config/disk-guards", put(handlers::h_disk_guards_set))
         .route("/config/debug-logging", get(handlers::h_debug_logging_get))

@@ -4,7 +4,7 @@ import { FormsModule } from '@angular/forms';
 import { RouterModule } from '@angular/router';
 import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { ApiService } from '../../core/services/api.service';
-import { formatBytes } from '../../core/format';
+import { formatBytes, formatSpeed } from '../../core/format';
 import { StatusResponse } from '../../core/models/queue.model';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
@@ -65,11 +65,64 @@ type Tab =
   | 'categories'
   | 'postproc'
   | 'paths'
+  | 'schedule'
   | 'dav'
   | 'general'
   | 'api'
   | 'telemetry'
   | 'about';
+
+type ScheduleAction = 'pause' | 'speed_limit' | 'disable_servers';
+
+/** `MM:SS`-free 24-hour clock, with `24:00` allowed as the end of the day. */
+const CLOCK_RE = /^([01]\d|2[0-3]):[0-5]\d$|^24:00$/;
+
+const SHORT_DAYS: Record<string, string> = {
+  mon: 'mon',
+  monday: 'mon',
+  tue: 'tue',
+  tues: 'tue',
+  tuesday: 'tue',
+  wed: 'wed',
+  weds: 'wed',
+  wednesday: 'wed',
+  thu: 'thu',
+  thur: 'thu',
+  thurs: 'thu',
+  thursday: 'thu',
+  fri: 'fri',
+  friday: 'fri',
+  sat: 'sat',
+  saturday: 'sat',
+  sun: 'sun',
+  sunday: 'sun',
+};
+
+function shortDay(day: string): string {
+  return SHORT_DAYS[day.trim().toLowerCase()] ?? '';
+}
+
+/** One time-of-day window, as `GET/PUT /api/config/schedule` exchanges it. */
+interface ScheduleRule {
+  id: string;
+  name: string;
+  days: string[];
+  start: string;
+  end: string;
+  action: ScheduleAction;
+  speed_limit_bps: number;
+  servers: string[];
+}
+
+/** The saved schedule plus what it is doing right now. */
+interface ScheduleState {
+  enabled: boolean;
+  rules: ScheduleRule[];
+  active_rule_ids: string[];
+  paused: boolean;
+  speed_limit_bps: number | null;
+  disabled_servers: string[];
+}
 
 interface DavConfig {
   enabled: boolean;
@@ -130,14 +183,15 @@ type SettingsKey =
   | 'maxActive'
   | 'historyRetention'
   | 'diskGuards'
+  | 'schedule'
   | 'debugLogging'
   | 'dav'
   | 'sabApiKey';
 
 /** Settings edited in place and written by their own Save button. Toggles that save on change are not here. */
-type FormKey = 'speedLimit' | 'maxActive' | 'historyRetention' | 'diskGuards' | 'dav';
+type FormKey = 'speedLimit' | 'maxActive' | 'historyRetention' | 'diskGuards' | 'schedule' | 'dav';
 
-const FORM_KEYS: readonly FormKey[] = ['speedLimit', 'maxActive', 'historyRetention', 'diskGuards', 'dav'];
+const FORM_KEYS: readonly FormKey[] = ['speedLimit', 'maxActive', 'historyRetention', 'diskGuards', 'schedule', 'dav'];
 
 function isFormKey(key: SettingsKey): key is FormKey {
   return (FORM_KEYS as readonly string[]).includes(key);
@@ -153,6 +207,7 @@ function allLoading(): Record<SettingsKey, LoadState> {
     maxActive: { status: 'loading' },
     historyRetention: { status: 'loading' },
     diskGuards: { status: 'loading' },
+    schedule: { status: 'loading' },
     debugLogging: { status: 'loading' },
     dav: { status: 'loading' },
     sabApiKey: { status: 'loading' },
@@ -183,6 +238,7 @@ function emptyCategory(): CategoryConfig {
           Post-processing
         </button>
         <button [class.active]="tab === 'paths'" (click)="tab = 'paths'">Paths &amp; disk</button>
+        <button [class.active]="tab === 'schedule'" (click)="tab = 'schedule'">Scheduler</button>
         @if (webdavAvailable()) {
           <button [class.active]="tab === 'dav'" (click)="tab = 'dav'">Media Library (DAV)</button>
         }
@@ -701,6 +757,189 @@ function emptyCategory(): CategoryConfig {
                 </div>
               </div>
             </div>
+          </div>
+        }
+
+        <!-- =========== SCHEDULER =========== -->
+        @if (tab === 'schedule') {
+          @if (loadFailure('schedule'); as message) {
+            <div class="load-error" role="alert">
+              {{ message }}. Saving is paused until the schedule loads.
+              <button class="btn sm" (click)="loadSchedule()">Retry</button>
+            </div>
+          }
+          <div class="section-head">
+            <div>
+              <h2>Scheduler</h2>
+              <div class="sub">
+                Pause downloads, cap the speed, or take servers out of rotation on a
+                time-of-day window. Times use the server's local clock.
+              </div>
+            </div>
+            <button class="btn primary" (click)="addScheduleRule()" [disabled]="!canSave('schedule')">
+              + Add rule
+            </button>
+          </div>
+
+          <div class="panel">
+            <h3>
+              Status
+              @if (scheduleActiveNow()) {
+                <span class="pill ok">● active now</span>
+              }
+            </h3>
+            <div class="body">
+              <div class="form">
+                <label>Enable schedule</label>
+                <div class="inline">
+                  <label class="toggle">
+                    <input type="checkbox" [(ngModel)]="schedule.enabled" />
+                    <span>Apply these rules; turning this off lifts only the schedule's own pause</span>
+                  </label>
+                </div>
+                <label>Right now</label>
+                <div class="schedule-now">
+                  @if (!schedule.enabled) {
+                    <span class="dim">The schedule is off.</span>
+                  } @else if (!scheduleActiveNow()) {
+                    <span class="dim">No rule is active.</span>
+                  } @else {
+                    @for (rule of activeScheduleRules(); track rule.id) {
+                      <span class="pill">{{ rule.name || 'Unnamed rule' }} · {{ actionLabel(rule.action) }}</span>
+                    }
+                    @if (schedule.paused) {
+                      <span class="pill warn">paused by schedule</span>
+                    }
+                    @if (schedule.speed_limit_bps !== null) {
+                      <span class="pill">cap {{ formatSpeedValue(schedule.speed_limit_bps) }}</span>
+                    }
+                    @if (schedule.disabled_servers.length) {
+                      <span class="pill warn">{{ disabledServerNames() }} out of rotation</span>
+                    }
+                  }
+                </div>
+                <div class="dim">
+                  The schedule only lifts a pause it applied. A manual pause, a disk-space hold, or
+                  a paused job stays paused when a window ends.
+                </div>
+              </div>
+            </div>
+          </div>
+
+          @if (!schedule.rules.length) {
+            <div class="panel">
+              <div class="body empty">No rules yet. Add one to give downloads a quiet hours window.</div>
+            </div>
+          }
+
+          @for (rule of schedule.rules; track rule.id; let i = $index) {
+            <div class="panel">
+              <h3>
+                {{ rule.name || 'New rule' }}
+                @if (isRuleActive(rule)) {
+                  <span class="pill ok">● active now</span>
+                }
+                <span class="hint">
+                  <button class="btn sm danger" type="button" (click)="removeScheduleRule(i)">Remove</button>
+                </span>
+              </h3>
+              <div class="body">
+                <div class="form">
+                  <label>Name</label>
+                  <div class="inline">
+                    <input type="text" [(ngModel)]="rule.name" placeholder="Quiet hours" />
+                  </div>
+
+                  <label>Days</label>
+                  <div class="schedule-days" role="group" aria-label="Days this rule starts on">
+                    @for (day of weekdays; track day.value) {
+                      <label class="schedule-day">
+                        <input
+                          type="checkbox"
+                          [checked]="rule.days.includes(day.value)"
+                          (change)="toggleScheduleDay(rule, day.value, $event)"
+                        />
+                        <span>{{ day.label }}</span>
+                      </label>
+                    }
+                  </div>
+
+                  <label>Window</label>
+                  <div class="inline">
+                    <input
+                      type="text"
+                      class="schedule-clock"
+                      [(ngModel)]="rule.start"
+                      aria-label="Start time"
+                      placeholder="HH:MM"
+                      inputmode="numeric"
+                      autocomplete="off"
+                    />
+                    <span class="dim">to</span>
+                    <input
+                      type="text"
+                      class="schedule-clock"
+                      [(ngModel)]="rule.end"
+                      aria-label="End time"
+                      placeholder="HH:MM"
+                      inputmode="numeric"
+                      autocomplete="off"
+                    />
+                    <span class="dim">24-hour · end earlier than start runs overnight</span>
+                  </div>
+
+                  <label>Action</label>
+                  <div class="inline">
+                    <select [(ngModel)]="rule.action" aria-label="Action">
+                      <option value="pause">Pause downloads</option>
+                      <option value="speed_limit">Limit speed</option>
+                      <option value="disable_servers">Disable servers</option>
+                    </select>
+                  </div>
+
+                  @if (rule.action === 'speed_limit') {
+                    <label>Speed cap</label>
+                    <div class="inline">
+                      <input type="number" [(ngModel)]="rule.speed_limit_bps" min="0" step="1000" />
+                      <span class="dim">bytes/sec · 0 = unlimited (overrides other caps)</span>
+                    </div>
+                  }
+
+                  @if (rule.action === 'disable_servers') {
+                    <label>Servers</label>
+                    <div class="schedule-servers">
+                      @for (server of servers(); track server.id) {
+                        <label class="schedule-day">
+                          <input
+                            type="checkbox"
+                            [checked]="rule.servers.includes(server.id)"
+                            (change)="toggleScheduleServer(rule, server.id, $event)"
+                          />
+                          <span>{{ server.name || server.host }}</span>
+                        </label>
+                      } @empty {
+                        <span class="dim">No news servers configured.</span>
+                      }
+                    </div>
+                  }
+
+                  @if (ruleProblem(rule); as problem) {
+                    <div class="schedule-problem" role="alert">{{ problem }}</div>
+                  }
+                </div>
+              </div>
+            </div>
+          }
+
+          <div class="form-actions">
+            <button
+              class="btn primary"
+              (click)="saveSchedule()"
+              [disabled]="!canSave('schedule') || !!scheduleProblem()"
+            >
+              Save schedule
+            </button>
+            <button class="btn" (click)="reloadSchedule()" [disabled]="!canSave('schedule')">Discard changes</button>
           </div>
         }
 
@@ -1449,6 +1688,55 @@ function emptyCategory(): CategoryConfig {
         word-break: break-all;
       }
 
+      /* Scheduler */
+      .schedule-days,
+      .schedule-servers {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 12px;
+        align-items: center;
+      }
+      .schedule-day {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 13px;
+        color: var(--text);
+        background: var(--panel2);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-md);
+        padding: 4px 9px;
+        cursor: pointer;
+      }
+      .schedule-day:has(input:checked) {
+        border-color: var(--accent);
+        box-shadow: inset 0 0 0 1px var(--accent);
+      }
+      .schedule-day input {
+        margin: 0;
+        accent-color: var(--accent);
+      }
+      .schedule-now {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+      }
+      .schedule-problem {
+        grid-column: 2;
+        color: var(--danger);
+        font-size: 12px;
+      }
+      .form .schedule-clock {
+        max-width: 90px;
+        font-variant-numeric: tabular-nums;
+      }
+      @media (max-width: 720px) {
+        .form { grid-template-columns: 1fr; }
+        .form .help,
+        .schedule-problem { grid-column: 1; }
+      }
+
       .dir-table {
         display: flex;
         flex-direction: column;
@@ -1589,6 +1877,25 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
   minFreeSpaceGB = 1;
   abortHopeless = true;
 
+  // Scheduler
+  schedule: ScheduleState = {
+    enabled: false,
+    rules: [],
+    active_rule_ids: [],
+    paused: false,
+    speed_limit_bps: null,
+    disabled_servers: [],
+  };
+  readonly weekdays = [
+    { value: 'mon', label: 'Mon' },
+    { value: 'tue', label: 'Tue' },
+    { value: 'wed', label: 'Wed' },
+    { value: 'thu', label: 'Thu' },
+    { value: 'fri', label: 'Fri' },
+    { value: 'sat', label: 'Sat' },
+    { value: 'sun', label: 'Sun' },
+  ];
+
   // Status / feature flags
   status = signal<StatusResponse | null>(null);
   webdavAvailable = computed(() => this.status()?.webdav_available ?? false);
@@ -1630,6 +1937,7 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     this.loadServers();
     this.loadCategories();
     this.loadGeneralSettings();
+    this.loadSchedule();
     this.loadSabApiKey();
     this.loadStatus();
     this.loadDirs();
@@ -1654,6 +1962,8 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
         return JSON.stringify(this.historyRetention);
       case 'diskGuards':
         return JSON.stringify([this.minFreeSpaceGB, this.abortHopeless]);
+      case 'schedule':
+        return JSON.stringify({ enabled: this.schedule.enabled, rules: this.schedule.rules });
       case 'dav':
         return JSON.stringify(this.davConfig);
     }
@@ -2122,6 +2432,155 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
       'History retention saved',
       'Failed to save retention',
     );
+  }
+
+  // ======================== SCHEDULER ========================
+
+  loadSchedule(): void {
+    this.loadSetting<ScheduleState>('schedule', '/config/schedule', 'Failed to load the schedule', (state) => {
+      const rules = Array.isArray(state.rules) ? state.rules : [];
+      this.schedule = {
+        ...this.schedule,
+        ...state,
+        rules: rules.map((rule) => ({
+          ...rule,
+          // A hand-edited config may spell days out in full; the checkboxes
+          // work in the short form the API writes.
+          days: [...new Set((rule.days ?? []).map((day) => shortDay(day)))].filter(Boolean),
+        })),
+      };
+    });
+  }
+
+  /** Re-read the schedule, dropping any unsaved edits. */
+  reloadSchedule(): void {
+    this.loadSchedule();
+  }
+
+  scheduleActiveNow(): boolean {
+    return this.schedule.enabled && this.schedule.active_rule_ids.length > 0;
+  }
+
+  activeScheduleRules(): ScheduleRule[] {
+    return this.schedule.rules.filter((rule) => this.isRuleActive(rule));
+  }
+
+  isRuleActive(rule: ScheduleRule): boolean {
+    return this.schedule.enabled && !!rule.id && this.schedule.active_rule_ids.includes(rule.id);
+  }
+
+  disabledServerNames(): string {
+    const ids = this.schedule.disabled_servers;
+    const names = ids.map((id) => {
+      const server = this.servers().find((candidate) => candidate.id === id);
+      return server ? server.name || server.host : id;
+    });
+    return names.join(', ');
+  }
+
+  actionLabel(action: ScheduleAction): string {
+    switch (action) {
+      case 'pause':
+        return 'pause';
+      case 'speed_limit':
+        return 'speed cap';
+      case 'disable_servers':
+        return 'servers out';
+    }
+  }
+
+  formatSpeedValue(bps: number | null): string {
+    return bps === null ? 'unlimited' : formatSpeed(bps);
+  }
+
+  addScheduleRule(): void {
+    if (!this.canSave('schedule')) return;
+    this.schedule.rules = [
+      ...this.schedule.rules,
+      {
+        id: '',
+        name: '',
+        days: ['mon', 'tue', 'wed', 'thu', 'fri'],
+        start: '01:00',
+        end: '06:00',
+        action: 'pause',
+        speed_limit_bps: 0,
+        servers: [],
+      },
+    ];
+  }
+
+  removeScheduleRule(index: number): void {
+    this.schedule.rules = this.schedule.rules.filter((_, i) => i !== index);
+  }
+
+  toggleScheduleDay(rule: ScheduleRule, day: string, event: Event): void {
+    const checked = (event.target as HTMLInputElement).checked;
+    rule.days = checked
+      ? [...rule.days, day]
+      : rule.days.filter((candidate) => candidate !== day);
+  }
+
+  toggleScheduleServer(rule: ScheduleRule, id: string, event: Event): void {
+    const checked = (event.target as HTMLInputElement).checked;
+    rule.servers = checked
+      ? [...rule.servers, id]
+      : rule.servers.filter((candidate) => candidate !== id);
+  }
+
+  /** The first thing wrong with a draft rule, worded for the row. */
+  ruleProblem(rule: ScheduleRule): string | null {
+    if (!rule.days.length) return 'Pick at least one day.';
+    if (!CLOCK_RE.test(rule.start.trim())) return 'Start must be HH:MM (00:00 to 23:59).';
+    if (!CLOCK_RE.test(rule.end.trim())) return 'End must be HH:MM (00:00 to 24:00).';
+    if (rule.start.trim() === rule.end.trim()) return 'Start and end must differ.';
+    if (rule.action === 'disable_servers' && !rule.servers.length) {
+      return 'Pick at least one server to take out of rotation.';
+    }
+    return null;
+  }
+
+  /** The first problem across every draft rule, or `null` when the form can be saved. */
+  scheduleProblem(): string | null {
+    for (let i = 0; i < this.schedule.rules.length; i++) {
+      const problem = this.ruleProblem(this.schedule.rules[i]);
+      if (problem) return `Rule ${i + 1}: ${problem}`;
+    }
+    return null;
+  }
+
+  saveSchedule(): void {
+    if (!this.canSave('schedule')) return;
+    const problem = this.scheduleProblem();
+    if (problem) {
+      this.snack.open(problem, 'Close', { duration: 4000 });
+      return;
+    }
+    const sent = this.formSnapshot('schedule');
+    const body = {
+      enabled: this.schedule.enabled,
+      rules: this.schedule.rules.map((rule) => ({
+        ...rule,
+        name: rule.name.trim(),
+        days: [...rule.days],
+        servers: [...rule.servers],
+      })),
+    };
+    this.api.put<ScheduleState>('/config/schedule', body).subscribe({
+      next: (state) => {
+        // The response carries the ids the server assigned and what the
+        // schedule is doing now. If the form was edited while the save was
+        // in flight, keep that draft (dirty) instead of overwriting it; the
+        // server assigns ids on the next save.
+        if (this.formSnapshot('schedule') === sent) {
+          const rules = Array.isArray(state.rules) ? state.rules : [];
+          this.schedule = { ...state, rules: rules.map((rule) => ({ ...rule })) };
+        }
+        this.baselines.schedule = this.formSnapshot('schedule');
+        this.snack.open('Schedule saved', 'Close', { duration: 2000 });
+      },
+      error: (err) => showHttpError(this.snack, err, 'Failed to save the schedule'),
+    });
   }
 
   // ======================== DAV CONFIG ========================
