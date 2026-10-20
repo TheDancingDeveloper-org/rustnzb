@@ -209,6 +209,19 @@ jobs:
           mkdir -p .ci-output/packages
           docker cp "$container:/workspace/.ci-output/packages/." .ci-output/packages/
           (cd .ci-output/packages && sha256sum -c "SHA256SUMS-${GITHUB_REF_NAME}.txt")
+      # The shipped binaries must carry cargo-auditable's `.dep-v0` section, or
+      # syft falls back to guessing and the SBOM is not dependency-accurate.
+      - name: Verify the audit section reached the shipped binaries
+        run: |
+          set -eu
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          for arch in x86_64 aarch64; do
+            tar -xzf ".ci-output/packages/rustnzb-${GITHUB_REF_NAME}-linux-${arch}.tar.gz" \
+              -C "$work" "rustnzb-${GITHUB_REF_NAME}/rustnzb"
+            objdump -h "$work/rustnzb-${GITHUB_REF_NAME}/rustnzb" | grep -q '\.dep-v0'
+            printf 'audit: linux-%s carries .dep-v0\n' "$arch"
+          done
       - uses: sigstore/cosign-installer@v3.7.0
         with:
           cosign-release: v2.4.1
@@ -231,6 +244,26 @@ jobs:
             case "$file" in *.spdx.json) continue ;; esac
             syft "$file" -o "spdx-json=${file}.spdx.json"
           done
+      # Package-manager manifests, rendered from the release's own checksum file
+      # that was produced above. This is a dry run: the files are uploaded as a
+      # workflow artefact for the operator to review and submit. Nothing is
+      # published to Homebrew, Scoop or winget from CI.
+      - name: Render Scoop and winget manifests (dry run, upload only)
+        run: |
+          set -eu
+          mkdir -p .ci-output/manifests
+          packaging/distribution/render-windows-manifests.sh \
+            "${GITHUB_REF_NAME}" \
+            --sums ".ci-output/packages/SHA256SUMS-${GITHUB_REF_NAME}.txt" \
+            --assets-dir .ci-output/packages \
+            --release-date "$(date -u +%Y-%m-%d)" \
+            --out .ci-output/manifests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustnzb-${{ github.ref_name }}-distribution-manifests
+          path: .ci-output/manifests/packaging/**
+          if-no-files-found: error
+          retention-days: 30
       # Build provenance (who built what, from which commit and workflow) for
       # every binary package, plus the signed checksum file.
       - name: Attest build provenance for the release artefacts

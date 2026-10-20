@@ -1,0 +1,100 @@
+#!/bin/sh
+# cargo-auditable install/verification, shared by the release build tasks.
+#
+# Every standalone release binary (Linux amd64/arm64, Windows) is built with
+# rust-secure-code/cargo-auditable so its dependency list is embedded in a
+# `.dep-v0` section (ELF) / `.dep-v0`-equivalent PE section. That is what lets
+# `Syft`/`cargo audit bin`/`grype` read the exact crate versions from the shipped
+# file instead of guessing from the build tree.
+#
+# The version and the Linux tarball checksum are pinned here, mirroring the
+# SHA-256 style used for Zig and sccache in Dockerfile.ci. Bump both together.
+#
+# Usage:
+#   . ci/tasks/auditable
+#   install_cargo_auditable            # puts cargo-auditable on PATH
+#   auditable_cargo build --release    # `cargo` with audit data injected
+#   verify_auditable_binary PATH TRIPLE
+set -eu
+
+CARGO_AUDITABLE_VERSION=v0.7.7
+CARGO_AUDITABLE_TARBALL=cargo-auditable-x86_64-unknown-linux-gnu.tar.xz
+CARGO_AUDITABLE_SHA256=4c8d3b08c3c34e9f2333367224dbbfb4aab68067698b43de59fe19aded3416dd
+CARGO_AUDITABLE_URL="https://github.com/rust-secure-code/cargo-auditable/releases/download/${CARGO_AUDITABLE_VERSION}/${CARGO_AUDITABLE_TARBALL}"
+
+auditable_dir() {
+    printf '%s\n' "${CARGO_AUDITABLE_DIR:-$REPO_ROOT/.ci-output/cargo-auditable-${CARGO_AUDITABLE_VERSION}}"
+}
+
+install_cargo_auditable() {
+    dir=$(auditable_dir)
+    if [ ! -x "$dir/cargo-auditable" ]; then
+        mkdir -p "$dir"
+        tarball="$dir/$CARGO_AUDITABLE_TARBALL"
+        curl -fsSL -o "$tarball" "$CARGO_AUDITABLE_URL"
+        printf '%s  %s\n' "$CARGO_AUDITABLE_SHA256" "$tarball" | sha256sum -c - >/dev/null
+        tar -xJf "$tarball" -C "$dir" --strip-components=1
+        rm -f "$tarball"
+    fi
+    test -x "$dir/cargo-auditable"
+    PATH="$dir:$PATH"
+    export PATH
+}
+
+# `cargo auditable <args>` for the build tasks that invoke cargo themselves and
+# `RUSTC_WORKSPACE_WRAPPER=... cargo <args>` for the cross builders
+# (cargo zigbuild / cargo xwin) that construct their own cargo invocation.
+#
+# cargo-auditable embeds the dependency list by running a rustc wrapper on
+# workspace members only (RUSTC_WORKSPACE_WRAPPER), and only when
+# CARGO_AUDITABLE_ORIG_ARGS is present. Exported as a function so the build
+# scripts read the same way whichever cargo front end they use.
+auditable_cargo() {
+    dir=$(auditable_dir)
+    test -x "$dir/cargo-auditable" || {
+        printf 'auditable_cargo: run install_cargo_auditable first\n' >&2
+        return 127
+    }
+    PATH="$dir:$PATH" "$dir/cargo-auditable" auditable "$@"
+}
+
+# The cross builders spawn cargo with a modified environment. Pass the wrapper
+# explicitly and provide the flags `cargo auditable` would have recorded, so the
+# wrapper can call `cargo metadata` with the same --locked/--offline options.
+#
+# The JSON is deliberately a plain string: cargo-auditable parses it as JSON,
+# so the quotes and braces must survive the export unchanged.
+auditable_env() {
+    dir=$(auditable_dir)
+    test -x "$dir/cargo-auditable" || {
+        printf 'auditable_env: run install_cargo_auditable first\n' >&2
+        return 127
+    }
+    # cargo-auditable parses this value as JSON, so its quotes and braces must
+    # stay literal. shellcheck's SC2089/SC2090 warnings describe exactly that
+    # (deliberate) quoting, hence the directive rather than a rewrite.
+    # shellcheck disable=SC2089,SC2090
+    CARGO_AUDITABLE_ORIG_ARGS='{"offline":false,"locked":true,"frozen":false,"config":[]}'
+    RUSTC_WORKSPACE_WRAPPER="$dir/cargo-auditable"
+    # shellcheck disable=SC2090
+    export CARGO_AUDITABLE_ORIG_ARGS
+    export RUSTC_WORKSPACE_WRAPPER
+}
+
+# Fail the release build when the audit data did not make it into the binary.
+# ELF and PE both expose it through the section table, so objdump is enough and
+# no extra dependency is required in the cross image.
+verify_auditable_binary() {
+    binary=$1
+    triple=${2:-}
+    test -f "$binary" || {
+        printf 'verify_auditable_binary: %s is missing\n' "$binary" >&2
+        return 1
+    }
+    if objdump -h "$binary" 2>/dev/null | grep -q '\.dep-v0'; then
+        printf 'audit: %s carries .dep-v0 (%s)\n' "$binary" "${triple:-unknown target}"
+        return 0
+    fi
+    printf 'verify_auditable_binary: %s has no .dep-v0 audit section\n' "$binary" >&2
+    return 1
+}

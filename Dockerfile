@@ -3,6 +3,8 @@
 ARG CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:d747454fca94ebfd9dba1f566d9f549c4c9fbedf785c6aba36a0c383d9b9a955
 ARG UNRAR_VERSION=7.2.3
 ARG UNRAR_SHA256=3995af0aa32b1505a566da053725551a1f0698dc42b2fdf7ba7d65db0d004e33
+ARG CARGO_AUDITABLE_VERSION=v0.7.7
+ARG CARGO_AUDITABLE_SHA256=4c8d3b08c3c34e9f2333367224dbbfb4aab68067698b43de59fe19aded3416dd
 
 FROM alpine:3.23 AS unrar-builder
 
@@ -22,6 +24,8 @@ FROM --platform=$BUILDPLATFORM ${CROSS_IMAGE} AS builder
 ARG TARGETPLATFORM
 ARG RUSTNZB_BUILD_REF=local
 ARG RELEASE_OPTIMIZED=false
+ARG CARGO_AUDITABLE_VERSION
+ARG CARGO_AUDITABLE_SHA256
 
 WORKDIR /build
 
@@ -41,6 +45,19 @@ COPY Cargo.toml Cargo.lock ./
 COPY apps apps
 COPY crates crates
 
+# cargo-auditable embeds the exact crate versions in a `.dep-v0` section, so
+# `syft` reads the dependencies from the shipped binary instead of guessing
+# from the build tree. Pinned by version and tarball checksum.
+RUN set -eu; \
+    tarball=/tmp/cargo-auditable.tar.xz; \
+    curl -fsSL -o "$tarball" \
+        "https://github.com/rust-secure-code/cargo-auditable/releases/download/${CARGO_AUDITABLE_VERSION}/cargo-auditable-x86_64-unknown-linux-gnu.tar.xz"; \
+    printf '%s  %s\n' "${CARGO_AUDITABLE_SHA256}" "$tarball" | sha256sum -c -; \
+    mkdir -p /usr/local/lib/cargo-auditable; \
+    tar -xJf "$tarball" -C /usr/local/lib/cargo-auditable --strip-components=1; \
+    rm -f "$tarball"; \
+    test -x /usr/local/lib/cargo-auditable/cargo-auditable
+
 # The build uses only public crates.io dependencies for the rustnzb binary.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
@@ -57,9 +74,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
             CARGO_PROFILE_RELEASE_STRIP=symbols; \
     fi; \
     CARGO_TARGET_DIR=/build/target \
+    RUSTC_WORKSPACE_WRAPPER=/usr/local/lib/cargo-auditable/cargo-auditable \
+    CARGO_AUDITABLE_ORIG_ARGS='{"offline":false,"locked":true,"frozen":false,"config":[]}' \
     RUSTNZB_BUILD_REF="$RUSTNZB_BUILD_REF" \
         cargo zigbuild --release --locked -p rustnzb \
             --features webdav,vendored-openssl --target "$rust_target"; \
+    objdump -h "/build/target/$rust_target/release/rustnzb" | grep -q '\.dep-v0'; \
     mkdir -p /out; \
     cp "/build/target/$rust_target/release/rustnzb" /out/rustnzb
 
