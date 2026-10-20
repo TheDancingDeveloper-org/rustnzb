@@ -36,7 +36,7 @@ pub enum SliceState {
 }
 
 /// The expected checksums for one slice, from a PAR2 IFSC packet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SliceDigest {
     pub md5: Md5Hash,
     pub crc32: u32,

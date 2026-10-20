@@ -10,6 +10,7 @@ pub mod detect;
 pub mod fold_repair;
 pub mod inflight;
 pub mod par2;
+pub mod par2_fold;
 pub mod pipeline;
 pub mod resources;
 pub mod unpack;
@@ -23,6 +24,9 @@ pub use detect::{
     parse_rar_volume_at,
 };
 pub use par2::recovery_can_cover;
+pub use par2_fold::{
+    Feed, FoldError as RepairFoldError, MAX_ROW_BYTES, MAX_SLICE_SIZE, RepairBudget, RepairFold,
+};
 pub use pipeline::{
     PostProcConfig, PostProcResult, run_pipeline, run_pipeline_with_cleanup,
     run_pipeline_with_resources, run_repair_pipeline,
