@@ -142,6 +142,20 @@ jobs:
           mkdir -p .ci-output/packages
           docker cp "$container:/workspace/.ci-output/packages/." .ci-output/packages/
           (cd .ci-output/packages && sha256sum -c "SHA256SUMS-${STABLE}.txt")
+      # Stable binaries are rebuilt by the same tasks as a tag release, so they
+      # must carry cargo-auditable's `.dep-v0` section too. Without it the SBOMs
+      # generated from these files fall back to detection heuristics.
+      - name: Verify the audit section reached the shipped binaries
+        run: |
+          set -eu
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          for arch in x86_64 aarch64; do
+            tar -xzf ".ci-output/packages/rustnzb-${STABLE}-linux-${arch}.tar.gz" \
+              -C "$work" "rustnzb-${STABLE}/rustnzb"
+            objdump -h "$work/rustnzb-${STABLE}/rustnzb" | grep -q '\.dep-v0'
+            printf 'audit: linux-%s carries .dep-v0\n' "$arch"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: rustnzb-${{ needs.resolve.outputs.stable_tag }}-release-assets

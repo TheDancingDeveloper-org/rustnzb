@@ -1,10 +1,13 @@
 #!/bin/sh
 set -eu
 . "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/auditable"
 trap cleanup_task_frontend EXIT
-task_start build-linux-arm64 cargo zig
+task_start build-linux-arm64 cargo zig curl xz
 task_target_dir build-linux-arm64
 ensure_frontend
+install_cargo_auditable
+auditable_env
 if [ -n "${CI_COMMIT_TAG:-}" ]; then
     export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols
 fi
@@ -13,6 +16,7 @@ cargo zigbuild --release -p rustnzb \
     --features webdav,vendored-openssl --locked
 binary=$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/rustnzb
 test -x "$binary"
+verify_auditable_binary "$binary" aarch64-unknown-linux-gnu
 file "$binary"
 ls -lh "$binary"
 show_sccache_stats
