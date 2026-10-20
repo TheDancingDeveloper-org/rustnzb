@@ -98,7 +98,7 @@ The container image (built on the linuxserver.io Alpine base) also reads:
 | `min_free_space_bytes` | `1073741824` (1 GB) | Pause downloads when free space drops below this. |
 | `watch_dir` | unset | Folder watched for `.nzb` files to queue. |
 | `rss_history_limit` | `500` | RSS feed items kept. Unset keeps all. |
-| `rss_downloaded_item_expiry_days` | unset | Remove downloaded RSS records after this many days. |
+| `rss_downloaded_item_expiry_days` | unset | Remove downloaded RSS records after this many days. Values above 36500 (100 years) are clamped. |
 | `direct_unpack` | `true` | Extract RAR volumes during the download. Needs `unrar`. |
 | `max_nested_archive_depth` | `5` | Archive layers extracted after the outer one. `0` extracts only the outer archive. The API accepts 0 to 10. |
 | `abort_hopeless` | `true` | Abort jobs that cannot complete because too many articles are missing. Applied at start. |

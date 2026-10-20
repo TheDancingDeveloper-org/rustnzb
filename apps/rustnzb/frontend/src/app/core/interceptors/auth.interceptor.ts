@@ -1,7 +1,12 @@
-import { HttpInterceptorFn, HttpErrorResponse, HttpRequest } from '@angular/common/http';
+import {
+  HttpInterceptorFn,
+  HttpErrorResponse,
+  HttpRequest,
+  HttpResponse,
+} from '@angular/common/http';
 import { inject } from '@angular/core';
 import { Router } from '@angular/router';
-import { catchError, of, switchMap, throwError } from 'rxjs';
+import { catchError, of, switchMap, tap, throwError } from 'rxjs';
 import { AuthService, TokenResponse } from '../services/auth.service';
 
 function withToken<T>(req: HttpRequest<T>, token: string): HttpRequest<T> {
@@ -66,7 +71,16 @@ export const authInterceptor: HttpInterceptorFn = (req, next) => {
           router.navigate(['/login']);
           return throwError(() => refreshError);
         }),
-        switchMap((tokens) => next(withToken(req, tokens.access_token))),
+        // The retried request is the server's confirmation of this token, so
+        // a session adopted from another tab becomes authenticated here and
+        // not before. A 401 from the retry falls through as an error.
+        switchMap((tokens) =>
+          next(withToken(req, tokens.access_token)).pipe(
+            tap((event) => {
+              if (event instanceof HttpResponse) authService.markSessionVerified();
+            }),
+          ),
+        ),
       );
     }),
   );

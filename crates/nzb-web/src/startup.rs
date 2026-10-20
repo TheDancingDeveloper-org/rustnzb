@@ -509,21 +509,73 @@ mod tests {
     }
 
     /// Desktop `start_engine` moves `StartupResult.instance_lock` into process
-    /// state and then drops the rest of the result. The moved lock must still
-    /// exclude a second instance until that owner drops it.
-    #[test]
-    fn moved_instance_lock_still_excludes_a_second_instance() {
+    /// state and then drops the rest of the result, whose `state` moves into
+    /// the HTTP task. That partial move is the regression: the lock must keep
+    /// excluding a second instance until its new owner drops it.
+    #[tokio::test]
+    async fn instance_lock_survives_dropping_the_rest_of_the_startup_result() {
+        use std::sync::Arc;
+
+        use arc_swap::ArcSwap;
+
+        use super::StartupResult;
+        use crate::auth::{CredentialStore, TokenStore};
+        use crate::nzb_core::db::Database;
+        use crate::queue_manager::QueueManager;
+        use crate::state::AppState;
+
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        let lock = acquire_instance_lock(&data_dir).unwrap();
-        let retained = lock;
+        let log_buffer = crate::log_buffer::LogBuffer::default();
+        let queue_manager = QueueManager::new(
+            Vec::new(),
+            Database::open_memory().expect("in-memory database"),
+            data_dir.join("incomplete"),
+            data_dir.join("complete"),
+            log_buffer.clone(),
+            1,
+            Vec::new(),
+            0,
+            0,
+            false,
+            5,
+            false,
+            false,
+            100.0,
+            30,
+        );
+        let state = Arc::new(AppState::new(
+            Arc::new(ArcSwap::from_pointee(AppConfig::default())),
+            tmp.path().join("config.toml"),
+            Arc::clone(&queue_manager),
+            log_buffer.clone(),
+            Arc::new(TokenStore::new()),
+            Arc::new(CredentialStore::new(data_dir.clone())),
+        ));
+        let result = StartupResult {
+            state,
+            queue_manager: Arc::clone(&queue_manager),
+            log_buffer,
+            instance_lock: acquire_instance_lock(&data_dir).unwrap(),
+        };
+
+        // Destructure as the desktop shell does: every field moves out, so
+        // what is dropped below is the rest of the result, not the lock.
+        let StartupResult {
+            state,
+            queue_manager: result_queue_manager,
+            log_buffer,
+            instance_lock,
+        } = result;
+        drop((state, result_queue_manager, log_buffer));
+
         assert!(
             acquire_instance_lock(&data_dir).is_err(),
-            "moving the lock out of StartupResult must not release it"
+            "dropping the rest of StartupResult must not release the moved lock"
         );
-        drop(retained);
+        drop(instance_lock);
         acquire_instance_lock(&data_dir).expect("released on drop");
     }
 

@@ -25,6 +25,7 @@ use nzb_web::nzb_core::NzbError;
 use nzb_web::nzb_core::config::DavConfig;
 use nzb_web::nzb_core::config::{
     CategoryConfig, RssFeedConfig, ServerConfig, normalize_history_retention,
+    normalize_rss_expiry_days,
 };
 use nzb_web::nzb_core::models::*;
 use nzb_web::nzb_core::nzb_parser;
@@ -82,8 +83,9 @@ pub struct HistoryQuery {
     /// Case-insensitive substring of the job name.
     pub search: Option<String>,
     /// Only entries completed within the last N days. Also bounds `stats`.
-    /// Values above [`MAX_HISTORY_DAYS`] are rejected: `chrono::Duration::days`
-    /// panics when the span does not fit in an `i64` of milliseconds.
+    /// Values above [`MAX_HISTORY_DAYS`] are rejected: subtracting the span
+    /// from `Utc::now()` overflows chrono's DateTime range (about
+    /// ±262 000 years), which panics.
     pub days: Option<u32>,
 }
 
@@ -887,11 +889,13 @@ pub async fn h_history_list(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HistoryQuery>,
 ) -> Result<Json<HistoryResponse>, ApiError> {
-    let limit = q.limit.unwrap_or(50);
-    let offset = q.offset.unwrap_or(0);
+    // Reject an oversized window before touching the database: the filter
+    // would otherwise be built and the full history loaded only to fail.
     if q.days.is_some_and(|d| d > MAX_HISTORY_DAYS) {
         return Err(ApiError::bad_request("days must be at most 36500"));
     }
+    let limit = q.limit.unwrap_or(50);
+    let offset = q.offset.unwrap_or(0);
     let completed_since = q
         .days
         .map(|d| chrono::Utc::now() - chrono::Duration::days(i64::from(d)));
@@ -2452,7 +2456,7 @@ pub async fn h_general_update(
             config.general.duplicate_policy = policy;
         }
         if let Some(days) = body.rss_downloaded_item_expiry_days {
-            config.general.rss_downloaded_item_expiry_days = days;
+            config.general.rss_downloaded_item_expiry_days = normalize_rss_expiry_days(days);
         }
         if let Some(directory) = body.scripts_dir {
             config.general.scripts_dir = if directory.is_empty() {

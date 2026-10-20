@@ -148,7 +148,24 @@ describe('AuthService', () => {
     expect(service.discardFailedSession()).toBe(false);
 
     expect(service.getAccessToken()).toBe('access-from-other-tab');
-    expect(service.authenticated()).toBe(true);
     expect(localStorage.getItem('refresh_token')).toBe('refresh-from-other-tab');
+  });
+
+  it('does not treat another tab’s token as authenticated until the server accepts it', () => {
+    localStorage.setItem('access_token', 'access-from-other-tab');
+    localStorage.setItem('refresh_token', 'refresh-from-other-tab');
+    service = new AuthService(http as unknown as HttpClient);
+    (service as unknown as { lastSpentRefresh: string }).lastSpentRefresh = 'spent-here';
+
+    expect(service.discardFailedSession()).toBe(false);
+    expect(service.authenticated()).toBe(false);
+
+    service.markSessionVerified();
+    expect(service.authenticated()).toBe(true);
+  });
+
+  it('does not verify a session that has no access token', () => {
+    service.markSessionVerified();
+    expect(service.authenticated()).toBe(false);
   });
 });

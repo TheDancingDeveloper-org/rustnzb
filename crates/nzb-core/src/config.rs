@@ -298,6 +298,19 @@ pub fn normalize_history_retention(limit: Option<usize>) -> Option<usize> {
     limit.filter(|max| *max > 0)
 }
 
+/// Upper bound for `rss_downloaded_item_expiry_days`: 100 years.
+///
+/// The value is subtracted from `Utc::now()` when downloaded RSS items are
+/// pruned; a large enough span overflows chrono's `DateTime` range (about
+/// ±262 000 years) and panics. A hundred years is already far past any useful
+/// retention.
+pub const MAX_RSS_EXPIRY_DAYS: u64 = 36_500;
+
+/// Clamp a configured RSS expiry so the cutoff can always be computed.
+pub fn normalize_rss_expiry_days(days: Option<u64>) -> Option<u64> {
+    days.map(|days| days.min(MAX_RSS_EXPIRY_DAYS))
+}
+
 fn default_script_timeout_secs() -> u64 {
     300
 }
@@ -590,6 +603,8 @@ impl AppConfig {
         let mut config: AppConfig = toml::from_str(&contents)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
         config.assign_missing_server_ids();
+        config.general.rss_downloaded_item_expiry_days =
+            normalize_rss_expiry_days(config.general.rss_downloaded_item_expiry_days);
         Ok(config)
     }
 
@@ -812,6 +827,37 @@ ssl = false
         assert_eq!(general.duplicate_policy, DuplicatePolicy::Skip);
         let omitted: GeneralConfig = toml::from_str("").unwrap();
         assert_eq!(omitted.duplicate_policy, DuplicatePolicy::Warn);
+    }
+
+    #[test]
+    fn rss_expiry_is_clamped_to_a_computable_cutoff() {
+        assert_eq!(normalize_rss_expiry_days(None), None);
+        assert_eq!(normalize_rss_expiry_days(Some(0)), Some(0));
+        assert_eq!(normalize_rss_expiry_days(Some(30)), Some(30));
+        assert_eq!(
+            normalize_rss_expiry_days(Some(u64::MAX)),
+            Some(MAX_RSS_EXPIRY_DAYS)
+        );
+    }
+
+    #[test]
+    fn read_clamps_an_absurd_rss_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[general]\nrss_downloaded_item_expiry_days = {}\n",
+                u64::MAX
+            ),
+        )
+        .unwrap();
+
+        let config = AppConfig::read(&path).unwrap();
+        assert_eq!(
+            config.general.rss_downloaded_item_expiry_days,
+            Some(MAX_RSS_EXPIRY_DAYS)
+        );
     }
 
     #[test]
