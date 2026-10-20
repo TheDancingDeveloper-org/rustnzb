@@ -159,3 +159,115 @@ async fn sab_api_key_is_admin_only_and_rotation_takes_effect_immediately() {
 
     handle.abort();
 }
+
+/// The SABnzbd-compatible API accepts the key in an `X-Api-Key` header, so a
+/// client can keep it out of the request URL — and therefore out of the
+/// access logs of every reverse proxy in front of rustnzb (WI-1303).
+#[tokio::test]
+async fn sab_api_accepts_the_api_key_from_a_header_on_get_and_post() {
+    let (base_url, _state, _tempdir, handle) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let get_queue = client
+        .get(format!("{base_url}/sabnzbd/api?mode=queue&output=json"))
+        .header("X-Api-Key", "original-sab-key")
+        .send()
+        .await
+        .expect("SAB GET with key header");
+    assert!(get_queue.status().is_success());
+    let body = get_queue
+        .json::<serde_json::Value>()
+        .await
+        .expect("SAB GET response");
+    assert!(body.get("queue").is_some(), "resp={body}");
+
+    // The same header path works on the `/api` alias and over POST.
+    let alias = client
+        .get(format!("{base_url}/api?mode=queue&output=json"))
+        .header("X-Api-Key", "original-sab-key")
+        .send()
+        .await
+        .expect("alias GET with key header");
+    assert!(alias.status().is_success());
+    assert!(
+        alias
+            .json::<serde_json::Value>()
+            .await
+            .expect("alias response")
+            .get("queue")
+            .is_some()
+    );
+
+    let post = client
+        .post(format!("{base_url}/sabnzbd/api?mode=queue&output=json"))
+        .header("X-Api-Key", "original-sab-key")
+        .send()
+        .await
+        .expect("SAB POST with key header");
+    assert!(post.status().is_success());
+    assert!(
+        post.json::<serde_json::Value>()
+            .await
+            .expect("SAB POST response")
+            .get("queue")
+            .is_some()
+    );
+
+    handle.abort();
+}
+
+/// A header key is checked exactly like the query-string one, and an explicit
+/// header wins over a key left in the URL: a client that migrated to the
+/// header must not have a stale (rotated) query key decide the outcome.
+#[tokio::test]
+async fn sab_api_header_key_is_validated_and_outranks_the_query_key() {
+    let (base_url, _state, _tempdir, handle) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let wrong_header = client
+        .get(format!(
+            "{base_url}/sabnzbd/api?mode=queue&apikey=original-sab-key"
+        ))
+        .header("X-Api-Key", "not-the-key")
+        .send()
+        .await
+        .expect("SAB GET with wrong header key");
+    let body = wrong_header
+        .json::<serde_json::Value>()
+        .await
+        .expect("wrong header response");
+    assert_eq!(body["status"], false);
+    assert_eq!(body["error"], "API Key Incorrect");
+
+    let good_header = client
+        .get(format!(
+            "{base_url}/sabnzbd/api?mode=queue&apikey=stale-rotated-key"
+        ))
+        .header("X-Api-Key", "original-sab-key")
+        .send()
+        .await
+        .expect("SAB GET with good header key");
+    assert!(
+        good_header
+            .json::<serde_json::Value>()
+            .await
+            .expect("good header response")
+            .get("queue")
+            .is_some()
+    );
+
+    // `mode=auth` reports the header key's verdict too, so a client probing
+    // with the header sees the same answer as one probing with `apikey`.
+    let auth = client
+        .get(format!("{base_url}/sabnzbd/api?mode=auth"))
+        .header("X-Api-Key", "original-sab-key")
+        .send()
+        .await
+        .expect("SAB auth with header key")
+        .json::<serde_json::Value>()
+        .await
+        .expect("auth response");
+    assert_eq!(auth["auth"], "apikey");
+
+    handle.abort();
+}

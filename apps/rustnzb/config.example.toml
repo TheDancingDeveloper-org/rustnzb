@@ -2,6 +2,9 @@
 listen_addr = "0.0.0.0"
 port = 9090
 # api_key = "your-secret-api-key-here"
+# Accepted by the native API and the SABnzbd-compatible API as an
+# `X-Api-Key` header, which keeps it out of URLs and access logs. The
+# SABnzbd-compatible API also takes `apikey` in the query string or body.
 incomplete_dir = "/downloads/incomplete"
 complete_dir = "/downloads/complete"
 data_dir = "/data"

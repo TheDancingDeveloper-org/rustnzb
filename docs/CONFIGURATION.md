@@ -82,7 +82,7 @@ The container image (built on the linuxserver.io Alpine base) also reads:
 |-----|---------|-------------|
 | `listen_addr` | `"0.0.0.0"` | HTTP listen address. |
 | `port` | `9090` | HTTP port. |
-| `api_key` | unset | API key. The SABnzbd-compatible API (`/api`, `/sabnzbd/api`) takes it as `apikey`, and the native API accepts it as an `X-Api-Key` header. Settings → API & SABnzbd compat can show and rotate it. |
+| `api_key` | unset | API key. The SABnzbd-compatible API (`/api`, `/sabnzbd/api`) takes it as `apikey` in the query string, the body, or an `X-Api-Key` header; the header keeps it out of request URLs and therefore out of reverse-proxy access logs, so prefer it. The native API accepts the same `X-Api-Key` header. Settings → API & SABnzbd compat can show and rotate it. |
 | `incomplete_dir` | `"/downloads/incomplete"` | Where jobs download. |
 | `complete_dir` | `"/downloads/complete"` | Where finished jobs go. Category `output_dir` is relative to this. |
 | `data_dir` | `"/data"` | Database, RSS state, credentials. |

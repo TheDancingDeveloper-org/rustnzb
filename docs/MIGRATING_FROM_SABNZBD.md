@@ -102,6 +102,18 @@ In each app, edit the existing SABnzbd download client, or add one
 Press **Test**, then save. Do the same in Prowlarr if it sends to the
 download client.
 
+*arr apps put the API key in the request query string, so it appears in the
+URL — and in the access log of any reverse proxy in front of rustnzb. That is
+unchanged for compatibility. A client that can set headers instead should
+send `X-Api-Key: <key>` and omit `apikey` from the URL:
+
+```bash
+curl -H "X-Api-Key: $API_KEY" \
+  "http://localhost:9090/sabnzbd/api?mode=queue&output=json"
+```
+
+The header is checked exactly like `apikey` and wins when both are present.
+
 ## 4. Check the rest of the settings
 
 These have no SABnzbd import, or work differently:

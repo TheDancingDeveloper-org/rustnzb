@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Form, FromRequest, Multipart, Query, Request, State};
-use axum::http::{StatusCode, header::CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +28,10 @@ const SABNZBD_COMPAT_VERSION: &str = "5.0.4";
 /// Upper bound on an `addurl`-fetched NZB body, to avoid unbounded memory use.
 const MAX_ADDURL_BODY_BYTES: usize = 100 * 1024 * 1024;
 
-/// Arr-compatible API request -- all parameters come as query strings.
+/// Arr-compatible API request -- parameters arrive as query-string fields,
+/// form fields or multipart fields, as SABnzbd's API accepts them. The API key
+/// may also arrive as an `X-Api-Key` header (see [`API_KEY_HEADER`]), which
+/// keeps it out of the URL.
 #[derive(Deserialize, Default)]
 pub struct SabApiRequest {
     pub mode: Option<String>,
@@ -81,6 +84,26 @@ fn validate_api_key(
     Ok(())
 }
 
+/// Header a client may use instead of the `apikey` query parameter, so the
+/// key never has to appear in a request URL (and therefore in an access log).
+const API_KEY_HEADER: &str = "X-Api-Key";
+
+/// Read the API key from the `X-Api-Key` request header.
+///
+/// The SABnzbd-compatible API still accepts `apikey` in the query string,
+/// because that is what *arr clients and SABnzbd itself send. A URL is
+/// recorded by every reverse proxy in front of the server, though, so the
+/// header is the form to prefer: `X-Api-Key` is authenticated the same way
+/// and is not part of the logged request line.
+fn api_key_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(API_KEY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 /// Answer the modes SABnzbd serves without an API key. Clients probe
 /// `version` and `auth` before they have been given a key, so real SABnzbd
 /// exempts both from the key check (`sabnzbd/interface.py`, `api.py::_api_auth`).
@@ -116,8 +139,12 @@ fn keyless_response(
 /// GET /sabnzbd/api -- Handle GET requests.
 pub async fn h_sabnzbd_api_get(
     State(state): State<Arc<AppState>>,
-    Query(req): Query<SabApiRequest>,
+    Query(mut req): Query<SabApiRequest>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
+    if let Some(key) = api_key_from_headers(&headers) {
+        req.apikey = Some(key);
+    }
     if let Some(resp) = keyless_response(
         &state,
         req.mode.as_deref().unwrap_or(""),
@@ -540,6 +567,9 @@ pub async fn h_sabnzbd_api_post(
     // Query-string parameters are the baseline; body fields override them.
     let mut mode = query_req.mode.clone().unwrap_or_default();
     let mut apikey = query_req.apikey.clone();
+    // An explicit `X-Api-Key` header outranks a key carried in the URL or the
+    // body: it is the channel that keeps the secret out of access logs.
+    let header_apikey = api_key_from_headers(request.headers());
     let mut cat = query_req.cat.clone();
     let mut priority = query_req.priority.clone();
     let mut name = query_req.name.clone();
@@ -602,6 +632,10 @@ pub async fn h_sabnzbd_api_post(
             )
             .await?;
         }
+    }
+
+    if let Some(key) = header_apikey {
+        apikey = Some(key);
     }
 
     if let Some(resp) = keyless_response(&state, &mode, apikey.as_deref()) {
@@ -5966,10 +6000,14 @@ mod tests {
             ..SabApiRequest::default()
         };
 
-        let response = h_sabnzbd_api_get(State(Arc::new(test_state.state)), Query(req))
-            .await
-            .expect("addurl over GET should succeed")
-            .into_response();
+        let response = h_sabnzbd_api_get(
+            State(Arc::new(test_state.state)),
+            Query(req),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("addurl over GET should succeed")
+        .into_response();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -6047,7 +6085,7 @@ mod tests {
             mode: Some(mode.into()),
             ..SabApiRequest::default()
         };
-        let response = h_sabnzbd_api_get(State(Arc::new(state)), Query(req))
+        let response = h_sabnzbd_api_get(State(Arc::new(state)), Query(req), HeaderMap::new())
             .await
             .expect("GET response")
             .into_response();
@@ -6125,7 +6163,7 @@ mod tests {
             apikey: Some("contract-api-key".into()),
             ..SabApiRequest::default()
         };
-        let response = h_sabnzbd_api_get(State(state.clone()), Query(req))
+        let response = h_sabnzbd_api_get(State(state.clone()), Query(req), HeaderMap::new())
             .await
             .expect("addurl over GET")
             .into_response();
@@ -6524,7 +6562,7 @@ mod tests {
                 apikey: Some("contract-api-key".into()),
                 ..SabApiRequest::default()
             };
-            let response = h_sabnzbd_api_get(State(state.clone()), Query(req))
+            let response = h_sabnzbd_api_get(State(state.clone()), Query(req), HeaderMap::new())
                 .await
                 .expect("addurl over GET")
                 .into_response();
