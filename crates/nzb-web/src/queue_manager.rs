@@ -5066,6 +5066,7 @@ impl QueueManager {
         let _transition = self.pause_transition.lock();
         let (pause_requested, resume_requested) = {
             let mut holds = self.pause_holds.lock();
+            let before = holds.clone();
             let was_held = holds.schedule;
             let newly_opened = holds.newly_opened(windows);
             // Every window that newly opens takes a hold, even while a user
@@ -5082,7 +5083,12 @@ impl QueueManager {
             let paused = self.globally_paused.load(Ordering::SeqCst);
             let pause_requested = holds.schedule && !was_held && !paused;
             let resume_requested = !holds.schedule && was_held && !holds.any();
-            self.publish_holds(&holds);
+            // A tick that changes nothing writes nothing: the startup tick
+            // with an idle schedule must not materialise pause settings on a
+            // database that never chose one.
+            if *holds != before {
+                self.publish_holds(&holds);
+            }
             (pause_requested, resume_requested)
         };
         if pause_requested {
@@ -5126,12 +5132,26 @@ impl QueueManager {
         }
     }
 
-    /// Persist the current holds and publish the global gate.
+    /// Publish the global gate and persist the current holds.
     ///
     /// The gate is set while the holds still say paused, never cleared here:
     /// only [`Self::resume_hold`] may lift the last hold and resume.
     fn publish_holds(&self, holds: &PauseHolds) {
+        self.store_holds(holds);
+        self.persist_holds(holds);
+    }
+
+    /// Publish the global gate for `holds` without touching the database.
+    ///
+    /// Startup uses this: loading state must not write it back, or a database
+    /// that never chose a pause would gain the default rows on first boot and
+    /// look like it had.
+    fn store_holds(&self, holds: &PauseHolds) {
         self.globally_paused.store(holds.any(), Ordering::SeqCst);
+    }
+
+    /// Write `holds` as the settings a restart reads back.
+    fn persist_holds(&self, holds: &PauseHolds) {
         let db = self.db.lock();
         db.set_setting(
             "globally_paused",
@@ -6498,7 +6518,9 @@ impl QueueManager {
             let mut current = self.pause_holds.lock();
             *current = holds.clone();
         }
-        self.publish_holds(&holds);
+        // Load, do not save: restoring must not materialise settings a
+        // database never held, or a first boot would look like a chosen pause.
+        self.store_holds(&holds);
         info!(
             was_paused,
             disk_space_hold = holds.disk.is_some(),
@@ -8832,6 +8854,40 @@ mod global_pause_tests {
             .job
             .error_message = Some("server unavailable".to_string());
         assert_eq!(manager.pause_reason("srv"), Some(PauseReason::Server));
+    }
+
+    /// Neither loading nor an idle monitor tick may write pause settings.
+    ///
+    /// The e2e seed inserts its own `globally_paused` row after the backend's
+    /// first start; if boot materialises the defaults the seed collides with
+    /// them.
+    #[tokio::test]
+    async fn a_fresh_database_gets_no_pause_settings_from_boot() {
+        let (manager, _tempdir) = manager();
+        manager.restore_from_db().unwrap();
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+
+        for key in [
+            "globally_paused",
+            QueueManager::USER_HOLD_SETTING,
+            QueueManager::SCHEDULE_HOLD_SETTING,
+            QueueManager::DISK_SPACE_HOLD_SETTING,
+            QueueManager::PAUSE_OWNER_SETTING,
+            QueueManager::SCHEDULE_WINDOWS_SETTING,
+            QueueManager::SCHEDULE_TRIGGERED_SETTING,
+            QueueManager::SCHEDULE_RESUMED_SETTING,
+            QueueManager::SCHEDULE_USER_PAUSED_SETTING,
+        ] {
+            assert_eq!(
+                manager.db.lock().get_setting(key),
+                None,
+                "{key} was written on load"
+            );
+        }
+        assert!(!manager.is_paused());
     }
 
     #[tokio::test]
