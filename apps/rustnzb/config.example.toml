@@ -122,7 +122,8 @@ script_max_output_bytes = 1048576
 # `enabled` flag come back as configured. Pause reasons are additive: it only
 # lifts a pause it applied, so a manual pause or a disk-space hold survives,
 # and a window that opens during a disk hold keeps downloads paused once the
-# hold lifts.
+# hold lifts. A pause for a duration lets an overlapping window take effect
+# when it expires, and a manual resume inside a window lasts for that window.
 #
 # [schedule]
 # enabled = false

@@ -89,13 +89,15 @@ pub struct ScheduleDecision {
     /// Server ids to take out of rotation, in configuration order and without
     /// duplicates.
     pub disabled_servers: Vec<String>,
-    /// Identifies the open window *occurrence*, not just the rules active in
-    /// it: `rule id@the date the window started on` for every active pause
-    /// rule, sorted. Two evaluations a tick apart inside one window share it,
-    /// while the next day's window (or a window the user reopened after a
-    /// manual resume) has a different one. The queue uses it to tell "the same
-    /// window, do not re-pause" from "a new window".
-    pub pause_window: Option<String>,
+    /// Every open pause window *occurrence*, as `rule id@the date the window
+    /// started on`, sorted and without duplicates.
+    ///
+    /// The occurrences, not a single joined key, are what the queue compares:
+    /// with two windows overlapping, one closing must not look like a new
+    /// window opening. Two evaluations a tick apart inside one window share
+    /// their occurrence, while the next day's window (or a window the user
+    /// reopened after a manual resume) has a different one.
+    pub pause_windows: Vec<String>,
 }
 
 impl ScheduleDecision {
@@ -104,7 +106,7 @@ impl ScheduleDecision {
         !self.pause
             && self.speed_limit_bps.is_none()
             && self.disabled_servers.is_empty()
-            && self.pause_window.is_none()
+            && self.pause_windows.is_empty()
     }
 }
 
@@ -247,12 +249,11 @@ pub fn evaluate(rules: &[ScheduleRule], now: NaiveDateTime) -> ScheduleDecision 
     if saw_unlimited {
         decision.speed_limit_bps = Some(0);
     }
-    if decision.pause {
-        // Sorted so the occurrence does not depend on config order, which the
-        // settings page may reorder without changing what is open.
-        pause_windows.sort();
-        decision.pause_window = Some(pause_windows.join(","));
-    }
+    // Sorted so the occurrences do not depend on config order, which the
+    // settings page may reorder without changing what is open.
+    pause_windows.sort();
+    pause_windows.dedup();
+    decision.pause_windows = pause_windows;
     decision
 }
 
@@ -393,35 +394,49 @@ mod tests {
         ];
         // Inside Monday's window, before and after midnight: the same
         // occurrence, because it belongs to the day it started on.
-        let monday_late = evaluate(&rules[..1], at(19, 23, 0)).pause_window;
-        let tuesday_early = evaluate(&rules[..1], at(20, 5, 0)).pause_window;
+        let monday_late = evaluate(&rules[..1], at(19, 23, 0)).pause_windows;
+        let tuesday_early = evaluate(&rules[..1], at(20, 5, 0)).pause_windows;
         assert_eq!(monday_late, tuesday_early);
-        assert!(
-            monday_late
-                .as_deref()
-                .unwrap_or_default()
-                .contains("2026-10-19"),
-            "{monday_late:?}"
-        );
+        assert_eq!(monday_late.len(), 1);
+        assert!(monday_late[0].contains("2026-10-19"), "{monday_late:?}");
 
         // Tuesday's own window is a different occurrence, so the queue sees
         // it as a new window and pauses again.
-        let tuesday_late = evaluate(&rules[1..], at(20, 23, 0)).pause_window;
+        let tuesday_late = evaluate(&rules[1..], at(20, 23, 0)).pause_windows;
         assert_ne!(monday_late, tuesday_late);
-        assert!(
-            tuesday_late
-                .as_deref()
-                .unwrap_or_default()
-                .contains("2026-10-20"),
-            "{tuesday_late:?}"
-        );
+        assert!(tuesday_late[0].contains("2026-10-20"), "{tuesday_late:?}");
 
         // Outside every window there is no occurrence at all.
-        assert_eq!(evaluate(&rules, at(20, 12, 0)).pause_window, None);
+        assert!(evaluate(&rules, at(20, 12, 0)).pause_windows.is_empty());
         // A cap rule opens no pause window.
         let mut cap = rule(&["tue"], "00:00", "24:00", ScheduleAction::SpeedLimit);
         cap.speed_limit_bps = 1_000_000;
-        assert_eq!(evaluate(&[cap], at(20, 12, 0)).pause_window, None);
+        assert!(evaluate(&[cap], at(20, 12, 0)).pause_windows.is_empty());
+    }
+
+    #[test]
+    fn overlapping_windows_keep_their_own_occurrences() {
+        // A 20:00-24:00 and B 22:00-02:00: at 23:00 both are open and each
+        // contributes its own occurrence. At 01:00 only B is left, so B must
+        // still be in the new set for the queue to recognise it as the same
+        // window rather than a new one.
+        let mut a = rule(&["mon"], "20:00", "24:00", ScheduleAction::Pause);
+        a.id = "a".into();
+        let mut b = rule(&["mon"], "22:00", "02:00", ScheduleAction::Pause);
+        b.id = "b".into();
+        let rules = [a, b];
+
+        let both = evaluate(&rules, at(19, 23, 0)).pause_windows;
+        assert_eq!(both, vec!["a@2026-10-19", "b@2026-10-19"]);
+        let after_a_closes = evaluate(&rules, at(20, 1, 0)).pause_windows;
+        assert_eq!(after_a_closes, vec!["b@2026-10-19"]);
+        // The occurrence that is still open is unchanged: a set difference
+        // says nothing new opened, so the queue keeps its pause rather than
+        // re-pausing a manual resume.
+        assert!(
+            after_a_closes.iter().all(|window| both.contains(window)),
+            "{after_a_closes:?} vs {both:?}"
+        );
     }
 
     #[test]
@@ -432,8 +447,8 @@ mod tests {
         second.id = "b".into();
         // Reordering the rules in settings must not look like a new window.
         assert_eq!(
-            evaluate(&[first.clone(), second.clone()], at(20, 12, 0)).pause_window,
-            evaluate(&[second, first], at(20, 12, 0)).pause_window
+            evaluate(&[first.clone(), second.clone()], at(20, 12, 0)).pause_windows,
+            evaluate(&[second, first], at(20, 12, 0)).pause_windows
         );
     }
 
