@@ -12,7 +12,7 @@ use crate::fetch_guard::{
     FetchPolicy, MAX_FETCH_BODY_BYTES, build_fetch_client, read_response_bytes_limited,
     validate_fetch_url_with,
 };
-use crate::nzb_core::config::{AppConfig, RssFeedConfig};
+use crate::nzb_core::config::{AppConfig, RssFeedConfig, normalize_rss_expiry_days};
 use crate::nzb_core::models::{Priority, RssItem};
 
 use crate::queue_manager::QueueManager;
@@ -155,7 +155,8 @@ impl RssMonitor {
             info!(pruned, "Pruned old RSS items");
         }
 
-        if let Some(days) = cfg.general.rss_downloaded_item_expiry_days {
+        let expiry_days = normalize_rss_expiry_days(cfg.general.rss_downloaded_item_expiry_days);
+        if let Some(days) = expiry_days {
             let cutoff = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
             if let Ok(expired) = self.queue_manager.rss_items_expire_downloaded(&cutoff)
                 && expired > 0

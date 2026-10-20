@@ -79,6 +79,12 @@ export class AuthService {
   /**
    * Another tab may have rotated the tokens after our refresh failed; only
    * discard a session nobody has replaced.
+   *
+   * The replacement is adopted but not trusted: another tab storing a token
+   * is only a claim, so `verified` stays unset until a request carrying it
+   * succeeds (`markSessionVerified`). Otherwise a retry that the server
+   * rejects would still render the UI as authenticated until the next
+   * refresh cycle.
    */
   discardFailedSession(): boolean {
     const stored = localStorage.getItem(REFRESH_KEY);
@@ -87,11 +93,19 @@ export class AuthService {
       // The replacement is the access token another tab stored, never the
       // refresh token sitting next to it.
       this.accessToken.set(access);
-      this.verified.set(true);
       return false;
     }
     this.clearTokens();
     return true;
+  }
+
+  /**
+   * Confirm the current session: a request carrying its token succeeded.
+   * Only a server-confirmed token counts, so an adopted or stored one never
+   * shows authenticated content on its own.
+   */
+  markSessionVerified(): void {
+    if (this.getAccessToken()) this.verified.set(true);
   }
 
   logout(): Observable<void> {
@@ -166,7 +180,8 @@ export class AuthService {
     const refresh = localStorage.getItem(REFRESH_KEY);
     if (!access || !refresh || refresh === spent) return null;
     this.accessToken.set(access);
-    this.verified.set(true);
+    // Adopted, not confirmed: another tab storing a token is a claim, so the
+    // session stays unverified until a request carrying it succeeds.
     const expires_in = (Number(localStorage.getItem(EXPIRES_KEY)) - Date.now()) / 1000;
     return { access_token: access, refresh_token: refresh, token_type: 'Bearer', expires_in };
   }

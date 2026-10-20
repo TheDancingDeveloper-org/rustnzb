@@ -15,6 +15,7 @@ function setup(token = 'access-1') {
     refresh: vi.fn(() => of({ access_token: 'access-2' })),
     clearTokens: vi.fn(),
     discardFailedSession: vi.fn(() => true),
+    markSessionVerified: vi.fn(),
   };
   const router = { navigate: vi.fn() };
   TestBed.configureTestingModule({
@@ -76,6 +77,32 @@ describe('authInterceptor', () => {
     await run(new HttpRequest('GET', '/api/dav/status'), next);
 
     expect(auth.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('verifies the session only once the retried request succeeds', async () => {
+    const { auth, run } = setup();
+    const next = vi
+      .fn()
+      .mockReturnValueOnce(unauthorized('/api/queue'))
+      .mockReturnValueOnce(of(new HttpResponse({ status: 200 })));
+
+    await run(new HttpRequest('GET', '/api/queue'), next);
+
+    expect(auth.markSessionVerified).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves the session unverified when the retried request is rejected', async () => {
+    const { auth, run } = setup();
+    const next = vi
+      .fn()
+      .mockReturnValueOnce(unauthorized('/api/queue'))
+      .mockReturnValueOnce(unauthorized('/api/queue'));
+
+    await expect(run(new HttpRequest('GET', '/api/queue'), next)).rejects.toMatchObject({
+      status: 401,
+    });
+
+    expect(auth.markSessionVerified).not.toHaveBeenCalled();
   });
 
   it('retries with the other tab’s access token, not its refresh token', async () => {

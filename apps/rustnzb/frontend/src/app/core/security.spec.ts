@@ -53,6 +53,7 @@ describe('authInterceptor', () => {
       refresh: vi.fn(() => refreshResult),
       clearTokens: vi.fn(),
       discardFailedSession: vi.fn(() => true),
+      markSessionVerified: vi.fn(),
       setToken: (t: string | null) => (token = t),
     };
     const router = { navigate: vi.fn(() => Promise.resolve(true)) };

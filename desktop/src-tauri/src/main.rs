@@ -16,25 +16,16 @@ use tracing_subscriber::util::SubscriberInitExt;
 use nzb_web::startup::InstanceLock;
 use nzb_web::{LogBuffer, LogBufferLayer, QueueManager, StartupConfig};
 
-/// Keeps the data-dir flock alive independently of the HTTP task.
-///
-/// `start_engine` returns one of these. Dropping `StartupResult` after the
-/// server is spawned used to unlock immediately.
-struct RetainedInstanceLock {
-    lock: InstanceLock,
-}
-
-impl RetainedInstanceLock {
-    fn new(lock: InstanceLock) -> Self {
-        Self { lock }
-    }
-}
-
 /// Shared state accessible from Tauri commands and background tasks.
 struct EngineState {
     queue_manager: Arc<QueueManager>,
     server_port: u16,
-    instance_lock: RetainedInstanceLock,
+    /// Keeps the data-dir flock alive independently of the HTTP task.
+    /// Dropping `StartupResult` after the server is spawned used to unlock
+    /// immediately, letting a second desktop instance share the data dir.
+    /// The underscore-prefixed name is deliberate: the field is never read,
+    /// it only has to stay alive until the process exits.
+    _instance_lock: InstanceLock,
 }
 
 /// Determine the platform-appropriate config directory.
@@ -174,7 +165,7 @@ fn setup_tray(app: &AppHandle) -> anyhow::Result<()> {
 /// The returned lock must be kept alive for the process lifetime. Dropping
 /// `StartupResult` after moving `state` out used to unlock immediately, so a
 /// second desktop instance could start against the same data directory.
-async fn start_engine() -> anyhow::Result<(Arc<QueueManager>, u16, RetainedInstanceLock)> {
+async fn start_engine() -> anyhow::Result<(Arc<QueueManager>, u16, InstanceLock)> {
     let config_dir = config_dir()?;
     let data_dir = data_dir()?;
     let config_path = config_dir.join("config.toml");
@@ -212,7 +203,7 @@ async fn start_engine() -> anyhow::Result<(Arc<QueueManager>, u16, RetainedInsta
     let port = result.state.config().general.port;
     let queue_manager = Arc::clone(&result.queue_manager);
     // Take the lock before `result` is dropped by moving `state` below.
-    let instance_lock = RetainedInstanceLock::new(result.instance_lock);
+    let instance_lock = result.instance_lock;
 
     // Spawn the HTTP server in the background
     let state = result.state;
@@ -261,7 +252,7 @@ async fn start() {
         .manage(EngineState {
             queue_manager,
             server_port: port,
-            instance_lock,
+            _instance_lock: instance_lock,
         })
         .setup(move |app| {
             // Create main window pointing at the HTTP server
