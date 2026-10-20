@@ -536,6 +536,7 @@ interface PipelineStep {
 
     <!-- ============ History (collapsible) ============ -->
     <div
+      id="history"
       class="history-toggle"
       role="button"
       tabindex="0"
@@ -1184,6 +1185,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   private readonly connectionHold = new Map<string, { count: number; expiresAt: number }>();
   connectionClock = signal(Date.now());
   private routeSub: Subscription | null = null;
+  private fragmentSub: Subscription | null = null;
 
   // Filter
   filterStatus: 'all' | 'active' | 'queued' | 'paused' = 'all';
@@ -1225,6 +1227,17 @@ export class QueueViewComponent implements OnInit, OnDestroy {
         void this.router.navigate(['/downloads'], { replaceUrl: true });
       }
     });
+    // The shell's `g h` shortcut navigates here with #history: expand the
+    // panel even if the user had collapsed it, so the shortcut's destination
+    // is visible. This is a deliberate one-off, not a change to the stored
+    // preference.
+    this.fragmentSub = this.route.fragment.subscribe((fragment) => {
+      if (fragment !== 'history') return;
+      this.historyCollapsed.set(false);
+      // The outlet has mounted by the time the fragment arrives; the panel
+      // renders below the queue, so bring it into view.
+      setTimeout(() => document.getElementById('history')?.scrollIntoView({ block: 'start' }));
+    });
     this.loadAll();
     this.pollTimer = setInterval(() => {
       if (!pageHidden() && !this.queuePollInFlight) this.fetchQueue(false);
@@ -1249,6 +1262,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     if (this.pollTimer) clearInterval(this.pollTimer);
     if (this.connectionHoldTimer) clearTimeout(this.connectionHoldTimer);
     this.routeSub?.unsubscribe();
+    this.fragmentSub?.unsubscribe();
     this.toggleSub?.unsubscribe();
     this.prefillSub?.unsubscribe();
   }

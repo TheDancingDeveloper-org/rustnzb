@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Subject, of, throwError } from 'rxjs';
 
 import { GroupService } from '../../core/services/group.service';
+import { KeyboardShortcutsService } from '../../core/services/keyboard-shortcuts.service';
 import { GroupRow, HeaderRow } from '../../core/models/group.model';
 import { GroupsViewComponent } from './groups-view.component';
 
@@ -29,7 +30,18 @@ function makeComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {})
   };
   const snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
   const dialog = { open: vi.fn() };
-  return { component: new GroupsViewComponent(service as unknown as GroupService, snack as never, dialog as never), service, snack };
+  const shortcuts = new KeyboardShortcutsService();
+  return {
+    component: new GroupsViewComponent(
+      service as unknown as GroupService,
+      snack as never,
+      dialog as never,
+      shortcuts,
+    ),
+    service,
+    snack,
+    shortcuts,
+  };
 }
 
 describe('GroupsViewComponent', () => {
@@ -149,5 +161,35 @@ describe('GroupsViewComponent', () => {
       expect(service.listHeaders.mock.calls.length - before).toBe(1);
       component.ngOnDestroy();
     });
+  });
+
+  it('focuses the search box when the shell asks for it', () => {
+    const { component, shortcuts } = makeComponent();
+    const input = document.createElement('input');
+    const focus = vi.spyOn(input, 'focus');
+    const select = vi.spyOn(input, 'select');
+    component.searchInput = { nativeElement: input } as never;
+    component.ngOnInit();
+
+    shortcuts.requestSearchFocus();
+
+    expect(focus).toHaveBeenCalled();
+    expect(select).toHaveBeenCalled();
+    component.ngOnDestroy();
+  });
+
+  it('focuses the search box when the request arrives before the view exists', () => {
+    const { component, shortcuts } = makeComponent();
+    component.ngOnInit();
+    // The router outlet has not attached the view yet, so there is no input.
+    shortcuts.requestSearchFocus();
+
+    const input = document.createElement('input');
+    const focus = vi.spyOn(input, 'focus');
+    component.searchInput = { nativeElement: input } as never;
+    component.ngAfterViewInit();
+
+    expect(focus).toHaveBeenCalled();
+    component.ngOnDestroy();
   });
 });

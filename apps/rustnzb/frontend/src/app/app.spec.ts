@@ -8,6 +8,8 @@ import { App, MENU_WIDTH, documentTitle, isBareRoute, isDemoPath } from './app';
 import { AddNzbService } from './core/services/add-nzb.service';
 import { PauseStateService } from './core/services/pause-state.service';
 import { AnnouncerService } from './core/services/announcer.service';
+import { KeyboardShortcutsService } from './core/services/keyboard-shortcuts.service';
+import { WidthModeService } from './core/services/width-mode.service';
 
 function makeApp(postResult = new Subject<unknown>()) {
   const api = {
@@ -27,19 +29,30 @@ function makeApp(postResult = new Subject<unknown>()) {
   const pauseState = new PauseStateService();
   const snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
   const addNzb = new AddNzbService();
+  const shortcuts = new KeyboardShortcutsService();
+  const dialog = { open: vi.fn() };
+  const widthMode = {
+    mode: signal<'compact' | 'expanded'>('compact'),
+    set: vi.fn(),
+    toggle: vi.fn(function (this: { mode: { set: (v: 'compact' | 'expanded') => void } }) {
+      this.mode.set('expanded');
+    }),
+  };
   const app = new App(
     api as never,
     auth as never,
     router as never,
     addNzb,
-    {} as never,
+    widthMode as unknown as WidthModeService,
     {} as never,
     pauseState,
     snack as never,
     { observeStatus: vi.fn() } as never,
     new AnnouncerService(),
+    shortcuts,
+    dialog as never,
   );
-  return { app, api, auth, pauseState, postResult, snack, router, addNzb };
+  return { app, api, auth, pauseState, postResult, snack, router, addNzb, shortcuts, dialog, widthMode };
 }
 
 describe('App global pause control', () => {
@@ -423,5 +436,105 @@ describe('paste a URL anywhere', () => {
     app.onWindowPaste(paste('https://idx.example/get/1', document.createElement('input')));
     app.onWindowPaste(paste('just some words'));
     expect(prefills).toEqual([]);
+  });
+});
+
+describe('global keyboard shortcuts', () => {
+  function signedIn() {
+    const ctx = makeApp();
+    ctx.auth.authenticated.set(true);
+    vi.spyOn(ctx.app, 'pollStatus').mockImplementation(() => {});
+    return ctx;
+  }
+
+  function press(key: string, target: EventTarget = document.body): KeyboardEvent {
+    const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'target', { configurable: true, value: target });
+    return event;
+  }
+
+  it('toggles pause with p', () => {
+    const { app, api, pauseState } = signedIn();
+
+    app.onShortcutKey(press('p'));
+
+    expect(pauseState.paused()).toBe(true);
+    expect(api.post).toHaveBeenCalledWith('/queue/pause');
+  });
+
+  it('opens the help sheet with ?', () => {
+    const { app, dialog } = signedIn();
+
+    app.onShortcutKey(press('?'));
+
+    expect(dialog.open).toHaveBeenCalled();
+  });
+
+  it('toggles the width mode with w', () => {
+    const { app, widthMode } = signedIn();
+
+    app.onShortcutKey(press('w'));
+
+    expect(widthMode.toggle).toHaveBeenCalled();
+  });
+
+  it('navigates on a g chord', () => {
+    const { app, router } = signedIn();
+
+    app.onShortcutKey(press('g'));
+    app.onShortcutKey(press('d'));
+
+    expect(router.navigate).toHaveBeenCalledWith(['/downloads']);
+  });
+
+  it('drops a chord that is not completed', () => {
+    const { app, router } = signedIn();
+
+    app.onShortcutKey(press('g'));
+    // A key that is not the chord's second half does nothing...
+    app.onShortcutKey(press('z'));
+    // ...and the prefix is gone, so the next key is judged on its own.
+    app.onShortcutKey(press('d'));
+    expect(router.navigate).not.toHaveBeenCalled();
+  });
+
+  it('ignores keys typed into a field', () => {
+    const { app, pauseState, router } = signedIn();
+    const input = document.createElement('input');
+
+    app.onShortcutKey(press('p', input));
+    app.onShortcutKey(press('g', input));
+    app.onShortcutKey(press('d', input));
+
+    expect(pauseState.paused()).toBe(false);
+    expect(router.navigate).not.toHaveBeenCalled();
+  });
+
+  it('leaves browser and OS modifier chords alone', () => {
+    const { app, pauseState, router } = signedIn();
+    for (const key of ['p', 'g']) {
+      const event = new KeyboardEvent('keydown', { key, ctrlKey: true, cancelable: true });
+      app.onShortcutKey(event);
+      expect(event.defaultPrevented).toBe(false);
+    }
+    expect(pauseState.paused()).toBe(false);
+    expect(router.navigate).not.toHaveBeenCalled();
+  });
+
+  it('does nothing on the bare login page', () => {
+    const { app } = makeApp();
+    app.onShortcutKey(press('p'));
+    // authenticated is still false, so the chrome (and its shortcuts) is off.
+    expect(app.paused()).toBe(false);
+  });
+
+  it('sends / to the search page and asks it for focus', () => {
+    const { app, router, shortcuts } = signedIn();
+    const focused = vi.fn();
+    shortcuts.searchFocus$.subscribe(focused);
+
+    app.onShortcutKey(press('/'));
+
+    expect(router.navigate).toHaveBeenCalledWith(['/groups']);
   });
 });

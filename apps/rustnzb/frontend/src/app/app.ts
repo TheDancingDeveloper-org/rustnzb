@@ -30,9 +30,17 @@ import { PauseStateService } from './core/services/pause-state.service';
 import { BrowserNotificationsService } from './core/services/browser-notifications.service';
 import { ThemeService } from './core/services/theme.service';
 import { AnnouncerService } from './core/services/announcer.service';
+import {
+  CHORD_TIMEOUT_MS,
+  KeyboardShortcutsService,
+  resolveShortcut,
+  startsChord,
+} from './core/services/keyboard-shortcuts.service';
 import { IconComponent } from './shared/icon.component';
+import { MatDialog } from '@angular/material/dialog';
 import { showHttpError } from './core/http/http-error';
 import { ToastService } from './core/services/toast.service';
+import { ShortcutsDialogComponent } from './shared/shortcuts-dialog.component';
 
 export function isDemoPath(pathname: string): boolean {
   return pathname === '/demo' || pathname.startsWith('/demo/');
@@ -267,6 +275,14 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
                 }
               }
             </div>
+            <button
+              class="action muted shortcuts-open"
+              (click)="openShortcuts()"
+              title="Keyboard shortcuts (?)"
+              aria-label="Keyboard shortcuts"
+            >
+              ?
+            </button>
             <button class="action muted" (click)="onLogout()" title="Sign out">Sign out</button>
           </div>
         </nav>
@@ -622,6 +638,11 @@ export function documentTitle(url: string, live: LiveTitleState | null): string 
         width: 14px;
         height: 14px;
       }
+      .shortcuts-open {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 13px;
+        min-width: 26px;
+      }
     `,
   ],
 })
@@ -658,6 +679,9 @@ export class App implements OnInit, OnDestroy {
   speedLimit = signal(0);
   speedMenuOpen = false;
   customSpeedMb: number | null = null;
+  /** First key of a two-key chord (`g d`), waiting for its second. */
+  private chordPrefix = '';
+  private chordTimer: ReturnType<typeof setTimeout> | null = null;
   readonly speedPresets = [
     { label: 'Unlimited', bps: 0 },
     { label: '1 MB/s', bps: 1 * MIB },
@@ -697,6 +721,8 @@ export class App implements OnInit, OnDestroy {
     private toast: ToastService,
     private notifications: BrowserNotificationsService,
     readonly announcer: AnnouncerService,
+    private shortcuts: KeyboardShortcutsService,
+    private dialog: MatDialog,
   ) {
     this.paused = pauseState.paused;
     this.authenticated = authService.authenticated;
@@ -729,6 +755,7 @@ export class App implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.chordTimer) clearTimeout(this.chordTimer);
     document.removeEventListener('click', this.docClickHandler);
     document.removeEventListener('visibilitychange', this.onVisibilityChange);
   }
@@ -895,6 +922,114 @@ export class App implements OnInit, OnDestroy {
     if (!url) return;
     e.preventDefault();
     this.openAddPanelWith({ url });
+  }
+
+  // ---- Keyboard shortcuts ----
+  //
+  // One window-level handler rather than per-page ones, so the bindings are
+  // the same everywhere and the help sheet is the whole list. Typing in a
+  // field, a modifier chord, or a dialog all leave the event alone.
+  @HostListener('window:keydown', ['$event'])
+  onShortcutKey(event: KeyboardEvent): void {
+    if (!this.showChrome()) return;
+    if (event.defaultPrevented) return;
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    if (isEditableTarget(event.target)) return;
+    // A menu or dialog owns its own keys (Escape, arrows) while it is open.
+    if (document.querySelector('.cdk-overlay-container .cdk-overlay-pane')) return;
+
+    const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+    if (key === 'shift') return; // bare modifier press
+
+    if (this.chordPrefix) {
+      const prefix = this.chordPrefix;
+      this.clearChord();
+      const action = resolveShortcut(key, prefix);
+      if (!action) return;
+      event.preventDefault();
+      this.runShortcut(action);
+      return;
+    }
+
+    if (startsChord(key)) {
+      event.preventDefault();
+      this.beginChord(key);
+      return;
+    }
+
+    const action = resolveShortcut(key);
+    if (!action) return;
+    event.preventDefault();
+    this.runShortcut(action);
+  }
+
+  private beginChord(prefix: string): void {
+    this.clearChord();
+    this.chordPrefix = prefix;
+    this.chordTimer = setTimeout(() => this.clearChord(), CHORD_TIMEOUT_MS);
+  }
+
+  private clearChord(): void {
+    this.chordPrefix = '';
+    if (this.chordTimer) {
+      clearTimeout(this.chordTimer);
+      this.chordTimer = null;
+    }
+  }
+
+  private runShortcut(action: string): void {
+    switch (action) {
+      case 'togglePause':
+        this.togglePause();
+        break;
+      case 'upload':
+        this.onAddNzb();
+        break;
+      case 'focusSearch':
+        this.focusSearch();
+        break;
+      case 'goDownloads':
+        this.router.navigate(['/downloads']);
+        break;
+      case 'goHistory':
+        this.goHistory();
+        break;
+      case 'goSettings':
+        this.router.navigate(['/settings']);
+        break;
+      case 'toggleLayout':
+        this.widthMode.toggle();
+        break;
+      case 'showHelp':
+        this.openShortcuts();
+        break;
+    }
+  }
+
+  /**
+   * Search lives on the header-search page; on Downloads the Queue page owns
+   * its add panel, so `/` goes to the page that has the box and asks it for
+   * focus. The page subscribes and focuses once its view exists.
+   */
+  private focusSearch(): void {
+    if (this.router.url.startsWith('/groups')) {
+      this.shortcuts.requestSearchFocus();
+    } else {
+      this.router.navigate(['/groups']).then(() => this.shortcuts.requestSearchFocus());
+    }
+  }
+
+  private goHistory(): void {
+    if (this.router.url.startsWith('/downloads')) {
+      void this.router.navigate(['/downloads'], { fragment: 'history' });
+      document.getElementById('history')?.scrollIntoView({ block: 'start' });
+    } else {
+      void this.router.navigate(['/downloads'], { fragment: 'history' });
+    }
+  }
+
+  openShortcuts(): void {
+    this.dialog.open(ShortcutsDialogComponent, { width: '420px', autoFocus: 'dialog' });
   }
 
   private openAddPanelWith(prefill: AddNzbPrefill): void {
