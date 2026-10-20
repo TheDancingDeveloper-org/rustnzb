@@ -11,7 +11,7 @@ import { AnnouncerService } from './core/services/announcer.service';
 import { KeyboardShortcutsService } from './core/services/keyboard-shortcuts.service';
 import { WidthModeService } from './core/services/width-mode.service';
 
-function makeApp(postResult = new Subject<unknown>()) {
+function makeApp(postResult = new Subject<unknown>(), openDialogs: unknown[] = []) {
   const api = {
     get: vi.fn(() => of({})),
     post: vi.fn(() => postResult.asObservable()),
@@ -30,7 +30,7 @@ function makeApp(postResult = new Subject<unknown>()) {
   const snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
   const addNzb = new AddNzbService();
   const shortcuts = new KeyboardShortcutsService();
-  const dialog = { open: vi.fn() };
+  const dialog = { open: vi.fn(), openDialogs };
   const widthMode = {
     mode: signal<'compact' | 'expanded'>('compact'),
     set: vi.fn(),
@@ -334,8 +334,8 @@ function fileDrag(type: string, files: File[] = [], defaultPrevented = false) {
 }
 
 describe('drop .nzb files anywhere', () => {
-  function signedIn() {
-    const ctx = makeApp();
+  function signedIn(options: { openDialogs?: unknown[] } = {}) {
+    const ctx = makeApp(new Subject<unknown>(), options.openDialogs ?? []);
     ctx.auth.authenticated.set(true);
     const prefills: unknown[] = [];
     ctx.addNzb.prefill$.subscribe((p) => prefills.push(p));
@@ -415,8 +415,8 @@ describe('paste a URL anywhere', () => {
       preventDefault: vi.fn(),
     } as unknown as ClipboardEvent & { preventDefault: ReturnType<typeof vi.fn> };
   }
-  function signedIn() {
-    const ctx = makeApp();
+  function signedIn(options: { openDialogs?: unknown[] } = {}) {
+    const ctx = makeApp(new Subject<unknown>(), options.openDialogs ?? []);
     ctx.auth.authenticated.set(true);
     const prefills: unknown[] = [];
     ctx.addNzb.prefill$.subscribe((p) => prefills.push(p));
@@ -440,8 +440,8 @@ describe('paste a URL anywhere', () => {
 });
 
 describe('global keyboard shortcuts', () => {
-  function signedIn() {
-    const ctx = makeApp();
+  function signedIn(options: { openDialogs?: unknown[] } = {}) {
+    const ctx = makeApp(new Subject<unknown>(), options.openDialogs ?? []);
     ctx.auth.authenticated.set(true);
     vi.spyOn(ctx.app, 'pollStatus').mockImplementation(() => {});
     return ctx;
@@ -508,6 +508,64 @@ describe('global keyboard shortcuts', () => {
 
     expect(pauseState.paused()).toBe(false);
     expect(router.navigate).not.toHaveBeenCalled();
+  });
+
+  // A toast, tooltip or select panel shares the CDK overlay container with a
+  // dialog but does not take letter keys. Matching the container outright made
+  // `p` a no-op for the rest of the session once any toast had appeared.
+  it('still toggles pause while a snackbar pane is on screen', () => {
+    const { app, pauseState, api } = signedIn();
+    const container = document.createElement('div');
+    container.className = 'cdk-overlay-container';
+    const pane = document.createElement('div');
+    pane.className = 'cdk-overlay-pane';
+    const snack = document.createElement('div');
+    snack.className = 'mat-mdc-snack-bar-container';
+    pane.appendChild(snack);
+    container.appendChild(pane);
+    document.body.appendChild(container);
+    try {
+      app.onShortcutKey(press('p'));
+      expect(pauseState.paused()).toBe(true);
+      expect(api.post).toHaveBeenCalledWith('/queue/pause');
+    } finally {
+      container.remove();
+    }
+  });
+
+  it('leaves keys to an open dialog', () => {
+    const { app, pauseState } = signedIn({ openDialogs: [{}] });
+
+    app.onShortcutKey(press('p'));
+
+    expect(pauseState.paused()).toBe(false);
+  });
+
+  it('leaves keys to an open menu panel', () => {
+    const { app, pauseState } = signedIn();
+    const container = document.createElement('div');
+    container.className = 'cdk-overlay-container';
+    const pane = document.createElement('div');
+    pane.className = 'cdk-overlay-pane';
+    const menu = document.createElement('div');
+    menu.className = 'mat-mdc-menu-panel';
+    pane.appendChild(menu);
+    container.appendChild(pane);
+    document.body.appendChild(container);
+    try {
+      app.onShortcutKey(press('p'));
+      expect(pauseState.paused()).toBe(false);
+    } finally {
+      container.remove();
+    }
+  });
+
+  it('ignores a bare Shift press', () => {
+    const { app, pauseState } = signedIn();
+
+    app.onShortcutKey(press('Shift'));
+
+    expect(pauseState.paused()).toBe(false);
   });
 
   it('leaves browser and OS modifier chords alone', () => {

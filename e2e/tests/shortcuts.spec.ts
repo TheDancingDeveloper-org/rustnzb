@@ -52,6 +52,42 @@ test.describe('Keyboard shortcuts', () => {
     await expect(search).toBeFocused();
   });
 
+  // This puts a real toast in the CDK overlay container before pressing `p`.
+  // The shell used to skip every shortcut while any overlay pane existed, so a
+  // snackbar (a failed poll raises one) silently disabled all of them.
+  test('p still works while a snackbar is on screen', async ({ page, request }) => {
+    const token = readToken();
+    const headers = { Authorization: `Bearer ${token}` };
+    const isPaused = async () =>
+      (await (await request.get('/api/status', { headers })).json()).paused as boolean;
+
+    const initial = await isPaused();
+    try {
+      await page.goto('/downloads');
+      const pauseButton = page.locator('nav.topbar .pause-group button.action').first();
+      await expect(pauseButton).toHaveText(initial ? 'Resume' : 'Pause');
+
+      // A speed-limit change is a local POST; its success snackbar is enough
+      // to leave a pane in the overlay container while the key is pressed.
+      await page.locator('.speed-group button.pill-btn').click();
+      await page.locator('.speed-menu .pm-item', { hasText: '1 MB/s' }).click();
+      await expect(page.locator('.mdc-snackbar__label')).toBeVisible();
+
+      await page.keyboard.press('p');
+      await expect.poll(isPaused).toBe(!initial);
+      await expect(pauseButton).toHaveText(initial ? 'Pause' : 'Resume');
+
+      await page.keyboard.press('p');
+      await expect.poll(isPaused).toBe(initial);
+    } finally {
+      // Leave the speed limit as it was, whatever the assertions did.
+      await request.put('/api/config/speed-limit', { headers, data: { speed_limit_bps: 0 } });
+      if ((await isPaused()) !== initial) {
+        await request.post(`/api/queue/${initial ? 'pause' : 'resume'}`, { headers });
+      }
+    }
+  });
+
   test('p toggles the global pause and is ignored inside a field', async ({ page, request }) => {
     // The seeded backend starts globally paused and the rest of the suite relies
     // on that. Wait for each toggle to reach the server instead of racing the
