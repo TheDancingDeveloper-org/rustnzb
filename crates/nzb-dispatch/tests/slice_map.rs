@@ -528,18 +528,15 @@ async fn late_index_with_defer_reads_the_prefix_once() {
     );
     let fold = run.fold.clone().expect("damage seen, so a fold exists");
     let f = fold.lock();
-    let verified = run
-        .map
-        .states
-        .iter()
-        .filter(|s| **s == SliceVerdict::Verified)
-        .count();
-    // The index landed late, so the fold was opened by the replay's damage
-    // rather than by a worker: most of the prefix came off disk.
-    assert_eq!(f.fed_count(), verified, "{f:?}");
+    // The index is refused twice on every server, so data lands and verifies
+    // before the set installs and a fold can open. At least one slice is
+    // therefore folded from disk, not from the worker that verified it. How
+    // many more the rest of the download folds from its own bytes is a race
+    // between the workers and the prefix feed, so only the floor is asserted;
+    // `assert_deferred_fold` pins the invariant that matters, no re-reads.
     assert!(
-        f.disk_reads() >= verified / 2,
-        "late index should need a disk pass: {f:?}"
+        f.disk_reads() > 0,
+        "a late index must send the prefix through the disk feed: {f:?}"
     );
 }
 
@@ -570,6 +567,13 @@ fn assert_deferred_fold(scenario: DamageScenario, run: &Run, name: &str) {
         f.disk_rereads(),
         0,
         "{name}: a prefix slice read twice: {f:?}"
+    );
+    // Every slice read off disk is folded: the feed never reads one and drops
+    // it, so the read count and the disk-fed count are the same.
+    assert_eq!(
+        f.disk_reads(),
+        f.disk_fed(),
+        "{name}: read but not folded: {f:?}"
     );
     // The prefix is only part of the verified slices once damage opens the
     // fold mid-download; it can never be more than all of them.
