@@ -6,6 +6,7 @@ import { firstValueFrom, of, Subject, throwError } from 'rxjs';
 import { ApiService, POLL_TIMEOUT_MS } from '../../core/services/api.service';
 import { HistoryEntry } from '../../core/models/queue.model';
 import { HistoryViewComponent } from './history-view.component';
+import { AnnouncerService } from '../../core/services/announcer.service';
 
 function entry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
   return {
@@ -30,6 +31,7 @@ describe('HistoryViewComponent', () => {
   let api: { get: ReturnType<typeof vi.fn>; post: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
   let snack: { open: ReturnType<typeof vi.fn> };
   let confirm: { confirm: ReturnType<typeof vi.fn> };
+  let announcer: AnnouncerService;
   let component: HistoryViewComponent;
 
   beforeEach(() => {
@@ -44,10 +46,12 @@ describe('HistoryViewComponent', () => {
     };
     snack = { open: vi.fn() };
     confirm = { confirm: vi.fn(() => of(true)) };
+    announcer = new AnnouncerService();
     component = new HistoryViewComponent(
       api as unknown as ApiService,
       snack as never,
       confirm as never,
+      announcer,
     );
   });
 
@@ -324,5 +328,145 @@ describe('HistoryViewComponent', () => {
     component.selectEntry(entry({ id: 'gone' }));
     expect(component.detailLoading()).toBe(false);
     expect(snack.open).toHaveBeenCalledWith('Failed to load download details', 'Close', { duration: 5000 });
+  });
+
+  it('selects rows, reports the count, and clears the selection', () => {
+    component.toggleSelected('history-1');
+    component.toggleSelected('history-2');
+    expect([...component.selectedIds()]).toEqual(['history-1', 'history-2']);
+    expect(announcer.polite()).toContain('2 selected');
+    component.toggleSelected('history-1');
+    expect([...component.selectedIds()]).toEqual(['history-2']);
+    component.clearSelection();
+    expect(component.selectedIds().size).toBe(0);
+    expect(announcer.polite()).toContain('Selection cleared');
+  });
+
+  it('selects every entry on the page and deselects them again', () => {
+    api.get.mockImplementation((path: string) =>
+      of(path === '/history'
+        ? { entries: [entry(), entry({ id: 'history-2' })], total: 2 }
+        : {}),
+    );
+    component.load();
+    expect(component.allPageSelected()).toBe(false);
+    component.toggleSelectAll({ target: { checked: true } } as unknown as Event);
+    expect(component.allPageSelected()).toBe(true);
+    component.toggleSelectAll({ target: { checked: false } } as unknown as Event);
+    expect(component.selectedIds().size).toBe(0);
+  });
+
+  it('drops selected ids that a reload no longer returns', () => {
+    api.get.mockImplementation((path: string) =>
+      of(path === '/history' ? { entries: [entry(), entry({ id: 'history-2' })], total: 2 } : {}),
+    );
+    component.load();
+    component.toggleSelected('history-2');
+    api.get.mockImplementation((path: string) =>
+      of(path === '/history' ? { entries: [entry()], total: 1 } : {}),
+    );
+    component.load();
+    expect(component.selectedIds().size).toBe(0);
+  });
+
+  it('bulk-deletes the selection through one request after confirmation', () => {
+    const load = vi.spyOn(component, 'load').mockImplementation(() => {});
+    api.post.mockReturnValue(of({ status: true, succeeded: 2, failed: 0, failures: [] }));
+    component.toggleSelected('history-1');
+    component.toggleSelected('history-2');
+    component.bulkDelete();
+    expect(confirm.confirm).toHaveBeenCalledWith(expect.objectContaining({ danger: true }));
+    expect(api.post).toHaveBeenCalledWith('/history/bulk', {
+      action: 'delete',
+      ids: ['history-1', 'history-2'],
+    });
+    expect(component.selectedIds().size).toBe(0);
+    expect(snack.open).toHaveBeenCalledWith('Deleted 2 entries', 'Close', { duration: 2000 });
+    expect(load).toHaveBeenCalled();
+  });
+
+  it('bulk-retries without asking, and reports a partial failure', () => {
+    const load = vi.spyOn(component, 'load').mockImplementation(() => {});
+    api.post.mockReturnValue(
+      of({
+        status: false,
+        succeeded: 1,
+        failed: 1,
+        failures: [
+          {
+            id: 'history-2',
+            error: { status: 409, error_kind: 'conflict', human_readable: 'No NZB data stored for this entry' },
+          },
+        ],
+      }),
+    );
+    component.toggleSelected('history-1');
+    component.toggleSelected('history-2');
+    component.bulkRetry();
+    expect(api.post).toHaveBeenCalledWith('/history/bulk', {
+      action: 'retry',
+      ids: ['history-1', 'history-2'],
+    });
+    expect(confirm.confirm).not.toHaveBeenCalled();
+    expect(snack.open).toHaveBeenCalledWith(
+      'Failed to retry 1 of 2 entries: No NZB data stored for this entry',
+      'Close',
+      { duration: 5000 },
+    );
+    expect(load).toHaveBeenCalled();
+    expect(component.bulkBusy()).toBe(false);
+  });
+
+  it('clears a status with the active filters and reports the count removed', () => {
+    api.get.mockImplementation((path: string) =>
+      of(path === '/history'
+        ? {
+            entries: [entry({ status: 'failed' })],
+            total: 1,
+            stats: { completed: 4, completed_bytes: 0, failed: 3, success_pct: 57, avg_duration_secs: null, fail_reasons: [] },
+          }
+        : {}),
+    );
+    component.load();
+    const load = vi.spyOn(component, 'load').mockImplementation(() => {});
+    component.filterTime = '30d';
+    component.filterCategory = 'tv';
+    component.nameFilter = '  release ';
+    api.post.mockReturnValue(of({ status: true, succeeded: 3, failed: 0, failures: [] }));
+    component.clearByStatus('failed');
+    expect(confirm.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Clear 3 failed entries?', danger: true }),
+    );
+    expect(api.post).toHaveBeenCalledWith('/history/bulk', {
+      action: 'delete',
+      status: 'failed',
+      ids: [],
+      days: 30,
+      category: 'tv',
+      search: 'release',
+    });
+    expect(snack.open).toHaveBeenCalledWith('Cleared 3 failed entries', 'Close', { duration: 2000 });
+    expect(load).toHaveBeenCalled();
+    expect(component.clearingStatus()).toBeNull();
+  });
+
+  it('sends no time window when clearing all time', () => {
+    const load = vi.spyOn(component, 'load').mockImplementation(() => {});
+    component.filterTime = 'all';
+    api.post.mockReturnValue(of({ status: true, succeeded: 1, failed: 0, failures: [] }));
+    component.clearByStatus('completed');
+    expect(api.post).toHaveBeenCalledWith('/history/bulk', {
+      action: 'delete',
+      status: 'completed',
+      ids: [],
+    });
+    expect(load).toHaveBeenCalled();
+  });
+
+  it('does not delete an empty selection', () => {
+    component.bulkDelete();
+    component.bulkRetry();
+    expect(confirm.confirm).not.toHaveBeenCalled();
+    expect(api.post).not.toHaveBeenCalled();
   });
 });

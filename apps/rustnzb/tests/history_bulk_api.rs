@@ -28,6 +28,11 @@ async fn setup_auth(client: &reqwest::Client, base_url: &str) -> String {
 
 /// A history row that can be retried, or a failed one with no NZB stored.
 fn entry(id: &str, status: JobStatus, with_nzb: bool) -> HistoryEntry {
+    aged_entry(id, status, with_nzb, 0)
+}
+
+/// As [`entry`], completed `age_days` ago.
+fn aged_entry(id: &str, status: JobStatus, with_nzb: bool, age_days: i64) -> HistoryEntry {
     let failed = status == JobStatus::Failed;
     HistoryEntry {
         id: id.into(),
@@ -36,8 +41,8 @@ fn entry(id: &str, status: JobStatus, with_nzb: bool) -> HistoryEntry {
         status,
         total_bytes: 10,
         downloaded_bytes: if failed { 5 } else { 10 },
-        added_at: Utc::now(),
-        completed_at: Utc::now(),
+        added_at: Utc::now() - chrono::Duration::days(age_days),
+        completed_at: Utc::now() - chrono::Duration::days(age_days),
         download_time_secs: None,
         output_dir: std::path::PathBuf::from(format!("/tmp/rustnzb-bulk-{id}")),
         stages: Vec::new(),
@@ -211,4 +216,49 @@ async fn invalid_bulk_requests_are_400s_and_change_nothing() {
         assert_eq!(body["error_kind"], "bad_request", "{body}");
     }
     assert_eq!(remaining_ids(&app), vec!["keep"]);
+}
+
+#[tokio::test]
+async fn delete_by_status_honours_the_window_category_and_search() {
+    let app = start_test_server(Vec::new()).await;
+    let client = reqwest::Client::new();
+    let access = setup_auth(&client, &app.base_url).await;
+    let mut old = aged_entry("old-fail", JobStatus::Failed, false, 60);
+    old.category = "tv".into();
+    let mut other = aged_entry("tv-fail", JobStatus::Failed, false, 0);
+    other.category = "tv".into();
+    let mut recent = aged_entry("recent-fail", JobStatus::Failed, false, 0);
+    recent.category = "movies".into();
+    seed(&app, &[old, other, recent]);
+
+    // A 7-day window clears the recent failures in every category...
+    let response = client
+        .post(format!("{}/api/history/bulk", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({"action": "delete", "status": "failed", "days": 7}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["succeeded"], 2, "{body}");
+    assert_eq!(remaining_ids(&app), vec!["old-fail"]);
+
+    // ...and category/search narrow what is left of it.
+    let response = client
+        .post(format!("{}/api/history/bulk", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({
+            "action": "delete",
+            "status": "failed",
+            "search": "no-such-name"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(response["succeeded"], 0, "{response}");
+    assert_eq!(remaining_ids(&app), vec!["old-fail"]);
 }
