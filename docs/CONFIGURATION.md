@@ -387,9 +387,13 @@ config_version = 1
 ```
 
 `backup_version` is the envelope schema and is independent of the config's own
-`config_version`. A file from a newer build is refused, and so is `config_version`
+`config_version`, and it is required — a file without it is not treated as
+version 1. A file from a newer build is refused, and so is `config_version`
 newer than this build understands. Unknown keys are refused rather than
-dropped, exactly as they are for `config.toml`.
+dropped, exactly as they are for `config.toml`, and that includes the `[backup]`
+header. A TOML syntax error is reported with its line and column but without
+echoing the offending source line, so a secrets-included file cannot leak a
+credential through the error response.
 
 ### Secrets
 
@@ -405,8 +409,25 @@ is never written as a value. A secret **absent** from a backup is cleared,
 because a restore replaces the file layer.
 
 The secrets covered are the SABnzbd API key, the DAV password and API key,
-news-server passwords, the `user:pass@` part of server proxy URLs, and the
-notification webhook, Apprise and ntfy values.
+news-server passwords, the `user:pass@` part of server proxy URLs, the
+notification webhook, Apprise and ntfy values (including the ntfy topic, which
+is a bearer secret on a public server), RSS feed URL query strings (indexers
+carry the account key there, for example `?t=2000&apikey=…`), and the
+`user:pass@` part of OTLP endpoints. A masked feed URL keeps its scheme, host
+and path (`https://indexer.example/rss?********`) so a restore can still match
+it to the right feed.
+
+A masked URL is kept only when the target has the same feed (by name) or
+endpoint. With nothing to keep, the feed is dropped and the endpoint returns to
+its default, with a warning; a document that still carries a mask after the
+merge is refused instead of saving `********` as a value.
+
+Because the whole query string is replaced, a masked backup carries no query
+parameters beyond the mask. Restoring one onto an install that does not already
+have the same feed therefore drops that feed; add it again with its URL. A key
+embedded in a feed's *path* rather than its query (for example
+`/rss/<key>/feed.xml`) is not detected — check such a URL before sharing a
+masked export.
 
 ### What a restore does
 

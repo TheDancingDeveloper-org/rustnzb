@@ -512,7 +512,7 @@ describe('SettingsViewComponent backup & restore', () => {
     component.downloadBackup();
 
     expect(api.getText).toHaveBeenCalledWith('/config/backup', undefined);
-    expect(snack.open).toHaveBeenCalledWith('Backup downloaded', 'Close', { duration: 3000 });
+    expect(snack.info).toHaveBeenCalledWith('Backup downloaded');
     // The name comes from the server, not from a guess on the client.
     expect(saved?.filename).toBe('rustnzb-backup-20261020T090000Z.toml');
   });
@@ -601,10 +601,9 @@ describe('SettingsViewComponent backup & restore', () => {
     );
     expect(api.postText).toHaveBeenCalledWith('/config/backup/restore', component.backupText);
     expect(api.get.mock.calls.length).toBeGreaterThan(getsBefore);
-    expect(snack.open).toHaveBeenCalledWith(
+    expect(snack.info).toHaveBeenCalledWith(
       'Configuration restored. Restart to apply: general.port',
-      'Close',
-      { duration: 6000 },
+      6000,
     );
   });
 
