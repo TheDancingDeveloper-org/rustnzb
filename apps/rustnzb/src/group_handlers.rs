@@ -344,6 +344,12 @@ fn fetches_in_flight() -> &'static Mutex<HashSet<(usize, i64)>> {
     IN_FLIGHT.get_or_init(Default::default)
 }
 
+/// Whether a header fetch of `group_id` is in flight on this instance.
+pub fn header_fetch_in_flight(state: &AppState, group_id: i64) -> bool {
+    let key = (Arc::as_ptr(&state.queue_manager) as usize, group_id);
+    fetches_in_flight().lock().contains(&key)
+}
+
 /// Marks a group's header fetch as running until dropped.
 struct FetchInFlight {
     key: (usize, i64),
