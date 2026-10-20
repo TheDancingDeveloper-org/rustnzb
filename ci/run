@@ -148,7 +148,12 @@ done
 
 if [ "$copy_workspace" = true ]; then
     container="rustnzb-ci-${task}-$$"
-    create_args=("${docker_args[@]}")
+    # --rm would delete the container the moment the task exits, before the
+    # artifacts below can be copied out of it; the trap removes it instead.
+    create_args=()
+    for arg in "${docker_args[@]}"; do
+        [ "$arg" = --rm ] || create_args+=("$arg")
+    done
     create_args[0]=create
     cleanup_container() {
         docker rm -f "$container" >/dev/null 2>&1 || true
@@ -162,7 +167,11 @@ if [ "$copy_workspace" = true ]; then
     docker start -a "$container" || status=$?
     # Tasks write failure artifacts under .ci-artifacts; copy them out before
     # the container is removed so the CI upload step can find them.
-    docker cp "$container:/woodpecker/src/.ci-artifacts/." "$ROOT/.ci-artifacts" >/dev/null 2>&1 || true
+    if ! docker cp "$container:/woodpecker/src/.ci-artifacts/." "$ROOT/.ci-artifacts" >/dev/null 2>&1; then
+        # A passing task removes its artifacts; only a failure leaves logs the
+        # upload step would need, so only that case is worth a warning.
+        [ "$status" -eq 0 ] || printf 'warning: could not copy .ci-artifacts out of %s\n' "$container" >&2
+    fi
     exit "$status"
 fi
 
