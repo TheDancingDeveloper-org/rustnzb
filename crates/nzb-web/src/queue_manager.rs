@@ -7596,6 +7596,8 @@ mod global_pause_tests {
         manager.apply_schedule(&cap, true);
         assert_eq!(manager.scheduled_speed_cap(), Some(1_000_000));
         assert_eq!(manager.configured_speed_limit(), 5_000_000);
+        // The limiter the downloader reads is the cap, not the user's value.
+        assert_eq!(manager.get_speed_limit(), 1_000_000);
 
         manager.apply_schedule(
             &crate::nzb_core::schedule::ScheduleDecision::default(),
@@ -7603,6 +7605,57 @@ mod global_pause_tests {
         );
         assert_eq!(manager.scheduled_speed_cap(), None);
         assert_eq!(manager.configured_speed_limit(), 5_000_000);
+        // ...and ending the window puts the user's limit back on the wire.
+        assert_eq!(manager.get_speed_limit(), 5_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_schedule_cap_of_zero_means_unlimited_even_over_a_configured_limit() {
+        let (manager, _tempdir) = manager();
+        manager.set_speed_limit(5_000_000);
+
+        let cap = crate::nzb_core::schedule::ScheduleDecision {
+            speed_limit_bps: Some(0),
+            ..Default::default()
+        };
+        manager.apply_schedule(&cap, true);
+        assert_eq!(manager.scheduled_speed_cap(), Some(0));
+        assert_eq!(
+            manager.get_speed_limit(),
+            0,
+            "an explicit 0 cap lifts the user's limit for the window"
+        );
+
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert_eq!(manager.get_speed_limit(), 5_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_schedule_applies_nothing_and_lifts_an_active_cap() {
+        let (manager, _tempdir) = manager();
+        manager.set_speed_limit(5_000_000);
+
+        let cap = crate::nzb_core::schedule::ScheduleDecision {
+            speed_limit_bps: Some(1_000_000),
+            disabled_servers: vec!["backup".into()],
+            pause: true,
+            ..Default::default()
+        };
+        manager.apply_schedule(&cap, true);
+        assert_eq!(manager.get_speed_limit(), 1_000_000);
+        assert!(manager.schedule_pause_active());
+
+        // Toggling the schedule off must release everything it applied, even
+        // though the decision it is handed still says otherwise.
+        manager.apply_schedule(&cap, false);
+        assert_eq!(manager.scheduled_speed_cap(), None);
+        assert_eq!(manager.get_speed_limit(), 5_000_000);
+        assert!(manager.schedule_disabled_servers().is_empty());
+        assert!(!manager.schedule_pause_active());
+        assert!(!manager.is_paused());
     }
 
     #[tokio::test]
