@@ -276,7 +276,7 @@ fn par2_volume_counts(job: &NzbJob, held: &[String]) -> Option<(u32, u32)> {
 /// Per-server totals. The `today_*`, `week_*` and `month_*` fields are rolling
 /// windows (the last 24 hours, 7 days and 30 days before the request), not
 /// calendar periods; the UI labels them "24 hours", "7 days" and "30 days".
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServerStatsData {
     pub server_id: String,
     pub server_name: String,
@@ -295,7 +295,7 @@ pub struct ServerStatsData {
     pub last_active: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StatisticsPeriodData {
     pub downloads: usize,
     pub completed: usize,
@@ -309,14 +309,14 @@ pub struct StatisticsPeriodData {
     pub articles_missing: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DailyStatisticsData {
     pub date: String,
     #[serde(flatten)]
     pub totals: StatisticsPeriodData,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GlobalStatisticsData {
     pub generated_at: DateTime<Utc>,
     pub lifetime: StatisticsPeriodData,
@@ -1629,7 +1629,7 @@ impl std::str::FromStr for QueueSortField {
 ///
 /// Exposed on the native API so a pause applied by the disk-space guard can
 /// be told apart from one the user asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PauseReason {
     /// The user paused this job.

@@ -129,6 +129,19 @@ enum XpatOutcome {
     Stopped(Stop),
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/groups/clear-search",
+    tag = "groups",
+    summary = "Search a group's headers",
+    description = "Scans admitted article ranges with up to 16 XPAT patterns, under a response-size and deadline bound. A provider or policy failure is reported in the body as `status: failed` or `status: blocked`.",
+    request_body = ClearSearchInput,
+    responses(
+        (status = 200, description = "Search observation", body = serde_json::Value),
+        (status = 400, description = "The request is outside its admitted bounds", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub(crate) async fn h_clear_search(
     State(state): State<Arc<AppState>>,
     Json(input): Json<ClearSearchInput>,

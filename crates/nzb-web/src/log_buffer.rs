@@ -13,12 +13,13 @@ use tracing::field::{Field, Visit};
 use tracing::span;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
+use utoipa::ToSchema;
 
 /// Maximum number of log entries kept in the ring buffer.
 const MAX_LOG_ENTRIES: usize = 2000;
 
 /// A single captured log entry.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, ToSchema)]
 pub struct LogEntry {
     pub timestamp: DateTime<Utc>,
     pub level: String,

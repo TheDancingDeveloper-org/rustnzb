@@ -11,6 +11,19 @@ use nzb_web::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+#[utoipa::path(
+    post,
+    path = "/api/groups/article-availability",
+    tag = "groups",
+    summary = "Probe article availability",
+    description = "STATs up to 64 message ids through the browse server. A provider or policy failure is reported in the body as `status: blocked` with a stable `failure_code`, not as an HTTP error.",
+    request_body = ArticleAvailabilityInput,
+    responses(
+        (status = 200, description = "Observation, or a blocked report", body = serde_json::Value),
+        (status = 400, description = "The request is outside its admitted bounds", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub(crate) async fn h_article_availability(
     State(state): State<Arc<AppState>>,
     Json(input): Json<ArticleAvailabilityInput>,

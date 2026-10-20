@@ -13,6 +13,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(15 * 60); // 15 minutes
 const REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60); // 30 days
@@ -32,7 +33,7 @@ pub struct TokenStore {
     next_session: AtomicU64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct TokenResponse {
     pub access_token: String,
     pub refresh_token: String,
@@ -40,18 +41,18 @@ pub struct TokenResponse {
     pub expires_in: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, ToSchema)]
 pub struct LogoutRequest {
     #[serde(default)]
     pub refresh_token: Option<String>,
@@ -321,12 +322,22 @@ type ApiState = Arc<AppState>;
 
 // --- Auth Status ---
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct AuthStatus {
     pub auth_enabled: bool,
     pub setup_required: bool,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/auth/status",
+    tag = "auth",
+    summary = "Authentication status",
+    description = "Reports whether credentials are configured and whether the first-boot setup wizard is required.",
+    responses(
+        (status = 200, description = "Authentication state", body = AuthStatus),
+    ),
+)]
 pub async fn h_auth_status(State(state): State<ApiState>) -> impl IntoResponse {
     let has_stored_creds = state.credential_store.has_credentials();
     Json(AuthStatus {
@@ -337,12 +348,26 @@ pub async fn h_auth_status(State(state): State<ApiState>) -> impl IntoResponse {
 
 // --- Auth Setup (first-boot) ---
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct SetupRequest {
     pub username: String,
     pub password: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/auth/setup",
+    tag = "auth",
+    summary = "Create the first-boot credentials",
+    description = "Stores the initial username and password and returns a token pair. Refused once credentials exist.",
+    request_body = SetupRequest,
+    responses(
+        (status = 200, description = "Credentials created; tokens issued", body = TokenResponse),
+        (status = 400, description = "Username or password missing", body = String, content_type = "text/plain"),
+        (status = 403, description = "Credentials are already configured", body = String, content_type = "text/plain"),
+        (status = 500, description = "Credentials could not be saved", body = String, content_type = "text/plain"),
+    ),
+)]
 pub async fn h_auth_setup(
     State(state): State<ApiState>,
     Json(req): Json<SetupRequest>,
@@ -379,13 +404,28 @@ pub async fn h_auth_setup(
 
 // --- Change Credentials ---
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct ChangeCredentialsRequest {
     pub current_password: String,
     pub new_username: Option<String>,
     pub new_password: Option<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/auth/change_credentials",
+    tag = "auth",
+    summary = "Change the credentials",
+    description = "Verifies the current password, stores the new credentials and revokes every issued token.",
+    request_body = ChangeCredentialsRequest,
+    responses(
+        (status = 200, description = "Credentials changed; all tokens revoked"),
+        (status = 400, description = "A new username or password is empty", body = String, content_type = "text/plain"),
+        (status = 401, description = "Current password is incorrect", body = String, content_type = "text/plain"),
+        (status = 404, description = "No credentials configured", body = String, content_type = "text/plain"),
+        (status = 500, description = "Credentials could not be saved", body = String, content_type = "text/plain"),
+    ),
+)]
 pub async fn h_auth_change_credentials(
     State(state): State<ApiState>,
     Json(req): Json<ChangeCredentialsRequest>,
@@ -432,6 +472,19 @@ pub async fn h_auth_change_credentials(
 
 // --- Login ---
 
+#[utoipa::path(
+    post,
+    path = "/api/auth/login",
+    tag = "auth",
+    summary = "Log in",
+    description = "Exchanges a username and password for an access token and a refresh token.",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "Credentials accepted; tokens issued", body = TokenResponse),
+        (status = 401, description = "Invalid credentials", body = String, content_type = "text/plain"),
+        (status = 404, description = "Authentication is not configured", body = String, content_type = "text/plain"),
+    ),
+)]
 pub async fn h_auth_login(
     State(state): State<ApiState>,
     Json(req): Json<LoginRequest>,
@@ -454,6 +507,18 @@ pub async fn h_auth_login(
 
 // --- Refresh ---
 
+#[utoipa::path(
+    post,
+    path = "/api/auth/refresh",
+    tag = "auth",
+    summary = "Refresh tokens",
+    description = "Redeems a refresh token once and returns a new token pair.",
+    request_body = RefreshRequest,
+    responses(
+        (status = 200, description = "New token pair", body = TokenResponse),
+        (status = 401, description = "Refresh token invalid or expired", body = String, content_type = "text/plain"),
+    ),
+)]
 pub async fn h_auth_refresh(
     State(state): State<ApiState>,
     Json(req): Json<RefreshRequest>,
@@ -469,6 +534,17 @@ pub async fn h_auth_refresh(
 /// Revoke the caller's session: the refresh token in the body and the
 /// access token in the `Authorization: Bearer` header (if any), together
 /// with every other token issued for the same login.
+#[utoipa::path(
+    post,
+    path = "/api/auth/logout",
+    tag = "auth",
+    summary = "Log out",
+    description = "Revokes the login session of the refresh token in the body and of the `Authorization: Bearer` access token, if either is supplied.",
+    request_body = LogoutRequest,
+    responses(
+        (status = 204, description = "Session revoked"),
+    ),
+)]
 pub async fn h_auth_logout(
     State(state): State<ApiState>,
     headers: http::HeaderMap,

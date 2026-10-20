@@ -10,9 +10,10 @@
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// What an active rule does to the queue.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleAction {
     /// Pause all downloads.
@@ -25,7 +26,7 @@ pub enum ScheduleAction {
 }
 
 /// The whole `[schedule]` section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScheduleConfig {
     /// Rules are only evaluated when this is on. Turning it off restores the
@@ -36,7 +37,7 @@ pub struct ScheduleConfig {
 }
 
 /// One time-of-day window.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScheduleRule {
     /// Stable identifier, assigned by the API when a rule is created.

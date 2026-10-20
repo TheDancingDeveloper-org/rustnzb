@@ -2,12 +2,13 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 // ---------------------------------------------------------------------------
 // Job status lifecycle
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
@@ -41,7 +42,7 @@ impl std::fmt::Display for JobStatus {
 ///
 /// These carry stable snake_case wire values so consumers key off a typed code
 /// instead of parsing human-readable diagnostic prose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobFailureCode {
     ArticlesUnavailable,
@@ -85,7 +86,7 @@ impl std::str::FromStr for JobFailureCode {
 // Priority
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, ToSchema)]
 pub enum Priority {
     Low = 0,
     #[default]
@@ -131,7 +132,7 @@ impl<'de> Deserialize<'de> for Priority {
 // ---------------------------------------------------------------------------
 
 /// Per-server article download statistics for a job.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ServerArticleStats {
     pub server_id: String,
     pub server_name: String,
@@ -141,7 +142,7 @@ pub struct ServerArticleStats {
 }
 
 /// The verdict for one PAR2 slice, as the download engine left it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SliceVerdict {
     /// Not fully written, not checked, or its only gap is an article whose
@@ -157,7 +158,7 @@ pub enum SliceVerdict {
 /// The per-job slice map the download engine emits with `JobFinished`
 /// (WI-1228), read by the hopeless check (WI-145) and the verify skip
 /// (WI-147).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SliceMapSummary {
     /// One verdict per global slice, in PAR2 Main-packet file order.
     pub states: Vec<SliceVerdict>,
@@ -168,7 +169,7 @@ pub struct SliceMapSummary {
 }
 
 /// A complete download job (parsed from one NZB file).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NzbJob {
     /// Unique job identifier
     pub id: String,
@@ -199,8 +200,10 @@ pub struct NzbJob {
     /// When the job completed (if applicable)
     pub completed_at: Option<DateTime<Utc>>,
     /// Working directory for this job (incomplete)
+    #[schema(value_type = String)]
     pub work_dir: PathBuf,
     /// Final output directory
+    #[schema(value_type = String)]
     pub output_dir: PathBuf,
     /// Optional password for extraction
     pub password: Option<String>,
@@ -238,7 +241,7 @@ pub struct NzbJob {
 }
 
 /// A single file within an NZB job (collection of NNTP articles).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NzbFile {
     /// Unique file identifier
     pub id: String,
@@ -273,7 +276,7 @@ pub use nzb_nntp::Article;
 // ---------------------------------------------------------------------------
 
 /// A history entry for a completed or failed job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HistoryEntry {
     pub id: String,
     pub name: String,
@@ -286,6 +289,7 @@ pub struct HistoryEntry {
     /// Active download duration, excluding queue wait and pauses.
     #[serde(default)]
     pub download_time_secs: Option<f64>,
+    #[schema(value_type = String)]
     pub output_dir: PathBuf,
     /// Post-processing stages with results
     pub stages: Vec<StageResult>,
@@ -324,7 +328,7 @@ pub struct HistoryEntry {
 /// Immutable statistics ledger row recorded when a job leaves the queue.
 /// Unlike history, these compact rows are retained when users clear or prune
 /// individual history entries so lifetime counters remain meaningful.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DownloadStatistic {
     pub job_id: String,
     pub completed_at: DateTime<Utc>,
@@ -340,7 +344,7 @@ pub struct DownloadStatistic {
 ///
 /// This row intentionally outlives queue and history retention so a caller can
 /// resolve an ambiguous admission response without creating another job.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct QueueAdmission {
     pub idempotency_key: String,
     pub payload_digest: String,
@@ -348,13 +352,14 @@ pub struct QueueAdmission {
     pub accepted_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "location", rename_all = "snake_case")]
 pub enum QueueAdmissionState {
     Queue {
         status: JobStatus,
         total_bytes: u64,
         downloaded_bytes: u64,
+        #[schema(value_type = String)]
         output_dir: PathBuf,
         error_message: Option<String>,
     },
@@ -363,6 +368,7 @@ pub enum QueueAdmissionState {
         total_bytes: u64,
         downloaded_bytes: u64,
         completed_at: DateTime<Utc>,
+        #[schema(value_type = String)]
         output_dir: PathBuf,
         error_message: Option<String>,
         failure_code: Option<JobFailureCode>,
@@ -371,7 +377,7 @@ pub enum QueueAdmissionState {
 }
 
 /// Exact observation of a durable admission and its current engine location.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct QueueAdmissionObservation {
     pub admission: QueueAdmission,
     pub state: QueueAdmissionState,
@@ -383,7 +389,7 @@ pub enum QueueAdmissionOutcome {
     Existing(QueueAdmission),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StageResult {
     pub name: String,
     pub status: StageStatus,
@@ -391,7 +397,7 @@ pub struct StageResult {
     pub duration_secs: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StageStatus {
     Success,
@@ -404,7 +410,7 @@ pub enum StageStatus {
 // ---------------------------------------------------------------------------
 
 /// A discovered item from an RSS feed, persisted in the database.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RssItem {
     /// Feed entry ID (from the RSS feed)
     pub id: String,
@@ -429,7 +435,7 @@ pub struct RssItem {
 }
 
 /// A download rule that automatically enqueues matching RSS feed items.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RssRule {
     /// Unique rule identifier
     pub id: String,
@@ -452,7 +458,7 @@ pub struct RssRule {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "groups-db")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GroupRow {
     pub id: i64,
     pub name: String,
@@ -469,7 +475,7 @@ pub struct GroupRow {
 }
 
 #[cfg(feature = "groups-db")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HeaderRow {
     pub id: i64,
     pub group_id: i64,
@@ -486,7 +492,7 @@ pub struct HeaderRow {
 }
 
 #[cfg(feature = "groups-db")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ThreadSummary {
     pub root_message_id: String,
     pub subject: String,
@@ -498,7 +504,7 @@ pub struct ThreadSummary {
 }
 
 #[cfg(feature = "groups-db")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ThreadArticle {
     #[serde(flatten)]
     pub header: HeaderRow,
@@ -506,13 +512,13 @@ pub struct ThreadArticle {
 }
 
 #[cfg(feature = "groups-db")]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct MarkReadInput {
     pub header_ids: Vec<i64>,
 }
 
 #[cfg(feature = "groups-db")]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct DownloadSelectedInput {
     pub message_ids: Vec<String>,
     pub name: Option<String>,

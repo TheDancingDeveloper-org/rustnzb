@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::config::{CategoryConfig, RssFeedConfig, ServerConfig};
 
@@ -14,7 +15,7 @@ use crate::config::{CategoryConfig, RssFeedConfig, ServerConfig};
 // ---------------------------------------------------------------------------
 
 /// Preview returned by both INI and API import — same shape for both.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SabnzbdImportPreview {
     pub servers: Vec<ImportedServer>,
     pub categories: Vec<CategoryConfig>,
@@ -27,7 +28,7 @@ pub struct SabnzbdImportPreview {
 }
 
 /// A server imported from SABnzbd.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ImportedServer {
     pub name: String,
     pub host: String,
@@ -67,7 +68,7 @@ impl ImportedServer {
 }
 
 /// General settings imported from SABnzbd.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ImportedGeneral {
     pub api_key: Option<String>,
     pub complete_dir: Option<String>,

@@ -1,9 +1,10 @@
 //! NNTP server and article configuration types.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// NNTP server configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[non_exhaustive]
 pub struct ServerConfig {
     /// Unique server identifier. Empty when omitted; the API assigns one.
