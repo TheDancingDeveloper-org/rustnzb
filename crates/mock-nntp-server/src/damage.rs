@@ -83,15 +83,22 @@ impl DamageRelease {
     /// release with no recovery slices.
     pub fn generate_with_volumes(name: &str, seed: u64, volume_blocks: &[u32]) -> Self {
         let mut rng = SplitMix64(seed);
-        let mkv_name = format!("{name}.mkv");
-        let nfo_name = format!("{name}.nfo");
-        let mkv = rng.bytes(MKV_SIZE);
-        let nfo = rng.bytes(NFO_SIZE);
+        let files = vec![
+            (format!("{name}.mkv"), rng.bytes(MKV_SIZE)),
+            (format!("{name}.nfo"), rng.bytes(NFO_SIZE)),
+        ];
+        Self::from_files(name, files, volume_blocks)
+    }
 
-        let par2 = Par2Fixture::new()
-            .with_slice_size(DAMAGE_SLICE_SIZE)
-            .add_file(&mkv_name, &mkv)
-            .add_file(&nfo_name, &nfo);
+    /// Build a release from caller-supplied data files, in order, protected
+    /// by one PAR2 set with recovery volumes of the given block counts. Files
+    /// are split into [`DAMAGE_ARTICLE_SIZE`] articles and sliced at
+    /// [`DAMAGE_SLICE_SIZE`], as in the standard release.
+    pub fn from_files(name: &str, files: Vec<(String, Vec<u8>)>, volume_blocks: &[u32]) -> Self {
+        let par2 = files.iter().fold(
+            Par2Fixture::new().with_slice_size(DAMAGE_SLICE_SIZE),
+            |par2, (filename, payload)| par2.add_file(filename, payload),
+        );
 
         let mut volumes = Vec::new();
         let mut next_exponent = 0u32;
@@ -108,10 +115,10 @@ impl DamageRelease {
 
         Self {
             name: name.to_string(),
-            data_files: vec![
-                ReleaseFile::split(mkv_name, mkv),
-                ReleaseFile::split(nfo_name, nfo),
-            ],
+            data_files: files
+                .into_iter()
+                .map(|(filename, payload)| ReleaseFile::split(filename, payload))
+                .collect(),
             par2_index: ReleaseFile::split(format!("{name}.par2"), par2.index_bytes()),
             volumes,
             par2,
@@ -558,6 +565,12 @@ fn encode(segment: &FixtureSegment, body: &[u8]) -> Vec<u8> {
         segment.total_file_size,
     )
     .0
+}
+
+/// `len` deterministic pseudo-random bytes from `seed`, for building
+/// payloads to pass to [`DamageRelease::from_files`].
+pub fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
+    SplitMix64(seed).bytes(len)
 }
 
 /// Small seeded generator so payloads need no RNG dependency.
