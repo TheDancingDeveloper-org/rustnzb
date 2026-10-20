@@ -17,8 +17,11 @@ mod body_prefix;
 mod clear_search;
 mod contract;
 
+pub(crate) use availability::__path_h_article_availability;
 pub(crate) use availability::h_article_availability;
+pub(crate) use body_prefix::__path_h_article_body_prefix;
 pub(crate) use body_prefix::h_article_body_prefix;
+pub(crate) use clear_search::__path_h_clear_search;
 pub(crate) use clear_search::h_clear_search;
 
 use crate::group_handlers::select_browse_server;
@@ -59,6 +62,19 @@ fn nntp_failure(error: &NntpError, operation: &str) -> &'static str {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/groups/article-head",
+    tag = "groups",
+    summary = "Observe one article's headers",
+    description = "Runs HEAD through the browse server and returns the wire headers as an observation. A provider or policy failure is reported in the body as `status: blocked` with a stable `failure_code`, not as an HTTP error.",
+    request_body = ArticleHeadInput,
+    responses(
+        (status = 200, description = "Observation, or a blocked report", body = serde_json::Value),
+        (status = 400, description = "The request is outside its admitted bounds", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub(crate) async fn h_article_head(
     State(state): State<Arc<AppState>>,
     Json(input): Json<ArticleHeadInput>,
@@ -210,6 +226,19 @@ fn defective_row_json(row: DefectiveOverviewRow) -> Value {
     })
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/groups/overview-range",
+    tag = "groups",
+    summary = "Observe an OVERVIEW range",
+    description = "Reads OVERVIEW rows for an article range. A provider or policy failure is reported in the body as `status: blocked` with a stable `failure_code`, not as an HTTP error.",
+    request_body = OverviewRangeInput,
+    responses(
+        (status = 200, description = "Observation, or a blocked report", body = serde_json::Value),
+        (status = 400, description = "The request is outside its admitted bounds", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
 pub(crate) async fn h_overview_range(
     State(state): State<Arc<AppState>>,
     Json(input): Json<OverviewRangeInput>,

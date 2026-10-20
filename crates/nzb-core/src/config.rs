@@ -2,12 +2,13 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Top-level application configuration.
 ///
 /// Unknown keys are rejected at parse time (`deny_unknown_fields`), so a typo
 /// in `config.toml` fails loudly instead of silently keeping the default.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     /// Schema version of the file, stamped on every save. A file without it
@@ -46,7 +47,7 @@ impl Default for AppConfig {
 }
 
 /// PAR2 handling during download.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Par2Config {
     /// Hold PAR2 recovery volumes until the in-flight slice map shows
@@ -70,7 +71,7 @@ impl Default for Par2Config {
 
 /// What admission does when an incoming NZB matches a queued or history job
 /// by name or by content digest.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum DuplicatePolicy {
     /// Admit the NZB without checking for a match.
@@ -107,7 +108,7 @@ impl std::str::FromStr for DuplicatePolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct GeneralConfig {
     /// HTTP API listen address
@@ -117,10 +118,13 @@ pub struct GeneralConfig {
     /// API key for authentication
     pub api_key: Option<String>,
     /// Directory for incomplete downloads
+    #[schema(value_type = String)]
     pub incomplete_dir: PathBuf,
     /// Directory for completed downloads
+    #[schema(value_type = String)]
     pub complete_dir: PathBuf,
     /// Directory for application data (DB, logs)
+    #[schema(value_type = String)]
     pub data_dir: PathBuf,
     /// Download speed limit in bytes/sec (0 = unlimited)
     pub speed_limit_bps: u64,
@@ -133,6 +137,7 @@ pub struct GeneralConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_level_before_debug: Option<String>,
     /// Log file path (None = stdout only)
+    #[schema(value_type = Option<String>)]
     pub log_file: Option<PathBuf>,
     /// History retention: how many NZBs to keep in history.
     /// `None` or `Some(0)` both mean keep all; see [`normalize_history_retention`].
@@ -153,6 +158,7 @@ pub struct GeneralConfig {
     #[serde(default = "default_min_free_space")]
     pub min_free_space_bytes: u64,
     /// Directory to watch for new .nzb files to auto-enqueue
+    #[schema(value_type = Option<String>)]
     pub watch_dir: Option<PathBuf>,
     /// RSS feed history limit: how many feed items to keep (None = keep all, default 500)
     #[serde(default = "default_rss_history_limit")]
@@ -203,6 +209,7 @@ pub struct GeneralConfig {
     /// the mode; a file outside this directory (after resolving symlinks and
     /// `..`) is refused too.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub local_import_dir: Option<PathBuf>,
     /// Keep the SABnzbd `change_complete_action` after it has run once. When
     /// false (SABnzbd's default) the action is reset after each run.
@@ -210,12 +217,15 @@ pub struct GeneralConfig {
     pub queue_complete_pers: bool,
     /// Optional directory containing post-processing scripts.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub scripts_dir: Option<PathBuf>,
     /// Script run after a successful post-processing job.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub script_success: Option<PathBuf>,
     /// Script run after a failed post-processing job.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub script_failure: Option<PathBuf>,
     /// Maximum runtime for a post-processing script.
     #[serde(default = "default_script_timeout_secs")]
@@ -366,7 +376,7 @@ impl Default for GeneralConfig {
 }
 
 /// OpenTelemetry configuration. All values can be overridden via env vars.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct OtelConfig {
     /// Enable both OTEL logs and metrics. Retained as a shared fallback for
@@ -423,11 +433,12 @@ impl OtelConfig {
 pub use nzb_nntp::ServerConfig;
 
 /// Category configuration for organizing downloads.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CategoryConfig {
     /// Category name
     pub name: String,
     /// Output directory override (relative to complete_dir)
+    #[schema(value_type = Option<String>)]
     pub output_dir: Option<PathBuf>,
     /// Post-processing level: 0=none, 1=repair, 2=unpack, 3=repair+unpack
     pub post_processing: u8,
@@ -476,7 +487,7 @@ impl CategoryConfig {
 }
 
 /// RSS feed configuration for automatic NZB downloading.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RssFeedConfig {
     /// Display name for the feed
     pub name: String,
@@ -517,7 +528,7 @@ fn default_true() -> bool {
 ///
 /// Each target is off until its URL or topic is set. Targets are read at
 /// startup, so a change takes effect after a restart.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(default)]
 pub struct NotificationConfig {
     /// Generic webhook: each event is POSTed as a JSON document.
@@ -550,7 +561,7 @@ impl Default for NotificationConfig {
 }
 
 /// DAV pipeline auto-send configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct DavConfig {
     /// Whether the WebDAV media library is mounted at runtime.

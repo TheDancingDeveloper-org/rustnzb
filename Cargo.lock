@@ -1864,6 +1864,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "unicode-normalization",
+ "utoipa",
  "uuid",
 ]
 
@@ -1935,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "nzb-nntp"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1957,6 +1958,7 @@ dependencies = [
  "tokio-socks",
  "toml",
  "tracing",
+ "utoipa",
  "uuid",
  "webpki-roots",
 ]
@@ -1985,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "nzb-web"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "arc-swap",

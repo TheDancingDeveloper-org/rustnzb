@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
+use utoipa::ToSchema;
 
 const MAX_OBSERVATION_HEADERS: u64 = 10_000;
 const MAX_PATTERNS: usize = 16;
@@ -15,61 +16,89 @@ const MAX_CLEAR_SEARCH_ARTICLES_PER_RANGE: u64 = 10_000;
 const MAX_CLEAR_SEARCH_DURATION_MS: u64 = 120_000;
 const MAX_AVAILABILITY_SEGMENTS: usize = 64;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OverviewRangeInput {
+    /// Caller-supplied id echoed in the response.
     pub(crate) request_id: String,
+    /// Group to read OVERVIEW from.
     pub(crate) group: String,
+    /// First article number in the range.
     pub(crate) start_article: u64,
+    /// Last article number in the range.
     pub(crate) end_article: u64,
+    /// Admission bound on headers in the range (at most 10 000).
     pub(crate) max_headers: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ArticleHeadInput {
+    /// Caller-supplied id echoed in the response.
     pub(crate) request_id: String,
+    /// Group the article belongs to.
     pub(crate) group: String,
+    /// Article number to HEAD.
     pub(crate) article_number: u64,
+    /// Admission bound on the header bytes returned (at most 64 KiB).
     pub(crate) max_header_bytes: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ArticleBodyPrefixInput {
+    /// Caller-supplied id echoed in the response.
     pub(crate) request_id: String,
+    /// Group the article belongs to.
     pub(crate) group: String,
+    /// Message id to BODY.
     pub(crate) message_id: String,
+    /// Admission bound on wire bytes read (at most 256 KiB).
     pub(crate) max_wire_bytes: usize,
+    /// Admission bound on decoded payload bytes (at most 64 KiB).
     pub(crate) max_payload_bytes: usize,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClearSearchRangeInput {
+    /// First article number in the range.
     pub(crate) start_article: u64,
+    /// Last article number in the range.
     pub(crate) end_article: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClearSearchInput {
+    /// Caller-supplied id echoed in the response.
     pub(crate) request_id: String,
+    /// Id used to cancel the scan.
     pub(crate) cancellation_id: String,
+    /// Group to search.
     pub(crate) group: String,
+    /// Up to eight article ranges to scan.
     pub(crate) ranges: Vec<ClearSearchRangeInput>,
+    /// XPAT patterns to match (at most 16).
     pub(crate) patterns: Vec<String>,
+    /// Digest of the predicate being searched for.
     pub(crate) predicate_sha256: String,
+    /// Matches collected per range before stopping.
     pub(crate) max_matches_per_range: usize,
+    /// Admission bound on the response body.
     pub(crate) max_response_bytes: usize,
+    /// Unix time in milliseconds after which the scan stops.
     pub(crate) deadline_at_unix_ms: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ArticleAvailabilityInput {
+    /// Caller-supplied id echoed in the response.
     pub(crate) request_id: String,
+    /// Message ids to STAT (at most 64).
     pub(crate) message_ids: Vec<String>,
+    /// Digest of the sample being probed.
     pub(crate) sample_sha256: String,
 }
 
