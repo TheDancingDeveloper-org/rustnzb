@@ -93,6 +93,16 @@ const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_WORKER_IDLE: Duration = Duration::from_secs(60);
 /// Worker idle poll interval when the shared queue is empty.
 const WORKER_IDLE_POLL: Duration = Duration::from_millis(500);
+/// How often an idle worker checks that its socket is still open. Providers
+/// close idle sessions on their side; without a probe the worker would only
+/// notice at its next fetch, and the open-socket count would stay high.
+/// Tunable per pool via [`WorkerPool::set_idle_keepalive`].
+const DEFAULT_IDLE_KEEPALIVE: Duration = Duration::from_secs(30);
+/// Upper bound on one idle keepalive round trip.
+const IDLE_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Message-id used by the idle keepalive `STAT`. The provider answers 430,
+/// which proves the session is alive without transferring an article.
+const IDLE_KEEPALIVE_MESSAGE_ID: &str = "rustnzb-keepalive@invalid";
 
 /// Phase 7: capacity of the per-job progress channel. The handler reads
 /// this at ~articles per second; under DB-lock contention or
@@ -196,6 +206,8 @@ struct ServerSlot {
     limit: usize,
     semaphore: Arc<tokio::sync::Semaphore>,
     connected: Arc<AtomicUsize>,
+    /// Sockets currently open (connected and authenticated), busy or idle.
+    open: Arc<AtomicUsize>,
 }
 
 impl ConnectionTracker {
@@ -245,6 +257,7 @@ impl ConnectionTracker {
                         limit,
                         semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
                         connected: Arc::new(AtomicUsize::new(0)),
+                        open: Arc::new(AtomicUsize::new(0)),
                     },
                 );
                 if let Some(prev) = prev_limit {
@@ -298,6 +311,8 @@ impl ConnectionTracker {
             semaphore_origin: server_slot.semaphore,
             connected: server_slot.connected,
             is_connected: false,
+            open: server_slot.open,
+            is_open: false,
             _permit: permit,
         })
     }
@@ -358,6 +373,23 @@ impl ConnectionTracker {
             .collect()
     }
 
+    /// `(server_id, open, limit)` triples for NNTP sockets actually open,
+    /// busy or idle. A worker whose socket the provider closed, or which is
+    /// waiting for work without a socket, is not counted.
+    pub fn open_snapshot(&self) -> Vec<(String, usize, usize)> {
+        let pools = self.pools.lock();
+        pools
+            .iter()
+            .map(|(id, slot)| {
+                (
+                    id.clone(),
+                    slot.open.load(Ordering::Relaxed).min(slot.limit),
+                    slot.limit,
+                )
+            })
+            .collect()
+    }
+
     /// Total currently-held permits across all servers in the live pool.
     /// Permits held against orphaned (replaced) semaphores are NOT counted —
     /// they'll go away as the holding workers exit.
@@ -401,6 +433,8 @@ pub struct ConnectionSlot {
     semaphore_origin: Arc<tokio::sync::Semaphore>,
     connected: Arc<AtomicUsize>,
     is_connected: bool,
+    open: Arc<AtomicUsize>,
+    is_open: bool,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -426,6 +460,20 @@ impl ConnectionSlot {
         }
     }
 
+    fn mark_open(&mut self) {
+        if !self.is_open {
+            self.open.fetch_add(1, Ordering::Relaxed);
+            self.is_open = true;
+        }
+    }
+
+    fn mark_closed(&mut self) {
+        if self.is_open {
+            self.open.fetch_sub(1, Ordering::Relaxed);
+            self.is_open = false;
+        }
+    }
+
     fn activity(&mut self) -> ConnectionActivity<'_> {
         self.mark_active();
         ConnectionActivity { slot: self }
@@ -435,6 +483,7 @@ impl ConnectionSlot {
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
         self.mark_inactive();
+        self.mark_closed();
     }
 }
 
@@ -1232,6 +1281,8 @@ pub struct WorkerPool {
     /// Mutable so the harness (and runtime config reload) can adjust it
     /// without recreating the pool.
     max_worker_idle: Mutex<Duration>,
+    /// How often idle workers probe their socket for a provider-side close.
+    idle_keepalive: Mutex<Duration>,
     /// Per-server "last starvation log" timestamp; rate-limits the
     /// "no workable items" diagnostic to once per minute per server.
     starvation_log: Mutex<HashMap<String, Instant>>,
@@ -1268,6 +1319,7 @@ impl WorkerPool {
             stall_timeout,
             created_at: Instant::now(),
             max_worker_idle: Mutex::new(DEFAULT_MAX_WORKER_IDLE),
+            idle_keepalive: Mutex::new(DEFAULT_IDLE_KEEPALIVE),
             starvation_log: Mutex::new(HashMap::new()),
             evictions: AtomicU64::new(0),
             defer_par2_volumes: AtomicBool::new(true),
@@ -1291,6 +1343,17 @@ impl WorkerPool {
     /// Read current worker idle eviction threshold.
     pub fn max_worker_idle(&self) -> Duration {
         *self.max_worker_idle.lock()
+    }
+
+    /// Override how often idle workers probe their socket. Tests shrink this
+    /// so a provider-side close is noticed in milliseconds.
+    pub fn set_idle_keepalive(&self, d: Duration) {
+        *self.idle_keepalive.lock() = d;
+    }
+
+    /// Read the current idle keepalive interval.
+    pub fn idle_keepalive(&self) -> Duration {
+        *self.idle_keepalive.lock()
     }
 
     /// Millis elapsed since the pool was constructed. Used as the
@@ -1969,6 +2032,7 @@ async fn pool_worker(
             connect_started.elapsed().as_secs_f64(),
         );
         pool.report_providers_available();
+        conn_slot.mark_open();
         let pipe_depth = primary_server.pipelining.max(1);
         let active_conns = pool.conn_tracker.total();
         info!(
@@ -2011,9 +2075,28 @@ async fn pool_worker(
         };
 
         let _ = conn.quit().await;
+        conn_slot.mark_closed();
         match reconnect_needed {
             WorkerExit::Reconnect => {
                 // Loop back to the top and reconnect — slot is preserved.
+                continue 'reconnect;
+            }
+            WorkerExit::PeerClosed => {
+                // The provider closed the idle socket. Stay disconnected
+                // until there is work, so an empty queue holds no sockets
+                // and the provider is not reconnected to only to drop us
+                // again.
+                info!(
+                    worker = %worker_id,
+                    server = %primary_server.name,
+                    "Idle connection closed by the server; reconnecting when work arrives"
+                );
+                if !wait_for_workable(&pool, &primary_server, &worker_shutdown).await {
+                    return;
+                }
+                // Waiting for work is not a stall: give the reconnect a full
+                // grace period before the watchdog looks at this worker.
+                last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
                 continue 'reconnect;
             }
             WorkerExit::Exit => {
@@ -2029,6 +2112,63 @@ enum WorkerExit {
     Exit,
     /// Reconnect and keep pulling work (transient connection loss).
     Reconnect,
+    /// The idle socket was closed by the server. Reconnect only once there
+    /// is work for this server.
+    PeerClosed,
+}
+
+/// Outcome of [`next_work_item`].
+enum NextWork {
+    Item(WorkItem, Arc<JobContext>),
+    /// The worker should exit (shutdown or server retirement).
+    Exit,
+    /// The idle keepalive found the socket closed.
+    PeerClosed,
+}
+
+/// Probe an idle connection with a cheap `STAT` of a message-id that cannot
+/// exist. A 430 (or 223) reply means the session is alive; anything else,
+/// including a timeout, means the socket is gone or unusable.
+async fn idle_socket_alive(conn: &mut NntpConnection) -> bool {
+    if !conn.is_connected() {
+        return false;
+    }
+    if !conn.capabilities().have_stat {
+        // No cheap command to probe with; assume alive and let the next
+        // fetch discover a close, as before.
+        return true;
+    }
+    matches!(
+        tokio::time::timeout(
+            IDLE_KEEPALIVE_TIMEOUT,
+            conn.stat_article(IDLE_KEEPALIVE_MESSAGE_ID)
+        )
+        .await,
+        Ok(Ok(_) | Err(NntpError::ArticleNotFound(_)))
+    )
+}
+
+/// Wait without a socket until `server` has workable items. Returns false if
+/// the worker should exit instead.
+async fn wait_for_workable(
+    pool: &Arc<WorkerPool>,
+    server: &ServerConfig,
+    worker_shutdown: &Arc<AtomicBool>,
+) -> bool {
+    loop {
+        if worker_shutdown.load(Ordering::Relaxed) || pool.shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        let hp = pool.higher_priority_servers(server.priority, &server.id);
+        if pool.work_queue.workable_count_for(&server.id, &hp).0 > 0 {
+            return true;
+        }
+        let notified = pool.work_queue.notify.notified();
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(WORKER_IDLE_POLL) => {}
+        }
+    }
 }
 
 /// Wait for work, with early exit on shutdown / server retirement.
@@ -2042,10 +2182,12 @@ async fn next_work_item(
     server_id: &str,
     higher_priority_servers: &[String],
     worker_shutdown: &Arc<AtomicBool>,
-) -> Option<(WorkItem, Arc<JobContext>)> {
+    conn: &mut NntpConnection,
+) -> NextWork {
+    let mut last_probe = Instant::now();
     loop {
         if worker_shutdown.load(Ordering::Relaxed) || pool.shutdown.load(Ordering::Relaxed) {
-            return None;
+            return NextWork::Exit;
         }
 
         if let Some(item) = pool
@@ -2068,7 +2210,15 @@ async fn next_work_item(
                 tokio::time::sleep(WORKER_IDLE_POLL).await;
                 continue;
             }
-            return Some((item, ctx));
+            return NextWork::Item(item, ctx);
+        }
+
+        // Idle: check the provider has not closed the socket under us.
+        if last_probe.elapsed() >= pool.idle_keepalive() {
+            if !idle_socket_alive(conn).await {
+                return NextWork::PeerClosed;
+            }
+            last_probe = Instant::now();
         }
 
         // Queue empty (or nothing workable for this server) — wait with a
@@ -2132,15 +2282,18 @@ async fn run_worker_serial(
         let higher_priority_servers =
             pool.higher_priority_servers(primary_server.priority, &primary_server.id);
 
-        let Some((mut item, ctx)) = next_work_item(
+        let (mut item, ctx) = match next_work_item(
             pool,
             &primary_server.id,
             &higher_priority_servers,
             worker_shutdown,
+            conn,
         )
         .await
-        else {
-            return WorkerExit::Exit;
+        {
+            NextWork::Item(item, ctx) => (item, ctx),
+            NextWork::Exit => return WorkerExit::Exit,
+            NextWork::PeerClosed => return WorkerExit::PeerClosed,
         };
 
         let result = {
@@ -2460,15 +2613,18 @@ async fn run_worker_pipelined(
 
         // If nothing is queued and nothing in flight, wait for work.
         if pipeline.is_empty() && in_flight_items.is_empty() {
-            let Some((first_item, ctx)) = next_work_item(
+            let (first_item, ctx) = match next_work_item(
                 pool,
                 &primary_server.id,
                 &higher_priority_servers,
                 worker_shutdown,
+                conn,
             )
             .await
-            else {
-                return WorkerExit::Exit;
+            {
+                NextWork::Item(item, ctx) => (item, ctx),
+                NextWork::Exit => return WorkerExit::Exit,
+                NextWork::PeerClosed => return WorkerExit::PeerClosed,
             };
             let _ = ctx; // ctx is validated in next_work_item
             let tag = next_tag;
@@ -5281,6 +5437,26 @@ mod tests {
 
         assert_eq!(t.connected_snapshot(), vec![("srv1".into(), 0, 1)]);
         assert_eq!(t.snapshot(), vec![("srv1".into(), 1, 1)]);
+    }
+
+    #[tokio::test]
+    async fn open_snapshot_counts_open_sockets_not_held_slots() {
+        let t = ConnectionTracker::new();
+        t.set_limit("srv1", "Server 1", 3);
+        let mut a = t.acquire("srv1").await.unwrap();
+        let _idle_without_socket = t.acquire("srv1").await.unwrap();
+        assert_eq!(t.open_snapshot(), vec![("srv1".into(), 0, 3)]);
+
+        a.mark_open();
+        a.mark_open();
+        assert_eq!(t.open_snapshot(), vec![("srv1".into(), 1, 3)]);
+        a.mark_closed();
+        assert_eq!(t.open_snapshot(), vec![("srv1".into(), 0, 3)]);
+        assert_eq!(t.snapshot(), vec![("srv1".into(), 2, 3)]);
+
+        a.mark_open();
+        drop(a);
+        assert_eq!(t.open_snapshot(), vec![("srv1".into(), 0, 3)]);
     }
 
     #[test]

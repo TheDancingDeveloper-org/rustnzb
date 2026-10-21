@@ -302,3 +302,55 @@ async fn raising_connection_count_live_adds_concurrent_transfers() {
 
     pool.shutdown().await;
 }
+
+#[tokio::test]
+async fn idle_sockets_closed_by_the_server_leave_the_open_count() {
+    // The provider recycles sessions after a few commands, so the idle
+    // keepalive (or the article fetch itself) runs into a closed socket. The
+    // queue is then empty, so the worker must report the socket gone and
+    // not reconnect.
+    let mock = MockNntpServer::start(MockConfig {
+        articles: HashMap::from([(MESSAGE_ID.to_string(), encoded_payload())]),
+        close_after_n_commands: Some(4),
+        ..MockConfig::default()
+    })
+    .await;
+    let pool = pool_with(vec![server(mock.port())]);
+    let keepalive = Duration::from_millis(100);
+    pool.set_idle_keepalive(keepalive);
+    pool.start();
+
+    let dir = tempfile::tempdir().unwrap();
+    let delivered = submit_and_observe(&pool, &one_article_job("job-a", dir.path())).await;
+    assert!(
+        matches!(delivered, ProgressUpdate::ArticleComplete { .. }),
+        "the article must download, got {delivered:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let open: usize = pool.connection_snapshot().iter().map(|(_, n, _)| n).sum();
+        if open == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "open count stayed at {open} after the server closed the idle socket"
+        );
+        tokio::time::sleep(keepalive / 2).await;
+    }
+
+    // Nothing is queued, so the worker must stay disconnected.
+    tokio::time::sleep(keepalive * 5).await;
+    assert_eq!(pool.connection_snapshot(), vec![("srv".into(), 0, 1)]);
+
+    // New work reconnects and is served.
+    let dir = tempfile::tempdir().unwrap();
+    let again = submit_and_observe(&pool, &one_article_job("job-b", dir.path())).await;
+    assert!(
+        matches!(again, ProgressUpdate::ArticleComplete { .. }),
+        "work after an idle close must reconnect and download, got {again:?}"
+    );
+
+    pool.shutdown().await;
+}
