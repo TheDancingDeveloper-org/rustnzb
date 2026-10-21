@@ -57,7 +57,10 @@ export interface StatusResponse {
 
 export interface NntpConnectionStatus {
   server_id: string;
+  /** Open sockets to the server (connected and authenticated), busy or idle. */
   connected: number;
+  /** Sockets transferring an article at the time of the poll; `<= connected`. */
+  active: number;
   limit: number;
 }
 

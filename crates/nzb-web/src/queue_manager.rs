@@ -2141,15 +2141,20 @@ impl QueueManager {
         self.add_tx.subscribe()
     }
 
-    /// Per-server `(server_id, active, limit)` triples for the live NNTP
-    /// connection pool. `active` is by-construction `<= limit` because the
-    /// pool is semaphore-backed.
+    /// Per-server `(server_id, open_sockets, limit)` triples for the live
+    /// NNTP connection pool: sockets that are connected and authenticated,
+    /// busy or idle (WI-2081). This is what `/api/status.nntp_connections[].connected`
+    /// and the SABnzbd `fullstatus` `serveractiveconn` report. `open_sockets`
+    /// is `<= limit` by construction.
     pub fn connection_snapshot(&self) -> Vec<(String, usize, usize)> {
         self.dispatch.connection_snapshot()
     }
 
-    /// Per-server sockets actively transferring articles. Connected workers
-    /// waiting for work are reported as free capacity.
+    /// Per-server `(server_id, transferring, limit)` triples: sockets in the
+    /// middle of an article fetch at this instant. Open sockets waiting for
+    /// work are not counted here; see [`Self::connection_snapshot`] for
+    /// those. Despite the name this is the *activity* count, not the
+    /// connected count — `/api/status` exposes it as `active`.
     pub fn connected_snapshot(&self) -> Vec<(String, usize, usize)> {
         self.dispatch.active_connection_snapshot()
     }
