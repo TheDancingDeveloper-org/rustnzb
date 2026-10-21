@@ -35,7 +35,7 @@ use nzb_web::nzb_core::models::*;
 use nzb_web::nzb_core::nzb_parser;
 use nzb_web::nzb_core::sabnzbd_import;
 use nzb_web::nzb_core::schedule::{ScheduleRule, evaluate_config};
-use nzb_web::nzb_core::{HistoryFilter, HistorySummary};
+use nzb_web::nzb_core::{HistoryFilter, HistorySummary, HistoryWindowStats};
 use nzb_web::queue_manager::PauseReason;
 
 use nzb_web::HistoryRetryOutcome;
@@ -237,35 +237,37 @@ pub struct HistoryFailReason {
 }
 
 impl HistoryStats {
-    fn from_entries<'a>(entries: impl Iterator<Item = &'a HistorySummary>) -> Self {
-        let mut stats = Self::default();
-        let mut duration_total = 0.0;
+    /// Build the panel statistics from SQL aggregates plus the failed rows'
+    /// error text (most recent first).
+    ///
+    /// This is the same fold the panel used to perform over whole summaries,
+    /// but the counts, bytes and duration are already summed by SQLite over a
+    /// covering index, so the endpoint no longer loads every matching history
+    /// row to render them.
+    fn from_window_stats(
+        window: &HistoryWindowStats,
+        failure_messages: impl Iterator<Item = Option<String>>,
+    ) -> Self {
+        let mut stats = Self {
+            completed: window.completed as usize,
+            completed_bytes: window.completed_bytes,
+            failed: window.failed as usize,
+            ..Self::default()
+        };
         let mut reasons: Vec<HistoryFailReason> = Vec::new();
-        for e in entries {
-            match e.status {
-                JobStatus::Completed => {
-                    stats.completed += 1;
-                    stats.completed_bytes += e.total_bytes;
-                    duration_total +=
-                        (e.completed_at - e.added_at).num_milliseconds() as f64 / 1000.0;
-                }
-                JobStatus::Failed => {
-                    stats.failed += 1;
-                    // First clause of the message, as a short grouping key.
-                    let msg = e.error_message.as_deref().unwrap_or("unknown");
-                    let reason: String = msg
-                        .split(['.', ':'])
-                        .next()
-                        .unwrap_or_default()
-                        .chars()
-                        .take(32)
-                        .collect();
-                    match reasons.iter_mut().find(|r| r.reason == reason) {
-                        Some(r) => r.count += 1,
-                        None => reasons.push(HistoryFailReason { reason, count: 1 }),
-                    }
-                }
-                _ => {}
+        for message in failure_messages {
+            // First clause of the message, as a short grouping key.
+            let msg = message.as_deref().unwrap_or("unknown");
+            let reason: String = msg
+                .split(['.', ':'])
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(32)
+                .collect();
+            match reasons.iter_mut().find(|r| r.reason == reason) {
+                Some(r) => r.count += 1,
+                None => reasons.push(HistoryFailReason { reason, count: 1 }),
             }
         }
         let finished = stats.completed + stats.failed;
@@ -273,7 +275,8 @@ impl HistoryStats {
             stats.success_pct = ((stats.completed as f64 / finished as f64) * 100.0).round() as u32;
         }
         if stats.completed > 0 {
-            stats.avg_duration_secs = Some(duration_total / stats.completed as f64);
+            stats.avg_duration_secs =
+                Some(window.completed_duration_ms as f64 / 1000.0 / stats.completed as f64);
         }
         // Stable sort keeps first-seen order among equal counts.
         reasons.sort_by_key(|r| std::cmp::Reverse(r.count));
@@ -1143,7 +1146,10 @@ pub async fn h_history_list(
 
     let (entries, total, categories, stats) = db_blocking(&state, move |db| {
         let categories = db.history_categories()?;
-        let stats = HistoryStats::from_entries(db.history_summaries(&window)?.iter());
+        let stats = HistoryStats::from_window_stats(
+            &db.history_window_stats(&window)?,
+            db.history_failure_messages(&window)?.into_iter(),
+        );
         let (entries, total) = if unknown_status {
             (Vec::new(), 0)
         } else {

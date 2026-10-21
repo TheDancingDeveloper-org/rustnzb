@@ -725,6 +725,60 @@ impl Database {
             applied = 20;
         }
 
+        if version < 21 {
+            info!("Applying database migration v21: covering indexes for history aggregates");
+            // The history panel's statistics (completed/failed counts, bytes,
+            // duration and failure reasons) used to load every summary row
+            // just to fold it in Rust, which meant a cold read of the whole
+            // table. `history_window_stats` and `history_failure_messages`
+            // aggregate in SQLite instead, and these indexes let them, the
+            // category list and the paged count run without opening the table
+            // or walking any row's stored NZB blob.
+            //
+            // `idx_h_stats_cover` also serves the page and its count; the
+            // partial `idx_h_fail_cover` carries only the failed rows' error
+            // text. Its predicate must spell `COLLATE NOCASE`, because the
+            // query compares status case-insensitively and SQLite only uses a
+            // partial index whose term matches the query's collation.
+            //
+            // `idx_meta_trash` matters most: the anti-join that hides trashed
+            // rows probes `history_list_meta(trash, id)` on every stats,
+            // category and count query, and without it each probe walks the
+            // meta table.
+            //
+            // Each index is created only when its table and columns exist:
+            // migration tests build partial schemas to exercise older steps,
+            // and those must still reach the newest schema version.
+            create_index_if_columns(
+                &tx,
+                "history",
+                &["completed_at", "status", "total_bytes", "added_at", "id"],
+                "CREATE INDEX IF NOT EXISTS idx_h_stats_cover
+                    ON history(completed_at DESC, status, total_bytes, added_at, id);",
+            )?;
+            create_index_if_columns(
+                &tx,
+                "history",
+                &["category", "id"],
+                "CREATE INDEX IF NOT EXISTS idx_h_cat_cover ON history(category, id);",
+            )?;
+            create_index_if_columns(
+                &tx,
+                "history_list_meta",
+                &["trash", "id"],
+                "CREATE INDEX IF NOT EXISTS idx_meta_trash ON history_list_meta(trash, id);",
+            )?;
+            create_index_if_columns(
+                &tx,
+                "history",
+                &["completed_at", "error_message", "id", "status"],
+                "CREATE INDEX IF NOT EXISTS idx_h_fail_cover
+                    ON history(completed_at DESC, error_message, id)
+                    WHERE status = 'Failed' COLLATE NOCASE;",
+            )?;
+            applied = 21;
+        }
+
         if applied > version {
             stamp_schema_version(&tx, applied)?;
             tx.commit()?;
@@ -1268,10 +1322,17 @@ impl Database {
         limit: usize,
     ) -> Result<(Vec<HistoryEntry>, usize), NzbError> {
         let (where_sql, args) = filter.to_sql();
+        // Count with an anti-join, not the page's `LEFT JOIN`: the page still
+        // needs the meta columns, but the count only needs to know that no
+        // trashed row matched, and the anti-join lets it run entirely on the
+        // covering indexes.
         let total: i64 = self.conn.query_row(
             &format!(
-                "SELECT COUNT(*) FROM {HISTORY_LIST_FROM}{}",
-                with_condition(&where_sql, "COALESCE(m.trash, 0) = 0")
+                "SELECT COUNT(*) FROM history h{}",
+                with_condition(
+                    &where_sql,
+                    "h.id NOT IN (SELECT id FROM history_list_meta WHERE trash = 1)"
+                )
             ),
             rusqlite::params_from_iter(args.iter()),
             |row| row.get(0),
@@ -1292,12 +1353,15 @@ impl Database {
     }
 
     /// Distinct non-empty history categories, sorted.
+    ///
+    /// Trashed rows are excluded with an anti-join rather than the list
+    /// query's `LEFT JOIN` + `COALESCE(m.trash, 0) = 0`: the subquery only
+    /// ever yields rows whose `trash` is 1, so its ids are never NULL and
+    /// `NOT IN` and the `COALESCE` test select the same rows. Either way the
+    /// plan can read `idx_h_cat_cover` and probe `idx_meta_trash` without
+    /// opening the `history` table.
     pub fn history_categories(&self) -> Result<Vec<String>, NzbError> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT DISTINCT h.category FROM {HISTORY_LIST_FROM}
-             WHERE COALESCE(m.trash, 0) = 0 AND h.category <> ''
-             ORDER BY h.category"
-        ))?;
+        let mut stmt = self.conn.prepare(&history_categories_sql())?;
         let categories = stmt
             .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1335,6 +1399,53 @@ impl Database {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Completed/failed counts, completed bytes and completed duration over
+    /// every history row matching `filter`.
+    ///
+    /// The history panel's statistics used to be folded in Rust from
+    /// [`Self::history_summaries`], which reads a summary row (including its
+    /// error text) for every entry in the window. The same fold runs here as
+    /// one aggregate over `idx_h_stats_cover`, so a cold panel load touches a
+    /// narrow index instead of the table.
+    pub fn history_window_stats(
+        &self,
+        filter: &HistoryFilter,
+    ) -> Result<HistoryWindowStats, NzbError> {
+        let (where_sql, args) = filter.to_sql();
+        let sql = history_window_stats_sql(&where_sql);
+        let stats = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                Ok(HistoryWindowStats {
+                    completed: row.get::<_, i64>(0)? as u64,
+                    completed_bytes: row.get::<_, i64>(1)? as u64,
+                    completed_duration_ms: row.get(2)?,
+                    failed: row.get::<_, i64>(3)? as u64,
+                })
+            })?;
+        Ok(stats)
+    }
+
+    /// Error text of every failed row matching `filter`, most recent first.
+    ///
+    /// Only the failure reasons need the text, so this reads the partial
+    /// `idx_h_fail_cover` index instead of the summary columns. The index is
+    /// named explicitly because the planner would otherwise prefer the
+    /// completed-at index when a days window narrows the scan, and then walk
+    /// the table for each row's error message.
+    pub fn history_failure_messages(
+        &self,
+        filter: &HistoryFilter,
+    ) -> Result<Vec<Option<String>>, NzbError> {
+        let (where_sql, args) = filter.to_sql();
+        let sql = history_failure_messages_sql(&where_sql);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let messages = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(messages)
     }
 
     /// List-shaped history entries for `ids`, in the order given. Unknown ids
@@ -2088,6 +2199,69 @@ pub struct HistorySummary {
     pub error_message: Option<String>,
 }
 
+/// The aggregate half of the history panel's statistics: completed count,
+/// completed bytes, completed duration and failed count.
+///
+/// Kept beside [`HISTORY_LIST_FROM`]'s query helpers so the query-plan test
+/// asserts on the SQL the endpoint actually runs.
+fn history_window_stats_sql(where_sql: &str) -> String {
+    format!(
+        "SELECT
+            COALESCE(SUM(CASE WHEN h.status = 'Completed' COLLATE NOCASE
+                              THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN h.status = 'Completed' COLLATE NOCASE
+                              THEN h.total_bytes ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN h.status = 'Completed' COLLATE NOCASE
+                              THEN CAST(ROUND((julianday(h.completed_at)
+                                               - julianday(h.added_at)) * 86400000.0)
+                                        AS INTEGER)
+                              ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN h.status = 'Failed' COLLATE NOCASE
+                              THEN 1 ELSE 0 END), 0)
+         FROM history h{}",
+        with_condition(
+            where_sql,
+            "h.id NOT IN (SELECT id FROM history_list_meta WHERE trash = 1)"
+        )
+    )
+}
+
+/// Error text of the failed rows matching the same filter, newest first.
+fn history_failure_messages_sql(where_sql: &str) -> String {
+    format!(
+        "SELECT h.error_message FROM history h INDEXED BY idx_h_fail_cover{}
+         ORDER BY h.completed_at DESC",
+        with_condition(
+            &with_condition(where_sql, "h.status = 'Failed' COLLATE NOCASE"),
+            "h.id NOT IN (SELECT id FROM history_list_meta WHERE trash = 1)"
+        )
+    )
+}
+
+/// The distinct non-empty categories of the untrashed rows, in name order.
+fn history_categories_sql() -> String {
+    "SELECT DISTINCT h.category FROM history h
+     WHERE h.id NOT IN (SELECT id FROM history_list_meta WHERE trash = 1)
+       AND h.category <> ''
+     ORDER BY h.category"
+        .to_string()
+}
+
+/// The history panel's aggregates over a time window, computed in SQL.
+///
+/// `completed_duration_ms` is the sum of each completed row's
+/// `(completed_at - added_at)` in whole milliseconds. SQLite derives it from
+/// `julianday`, whose double precision is finer than a millisecond, and rounds
+/// to the nearest one, so the totals match the Rust fold's `num_milliseconds()`
+/// except where a row's duration has a sub-millisecond remainder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryWindowStats {
+    pub completed: u64,
+    pub completed_bytes: u64,
+    pub completed_duration_ms: i64,
+    pub failed: u64,
+}
+
 fn parse_status(s: &str) -> JobStatus {
     match s.to_lowercase().as_str() {
         "queued" => JobStatus::Queued,
@@ -2167,6 +2341,35 @@ fn add_column_if_missing(
         ))?;
     }
 
+    Ok(())
+}
+
+/// Run `definition` to create an index only when `table` exists and carries
+/// every column it indexes.
+///
+/// Migration tests build partial schemas to reach an older version, so a
+/// later step must not assume the full table shape. An index over a column a
+/// partial schema lacks is skipped, exactly as `add_column_if_missing` would
+/// leave the column absent.
+fn create_index_if_columns(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    columns: &[&str],
+    definition: &str,
+) -> Result<(), NzbError> {
+    for column in columns {
+        let exists: bool = tx
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info(?) WHERE name = ?",
+                [table, column],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            return Ok(());
+        }
+    }
+    tx.execute_batch(definition)?;
     Ok(())
 }
 
@@ -3075,7 +3278,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert!(version >= 20, "schema should reach v20, got {version}");
+        assert!(version >= 21, "schema should reach v21, got {version}");
 
         // Every migration's objects are present, which is only true if the
         // single batch ran to the end before stamping the version.
@@ -3428,6 +3631,238 @@ mod tests {
             assert_eq!(summaries, want, "{filter:?}");
         }
         assert_eq!(db.history_categories().unwrap(), vec!["movies", "tv"]);
+    }
+
+    /// The panel's statistics now come from SQL aggregates plus the failed
+    /// rows' error text. They must equal the fold the endpoint used to run
+    /// over whole summaries, for every filter the panel sends: the unfiltered
+    /// window, a days window, a status filter and a category+search filter.
+    #[test]
+    fn history_window_stats_match_the_fold_over_summaries() {
+        let (db, all) = seeded_history_db();
+        let now = Utc::now();
+        let filters = [
+            HistoryFilter::default(),
+            HistoryFilter {
+                completed_since: Some(now - chrono::Duration::days(3)),
+                ..Default::default()
+            },
+            HistoryFilter {
+                status: Some(JobStatus::Failed),
+                ..Default::default()
+            },
+            HistoryFilter {
+                completed_since: Some(now - chrono::Duration::days(7)),
+                status: Some(JobStatus::Completed),
+                category: Some("movies".into()),
+                search: Some("MOVIE".into()),
+            },
+        ];
+        for filter in &filters {
+            let in_window: Vec<&HistoryEntry> = all
+                .iter()
+                .filter(|e| filter.completed_since.is_none_or(|c| e.completed_at >= c))
+                .filter(|e| filter.status.is_none_or(|s| e.status == s))
+                .filter(|e| filter.category.as_ref().is_none_or(|c| &e.category == c))
+                .filter(|e| {
+                    filter
+                        .search
+                        .as_ref()
+                        .is_none_or(|s| e.name.to_lowercase().contains(&s.to_lowercase()))
+                })
+                .collect();
+
+            let completed: Vec<&&HistoryEntry> = in_window
+                .iter()
+                .filter(|e| e.status == JobStatus::Completed)
+                .collect();
+            let expected = HistoryWindowStats {
+                completed: completed.len() as u64,
+                completed_bytes: completed.iter().map(|e| e.total_bytes).sum(),
+                completed_duration_ms: completed
+                    .iter()
+                    .map(|e| (e.completed_at - e.added_at).num_milliseconds())
+                    .sum(),
+                failed: in_window
+                    .iter()
+                    .filter(|e| e.status == JobStatus::Failed)
+                    .count() as u64,
+            };
+            assert_eq!(
+                db.history_window_stats(filter).unwrap(),
+                expected,
+                "{filter:?}"
+            );
+
+            // Failure reasons are grouped from the messages, newest first.
+            let want_messages: Vec<Option<String>> = {
+                let mut failed: Vec<&&HistoryEntry> = in_window
+                    .iter()
+                    .filter(|e| e.status == JobStatus::Failed)
+                    .collect();
+                failed.sort_by_key(|e| std::cmp::Reverse(e.completed_at));
+                failed.iter().map(|e| e.error_message.clone()).collect()
+            };
+            assert_eq!(
+                db.history_failure_messages(filter).unwrap(),
+                want_messages,
+                "{filter:?}"
+            );
+        }
+    }
+
+    /// Reason text that differs only after the first clause must group the way
+    /// the old Rust fold grouped it: split on the first `.` or `:`, keep 32
+    /// chars, and treat a missing message as `unknown`.
+    #[test]
+    fn history_window_stats_aggregate_edge_case_statuses_and_messages() {
+        let db = Database::open_memory().unwrap();
+        let now = Utc::now();
+        let cases: [(&str, JobStatus, Option<&str>); 5] = [
+            ("a", JobStatus::Completed, None),
+            ("b", JobStatus::Completed, None),
+            ("c", JobStatus::Failed, Some("CRC mismatch: volume 2")),
+            ("d", JobStatus::Failed, Some("CRC mismatch. volume 3")),
+            ("e", JobStatus::Failed, None),
+        ];
+        for (i, (id, status, message)) in cases.iter().enumerate() {
+            let mut entry = make_history(id, id);
+            entry.status = *status;
+            if *status == JobStatus::Failed {
+                entry.failure_code = Some(JobFailureCode::ArchiveInvalid);
+            }
+            entry.total_bytes = 1_000;
+            entry.completed_at = now - chrono::Duration::minutes(i as i64);
+            entry.added_at = entry.completed_at - chrono::Duration::seconds(30);
+            entry.error_message = message.map(str::to_owned);
+            db.history_insert(&entry).unwrap();
+        }
+
+        let stats = db.history_window_stats(&HistoryFilter::default()).unwrap();
+        assert_eq!(
+            stats,
+            HistoryWindowStats {
+                completed: 2,
+                completed_bytes: 2_000,
+                completed_duration_ms: 60_000,
+                failed: 3,
+            }
+        );
+        // Newest first, and a NULL message survives as NULL so the caller can
+        // render its `unknown` fallback.
+        assert_eq!(
+            db.history_failure_messages(&HistoryFilter::default())
+                .unwrap(),
+            vec![
+                Some("CRC mismatch: volume 2".into()),
+                Some("CRC mismatch. volume 3".into()),
+                None,
+            ]
+        );
+
+        // A trashed row is in neither aggregate nor the message list.
+        db.history_trash(&["c".to_string()], now + chrono::Duration::seconds(5))
+            .unwrap();
+        let stats = db.history_window_stats(&HistoryFilter::default()).unwrap();
+        assert_eq!((stats.completed, stats.failed), (2, 2));
+        assert_eq!(
+            db.history_failure_messages(&HistoryFilter::default())
+                .unwrap(),
+            vec![Some("CRC mismatch. volume 3".into()), None]
+        );
+    }
+
+    /// The history panel's aggregates, category list and page count must all
+    /// run off an index and never `SCAN history`, so a cold load neither
+    /// walks the wide table nor reaches its overflow pages, where the stored
+    /// NZB blobs live. The panel sends two windows: the whole history (the
+    /// aggregates and page) and a days window.
+    ///
+    /// The category list is deliberately unfiltered — the panel offers every
+    /// category in the history — and a days filter on it would have no index
+    /// to scan in date order, so it is asserted once, outside the window loop.
+    #[test]
+    fn history_panel_aggregates_use_covering_indexes() {
+        let (db, _) = seeded_history_db();
+        let filters = [
+            HistoryFilter::default(),
+            HistoryFilter {
+                completed_since: Some(Utc::now() - chrono::Duration::days(3)),
+                ..Default::default()
+            },
+        ];
+        for filter in &filters {
+            let (where_sql, args) = filter.to_sql();
+            // Without a date bound the count is answered by the implicit
+            // unique index on `history.id`; a days window narrows it through
+            // the statistics' covering index instead.
+            let count_index = if filter.completed_since.is_some() {
+                "idx_h_stats_cover"
+            } else {
+                "sqlite_autoindex_history_1"
+            };
+            let statements = [
+                (
+                    "window stats",
+                    history_window_stats_sql(&where_sql),
+                    "idx_h_stats_cover",
+                ),
+                (
+                    "failure messages",
+                    history_failure_messages_sql(&where_sql),
+                    "idx_h_fail_cover",
+                ),
+                (
+                    "page count",
+                    format!(
+                        "SELECT COUNT(*) FROM history h{}",
+                        with_condition(
+                            &where_sql,
+                            "h.id NOT IN (SELECT id FROM history_list_meta WHERE trash = 1)"
+                        )
+                    ),
+                    count_index,
+                ),
+            ];
+            for (label, sql, index) in &statements {
+                let mut stmt = db
+                    .conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap();
+                let bound: Vec<&dyn rusqlite::ToSql> =
+                    args.iter().map(|a| a as &dyn rusqlite::ToSql).collect();
+                let plan: Vec<String> = stmt
+                    .query_map(rusqlite::params_from_iter(bound), |row| row.get(3))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                let plan = plan.join("\n");
+                assert!(
+                    !plan.contains("SCAN history"),
+                    "{label} scans the history table: {sql}\n{plan}"
+                );
+                assert!(
+                    plan.contains(&format!("USING INDEX {index}"))
+                        || plan.contains(&format!("USING COVERING INDEX {index}")),
+                    "{label} does not use {index}: {sql}\n{plan}"
+                );
+            }
+        }
+
+        let mut stmt = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", history_categories_sql()))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("USING COVERING INDEX idx_h_cat_cover"),
+            "categories do not use idx_h_cat_cover\n{plan}"
+        );
     }
 
     #[test]

@@ -45,6 +45,9 @@ also carries generated release notes with the merged pull requests.
 - **http:** Compress API and SPA responses, and leave detail-only fields out of
   history list rows (a 50-row history page drops from 67 KB to 5.2 KB on the
   wire)
+- **history:** Aggregate the panel's statistics, categories and page count in
+  SQLite over covering indexes (a cold all-time load drops from ~380 ms to
+  ~20 ms; a 7-day failure-reason scan from ~32 ms to ~3 ms)
 
 ## [1.7.0-beta.1] - 2026-10-18
 
