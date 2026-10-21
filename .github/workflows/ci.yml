@@ -103,7 +103,6 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: [self-hosted, Linux, X64, tailnet]
     env:
-      CARGO_BUILD_JOBS: 1
       CARGO_INCREMENTAL: 0
       # Restore the cache on every run, but only save it from the queue and
       # manual runs. A PR run is untrusted input; letting it write the shared
