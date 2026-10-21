@@ -130,12 +130,59 @@ describe('HistoryViewComponent', () => {
   });
 
   function historyCalls() {
-    return api.get.mock.calls.filter(([path]) => path === '/history');
+    // List requests only, not the one-row 7-day stats request.
+    return api.get.mock.calls.filter(([path, params]) => path === '/history' && params?.['limit'] !== '1');
   }
 
-  it('requests one page with the default 7-day window', () => {
+  it('lists all history by default and keeps the stat cards on a 7-day window', () => {
+    api.get.mockImplementation((path: string, params?: Record<string, string>) =>
+      of(path !== '/history'
+        ? {}
+        : params?.['days'] === '7'
+          ? { entries: [entry()], total: 3, stats: { completed: 3, failed: 0 } }
+          : { entries: [entry()], total: 1729, stats: { completed: 1700, failed: 29 } }),
+    );
     component.load();
-    expect(api.get).toHaveBeenCalledWith('/history', { offset: '0', limit: '50', days: '7' });
+    expect(api.get).toHaveBeenCalledWith('/history', { offset: '0', limit: '50' });
+    expect(api.get).toHaveBeenCalledWith('/history', { offset: '0', limit: '1', days: '7' });
+    expect(component.total()).toBe(1729);
+    expect(component.rangeLabel()).toBe('1–50 of 1729');
+    expect(component.hasActiveFilters()).toBe(false);
+    expect(component.statCards()).toMatchObject({ windowLabel: '7 days', completed: 3, failed: 0 });
+  });
+
+  it('uses the list response for the stat cards when a time window is picked', () => {
+    component.filterTime = '30d';
+    api.get.mockImplementation((path: string) =>
+      of(path === '/history' ? { entries: [entry()], total: 40, stats: { completed: 40, failed: 0 } } : {}),
+    );
+    component.onFiltersChanged();
+    expect(historyCalls()).toHaveLength(1);
+    expect(api.get).not.toHaveBeenCalledWith('/history', expect.objectContaining({ limit: '1' }));
+    expect(component.statCards()).toMatchObject({ windowLabel: '30 days', completed: 40 });
+    expect(component.hasActiveFilters()).toBe(true);
+  });
+
+  it('reports each active filter and clears every filter on reset', () => {
+    for (const set of [
+      () => (component.filterTime = '7d'),
+      () => (component.filterStatus = 'failed'),
+      () => (component.filterCategory = 'tv'),
+      () => (component.nameFilter = 'x'),
+    ]) {
+      component.resetFilters();
+      expect(component.hasActiveFilters()).toBe(false);
+      set();
+      expect(component.hasActiveFilters()).toBe(true);
+    }
+    component.filterTime = '30d';
+    component.filterStatus = 'completed';
+    component.offset.set(50);
+    api.get.mockClear();
+    component.resetFilters();
+    expect(component.hasActiveFilters()).toBe(false);
+    expect(component.offset()).toBe(0);
+    expect(api.get).toHaveBeenCalledWith('/history', { offset: '0', limit: '50' });
   });
 
   it('sends name, status, category, and time filters to the server and resets to page one', () => {
