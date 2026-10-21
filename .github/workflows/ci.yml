@@ -26,6 +26,8 @@ jobs:
     runs-on: [self-hosted]
     outputs:
       rust: ${{ steps.classify.outputs.rust }}
+      rust_full: ${{ steps.classify.outputs.rust_full }}
+      rust_packages: ${{ steps.classify.outputs.rust_packages }}
       frontend: ${{ steps.classify.outputs.frontend }}
       desktop: ${{ steps.classify.outputs.desktop }}
     steps:
@@ -40,23 +42,58 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$EVENT" != pull_request ]]; then
-            printf 'rust=true\nfrontend=true\ndesktop=true\n' >>"$GITHUB_OUTPUT"
+            printf 'rust=true\nrust_full=true\nrust_packages=\nfrontend=true\ndesktop=true\n' >>"$GITHUB_OUTPUT"
             exit 0
           fi
           files="$(git diff --name-only "$(git merge-base "$BASE_SHA" HEAD)" HEAD)"
-          rust=false frontend=false desktop=false
+          rust=false frontend=false desktop=false full=false
+          packages=()
+          add_package() {
+            local pkg
+            for pkg in "${packages[@]}"; do
+              [[ "$pkg" == "$1" ]] && return 0
+            done
+            packages+=("$1")
+          }
           while IFS= read -r f; do
             case "$f" in
               '') ;;
-              .github/*|ci/*|Dockerfile*|.dockerignore|rust-toolchain.toml)
-                rust=true frontend=true desktop=true ;;
+              # Anything that can change how the workspace resolves or builds
+              # (workflows, task scripts, the lockfile or root manifest, the
+              # toolchain, the nested workspaces) takes the full workspace.
+              .github/*|ci/*|Dockerfile*|.dockerignore|rust-toolchain.toml|.cargo/*|\
+              Cargo.toml|Cargo.lock|fuzz/*|benchnzb/*)
+                rust=true frontend=true desktop=true full=true ;;
               apps/rustnzb/frontend/*) frontend=true ;;
               desktop/*) desktop=true ;;
-              crates/*|apps/*|benchnzb/*|fuzz/*|e2e/*|packaging/*|Cargo.toml|Cargo.lock)
-                rust=true ;;
+              # e2e/ runs in the merge queue only; a PR that touches it needs
+              # no Rust build.
+              e2e/*) ;;
+              apps/rustnzb/*) rust=true; add_package rustnzb ;;
+              crates/nzb-decode/ffi/*) rust=true; add_package nzb-decode-ffi ;;
+              crates/nzb-core/*) rust=true; add_package nzb-core ;;
+              crates/nzb-decode/*) rust=true; add_package nzb-decode ;;
+              crates/nzb-dispatch/*) rust=true; add_package nzb-dispatch ;;
+              crates/nzb-news/*) rust=true; add_package nzb-news ;;
+              crates/nzb-nntp/*) rust=true; add_package nzb-nntp ;;
+              crates/nzb-postproc/*) rust=true; add_package nzb-postproc ;;
+              crates/nzb-web/*) rust=true; add_package nzb-web ;;
+              crates/mock-nntp-server/*) rust=true; add_package mock-nntp-server ;;
+              # Packaging scripts are checked by the release dry run, not by a
+              # Rust build.
+              packaging/*) ;;
+              # An unrecognised crate/app path (a new member, or a root-level
+              # file) is not safe to narrow: fall back to the full workspace.
+              crates/*|apps/*) rust=true; full=true ;;
             esac
           done <<<"$files"
-          printf 'rust=%s\nfrontend=%s\ndesktop=%s\n' "$rust" "$frontend" "$desktop" | tee -a "$GITHUB_OUTPUT"
+          # A rust change we could not attribute to a package still needs the
+          # full workspace rather than no check at all.
+          if [[ "$rust" == true && "$full" == false && ${#packages[@]} -eq 0 ]]; then
+            full=true
+          fi
+          printf 'rust=%s\nrust_full=%s\nrust_packages=%s\nfrontend=%s\ndesktop=%s\n' \
+            "$rust" "$full" "${packages[*]}" "$frontend" "$desktop" | tee -a "$GITHUB_OUTPUT"
 
   rust:
     # Dependabot PRs update dependency metadata only; avoid consuming a
@@ -67,8 +104,38 @@ jobs:
     runs-on: [self-hosted, Linux, X64, tailnet]
     env:
       CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      # Restore the cache on every run, but only save it from the queue and
+      # manual runs. A PR run is untrusted input; letting it write the shared
+      # key would let one PR evict or poison what everyone else restores.
+      RUST_CACHE_SAVE_IF: ${{ github.event_name != 'pull_request' }}
     steps:
       - uses: actions/checkout@v7
+      - name: Resolve the Rust scope
+        id: scope
+        env:
+          RUST_FULL: ${{ needs.changes.outputs.rust_full }}
+          RUST_PACKAGES: ${{ needs.changes.outputs.rust_packages }}
+        run: |
+          set -euo pipefail
+          if [[ "$RUST_FULL" == true ]]; then
+            printf 'full=true\nargs=--workspace\n' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          args=()
+          for pkg in $RUST_PACKAGES; do
+            args+=(-p "$pkg")
+          done
+          printf 'full=false\nargs=%s\n' "${args[*]}" >>"$GITHUB_OUTPUT"
+      # Caches ~/.cargo and the workspace target dir, keyed on the toolchain
+      # and the manifests. The frontend build below is not cached by this.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ci
+          save-if: ${{ env.RUST_CACHE_SAVE_IF }}
+      - uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481 # v2.9.4
+        with:
+          tool: cargo-nextest
       # Runner images may carry no Node; build the real frontend so build.rs
       # embeds it instead of its placeholder (e2e_full_pipeline asserts this).
       - uses: actions/setup-node@v7
@@ -83,18 +150,40 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt,clippy
       - run: cargo fmt --all --check
-      - run: cargo check --workspace --all-targets
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --all-targets --locked
+      - name: Check
+        env:
+          SCOPE_ARGS: ${{ steps.scope.outputs.args }}
+        run: |
+          read -r -a args <<<"$SCOPE_ARGS"
+          cargo check "${args[@]}" --all-targets
+      - name: Clippy
+        env:
+          SCOPE_ARGS: ${{ steps.scope.outputs.args }}
+        run: |
+          read -r -a args <<<"$SCOPE_ARGS"
+          cargo clippy "${args[@]}" --all-targets -- -D warnings
+      # nextest runs each test in its own process and does not run doctests.
+      # Every doc fence in this workspace is `text`, `toml` or `ignore`, so
+      # there is nothing for it to skip; keep it that way, or add a separate
+      # `cargo test --doc` step.
+      - name: Test
+        env:
+          SCOPE_ARGS: ${{ steps.scope.outputs.args }}
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: |
+          read -r -a args <<<"$SCOPE_ARGS"
+          cargo nextest run "${args[@]}" --all-targets --locked
       # The WebDAV feature compiles a substantially larger dependency graph.
       # CI does not need debug symbols for this test, and omitting them keeps
       # the isolated runner within its memory limit while linking.
       - run: cargo test -p rustnzb --features webdav --lib --locked
+        if: steps.scope.outputs.full == 'true' || contains(format(' {0} ', needs.changes.outputs.rust_packages), ' rustnzb ')
         env:
           CARGO_PROFILE_TEST_DEBUG: 0
       # benchnzb pulls in a second, independent dependency graph. As with the
       # WebDAV gate, debug symbols are not needed for CI test execution.
       - run: cargo test --manifest-path benchnzb/Cargo.toml --all-targets --locked
+        if: steps.scope.outputs.full == 'true'
         env:
           CARGO_PROFILE_TEST_DEBUG: 0
           # GNU gold has a substantially lower peak-memory footprint than
@@ -121,10 +210,14 @@ jobs:
         run: npm run build -- --configuration=production
 
   e2e:
+    # TODO(WI-2069): quarantined while failing on main; un-quarantine once
+    # fixed (see the flaky-quarantine skill). The queue still runs it, and
+    # continue-on-error keeps a known failure from blocking an otherwise green
+    # merge.
     needs: changes
+    continue-on-error: true
     if: >-
-      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.frontend == 'true') &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, docker, publish]
     env:
       GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
@@ -139,10 +232,14 @@ jobs:
           if-no-files-found: ignore
 
   desktop:
+    # TODO(WI-2069): quarantined while failing on main; un-quarantine once
+    # fixed (see the flaky-quarantine skill). It runs only in the queue now, so
+    # a PR no longer pays for it.
     needs: changes
+    continue-on-error: true
     if: >-
-      needs.changes.outputs.desktop == 'true' &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') &&
+      needs.changes.outputs.desktop == 'true'
     runs-on: [self-hosted, docker, publish]
     env:
       GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}

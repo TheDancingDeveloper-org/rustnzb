@@ -81,4 +81,37 @@ body. Do not present unverified AI output as tested or production-ready.
   coverage in the pull request.
 - Do not include credentials, generated build output, or `node_modules`.
 
+## How changes land
+
+Every pull request runs two required checks, `policy` and `rust`. They are
+small on purpose: the merge queue is where the full suite runs.
+
+- **Targeted checks on a pull request.** The `rust` check builds, lints and
+  tests the crates your diff touches, with a shared build cache and
+  `cargo-nextest`. A change to the lockfile, the root `Cargo.toml`, the
+  toolchain, `ci/`, `.github/` or the nested workspaces falls back to the full
+  workspace. Run the same commands locally before you push; see
+  [docs/ci.md](docs/ci.md) for the path-to-crate mapping.
+- **The queue proves the exact tree.** `merge_group` runs the full workspace,
+  the frontend, `container-smoke`, and the quarantined `e2e` and `desktop`
+  jobs. `e2e` and `desktop` do not run on pull requests, so a PR no longer
+  pays for them.
+- **No run on push to `main`.** A queue entry lands the tree its `merge_group`
+  run already tested, so nothing repeats the suite after the merge.
+- **The app version bumps at release, not in feature PRs.** The
+  `[workspace.package]` version in the root `Cargo.toml` is the version the
+  shipped binary and the release tag use. `ci/check-version.sh` runs only when
+  a release tag is cut, and nothing gates a feature PR on it: do not bump the
+  workspace version, and do not rebase to resolve version numbers, as part of
+  an ordinary change. A crate that publishes on its own (`crates/nzb-*`) still
+  bumps its own version in its own `Cargo.toml` when its public API changes —
+  that is a per-crate fact, not a release version. Release PRs bump versions
+  only; they do not carry feature work.
+- **Release changes get a dry run.** A PR that touches
+  `.github/workflows/release*.yml`, `ci/tasks/**`, `packaging/**` or
+  `installer/**`, and a nightly run on `main`, builds the release artefacts
+  without publishing, signing or creating a release
+  (`.github/workflows/release-dry-run.yml`). A release tag therefore should
+  not be the first time the packaging path runs.
+
 By contributing, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).

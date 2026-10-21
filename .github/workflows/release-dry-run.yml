@@ -1,0 +1,104 @@
+name: Release dry run
+
+# Exercise the packaging path that `release.yml` runs on a tag, without
+# publishing anything: no image push, no signing, no attestations, no release.
+# This exists so a release tag is not the first time the build sees a change to
+# the release tooling (WI-2069). `ci.yml` treats a `packaging/` change the same
+# way: it is exercised here rather than by a Rust build.
+#
+# The build steps, the CROSS_IMAGE digest and the artefact names must stay in
+# step with the `release-assets` job in `.github/workflows/release.yml`.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release*.yml'
+      - 'ci/tasks/**'
+      - 'packaging/**'
+      - 'installer/**'
+  schedule:
+    # Nightly against the default branch, so breakage that no PR touched still
+    # surfaces before a release.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustnzb-release-dry-run-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dry-run:
+    # The build authenticates to repo.indexarr.net with FORGEJO_CARGO_TOKEN.
+    # A fork's PR run does not receive secrets, so it cannot run this job.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, docker, publish]
+    timeout-minutes: 120
+    env:
+      CROSS_IMAGE: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:d747454fca94ebfd9dba1f566d9f549c4c9fbedf785c6aba36a0c383d9b9a955
+    steps:
+      - uses: actions/checkout@v7
+      - name: Derive the tag the release would use
+        id: tag
+        run: |
+          set -euo pipefail
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -n1)
+          test -n "$version"
+          printf 'tag=v%s\n' "$version" >>"$GITHUB_OUTPUT"
+          printf 'dry run for v%s\n' "$version"
+      - name: Build Linux, arm64, Windows, and package artifacts
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GIT_AUTH_TOKEN" | docker login repo.indexarr.net --username x-access-token --password-stdin >/dev/null
+          container="rustnzb-release-dry-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker create --name "$container" -w /workspace \
+            -e GIT_AUTH_TOKEN -e CI_COMMIT_SHA="$GITHUB_SHA" \
+            -e CI_COMMIT_TAG="$TAG" -e CI_PIPELINE_NUMBER="$GITHUB_RUN_ID" \
+            "$CROSS_IMAGE" sh -ec '
+              ci/tasks/frontend-build
+              ci/tasks/build-linux
+              ci/tasks/build-linux-arm64
+              ci/tasks/build-windows
+              ci/tasks/package-release
+            ' >/dev/null
+          docker cp . "$container:/workspace"
+          docker start -a "$container"
+          mkdir -p .ci-output/packages
+          docker cp "$container:/workspace/.ci-output/packages/." .ci-output/packages/
+          (cd .ci-output/packages && sha256sum -c "SHA256SUMS-${TAG}.txt")
+      - name: Build Linux AppImages from the release tarballs
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -eu
+          packaging/appimage/build-appimage.sh "$TAG" --assets-dir .ci-output/packages
+          (cd .ci-output/packages && sha256sum rustnzb-* >"SHA256SUMS-${TAG}.txt" \
+            && sha256sum -c "SHA256SUMS-${TAG}.txt")
+      - name: Verify the audit section reached the shipped binaries
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -eu
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          for arch in x86_64 aarch64; do
+            tar -xzf ".ci-output/packages/rustnzb-${TAG}-linux-${arch}.tar.gz" \
+              -C "$work" "rustnzb-${TAG}/rustnzb"
+            objdump -h "$work/rustnzb-${TAG}/rustnzb" | grep -q '\.dep-v0'
+            printf 'audit: linux-%s carries .dep-v0\n' "$arch"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustnzb-${{ steps.tag.outputs.tag }}-release-dry-run-${{ github.sha }}
+          path: .ci-output/packages/*
+          if-no-files-found: error
+          retention-days: 7
