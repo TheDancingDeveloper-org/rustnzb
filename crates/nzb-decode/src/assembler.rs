@@ -14,10 +14,14 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 use std::path::PathBuf;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use parking_lot::RwLock;
+#[cfg(any(test, feature = "test-support"))]
+use parking_lot::{Condvar, Mutex};
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -47,6 +51,68 @@ pub enum AssemblerError {
 }
 
 pub type AssemblerResult<T> = std::result::Result<T, AssemblerError>;
+
+/// A gate a test can hold closed to stall positional writes.
+///
+/// Open on creation: a write passes straight through unless the test calls
+/// [`WriteStall::hold`] first. It is deliberately narrow, because the point of
+/// the seam is to make writes stall while the rest of the process keeps
+/// running; [`WriteStall::release`] then lets them finish normally.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct WriteStall {
+    open: Mutex<bool>,
+    changed: Condvar,
+    stalled: AtomicU32,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl WriteStall {
+    /// Create an open gate: writes pass through.
+    pub fn new() -> Self {
+        Self {
+            open: Mutex::new(true),
+            changed: Condvar::new(),
+            stalled: AtomicU32::new(0),
+        }
+    }
+
+    /// How many writes are blocked in `wait` right now.
+    pub fn stalled_writes(&self) -> u32 {
+        self.stalled.load(Ordering::SeqCst)
+    }
+
+    /// Close the gate. Writes that arrive from now on block in `wait`.
+    pub fn hold(&self) {
+        *self.open.lock() = false;
+    }
+
+    /// Open the gate and wake every stalled write.
+    pub fn release(&self) {
+        *self.open.lock() = true;
+        self.changed.notify_all();
+    }
+
+    /// Block while the gate is closed.
+    pub fn wait(&self) {
+        let mut open = self.open.lock();
+        if *open {
+            return;
+        }
+        self.stalled.fetch_add(1, Ordering::SeqCst);
+        while !*open {
+            self.changed.wait(&mut open);
+        }
+        self.stalled.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for WriteStall {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// The arguments of one file registration, grouped so the registration
 /// function stays under clippy's argument cap.
@@ -195,6 +261,11 @@ struct FileKey {
 pub struct FileAssembler {
     /// Per-file state, behind a RwLock for safe concurrent registration and lookup.
     files: RwLock<HashMap<FileKey, FileState>>,
+    /// Test-only stall applied before each positional write, so a test can
+    /// hold a write in flight and observe what the rest of the process does.
+    /// Absent unless the `test-support` feature is on.
+    #[cfg(any(test, feature = "test-support"))]
+    write_stall: RwLock<Option<Arc<WriteStall>>>,
 }
 
 impl FileAssembler {
@@ -202,7 +273,20 @@ impl FileAssembler {
     pub fn new() -> Self {
         Self {
             files: RwLock::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            write_stall: RwLock::new(None),
         }
+    }
+
+    /// Stall every positional write until `gate` is released.
+    ///
+    /// Test support only (behind the `test-support` feature): it exists so a
+    /// test can reproduce a disk writeback stall at line rate without needing
+    /// a slow disk, and assert that a stalled write does not block unrelated
+    /// work. Calling it again replaces the gate.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stall_writes(&self, gate: Arc<WriteStall>) {
+        *self.write_stall.write() = Some(gate);
     }
 
     /// Register a file for assembly.
@@ -352,6 +436,9 @@ impl FileAssembler {
         data_begin: u64,
         data: &[u8],
     ) -> AssemblerResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let stall = self.write_stall.read().clone();
+
         let key = FileKey {
             job_id: job_id.to_string(),
             file_id: file_id.to_string(),
@@ -396,6 +483,10 @@ impl FileAssembler {
         }
 
         // pwrite: write at offset without seeking — concurrent-safe on the same fd.
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(gate) = stall {
+            gate.wait();
+        }
         let io_start = Instant::now();
         #[cfg(unix)]
         state.file.write_all_at(data, data_begin)?;

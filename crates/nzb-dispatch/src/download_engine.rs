@@ -4143,6 +4143,110 @@ mod tests {
         assert_eq!(buffer, b"not yenc");
     }
 
+    /// WI-1847: a stalled write must not starve the async runtime.
+    ///
+    /// At line rate the assembler's positional write sits in disk writeback for
+    /// tens of milliseconds. When that write ran inline on a tokio worker, the
+    /// HTTP handlers sharing the worker pool stopped being scheduled, and API
+    /// latency climbed with download speed. This holds several writes stalled at
+    /// once — more than the runtime has worker threads — and asserts unrelated
+    /// async work still makes progress, then that the writes finish correctly
+    /// once the disk recovers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_file_writes_do_not_block_the_async_runtime() {
+        const STALLED_WRITES: usize = 4;
+
+        let temp = tempfile::tempdir().unwrap();
+        let assembler = Arc::new(FileAssembler::new());
+        let gate = Arc::new(nzb_decode::WriteStall::new());
+        gate.hold();
+        assembler.stall_writes(Arc::clone(&gate));
+
+        // If writes ever move back inline, they would park the runtime's own
+        // workers and this test would hang instead of failing. The watchdog
+        // releases the gate after a generous deadline so the harness always
+        // gets a verdict; the assertion below then reports the regression.
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
+        let (watchdog_tx, watchdog_rx) = std::sync::mpsc::channel::<()>();
+        let watchdog_gate = Arc::clone(&gate);
+        let watchdog = std::thread::spawn(move || {
+            if finished_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                watchdog_gate.release();
+                let _ = watchdog_tx.send(());
+            }
+        });
+
+        let mut expected = Vec::new();
+        let mut handles = Vec::new();
+        for i in 0..STALLED_WRITES {
+            let (file_id, path) = (format!("f{i}"), temp.path().join(format!("out{i}.bin")));
+            assembler
+                .register_file("j1", &file_id, path.clone(), 1)
+                .unwrap();
+            let (raw, _) = yenc_simd::encode_article(b"payload", "out.bin", 1, 1, 0, 7);
+            expected.push(path);
+            let mut item = decode_test_item("j1", 1);
+            item.file_id = file_id;
+            let assembler = Arc::clone(&assembler);
+            handles.push(tokio::spawn(async move {
+                let (result, _) = decode_and_assemble_offloaded(&item, raw, &assembler, None).await;
+                result
+            }));
+        }
+
+        // Wait on the runtime itself (not on a wall clock) until every write is
+        // parked in the assembler, which is the state that used to hold a worker.
+        let mut parked = 0;
+        for _ in 0..1_000 {
+            parked = gate.stalled_writes();
+            if parked as usize == STALLED_WRITES {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(parked as usize, STALLED_WRITES, "writes did not park");
+
+        // With the writes still stalled, the runtime must keep running other
+        // tasks — this is the progress the API and GUI handlers need.
+        let ticks = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ticker = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                for _ in 0..50 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        ticker.await.unwrap();
+        assert_eq!(ticks.load(Ordering::SeqCst), 50);
+        assert_eq!(
+            gate.stalled_writes() as usize,
+            STALLED_WRITES,
+            "the writes did not stay stalled while unrelated async work ran; \
+             if they are inline on the runtime, the API handlers starve"
+        );
+        assert!(
+            watchdog_rx.try_recv().is_err(),
+            "the runtime made no progress for 10s while writes were stalled — \
+             writes are blocking the async workers again"
+        );
+
+        // The disk recovers: every write completes normally and the files are
+        // byte-for-byte what the articles carried.
+        gate.release();
+        let _ = finished_tx.send(());
+        watchdog.join().unwrap();
+        for handle in handles {
+            let result = handle.await.unwrap().expect("stalled write should finish");
+            assert!(result.file_complete);
+            assert_eq!(result.decoded_bytes, 7);
+        }
+        for path in expected {
+            assert_eq!(std::fs::read(path).unwrap(), b"payload");
+        }
+    }
+
     #[test]
     fn decode_rejects_ypart_offset_beyond_declared_file_size() {
         let temp = tempfile::tempdir().unwrap();
