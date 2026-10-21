@@ -84,7 +84,8 @@ pub trait DispatchEngine: Send + Sync {
     /// Replace server configuration and reconcile connection budgets/workers.
     fn update_servers(&self, servers: Vec<ServerConfig>);
 
-    /// Per-server allocated worker slots and configured limits.
+    /// Per-server NNTP sockets actually open (busy or idle) and configured
+    /// limits. Worker slots whose socket the provider closed are not counted.
     fn connection_snapshot(&self) -> Vec<(String, usize, usize)>;
 
     /// Per-server connections actively transferring articles and limits.
@@ -100,6 +101,10 @@ pub trait DispatchEngine: Send + Sync {
     /// Override the idle-worker eviction threshold. Tests shrink this to
     /// make the watchdog converge in seconds; production uses the default.
     fn set_max_worker_idle(&self, d: Duration);
+
+    /// Override how often idle workers probe their socket for a
+    /// provider-side close. Tests shrink this; production uses the default.
+    fn set_idle_keepalive(&self, _d: Duration) {}
 
     /// `par2.defer_volumes`: hold PAR2 recovery volumes until the job's slice
     /// map shows damage. Applies to jobs submitted afterwards.
@@ -237,7 +242,7 @@ impl DispatchEngine for DispatchHandle {
     }
 
     fn connection_snapshot(&self) -> Vec<(String, usize, usize)> {
-        self.0.conn_tracker().snapshot()
+        self.0.conn_tracker().open_snapshot()
     }
 
     fn active_connection_snapshot(&self) -> Vec<(String, usize, usize)> {
@@ -254,6 +259,10 @@ impl DispatchEngine for DispatchHandle {
 
     fn set_max_worker_idle(&self, d: Duration) {
         self.0.set_max_worker_idle(d);
+    }
+
+    fn set_idle_keepalive(&self, d: Duration) {
+        self.0.set_idle_keepalive(d);
     }
 
     fn set_defer_par2_volumes(&self, on: bool) {
