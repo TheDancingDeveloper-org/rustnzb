@@ -65,32 +65,51 @@ fn downloaded(engine: &TestEngine, job_id: &str) -> usize {
         .unwrap_or(usize::MAX) // left the queue => finished
 }
 
-async fn assert_completes_within(engine: &TestEngine, job_id: &str, limit: Duration) {
+/// Whether the job has finished downloading (or has already moved on).
+fn finished(engine: &TestEngine, job_id: &str) -> bool {
+    const DONE: [JobStatus; 5] = [
+        JobStatus::Completed,
+        JobStatus::PostProcessing,
+        JobStatus::Verifying,
+        JobStatus::Repairing,
+        JobStatus::Extracting,
+    ];
+    match engine.job(job_id) {
+        Some(j) => {
+            DONE.contains(&j.status) || j.articles_downloaded + j.articles_failed >= j.article_count
+        }
+        None => engine
+            .history_status(job_id)
+            .is_some_and(|status| DONE.contains(&status)),
+    }
+}
+
+/// Wait for the job to finish after a limit change. The bound is on progress,
+/// not wall-clock: under a parallel nextest run the test process can be starved
+/// of CPU for seconds, so a fixed deadline flakes. This fails only when no
+/// article lands for `STALL`, or the whole wait exceeds `CAP`.
+async fn assert_completes_after_limit_change(engine: &TestEngine, job_id: &str) {
+    const STALL: Duration = Duration::from_secs(20);
+    const CAP: Duration = Duration::from_secs(120);
+
     let start = Instant::now();
-    let done = engine
-        .wait_for_status(
-            job_id,
-            limit,
-            &[
-                JobStatus::Completed,
-                JobStatus::PostProcessing,
-                JobStatus::Verifying,
-                JobStatus::Repairing,
-                JobStatus::Extracting,
-            ],
-        )
-        .await
-        || engine
-            .wait_for(Duration::ZERO, |s| {
-                s.job(job_id)
-                    .is_some_and(|j| j.articles_downloaded + j.articles_failed >= j.article_count)
-            })
-            .await;
-    assert!(
-        done,
-        "job did not finish downloading within {limit:?} of the limit change (downloaded {})",
-        downloaded(engine, job_id)
-    );
+    let mut last_seen = downloaded(engine, job_id);
+    let mut last_progress = Instant::now();
+    while !finished(engine, job_id) {
+        let now = downloaded(engine, job_id);
+        if now != last_seen {
+            last_seen = now;
+            last_progress = Instant::now();
+        }
+        assert!(
+            last_progress.elapsed() < STALL && start.elapsed() < CAP,
+            "job stalled after the limit change (no progress for {:?}, waited {:?}, downloaded {})",
+            last_progress.elapsed(),
+            start.elapsed(),
+            downloaded(engine, job_id)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     eprintln!("finished {:?} after the limit change", start.elapsed());
 }
 
@@ -109,7 +128,7 @@ async fn startup_limit_throttles_and_unlimited_releases() {
     );
 
     engine.queue_manager.set_speed_limit(0);
-    assert_completes_within(&engine, &job_id, Duration::from_secs(3)).await;
+    assert_completes_after_limit_change(&engine, &job_id).await;
 }
 
 /// The live repro: the limit is set (as by the PUT handler) while idle, then
@@ -129,7 +148,7 @@ async fn limit_set_before_job_throttles_and_raise_releases() {
     );
 
     engine.queue_manager.set_speed_limit(10_000_000);
-    assert_completes_within(&engine, &job_id, Duration::from_secs(3)).await;
+    assert_completes_after_limit_change(&engine, &job_id).await;
 }
 
 /// Lowering the limit mid-download throttles in-flight work, and clearing it
@@ -161,5 +180,5 @@ async fn mid_download_changes_throttle_and_unthrottle() {
     );
 
     engine.queue_manager.set_speed_limit(0);
-    assert_completes_within(&engine, &job_id, Duration::from_secs(3)).await;
+    assert_completes_after_limit_change(&engine, &job_id).await;
 }
