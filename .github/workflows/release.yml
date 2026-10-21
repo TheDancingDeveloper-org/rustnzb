@@ -218,6 +218,15 @@ jobs:
           mkdir -p .ci-output/packages
           docker cp "$container:/workspace/.ci-output/packages/." .ci-output/packages/
           (cd .ci-output/packages && sha256sum -c "SHA256SUMS-${GITHUB_REF_NAME}.txt")
+      # AppImages wrap the Linux binaries that were just built and verified; the
+      # binary inside is byte-identical to the tarball's. The checksum file is
+      # rewritten so it covers them, before it is signed below.
+      - name: Build Linux AppImages from the release tarballs
+        run: |
+          set -eu
+          packaging/appimage/build-appimage.sh "${GITHUB_REF_NAME}" --assets-dir .ci-output/packages
+          (cd .ci-output/packages && sha256sum rustnzb-* >"SHA256SUMS-${GITHUB_REF_NAME}.txt" \
+            && sha256sum -c "SHA256SUMS-${GITHUB_REF_NAME}.txt")
       # The shipped binaries must carry cargo-auditable's `.dep-v0` section, or
       # syft falls back to guessing and the SBOM is not dependency-accurate.
       - name: Verify the audit section reached the shipped binaries
@@ -284,6 +293,8 @@ jobs:
             .ci-output/packages/rustnzb-${{ github.ref_name }}-amd64.deb
             .ci-output/packages/rustnzb-${{ github.ref_name }}-arm64.deb
             .ci-output/packages/rustnzb-${{ github.ref_name }}-windows-x86_64-setup.exe
+            .ci-output/packages/rustnzb-${{ github.ref_name }}-x86_64.AppImage
+            .ci-output/packages/rustnzb-${{ github.ref_name }}-aarch64.AppImage
             .ci-output/packages/SHA256SUMS-${{ github.ref_name }}.txt
       - name: Attest SBOM for linux-x86_64.tar.gz
         uses: actions/attest-sbom@v2.2.0
@@ -343,3 +354,40 @@ jobs:
               --data-binary "@$file" \
               "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/$release_id/assets?name=$name" >/dev/null
           done
+
+  # macOS dmg: dry run, off by default. There is no macOS release binary and no
+  # macOS runner in the pool yet, so this job only runs when the repository
+  # variable RUSTNZB_MACOS_DMG is 'true' and a [self-hosted, macos] runner is
+  # online. It builds the binary on the runner, wraps it with
+  # packaging/macos/build-dmg.sh and uploads the dmg as a workflow artefact; it
+  # is not attached to the release. The dmg is unsigned and not notarised (no
+  # code signing, by decision), so nothing here needs an Apple identity.
+  macos-dmg:
+    needs: verify-release-ref
+    if: vars.RUSTNZB_MACOS_DMG == 'true'
+    runs-on: [self-hosted, macos]
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the macOS binary and the unsigned dmg
+        run: |
+          set -eu
+          ci/tasks/frontend-build
+          rustup target add "${{ matrix.target }}"
+          cargo build --release -p rustnzb --features webdav --locked --target "${{ matrix.target }}"
+          packaging/macos/build-dmg.sh "${GITHUB_REF_NAME}" \
+            --binary "target/${{ matrix.target }}/release/rustnzb" \
+            --arch "${{ matrix.arch }}" --out .ci-output/dmg
+          (cd .ci-output/dmg && shasum -a 256 rustnzb-*.dmg >"SHA256SUMS-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}.txt")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustnzb-${{ github.ref_name }}-macos-${{ matrix.arch }}-dmg
+          path: .ci-output/dmg/*
+          if-no-files-found: error
+          retention-days: 30

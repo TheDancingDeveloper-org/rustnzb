@@ -142,6 +142,14 @@ jobs:
           mkdir -p .ci-output/packages
           docker cp "$container:/workspace/.ci-output/packages/." .ci-output/packages/
           (cd .ci-output/packages && sha256sum -c "SHA256SUMS-${STABLE}.txt")
+      # Same AppImage step as a tag release: wrap the rebuilt Linux binaries and
+      # rewrite the checksum file so it covers the AppImages.
+      - name: Build Linux AppImages from the release tarballs
+        run: |
+          set -eu
+          packaging/appimage/build-appimage.sh "${STABLE}" --assets-dir .ci-output/packages
+          (cd .ci-output/packages && sha256sum rustnzb-* >"SHA256SUMS-${STABLE}.txt" \
+            && sha256sum -c "SHA256SUMS-${STABLE}.txt")
       # Stable binaries are rebuilt by the same tasks as a tag release, so they
       # must carry cargo-auditable's `.dep-v0` section too. Without it the SBOMs
       # generated from these files fall back to detection heuristics.
