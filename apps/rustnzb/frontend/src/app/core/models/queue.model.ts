@@ -85,6 +85,14 @@ export interface HistoryEntry {
   /** Article totals, sent on list rows so availability needs no breakdown. */
   articles_served?: number;
   articles_missing?: number;
+  /** Present when an *arr removed the job via the SABnzbd API and the row was kept. */
+  client_removal?: HistoryClientRemoval;
+}
+
+export interface HistoryClientRemoval {
+  removed_by: string;
+  removed_at: string;
+  files_deleted: boolean;
 }
 
 export interface LogEntry {

@@ -1352,6 +1352,19 @@ function emptyCategory(): CategoryConfig {
                   <span style="color:var(--mute)">days · blank = keep all</span>
                   <button class="btn sm" (click)="saveRetention()" [disabled]="!canSave('historyRetention')">Save</button>
                 </div>
+
+                <label>*arr removals</label>
+                <div class="inline">
+                  <label class="toggle">
+                    <input
+                      type="checkbox"
+                      [(ngModel)]="keepHistoryOnArrDelete"
+                      (change)="saveRetention()"
+                      [disabled]="!canSave('historyRetention')"
+                    />
+                    <span>Keep History when an *arr removes a job (its files are still deleted)</span>
+                  </label>
+                </div>
               </div>
             </div>
           </div>
@@ -2114,6 +2127,7 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
   speedLimit = 0;
   maxActiveDownloads = 3;
   historyRetention: number | null = null;
+  keepHistoryOnArrDelete = true;
   debugLogging = false;
   debugLoggingOverridden = false;
   debugLoggingEffective = '';
@@ -2215,7 +2229,7 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
       case 'maxActive':
         return JSON.stringify(this.maxActiveDownloads);
       case 'historyRetention':
-        return JSON.stringify(this.historyRetention);
+        return JSON.stringify([this.historyRetention, this.keepHistoryOnArrDelete]);
       case 'diskGuards':
         return JSON.stringify([this.minFreeSpaceGB, this.abortHopeless]);
       case 'schedule':
@@ -2572,11 +2586,14 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
       'Failed to load max downloads',
       (r) => (this.maxActiveDownloads = r.max_active_downloads),
     );
-    this.loadSetting<{ retention: number | null }>(
+    this.loadSetting<{ retention: number | null; keep_history_on_arr_delete?: boolean }>(
       'historyRetention',
       '/config/history-retention',
       'Failed to load history retention',
-      (r) => (this.historyRetention = r.retention),
+      (r) => {
+        this.historyRetention = r.retention;
+        this.keepHistoryOnArrDelete = r.keep_history_on_arr_delete ?? true;
+      },
     );
     this.loadDiskGuards();
     this.loadSetting<DebugLoggingState>('debugLogging', '/config/debug-logging', 'Failed to load debug logging', (r) =>
@@ -2684,8 +2701,8 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     this.saveForm(
       'historyRetention',
       '/config/history-retention',
-      { retention: this.historyRetention },
-      'History retention saved',
+      { retention: this.historyRetention, keep_history_on_arr_delete: this.keepHistoryOnArrDelete },
+      'History settings saved',
       'Failed to save retention',
     );
   }

@@ -321,6 +321,10 @@ pub struct HistoryResponseEntry {
     /// the per-server breakdown.
     pub articles_served: usize,
     pub articles_missing: usize,
+    /// Set when an *arr removed the job through the SABnzbd API and the row
+    /// was kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_removal: Option<HistoryClientRemoval>,
 }
 
 impl HistoryResponseEntry {
@@ -368,6 +372,7 @@ impl From<HistoryEntry> for HistoryResponseEntry {
             average_speed_bps,
             articles_served,
             articles_missing,
+            client_removal: e.client_removal,
         }
     }
 }
