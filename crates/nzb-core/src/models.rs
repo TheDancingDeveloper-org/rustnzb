@@ -317,12 +317,27 @@ pub struct HistoryEntry {
     /// PAR2 recovery volumes the NZB carries.
     #[serde(default)]
     pub par2_volumes_available: Option<u32>,
+    /// Set when an *arr removed the job through the SABnzbd API and the row
+    /// was kept (`general.keep_history_on_arr_delete`).
+    #[serde(default)]
+    pub client_removal: Option<HistoryClientRemoval>,
     /// Raw NZB XML data (for retry)
     #[serde(skip_serializing)]
     pub nzb_data: Option<Vec<u8>>,
     /// Serialized per-article outcomes used for missing-only retry.
     #[serde(skip_serializing)]
     pub retry_data: Option<Vec<u8>>,
+}
+
+/// How an external client (an *arr, through the SABnzbd API) removed a
+/// history entry that rustnzb kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct HistoryClientRemoval {
+    /// Client name, from its `User-Agent` (e.g. `Sonarr`).
+    pub removed_by: String,
+    pub removed_at: DateTime<Utc>,
+    /// Whether the client asked for the files to be deleted (`del_files=1`).
+    pub files_deleted: bool,
 }
 
 /// Immutable statistics ledger row recorded when a job leaves the queue.

@@ -4298,6 +4298,7 @@ impl QueueManager {
         let retry_data =
             serde_json::to_vec(&checkpoint_for_job(&state.job, state.output_dir_claimed)).ok();
         let history_entry = HistoryEntry {
+            client_removal: None,
             id: state.job.id.clone(),
             name: state.job.name.clone(),
             category: state.job.category.clone(),
@@ -4876,6 +4877,7 @@ impl QueueManager {
 
             if state.job.error_message.is_some() && !history_already_persisted {
                 let history_entry = HistoryEntry {
+                    client_removal: None,
                     id: state.job.id.clone(),
                     name: state.job.name.clone(),
                     category: state.job.category.clone(),
@@ -6100,6 +6102,33 @@ impl QueueManager {
         Ok(())
     }
 
+    /// Keep history entries an external client removed, marked with who
+    /// removed them and when. Returns how many rows were marked.
+    pub fn history_mark_client_removed(
+        &self,
+        ids: &[String],
+        removed_by: &str,
+        files_deleted: bool,
+    ) -> crate::nzb_core::Result<usize> {
+        let marked = self.db.lock().history_mark_client_removed(
+            ids,
+            removed_by,
+            Utc::now(),
+            files_deleted,
+        )?;
+        if marked > 0 {
+            self.history_changed();
+        }
+        Ok(marked)
+    }
+
+    /// Ids of the history entries an external client has removed.
+    pub fn history_client_removed_ids(
+        &self,
+    ) -> crate::nzb_core::Result<std::collections::HashSet<String>> {
+        self.db.lock().history_client_removed_ids()
+    }
+
     /// Move history entries into the undo window instead of deleting them.
     ///
     /// Their retained work directories stay put: the row still owns them
@@ -7174,6 +7203,7 @@ mod global_pause_tests {
         let (manager, tempdir) = manager();
         manager.set_duplicate_policy(DuplicatePolicy::Skip);
         let finished = HistoryEntry {
+            client_removal: None,
             id: "finished-show".into(),
             name: "Show.S01E01".into(),
             category: "Default".into(),
@@ -7209,6 +7239,7 @@ mod global_pause_tests {
         let (manager, tempdir) = manager();
         manager.set_duplicate_policy(DuplicatePolicy::Skip);
         let failed = HistoryEntry {
+            client_removal: None,
             id: "failed-show".into(),
             name: "Show.S01E01".into(),
             category: "Default".into(),
@@ -7570,6 +7601,7 @@ mod global_pause_tests {
             "work_dir": work_dir,
         });
         let entry = HistoryEntry {
+            client_removal: None,
             id: "retry".into(),
             name: "retry".into(),
             category: "Default".into(),
@@ -9758,6 +9790,7 @@ mod global_pause_tests {
             .db
             .lock()
             .history_insert(&HistoryEntry {
+                client_removal: None,
                 id: finished.id.clone(),
                 name: finished.name.clone(),
                 category: finished.category.clone(),

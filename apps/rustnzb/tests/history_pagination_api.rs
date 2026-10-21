@@ -18,6 +18,7 @@ use serde_json::Value;
 fn history(i: usize, status: JobStatus, category: &str, age_days: i64) -> HistoryEntry {
     let completed_at = Utc::now() - Duration::days(age_days) - Duration::minutes(i as i64);
     HistoryEntry {
+        client_removal: None,
         id: format!("h{i:03}"),
         name: format!("Release.{i:03}"),
         category: category.to_string(),

@@ -167,6 +167,10 @@ fn default_sort_ascending() -> bool {
 pub struct HistoryRetentionBody {
     /// Entries to keep; null or 0 keeps all.
     pub retention: Option<usize>,
+    /// Keep the History row when an *arr removes a job through the SABnzbd
+    /// API. Omitted on a PUT leaves the setting unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_history_on_arr_delete: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]
@@ -2776,6 +2780,9 @@ pub async fn h_history_retention_set(
     let retention = normalize_history_retention(body.retention);
     state.update_config_with(|config| {
         config.general.history_retention = retention;
+        if let Some(keep) = body.keep_history_on_arr_delete {
+            config.general.keep_history_on_arr_delete = keep;
+        }
         Ok::<_, ApiError>(())
     })?;
     state.queue_manager.set_history_retention(retention);
@@ -2799,6 +2806,7 @@ pub async fn h_history_retention_get(
     let config = state.config();
     Ok(Json(HistoryRetentionBody {
         retention: config.general.history_retention,
+        keep_history_on_arr_delete: Some(config.general.keep_history_on_arr_delete),
     }))
 }
 

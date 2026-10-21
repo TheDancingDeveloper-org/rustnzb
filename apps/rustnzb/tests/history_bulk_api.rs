@@ -35,6 +35,7 @@ fn entry(id: &str, status: JobStatus, with_nzb: bool) -> HistoryEntry {
 fn aged_entry(id: &str, status: JobStatus, with_nzb: bool, age_days: i64) -> HistoryEntry {
     let failed = status == JobStatus::Failed;
     HistoryEntry {
+        client_removal: None,
         id: id.into(),
         name: format!("Bulk {id}"),
         category: "Default".into(),

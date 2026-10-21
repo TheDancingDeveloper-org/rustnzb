@@ -91,6 +91,7 @@ The container image (built on the linuxserver.io Alpine base) also reads:
 | `log_level` | `"info"` | `trace`, `debug`, `info`, `warn`, `error`, `off`, or a full filter such as `info,nzb_nntp=debug`. Applied at start. |
 | `log_file` | unset | Also log to this file. Daily rotation, newest 7 kept. Applied at start. |
 | `history_retention` | unset (keep all) | Number of history entries to keep. `0` also keeps all. |
+| `keep_history_on_arr_delete` | `true` | When Sonarr, Radarr or another *arr removes a job through the SABnzbd API, delete its files as asked but keep the History row, marked "removed by <client>". The *arrs no longer see it. `false` removes the row too, as SABnzbd does. |
 | `max_active_downloads` | `1` | Jobs downloading at once. `0` is unlimited. The API accepts at most 100. |
 | `max_post_processing_jobs` | `2` | Jobs in post-processing at once. Applied at start. |
 | `max_repair_workers` | `1` | Concurrent PAR2 verify/repair workers. Applied at start. |
