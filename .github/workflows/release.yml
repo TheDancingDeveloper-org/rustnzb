@@ -192,6 +192,8 @@ jobs:
       attestations: write
     runs-on: [self-hosted, docker, publish]
     env:
+      # Keep in step with `.github/workflows/release-dry-run.yml`, which mirrors
+      # this build without publishing.
       CROSS_IMAGE: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:d747454fca94ebfd9dba1f566d9f549c4c9fbedf785c6aba36a0c383d9b9a955
     steps:
       - uses: actions/checkout@v7

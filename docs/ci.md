@@ -9,11 +9,15 @@ and run it all again.
 
 | Event | `ci.yml` | `codeql.yml` | `policy` / `runner-policy` | `dependency review` |
 |---|---|---|---|---|
-| `pull_request` | only the areas the diff touches (below) | **not run** | full | reviews the PR's dependency changes |
-| `merge_group` (the queue) | **everything** | **not run** | full | posts the context; the review already ran on the PR |
+| `pull_request` | the Rust crates the diff touches, plus a changed frontend (below) | **not run** | full | reviews the PR's dependency changes |
+| `merge_group` (the queue) | **everything**, including the quarantined `e2e` and `desktop` | **not run** | full | posts the context; the review already ran on the PR |
 | `push` to `main` | — (no trigger) | **not run** | full | — |
 | `v*` tag push (`release.yml`) | — | **both languages**, via `workflow_call` | — | — |
 | `workflow_dispatch` | everything | both languages | — | — |
+
+Two workflows also run outside a merge: `release-dry-run.yml` on a PR that
+touches the release tooling and the packaging paths, nightly on `main` (see below), and
+`quality-schedule.yml` on its own schedule.
 
 ### No run on push to `main`
 
@@ -46,14 +50,76 @@ the required checks before relying on this trigger set (see below).
 
 | Changed paths | Runs |
 |---|---|
-| `.github/`, `ci/`, `Dockerfile*`, `.dockerignore`, `rust-toolchain.toml` | everything, as in the queue |
-| `crates/`, `apps/` (outside the frontend), `benchnzb/`, `fuzz/`, `e2e/`, `packaging/`, `Cargo.*` | `rust`, `e2e`, `container-smoke` |
-| `apps/rustnzb/frontend/` | `frontend`, `e2e`, `container-smoke` |
-| `desktop/` | `desktop` |
+| `crates/nzb-core/`, `nzb-decode/`, `nzb-decode/ffi/`, `nzb-dispatch/`, `nzb-news/`, `nzb-nntp/`, `nzb-postproc/`, `nzb-web/`, `mock-nntp-server/` | the full workspace test set, scoped with `-p <crate>` |
+| `apps/rustnzb/` | the same set with `-p rustnzb` |
+| `apps/rustnzb/frontend/` | `frontend`, `container-smoke` |
+| `.github/`, `ci/`, `Dockerfile*`, `.dockerignore`, `.cargo/`, `rust-toolchain.toml`, `Cargo.*`, `fuzz/`, `benchnzb/` | the full workspace |
+| `packaging/`, `installer/` | nothing here; `release-dry-run.yml` builds them |
+| `e2e/` | nothing; `e2e` is a queue-only job |
+| `desktop/` | nothing; `desktop` is a queue-only job |
 | anything else (docs, website, design) | nothing; the skipped jobs report success |
 
 Workflows no longer use `paths-ignore`. A required check that never starts
 leaves a PR or queue entry waiting forever; a skipped job reports success.
+
+An unrecognised path under `crates/` or `apps/` (a new workspace member, or a
+root-level file) is not narrowed: it takes the full workspace rather than
+guessing. The same fallback applies when the classifier sees a Rust change but
+can attribute it to no package.
+
+### The required `rust` check
+
+`rust` is required on PRs and in the queue, and keeps its context name in both.
+On a pull request it is built to be quick:
+
+- `Swatinem/rust-cache` restores `~/.cargo` and the workspace `target/`, keyed
+  on the toolchain and the manifests and shared across the pool. PR runs only
+  restore; the queue and manual runs save, so an untrusted PR cannot write the
+  shared key.
+- `cargo-nextest` runs the tests. It does not run doctests; every fence in the
+  workspace is `text`, `toml` or `ignore`, so there is nothing to skip. Keep it
+  that way, or add a `cargo test --doc` step.
+- `cargo fmt --all --check` always runs over the full workspace, so formatting
+  cannot depend on which crates the diff touched.
+- The WebDAV feature test runs only when `rustnzb` is in scope (or on the full
+  workspace), and the separate `benchnzb` workspace only on the full workspace.
+- `CARGO_PROFILE_TEST_DEBUG=0` and a single build job keep the runner inside
+  its memory limit; neither changes test behaviour.
+
+The queue always runs the full workspace, so a PR-scoped run cannot let an
+untested crate merge.
+
+### Quarantined jobs
+
+`e2e` and `desktop` run only on `merge_group` and `workflow_dispatch`, and both
+are `continue-on-error: true` while they are failing on `main`
+(`TODO(WI-2069)`). A known failure therefore records as a success and does not
+block an otherwise green queue entry. Neither is a required check. Remove the
+`continue-on-error` and move each back to a PR trigger once it is fixed; the
+flaky-quarantine skill has the process.
+
+### Release dry run
+
+`.github/workflows/release-dry-run.yml` exercises the packaging path without
+publishing anything. It runs on a PR that changes `.github/workflows/release*.yml`,
+`ci/tasks/**`, `packaging/**` or `installer/**`, nightly on `main`, and on
+`workflow_dispatch`.
+
+It mirrors the `release-assets` job in `release.yml`: the same pinned
+`CROSS_IMAGE`, the same `ci/tasks` build sequence (frontend, Linux, arm64,
+Windows, packaging), the AppImage step, and `sha256sum -c` over the produced
+`SHA256SUMS` file. It then uploads the packages as a workflow artefact. It does
+not push an image, sign, attest, create a release, or upload to a package
+registry, and it needs no write permission.
+
+The tag it builds is derived from the workspace version (`v<version>`), so the
+dry run validates packaging against the version a release would ship. The
+`CROSS_IMAGE` digest must stay in step with `release.yml`; a comment in each
+file names the other.
+
+PR runs of the dry run are limited to branches in this repository, because the
+build authenticates to `repo.indexarr.net` with `FORGEJO_CARGO_TOKEN`, which a
+fork's run does not receive.
 
 CodeQL classifies `*.rs` plus `Cargo.*` as Rust, and JS/TS/HTML sources plus
 `package*.json` as `javascript-typescript`. Its release run analyses both
