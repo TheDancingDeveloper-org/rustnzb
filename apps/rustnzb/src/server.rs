@@ -84,6 +84,7 @@ use nzb_web::state::AppState;
         // config
         handlers::h_config_get,
         handlers::h_general_update,
+        handlers::h_restart_pending,
         handlers::h_config_backup_export,
         handlers::h_config_backup_preview,
         handlers::h_config_backup_restore,
@@ -446,6 +447,7 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         // Config
         .route("/config", get(handlers::h_config_get))
         .route("/config/general", put(handlers::h_general_update))
+        .route("/config/restart-pending", get(handlers::h_restart_pending))
         .route("/config/backup", get(handlers::h_config_backup_export))
         .route(
             "/config/backup/preview",

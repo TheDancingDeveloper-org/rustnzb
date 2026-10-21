@@ -44,6 +44,10 @@ pub struct AppState {
     /// schedule monitor applies it at once instead of at the next minute
     /// boundary.
     pub schedule_wake: Arc<tokio::sync::Notify>,
+    /// The effective configuration this process started with. Settings read
+    /// only at startup are compared against it to tell the operator a
+    /// restart is pending.
+    startup_config: Arc<AppConfig>,
 }
 
 impl AppState {
@@ -56,6 +60,7 @@ impl AppState {
         credential_store: Arc<CredentialStore>,
     ) -> Self {
         let file = (*config.load_full()).clone();
+        let startup_config = config.load_full();
         Self {
             config,
             config_path,
@@ -69,13 +74,16 @@ impl AppState {
             overrides: OverrideSet::default(),
             rss_monitor_wake: Arc::new(tokio::sync::Notify::new()),
             schedule_wake: Arc::new(tokio::sync::Notify::new()),
+            startup_config,
         }
     }
 
     /// Set the file layer and the overrides that apply over it. `config` is
     /// recomputed from them, so it becomes the effective configuration.
     pub fn with_overrides(mut self, file: AppConfig, overrides: OverrideSet) -> Self {
-        self.config.store(Arc::new(overrides.overlay(&file)));
+        let effective = Arc::new(overrides.overlay(&file));
+        self.startup_config = effective.clone();
+        self.config.store(effective);
         self.file = Mutex::new(file);
         self.overrides = overrides;
         self
@@ -84,6 +92,11 @@ impl AppState {
     /// Get current config snapshot.
     pub fn config(&self) -> Arc<AppConfig> {
         self.config.load_full()
+    }
+
+    /// The effective configuration the process started with.
+    pub fn startup_config(&self) -> Arc<AppConfig> {
+        self.startup_config.clone()
     }
 
     /// Replace the whole config in memory and on disk.
