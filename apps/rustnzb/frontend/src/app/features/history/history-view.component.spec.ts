@@ -77,6 +77,19 @@ describe('HistoryViewComponent', () => {
     component.ngOnDestroy();
   });
 
+  it('labels a row an *arr removed with the client and time', () => {
+    const text = component.clientRemovalText({
+      removed_by: 'Sonarr',
+      removed_at: '2026-07-09T10:05:00Z',
+      files_deleted: true,
+    });
+    expect(text.startsWith('by Sonarr, ')).toBe(true);
+    expect(text).toContain('2026');
+    expect(
+      component.clientRemovalText({ removed_by: 'Radarr', removed_at: 'not a date', files_deleted: false }),
+    ).toBe('by Radarr, not a date');
+  });
+
   it('skips background polls while the tab is hidden', () => {
     component.ngOnInit();
     const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);

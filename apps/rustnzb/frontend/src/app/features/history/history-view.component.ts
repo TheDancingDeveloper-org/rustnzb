@@ -4,7 +4,7 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { ApiService, POLL_TIMEOUT_MS, pageHidden } from '../../core/services/api.service';
-import { HistoryEntry, StatusResponse } from '../../core/models/queue.model';
+import { HistoryClientRemoval, HistoryEntry, StatusResponse } from '../../core/models/queue.model';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
 import { httpErrorMessage, showHttpError } from '../../core/http/http-error';
@@ -216,6 +216,12 @@ const EXPORT_PAGE_SIZE = 200;
                   @if (e.error_message) {
                     <div class="e-err" [title]="e.error_message">{{ e.error_message }}</div>
                   }
+                  @if (e.client_removal; as removal) {
+                    <div class="e-removed" [title]="clientRemovalText(removal)">
+                      <span class="tag removed">{{ removal.files_deleted ? 'Files removed' : 'Removed' }}</span>
+                      {{ clientRemovalText(removal) }}
+                    </div>
+                  }
                 </td>
                 <td>
                   @if (e.category) { <span class="tag cat">{{ e.category }}</span> }
@@ -361,6 +367,11 @@ const EXPORT_PAGE_SIZE = 200;
     .e-name { color: var(--text); font-size: 13px; }
     .e-name.dim { color: var(--mute); }
     .e-err { color: var(--danger); font-size: 11px; margin-top: 2px; opacity: .8; }
+    .e-removed {
+      color: var(--mute); font-size: 11px; margin-top: 2px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .tag.removed { font-size: 10px; margin-right: 4px; }
     .empty-cell {
       text-align: center; padding: 36px 20px !important;
       color: var(--mute); font-size: 13px;
@@ -963,6 +974,13 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
 
   articleMissing(entry: HistoryEntry): number {
     return entry.articles_missing ?? entry.server_stats.reduce((total, server) => total + server.articles_failed, 0);
+  }
+
+  /** "by Sonarr, 21 Oct 2026 14:02": who removed a kept row via the SABnzbd API, and when. */
+  clientRemovalText(removal: HistoryClientRemoval): string {
+    const when = new Date(removal.removed_at);
+    const stamp = isNaN(when.getTime()) ? removal.removed_at : when.toLocaleString();
+    return `by ${removal.removed_by}, ${stamp}`;
   }
 
   availability(entry: HistoryEntry): string {

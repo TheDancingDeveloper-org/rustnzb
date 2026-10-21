@@ -33,7 +33,7 @@ function makeComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {})
         '/config/categories': [],
         '/config/speed-limit': { speed_limit_bps: 123 },
         '/config/max-active-downloads': { max_active_downloads: 4 },
-        '/config/history-retention': { retention: 14 },
+        '/config/history-retention': { retention: 14, keep_history_on_arr_delete: false },
         '/config/disk-guards': { min_free_space_bytes: 2 * 1024 ** 3, abort_hopeless: false },
         '/config/schedule': {
           enabled: false,
@@ -402,6 +402,22 @@ function failGet(api: { get: ReturnType<typeof vi.fn> }, path: string): () => vo
 }
 
 describe('SettingsViewComponent unsaved changes', () => {
+  it('loads and saves the keep-History-on-*arr-delete setting with retention', () => {
+    const { component, api } = makeComponent();
+    component.ngOnInit();
+    expect(component.historyRetention).toBe(14);
+    expect(component.keepHistoryOnArrDelete).toBe(false);
+
+    component.keepHistoryOnArrDelete = true;
+    expect(component.unsavedSections()).toEqual(['historyRetention']);
+    component.saveRetention();
+    expect(api.put).toHaveBeenCalledWith('/config/history-retention', {
+      retention: 14,
+      keep_history_on_arr_delete: true,
+    });
+    expect(component.hasUnsavedChanges()).toBe(false);
+  });
+
   it('is clean after load and dirty after an edit', () => {
     const { component } = makeComponent();
     component.ngOnInit();
