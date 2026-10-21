@@ -485,8 +485,8 @@ slow-but-active body whose total duration exceeded the timeout while each
 socket read made progress. The full formatting, workspace Clippy with
 warnings denied, workspace build, and complete workspace test suite all passed.
 
-The retained benchmark gate did not. The [raw benchmark artifact](../../nntp-client-bench/results/comparison_20260728_055415.json)
-and its [HTML report](../../nntp-client-bench/results/comparison_20260728_055415.html)
+The retained benchmark gate did not. The [raw benchmark artifact](../../../nntp-client-bench/results/comparison_20260728_055415.json)
+and its [HTML report](../../../nntp-client-bench/results/comparison_20260728_055415.html)
 record three validated RustNZB runs of 6.644 s, 6.726 s, and 5.605 s
 (6.644 s median, 770.62 MiB/s). Every RustNZB output matched the expected
 5,368,709,120-byte SHA-256 value. Relative to the retained RustNZB depth-2

@@ -309,7 +309,7 @@ pub struct NntpConnection {
     /// the data immediately (`fetch_article`, `Pipeline::receive_one`) check
     /// it back in via `release_body_buffer`. This is what actually avoids
     /// the per-article page-fault/allocation cost identified by profiling —
-    /// see `docs/PERFORMANCE_STATUS.md`.
+    /// see `docs/internal/PERFORMANCE_STATUS.md`.
     body_pool: Vec<Vec<u8>>,
     /// Upper bound on each socket write/flush. Always [`WRITE_TIMEOUT`]
     /// outside of tests.
