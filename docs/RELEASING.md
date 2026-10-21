@@ -102,8 +102,9 @@ takes the rebuild path below.
    [packaging/README.md](../packaging/README.md) for submission. Pre-release
    tags are never offered to package managers.
 
-GitHub generates release notes from the tagged history. Review them before
-publishing; do not add version-specific release-note files to the repository.
+GitHub generates release notes from the tagged history, unless the tag has a
+checked-in `docs/releases/<tag>.md`; that file is then used verbatim as the
+release body. Review the notes before publishing.
 
 ## AppImage and macOS dmg
 

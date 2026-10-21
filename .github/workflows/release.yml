@@ -339,12 +339,24 @@ jobs:
           auth=(-H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GH_TOKEN" -H 'X-GitHub-Api-Version: 2022-11-28')
           prerelease=false
           case "$GITHUB_REF_NAME" in *alpha*|*beta*|*rc*) prerelease=true ;; esac
+          # A checked-in notes file is used verbatim; a tag without one (such
+          # as a promoted stable release) gets GitHub-generated notes.
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
           release_id=$(curl -fsS "${auth[@]}" "$api/releases/tags/$GITHUB_REF_NAME" | jq -r .id 2>/dev/null || true)
           if [ -z "$release_id" ] || [ "$release_id" = null ]; then
-            payload=$(jq -nc --arg tag "$GITHUB_REF_NAME" --argjson pre "$prerelease" \
-              '{tag_name:$tag,name:("rustnzb "+$tag),draft:false,prerelease:$pre,generate_release_notes:true}')
+            if [ -f "$notes" ]; then
+              payload=$(jq -nc --arg tag "$GITHUB_REF_NAME" --argjson pre "$prerelease" --rawfile body "$notes" \
+                '{tag_name:$tag,name:("rustnzb "+$tag),draft:false,prerelease:$pre,body:$body}')
+            else
+              payload=$(jq -nc --arg tag "$GITHUB_REF_NAME" --argjson pre "$prerelease" \
+                '{tag_name:$tag,name:("rustnzb "+$tag),draft:false,prerelease:$pre,generate_release_notes:true}')
+            fi
             release_id=$(curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
               --data "$payload" "$api/releases" | jq -r .id)
+          elif [ -f "$notes" ]; then
+            payload=$(jq -nc --rawfile body "$notes" '{body:$body}')
+            curl -fsS -X PATCH "${auth[@]}" -H 'Content-Type: application/json' \
+              --data "$payload" "$api/releases/$release_id" >/dev/null
           fi
           test -n "$release_id"
           for file in .ci-output/packages/rustnzb-* .ci-output/packages/SHA256SUMS-*; do
