@@ -17,6 +17,10 @@
 #   verify_auditable_binary PATH TRIPLE
 set -eu
 
+# Directory of the task script that sources this library (build-windows et al),
+# used to locate the shim beside it.
+AUDITABLE_TASK_DIR=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd)
+
 CARGO_AUDITABLE_VERSION=v0.7.7
 CARGO_AUDITABLE_TARBALL=cargo-auditable-x86_64-unknown-linux-gnu.tar.xz
 CARGO_AUDITABLE_SHA256=4c8d3b08c3c34e9f2333367224dbbfb4aab68067698b43de59fe19aded3416dd
@@ -79,6 +83,19 @@ auditable_env() {
     # shellcheck disable=SC2090
     export CARGO_AUDITABLE_ORIG_ARGS
     export RUSTC_WORKSPACE_WRAPPER
+}
+
+# Some cross builders (cargo-xwin) export CARGO_ENCODED_RUSTFLAGS globally so
+# their own cargo invocation applies the target linker. cargo-auditable's
+# nested `cargo metadata` inherits that environment and probes the host, where
+# the target's linker flavour is invalid. Route the wrapper through a shim that
+# drops the environment copy; cargo still passes the flags to rustc in argv.
+auditable_env_target_scoped() {
+    auditable_env
+    CARGO_AUDITABLE_BIN="$(auditable_dir)/cargo-auditable"
+    RUSTC_WORKSPACE_WRAPPER="$AUDITABLE_TASK_DIR/auditable-rustc-wrapper"
+    test -x "$RUSTC_WORKSPACE_WRAPPER"
+    export CARGO_AUDITABLE_BIN RUSTC_WORKSPACE_WRAPPER
 }
 
 # Fail the release build when the audit data did not make it into the binary.
