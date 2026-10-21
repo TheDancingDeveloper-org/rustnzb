@@ -3938,6 +3938,10 @@ pub(crate) const SETTINGS_AUDIT: &[(&str, Result<&str, &str>)] = &[
         ),
     ),
     (
+        "general.keep_history_on_arr_delete",
+        Ok("PUT /api/config/history-retention"),
+    ),
+    (
         "general.history_retention",
         Ok("PUT /api/config/history-retention"),
     ),
