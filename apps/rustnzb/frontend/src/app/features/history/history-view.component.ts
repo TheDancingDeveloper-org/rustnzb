@@ -78,6 +78,8 @@ export function undoDuration(purgeAfter: string | undefined, now = Date.now()): 
   return Math.max(1_000, deadline - now);
 }
 const EXPORT_PAGE_SIZE = 200;
+/** Window for the stat cards when the list has no time filter. */
+const DEFAULT_STATS_DAYS = 7;
 
 @Component({
   selector: 'app-history-view',
@@ -132,10 +134,13 @@ const EXPORT_PAGE_SIZE = 200;
             @for (cat of categoryOptions(); track cat) { <option [value]="cat">{{ cat }}</option> }
           </select>
           <select aria-label="Filter history by time range" [(ngModel)]="filterTime" (ngModelChange)="onFiltersChanged()">
+            <option value="all">All time</option>
             <option value="7d">Last 7 days</option>
             <option value="30d">Last 30 days</option>
-            <option value="all">All time</option>
           </select>
+          @if (hasActiveFilters()) {
+            <button class="btn ghost" (click)="resetFilters()" title="Show all history">Reset filters</button>
+          }
           <button class="btn ghost" (click)="exportCsv()" [disabled]="exporting()" title="Exports every entry matching the filters">
             {{ exporting() ? 'Exporting…' : 'Export CSV' }}
           </button>
@@ -338,7 +343,7 @@ const EXPORT_PAGE_SIZE = 200;
                   } @else if (filterTime === 'all') {
                     No download history yet. Finished jobs will show up here.
                   } @else {
-                    No downloads finished in the last {{ statCards().windowLabel }}.
+                    No downloads finished in the last {{ filterTime === '7d' ? '7 days' : '30 days' }}.
                   }
                 </td>
               </tr>
@@ -455,7 +460,8 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
   webdavEnabled = signal(false);
   filterStatus: StatusFilter = 'all';
   filterCategory = '';
-  filterTime: TimeFilter = '7d';
+  /** The list shows all history by default; the stat cards still use a 7-day window. */
+  filterTime: TimeFilter = 'all';
   nameFilter = '';
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -520,7 +526,8 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
         this.pruneSelection(entries);
         this.total.set(total);
         this.categories.set(r.categories ?? null);
-        this.stats.set(r.stats ?? null);
+        if (this.filterTime === 'all') this.loadDefaultStats(seq);
+        else this.stats.set(r.stats ?? null);
         this.loadError.set(null);
         this.loading.set(false);
       },
@@ -531,6 +538,36 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
         this.loading.set(false);
       },
     });
+  }
+
+  /**
+   * With no time filter the list is all-time, but the stat cards keep their
+   * 7-day window: fetch it with a one-row request.
+   */
+  private loadDefaultStats(seq: number): void {
+    const params = { offset: '0', limit: '1', days: String(DEFAULT_STATS_DAYS) };
+    this.api.get<HistoryPage>('/history', params).pipe(timeout(POLL_TIMEOUT_MS)).subscribe({
+      next: r => {
+        if (seq === this.loadSeq) this.stats.set(r.stats ?? null);
+      },
+      error: () => {
+        // The cards keep their last values; the list itself loaded fine.
+      },
+    });
+  }
+
+  /** Any filter, the time window included, is narrowing the list. */
+  hasActiveFilters(): boolean {
+    return this.narrowingFilters() || this.filterTime !== 'all';
+  }
+
+  resetFilters(): void {
+    if (this.nameDebounce) clearTimeout(this.nameDebounce);
+    this.filterStatus = 'all';
+    this.filterCategory = '';
+    this.filterTime = 'all';
+    this.nameFilter = '';
+    this.onFiltersChanged();
   }
 
   onFiltersChanged(): void {
@@ -629,7 +666,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
       .map(r => `${r.count} ${r.reason}`)
       .join(' · ');
     return {
-      windowLabel: this.filterTime === 'all' ? 'all time' : this.filterTime === '7d' ? '7 days' : '30 days',
+      windowLabel: this.filterTime === '30d' ? '30 days' : '7 days',
       completed: st?.completed ?? 0,
       completedBytes: st?.completed_bytes ?? 0,
       failed,
