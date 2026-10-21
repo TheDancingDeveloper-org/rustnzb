@@ -800,6 +800,39 @@ impl Database {
             applied = 22;
         }
 
+        if version < 23 {
+            info!("Applying database migration v23: history rows kept after an *arr delete");
+            // An *arr "Remove Completed" deletes the job's files through the
+            // SABnzbd API but leaves rustnzb's own History row in place. The
+            // marker lives in its own narrow table, so list reads join it
+            // without touching columns stored after the NZB blob, and the
+            // SABnzbd history the *arrs poll can skip the marked rows.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS history_client_removals (
+                    id TEXT PRIMARY KEY,
+                    removed_by TEXT NOT NULL,
+                    removed_at TEXT NOT NULL,
+                    files_deleted INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            let has_history: bool = tx
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'history'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if has_history {
+                tx.execute_batch(
+                    "CREATE TRIGGER IF NOT EXISTS history_client_removals_delete
+                        AFTER DELETE ON history BEGIN
+                        DELETE FROM history_client_removals WHERE id = OLD.id;
+                    END;",
+                )?;
+            }
+            applied = 23;
+        }
+
         if applied > version {
             stamp_schema_version(&tx, applied)?;
             tx.commit()?;
@@ -1676,8 +1709,10 @@ impl Database {
             "SELECT h.id, h.name, h.category, h.status, h.total_bytes, h.downloaded_bytes,
              h.added_at, h.completed_at, m.download_time_secs, h.output_dir, h.stages,
              h.error_message, m.server_stats, m.failure_code, m.post_processing, m.delete_archives,
-             m.par2_volumes_fetched, m.par2_volumes_available
+             m.par2_volumes_fetched, m.par2_volumes_available,
+             r.removed_by, r.removed_at, r.files_deleted
              FROM history h LEFT JOIN history_list_meta m ON m.id = h.id
+             LEFT JOIN history_client_removals r ON r.id = h.id
              WHERE h.id = ?1 AND COALESCE(m.trash, 0) = 0",
         )?;
 
@@ -1709,6 +1744,7 @@ impl Database {
                 retry_data: None,
                 par2_volumes_fetched: row.get(16)?,
                 par2_volumes_available: row.get(17)?,
+                client_removal: client_removal_at(row, 18)?,
             })
         });
 
@@ -1768,6 +1804,43 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    /// Mark history rows as removed by an external client (an *arr through
+    /// the SABnzbd API) instead of deleting them. Returns how many rows were
+    /// marked; an unknown id is skipped.
+    pub fn history_mark_client_removed(
+        &self,
+        ids: &[String],
+        removed_by: &str,
+        removed_at: chrono::DateTime<Utc>,
+        files_deleted: bool,
+    ) -> Result<usize, NzbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut marked = 0;
+        for id in ids {
+            marked += tx.execute(
+                "INSERT OR REPLACE INTO history_client_removals
+                    (id, removed_by, removed_at, files_deleted)
+                 SELECT id, ?2, ?3, ?4 FROM history WHERE id = ?1",
+                params![id, removed_by, removed_at.to_rfc3339(), files_deleted],
+            )?;
+        }
+        tx.commit()?;
+        Ok(marked)
+    }
+
+    /// Ids of every history row an external client has removed.
+    pub fn history_client_removed_ids(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, NzbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM history_client_removals")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
     }
 
     /// Remove a history entry, and the ledger rows of a job now gone.
@@ -2071,9 +2144,9 @@ impl Database {
 const HISTORY_LIST_COLUMNS: &str = "h.id, h.name, h.category, h.status, h.total_bytes,
      h.downloaded_bytes, h.added_at, h.completed_at, m.download_time_secs, h.output_dir, h.stages,
      h.error_message, m.server_stats, typeof(h.nzb_data) <> 'null' AS has_nzb, m.failure_code,
-     m.post_processing, m.delete_archives, m.par2_volumes_fetched, m.par2_volumes_available";
+     m.post_processing, m.delete_archives, m.par2_volumes_fetched, m.par2_volumes_available,
+     r.removed_by, r.removed_at, r.files_deleted";
 
-/// Source of [`HISTORY_LIST_COLUMNS`].
 /// Duplicate lookup for `find_duplicate_candidates`. Name and digest
 /// matches are separate SELECTs joined by UNION (which also removes a row
 /// matched both ways) so each one seeks its own index —
@@ -2092,7 +2165,9 @@ const DUPLICATE_CANDIDATES_SQL: &str = "
     SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'history'
     FROM history WHERE nzb_digest = ?2 AND trash = 0";
 
-const HISTORY_LIST_FROM: &str = "history h LEFT JOIN history_list_meta m ON m.id = h.id";
+/// Source of [`HISTORY_LIST_COLUMNS`].
+const HISTORY_LIST_FROM: &str = "history h LEFT JOIN history_list_meta m ON m.id = h.id
+     LEFT JOIN history_client_removals r ON r.id = h.id";
 
 /// Append `condition` to a filter's ` WHERE ...` clause (or start one).
 fn with_condition(where_sql: &str, condition: &str) -> String {
@@ -2169,7 +2244,24 @@ fn history_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
         retry_data: None,
         par2_volumes_fetched: row.get(17)?,
         par2_volumes_available: row.get(18)?,
+        client_removal: client_removal_at(row, 19)?,
     })
+}
+
+/// The [`HistoryClientRemoval`] read from `removed_by`, `removed_at` and
+/// `files_deleted`, starting at column `first`.
+fn client_removal_at(
+    row: &rusqlite::Row<'_>,
+    first: usize,
+) -> rusqlite::Result<Option<HistoryClientRemoval>> {
+    let Some(removed_by) = row.get::<_, Option<String>>(first)? else {
+        return Ok(None);
+    };
+    Ok(Some(HistoryClientRemoval {
+        removed_by,
+        removed_at: parse_datetime(&row.get::<_, String>(first + 1)?),
+        files_deleted: row.get(first + 2)?,
+    }))
 }
 
 /// SQL-side history filter. Every set field narrows the match.
@@ -2486,6 +2578,7 @@ mod tests {
 
     fn make_history(id: &str, name: &str) -> HistoryEntry {
         HistoryEntry {
+            client_removal: None,
             id: id.into(),
             name: name.into(),
             category: "movies".into(),
@@ -4049,6 +4142,58 @@ mod tests {
             }
             assert!(probed_nzb, "has_nzb probe missing from the plan");
         }
+    }
+
+    #[test]
+    fn history_client_removal_marks_the_row_until_it_is_deleted() {
+        let db = Database::open_memory().unwrap();
+        db.history_insert(&make_history("kept", "Kept")).unwrap();
+        db.history_insert(&make_history("plain", "Plain")).unwrap();
+        let marked = db
+            .history_mark_client_removed(
+                &["kept".to_string(), "missing".to_string()],
+                "Sonarr",
+                Utc::now(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(marked, 1, "an unknown id is skipped");
+
+        let removal = db.history_get("kept").unwrap().unwrap().client_removal;
+        assert_eq!(
+            removal.as_ref().map(|r| r.removed_by.as_str()),
+            Some("Sonarr")
+        );
+        assert!(removal.unwrap().files_deleted);
+        let listed = db.history_list(10).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.id == "kept" && e.client_removal.is_some())
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.id == "plain" && e.client_removal.is_none())
+        );
+        assert_eq!(
+            db.history_client_removed_ids().unwrap(),
+            std::collections::HashSet::from(["kept".to_string()])
+        );
+
+        // A UI delete still goes through the undo window, then drops the
+        // marker with the row.
+        let trashed = db
+            .history_trash(
+                &["kept".to_string()],
+                Utc::now() + chrono::Duration::hours(1),
+            )
+            .unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert!(db.history_get("kept").unwrap().is_none());
+        db.history_remove("kept").unwrap();
+        assert!(db.history_client_removed_ids().unwrap().is_empty());
     }
 
     #[test]

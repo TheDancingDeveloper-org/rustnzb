@@ -26,6 +26,7 @@ async fn setup_auth(client: &reqwest::Client, base_url: &str) -> String {
 
 fn failed_history_entry(id: &str, complete_dir: &std::path::Path) -> HistoryEntry {
     HistoryEntry {
+        client_removal: None,
         id: id.into(),
         name: "Retry Me".into(),
         category: "Default".into(),

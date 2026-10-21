@@ -183,6 +183,7 @@ async fn deleting_a_queued_job_removes_its_work_dir() {
 
 fn history_entry(id: &str, complete: &Path) -> HistoryEntry {
     HistoryEntry {
+        client_removal: None,
         id: id.to_string(),
         name: id.to_string(),
         category: "Default".to_string(),
