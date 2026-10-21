@@ -779,6 +779,27 @@ impl Database {
             applied = 21;
         }
 
+        if version < 22 {
+            info!("Applying database migration v22: indexed duplicate lookup by name");
+            // The duplicate check on every add matches names ignoring case.
+            // Without an index on LOWER(name) it scanned the whole history
+            // table, whose rows carry their NZB blob inline: on a 2.3 GB
+            // database that took 18 s under the global DB lock and froze the
+            // GUI. These expression indexes (with the v17 digest indexes) let
+            // each branch of the lookup seek instead.
+            for table in ["queue", "history"] {
+                create_index_if_columns(
+                    &tx,
+                    table,
+                    &["name"],
+                    &format!(
+                        "CREATE INDEX IF NOT EXISTS idx_{table}_name_lower ON {table}(LOWER(name));"
+                    ),
+                )?;
+            }
+            applied = 22;
+        }
+
         if applied > version {
             stamp_schema_version(&tx, applied)?;
             tx.commit()?;
@@ -1156,16 +1177,7 @@ impl Database {
         name: &str,
         digest: Option<&str>,
     ) -> Result<Vec<DuplicateMatch>, NzbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'queue'
-             FROM queue
-             WHERE LOWER(name) = LOWER(?1) OR (?2 IS NOT NULL AND nzb_digest = ?2)
-             UNION ALL
-             SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'history'
-             FROM history
-             WHERE trash = 0
-               AND (LOWER(name) = LOWER(?1) OR (?2 IS NOT NULL AND nzb_digest = ?2))",
-        )?;
+        let mut stmt = self.conn.prepare(DUPLICATE_CANDIDATES_SQL)?;
         let matches = stmt
             .query_map(params![name, digest], |row| {
                 let location = match row.get::<_, String>(4)?.as_str() {
@@ -2062,6 +2074,24 @@ const HISTORY_LIST_COLUMNS: &str = "h.id, h.name, h.category, h.status, h.total_
      m.post_processing, m.delete_archives, m.par2_volumes_fetched, m.par2_volumes_available";
 
 /// Source of [`HISTORY_LIST_COLUMNS`].
+/// Duplicate lookup for `find_duplicate_candidates`. Name and digest
+/// matches are separate SELECTs joined by UNION (which also removes a row
+/// matched both ways) so each one seeks its own index —
+/// `idx_*_name_lower` or `idx_*_nzb_digest` — rather than SQLite falling
+/// back to a full scan for the OR. Only matching rows are ever read.
+const DUPLICATE_CANDIDATES_SQL: &str = "
+    SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'queue'
+    FROM queue WHERE LOWER(name) = LOWER(?1)
+    UNION
+    SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'queue'
+    FROM queue WHERE nzb_digest = ?2
+    UNION
+    SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'history'
+    FROM history WHERE LOWER(name) = LOWER(?1) AND trash = 0
+    UNION
+    SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'history'
+    FROM history WHERE nzb_digest = ?2 AND trash = 0";
+
 const HISTORY_LIST_FROM: &str = "history h LEFT JOIN history_list_meta m ON m.id = h.id";
 
 /// Append `condition` to a filter's ` WHERE ...` clause (or start one).
@@ -2527,6 +2557,66 @@ mod tests {
             db.find_duplicate_candidates("Nothing.Here", Some(&nzb_digest(b"new")))
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn duplicate_candidates_seek_indexes_not_scan() {
+        let db = Database::open_memory().unwrap();
+        let mut stmt = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {DUPLICATE_CANDIDATES_SQL}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params!["x", "sha256:y"], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for index in [
+            "idx_queue_name_lower",
+            "idx_queue_nzb_digest",
+            "idx_history_name_lower",
+            "idx_history_nzb_digest",
+        ] {
+            assert!(
+                plan.iter().any(|step| step.contains(index)),
+                "{index} unused: {plan:?}"
+            );
+        }
+        assert!(
+            !plan
+                .iter()
+                .any(|step| step.starts_with("SCAN queue") || step.starts_with("SCAN history")),
+            "duplicate lookup scans a table: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_lookup_stays_fast_with_large_history() {
+        // A file database, like production: 2,000 history rows each carrying
+        // a 256 KiB NZB blob inline (~500 MB). The lookup must not read them.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("dup.db")).unwrap();
+        let blob = vec![b'x'; 256 * 1024];
+        db.conn.execute_batch("PRAGMA synchronous = OFF;").unwrap();
+        for i in 0..2000 {
+            let mut entry = make_history(&format!("h{i}"), &format!("Release.{i}"));
+            let mut data = blob.clone();
+            data.extend_from_slice(i.to_string().as_bytes());
+            entry.nzb_data = Some(data);
+            db.history_insert(&entry).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let found = db
+            .find_duplicate_candidates("release.1999", Some(&nzb_digest(b"new")))
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "h1999");
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "duplicate lookup took {elapsed:?}"
         );
     }
 
