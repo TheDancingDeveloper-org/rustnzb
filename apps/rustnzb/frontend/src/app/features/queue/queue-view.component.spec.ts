@@ -649,6 +649,69 @@ describe('QueueViewComponent', () => {
     expect(component.loadError()).toBeNull();
   });
 
+  describe('status poll (WI-2082)', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+      delete (document as unknown as { hidden?: boolean }).hidden;
+    });
+
+    /** Starts the component's real 2 s poll timer; /queue and /status answer per `status`. */
+    function startPolling(status: () => Observable<unknown>) {
+      vi.useFakeTimers();
+      const get = vi.fn((path: string) => {
+        if (path === '/status') return status();
+        if (path === '/queue') return of({ jobs: [], paused: false });
+        return of([]);
+      });
+      const ctx = makeComponent({ get });
+      ctx.component.ngOnInit();
+      return { ...ctx, get };
+    }
+
+    it('refreshes nntp_connections on each poll tick', () => {
+      let connected = 1;
+      const { component } = startPolling(() =>
+        of({ nntp_connections: [{ server_id: 'server_1', connected, limit: 100 }] }),
+      );
+      expect(component.status()?.nntp_connections?.[0].connected).toBe(1);
+
+      connected = 100;
+      vi.advanceTimersByTime(2000);
+
+      expect(component.status()?.nntp_connections?.[0].connected).toBe(100);
+      component.ngOnDestroy();
+    });
+
+    it('makes no status poll while the page is hidden', () => {
+      const { component, get } = startPolling(() => of({ nntp_connections: [] }));
+      get.mockClear();
+
+      Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+      vi.advanceTimersByTime(6000);
+
+      expect(get).not.toHaveBeenCalled();
+      component.ngOnDestroy();
+    });
+
+    it('does not stack a status poll while one is still in flight', () => {
+      const pending: Subject<unknown>[] = [];
+      const { component, get } = startPolling(() => {
+        const response = new Subject<unknown>();
+        pending.push(response);
+        return response.asObservable();
+      });
+      get.mockClear();
+
+      vi.advanceTimersByTime(4000);
+      expect(get.mock.calls.filter(([path]) => path === '/status')).toHaveLength(0);
+      expect(pending).toHaveLength(1);
+
+      pending[0].next({ nntp_connections: [] });
+      pending[0].complete();
+      component.ngOnDestroy();
+    });
+  });
+
   it('reports a failed category or server load as a toast', () => {
     const { component, snackBar } = makeComponent({
       get: vi.fn(() => throwError(() => ({ status: 500 }))),

@@ -1174,6 +1174,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private queueRequestSeq = 0;
   private queuePollInFlight = false;
+  private statusPollInFlight = false;
   // Polls started before this sequence finished must not apply their response:
   // a snapshot taken mid-reorder/delete would resurrect rows (BUG-126).
   private queueStaleThrough = 0;
@@ -1236,7 +1237,9 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     });
     this.loadAll();
     this.pollTimer = setInterval(() => {
-      if (!pageHidden() && !this.queuePollInFlight) this.fetchQueue(false);
+      if (pageHidden()) return;
+      if (!this.queuePollInFlight) this.fetchQueue(false);
+      this.fetchStatus();
     }, 2000);
     this.toggleSub = this.addNzbService.panelToggle$.subscribe(() => {
       this.showAddPanel = !this.showAddPanel;
@@ -1271,17 +1274,32 @@ export class QueueViewComponent implements OnInit, OnDestroy {
 
   loadQueue(): void {
     this.fetchQueue(true);
-    this.api.get<StatusResponse>('/status').subscribe({
-      next: (s) => {
-        this.status.set(s);
-        this.statusError.set(null);
-        this.updateConnectionHold(s.nntp_connections ?? [], Date.now());
-      },
-      error: (err) => {
-        if (isAuthHandledError(err)) return;
-        this.statusError.set(httpErrorMessage(err, "Couldn't load download status"));
-      },
-    });
+    this.fetchStatus();
+  }
+
+  /** Refreshes /status (connection pool, speed limit). Called on load and on each poll tick. */
+  fetchStatus(): void {
+    if (this.statusPollInFlight) return;
+    this.statusPollInFlight = true;
+    this.api
+      .get<StatusResponse>('/status')
+      .pipe(
+        timeout(POLL_TIMEOUT_MS),
+        finalize(() => {
+          this.statusPollInFlight = false;
+        }),
+      )
+      .subscribe({
+        next: (s) => {
+          this.status.set(s);
+          this.statusError.set(null);
+          this.updateConnectionHold(s.nntp_connections ?? [], Date.now());
+        },
+        error: (err) => {
+          if (isAuthHandledError(err)) return;
+          this.statusError.set(httpErrorMessage(err, "Couldn't load download status"));
+        },
+      });
   }
 
   fetchQueue(supersedeInFlight: boolean): void {
