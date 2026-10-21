@@ -24,7 +24,7 @@ response) until the process restarts; the settings UI shows a
 | `general.scripts_dir`, `script_success`, `script_failure`, `script_timeout_secs`, `script_max_output_bytes` | Post-processing | at once |
 | `general.listen_addr`, `general.port` | API | restart required |
 | `general.api_key` (regenerate) | API | at once |
-| speed limit, concurrent jobs, history retention, debug logging | General | at once |
+| speed limit, concurrent jobs, history retention, keep History when an *arr removes a job (`general.keep_history_on_arr_delete`), debug logging | General | at once |
 | servers, RSS feeds, schedule, DAV | their tabs | as before |
 
 Directory changes are checked inside the container before they are saved:
