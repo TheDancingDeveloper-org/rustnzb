@@ -42,8 +42,10 @@ a force-push cancels the superseded run. Each queue entry has its own
 ### Runners
 
 Queue runs use the same labels as PR runs: `self-hosted`, plus
-`docker, publish` for e2e, desktop and container-smoke. No workflow targets
-GCP or spot labels.
+`docker, publish` for e2e, desktop and container-smoke. The `rust` job runs on
+the local node-f runners, `[self-hosted, Linux, X64, tailnet]`. It no longer
+targets the `gcp-rust` spot runners: those scaled from zero, and jobs waited up
+to 68 minutes for a runner. No workflow targets GCP or spot labels.
 
 ## Landing
 

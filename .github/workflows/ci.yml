@@ -65,12 +65,12 @@ jobs:
     # successful check, so required checks do not remain pending.
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: [self-hosted, gcp-rust]
+    runs-on: [self-hosted, Linux, X64, tailnet]
     env:
       CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v7
-      # GCP runner images carry no Node; build the real frontend so build.rs
+      # Runner images may carry no Node; build the real frontend so build.rs
       # embeds it instead of its placeholder (e2e_full_pipeline asserts this).
       - uses: actions/setup-node@v7
         with:
