@@ -271,8 +271,9 @@ async fn config_routes_validate_duplicates_and_persist_successful_updates() {
     assert_eq!(servers[0]["host"], "news.example.test");
     assert_eq!(servers[0]["username"], "");
 
-    let category =
-        serde_json::json!({"name":"tv", "output_dir":"/downloads/tv", "post_processing":3});
+    let tv_dir = app._temp.path().join("tv");
+    std::fs::create_dir_all(&tv_dir).unwrap();
+    let category = serde_json::json!({"name":"tv", "output_dir": tv_dir, "post_processing":3});
     assert_eq!(
         client
             .post(format!("{}/api/config/categories", app.base_url))
@@ -1472,10 +1473,13 @@ async fn category_save_rejects_unsafe_name_and_output_dir() {
     assert!(saved.categories[0].output_dir.is_none());
 
     // What enqueue accepts is still accepted: relative subdirectories and
-    // absolute roots.
+    // absolute roots, once they exist and are writable.
+    let movies = app._temp.path().join("media/movies");
+    std::fs::create_dir_all(&movies).unwrap();
+    std::fs::create_dir_all(app._temp.path().join("complete/shows/tv")).unwrap();
     for body in [
         category("tv", serde_json::json!("shows/tv")),
-        category("movies", serde_json::json!("/srv/media/movies")),
+        category("movies", serde_json::json!(movies)),
     ] {
         let (status, response) = call(
             client
@@ -1733,4 +1737,177 @@ async fn general_config_persists_previously_unreachable_settings() {
     .await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(app.state.queue_manager.get_max_active_downloads(), 0);
+}
+
+/// WI-2079: a changed download directory is checked inside the process's
+/// filesystem before it is saved: a missing one is refused and never created,
+/// a writable one is saved and used for new jobs at once.
+#[tokio::test]
+async fn general_config_validates_download_directories_and_applies_them_to_new_jobs() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let (access, _) = login(&app, &client).await;
+    let url = format!("{}/api/config/general", app.base_url);
+    let before = AppConfig::load(&app.config_path).unwrap();
+
+    let missing = app._temp.path().join("not-mounted");
+    for field in ["complete_dir", "incomplete_dir"] {
+        let (status, body) = call(
+            client
+                .put(&url)
+                .bearer_auth(&access)
+                .json(&serde_json::json!({ field: missing })),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        let message = body["human_readable"].as_str().unwrap_or("");
+        assert!(message.contains(field), "{body}");
+        assert!(message.contains("does not exist"), "{body}");
+        assert!(!missing.exists(), "the directory must never be created");
+    }
+    let (status, body) = call(
+        client
+            .put(&url)
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"complete_dir": "relative/dir"})),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        serde_json::to_value(&AppConfig::load(&app.config_path).unwrap().general).unwrap(),
+        serde_json::to_value(&before.general).unwrap(),
+    );
+
+    // A missing category folder is refused the same way.
+    let (status, body) = call(
+        client
+            .post(format!("{}/api/config/categories", app.base_url))
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"name": "tv", "output_dir": missing, "post_processing": 3})),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["human_readable"]
+            .as_str()
+            .unwrap()
+            .contains("output_dir")
+    );
+
+    let complete = app._temp.path().join("new-complete");
+    let incomplete = app._temp.path().join("new-incomplete");
+    std::fs::create_dir_all(&complete).unwrap();
+    std::fs::create_dir_all(&incomplete).unwrap();
+    let old_output = app
+        .state
+        .queue_manager
+        .output_dir_for("Default", "Old.Job")
+        .unwrap();
+    let (status, body) = call(
+        client
+            .put(&url)
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"complete_dir": complete, "incomplete_dir": incomplete})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // Directories apply live, so they are not waiting for a restart.
+    assert_eq!(body["restart_required"], serde_json::json!([]), "{body}");
+    let saved = AppConfig::load(&app.config_path).unwrap().general;
+    assert_eq!(saved.complete_dir, complete);
+    assert_eq!(saved.incomplete_dir, incomplete);
+    assert_eq!(app.state.queue_manager.complete_dir(), complete);
+    assert_eq!(app.state.queue_manager.incomplete_dir(), incomplete);
+    let new_output = app
+        .state
+        .queue_manager
+        .output_dir_for("Default", "New.Job")
+        .unwrap();
+    assert!(new_output.starts_with(&complete), "{new_output:?}");
+    assert!(!old_output.starts_with(&complete), "{old_output:?}");
+    // The probe file is cleaned up.
+    assert_eq!(std::fs::read_dir(&complete).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn general_config_refuses_a_read_only_download_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root ignores directory permissions, so the check cannot fail there.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let (access, _) = login(&app, &client).await;
+    let read_only = app._temp.path().join("read-only");
+    std::fs::create_dir_all(&read_only).unwrap();
+    std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (status, body) = call(
+        client
+            .put(format!("{}/api/config/general", app.base_url))
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"complete_dir": read_only})),
+    )
+    .await;
+    std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(status, 400, "{body}");
+    let message = body["human_readable"].as_str().unwrap_or("");
+    assert!(message.contains("not writable by uid"), "{body}");
+}
+
+/// WI-2079: network settings are saved, flagged as waiting for a restart,
+/// and listed by the restart-pending endpoint until the process restarts.
+#[tokio::test]
+async fn network_settings_are_saved_and_flagged_restart_required() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let (access, _) = login(&app, &client).await;
+    let pending_url = format!("{}/api/config/restart-pending", app.base_url);
+    let (status, body) = call(client.get(&pending_url).bearer_auth(&access)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["restart_required"], serde_json::json!([]));
+
+    let url = format!("{}/api/config/general", app.base_url);
+    for (payload, field) in [
+        (serde_json::json!({"port": 0}), "port"),
+        (
+            serde_json::json!({"listen_addr": "not an ip"}),
+            "listen_addr",
+        ),
+    ] {
+        let (status, body) = call(client.put(&url).bearer_auth(&access).json(&payload)).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body["human_readable"].as_str().unwrap().contains(field));
+    }
+
+    let (status, body) = call(client.put(&url).bearer_auth(&access).json(
+        &serde_json::json!({"port": 9191, "listen_addr": "127.0.0.1", "par2_defer_volumes": false}),
+    ))
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["restart_required"],
+        serde_json::json!(["general.listen_addr", "general.port"])
+    );
+    let saved = AppConfig::load(&app.config_path).unwrap();
+    assert_eq!(saved.general.port, 9191);
+    assert_eq!(saved.general.listen_addr, "127.0.0.1");
+    assert!(!saved.par2.defer_volumes);
+    let (_, body) = call(client.get(&pending_url).bearer_auth(&access)).await;
+    assert_eq!(
+        body["restart_required"],
+        serde_json::json!(["general.listen_addr", "general.port"])
+    );
+
+    // Saving the startup values again clears the notice.
+    let default = AppConfig::default().general;
+    let (_, body) = call(
+        client
+            .put(&url)
+            .bearer_auth(&access)
+            .json(&serde_json::json!({"port": default.port, "listen_addr": default.listen_addr})),
+    )
+    .await;
+    assert_eq!(body["restart_required"], serde_json::json!([]));
 }

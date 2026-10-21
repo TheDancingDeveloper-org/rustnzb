@@ -41,6 +41,8 @@ interface CategoryConfig {
   name: string;
   output_dir: string | null;
   post_processing: number;
+  cleanup_patterns?: string[];
+  unwanted_extensions?: string[];
 }
 
 interface ServerStats {
@@ -141,6 +143,62 @@ interface GeneralDirs {
   incomplete_dir: string;
   complete_dir: string;
   watch_dir: string | null;
+  listen_addr?: string;
+  port?: number;
+  direct_unpack?: boolean;
+  max_nested_archive_depth?: number;
+  max_post_processing_jobs?: number;
+  max_repair_workers?: number;
+  max_extract_workers?: number;
+  scripts_dir?: string | null;
+  script_success?: string | null;
+  script_failure?: string | null;
+  script_timeout_secs?: number;
+  script_max_output_bytes?: number;
+}
+
+interface Par2Settings {
+  defer_volumes: boolean;
+  trust_inflight_verify: boolean;
+}
+
+interface GeneralUpdateResponse {
+  status: boolean;
+  restart_required: string[];
+}
+
+export interface PathsForm {
+  complete_dir: string;
+  incomplete_dir: string;
+  watch_dir: string;
+}
+
+export interface PostprocForm {
+  direct_unpack: boolean;
+  max_nested_archive_depth: number;
+  max_post_processing_jobs: number;
+  max_repair_workers: number;
+  max_extract_workers: number;
+  scripts_dir: string;
+  script_success: string;
+  script_failure: string;
+  script_timeout_secs: number;
+  script_max_output_bytes: number;
+  par2_defer_volumes: boolean;
+  par2_trust_inflight_verify: boolean;
+}
+
+export interface NetworkForm {
+  listen_addr: string;
+  port: number;
+}
+
+/** Split a comma- or newline-separated list, dropping blanks. */
+export function splitList(text: string): string[] {
+  return text
+    .split(/[,\n]/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
 }
 
 interface SabApiKeyResponse {
@@ -211,12 +269,37 @@ type SettingsKey =
   | 'schedule'
   | 'debugLogging'
   | 'dav'
-  | 'sabApiKey';
+  | 'sabApiKey'
+  | 'paths'
+  | 'postproc'
+  | 'network';
 
 /** Settings edited in place and written by their own Save button. Toggles that save on change are not here. */
-type FormKey = 'speedLimit' | 'maxActive' | 'historyRetention' | 'diskGuards' | 'schedule' | 'dav';
+type FormKey =
+  | 'speedLimit'
+  | 'maxActive'
+  | 'historyRetention'
+  | 'diskGuards'
+  | 'schedule'
+  | 'dav'
+  | 'paths'
+  | 'postproc'
+  | 'network';
 
-const FORM_KEYS: readonly FormKey[] = ['speedLimit', 'maxActive', 'historyRetention', 'diskGuards', 'schedule', 'dav'];
+const FORM_KEYS: readonly FormKey[] = [
+  'speedLimit',
+  'maxActive',
+  'historyRetention',
+  'diskGuards',
+  'schedule',
+  'dav',
+  'paths',
+  'postproc',
+  'network',
+];
+
+/** Forms filled from the one `GET /config` document and saved through `PUT /config/general`. */
+const CONFIG_FORM_KEYS: readonly FormKey[] = ['paths', 'postproc', 'network'];
 
 function isFormKey(key: SettingsKey): key is FormKey {
   return (FORM_KEYS as readonly string[]).includes(key);
@@ -267,6 +350,9 @@ function allLoading(): Record<SettingsKey, LoadState> {
     debugLogging: { status: 'loading' },
     dav: { status: 'loading' },
     sabApiKey: { status: 'loading' },
+    paths: { status: 'loading' },
+    postproc: { status: 'loading' },
+    network: { status: 'loading' },
   };
 }
 
@@ -314,6 +400,15 @@ function emptyCategory(): CategoryConfig {
       </aside>
 
       <div class="settings-main">
+        @if (restartPending().length) {
+          <div class="restart-banner" role="status">
+            <b>Restart pending.</b> Saved changes to
+            @for (key of restartPending(); track key; let last = $last) {
+              <code>{{ key }}</code>{{ last ? '' : ', ' }}
+            }
+            take effect after rustnzb restarts.
+          </div>
+        }
         <!-- =========== SERVERS =========== -->
         @if (tab === 'servers') {
           @if (loadFailure('servers'); as message) {
@@ -670,11 +765,23 @@ function emptyCategory(): CategoryConfig {
                   <input type="text" [(ngModel)]="editingCategory.name" placeholder="movies" />
 
                   <label>Output dir</label>
-                  <input
-                    type="text"
-                    [(ngModel)]="editingCategory.output_dir"
-                    placeholder="(optional — uses default if blank)"
-                  />
+                  <div>
+                    <input
+                      type="text"
+                      [(ngModel)]="editingCategory.output_dir"
+                      placeholder="(optional — uses default if blank)"
+                    />
+                    <div class="setting-description">
+                      Absolute, or relative to the complete directory. It must already exist in the
+                      container and be writable; rustnzb never creates it. New jobs only.
+                    </div>
+                    @if (categoryOutputChanged()) {
+                      <div class="path-warn" role="note">
+                        Sonarr, Radarr and the other *arrs import from this folder. Update their
+                        download-client path or remote path mapping to match, or imports will fail.
+                      </div>
+                    }
+                  </div>
 
                   <label>Post-processing</label>
                   <select [(ngModel)]="editingCategory.post_processing">
@@ -683,6 +790,22 @@ function emptyCategory(): CategoryConfig {
                     <option [ngValue]="2">Unpack</option>
                     <option [ngValue]="3">Repair + Unpack</option>
                   </select>
+
+                  <label>Delete after unpack</label>
+                  <div>
+                    <input
+                      type="text"
+                      [(ngModel)]="categoryCleanupText"
+                      placeholder="*.nfo, Sample/*"
+                    />
+                    <div class="setting-description">File or relative-path glob patterns, comma separated.</div>
+                  </div>
+
+                  <label>Unwanted extensions</label>
+                  <div>
+                    <input type="text" [(ngModel)]="categoryExtText" placeholder="exe, lnk" />
+                    <div class="setting-description">Removed after unpacking, comma separated.</div>
+                  </div>
                 </div>
                 <div class="form-actions">
                   <button class="btn primary" (click)="saveCategory()" [disabled]="!canSave('categories')">Save</button>
@@ -693,42 +816,117 @@ function emptyCategory(): CategoryConfig {
           }
         }
 
-        <!-- =========== POST-PROCESSING (static/overview) =========== -->
+        <!-- =========== POST-PROCESSING =========== -->
         @if (tab === 'postproc') {
+          @if (loadFailure('postproc'); as message) {
+            <div class="load-error" role="alert">
+              {{ message }}. Saving is paused until the settings load.
+              <button class="btn sm" (click)="loadDirs()">Retry</button>
+            </div>
+          }
           <div class="section-head">
             <div>
               <h2>Post-processing</h2>
-              <div class="sub">Par2 repair (native Rust), unrar / 7z extraction, cleanup.</div>
+              <div class="sub">Par2 repair (native Rust), unrar / 7z extraction, cleanup and scripts.</div>
             </div>
           </div>
 
           <div class="panel">
-            <h3>Par2 repair <span class="hint">rust-par2 · no external binary</span></h3>
-            <div class="body prose-secondary">
-              Par2 behaviour is currently controlled per-category (see
-              <a (click)="tab = 'categories'" style="cursor:pointer">Categories</a>). Global toggles
-              (mode, memory limit, threads) will live here once the backend exposes them.
+            <h3>Repair &amp; unpack</h3>
+            <div class="body">
+              <div class="form">
+                <label>Direct unpack</label>
+                <label class="toggle">
+                  <input type="checkbox" [(ngModel)]="postprocForm.direct_unpack" />
+                  <span>Extract RAR volumes while the job downloads <span class="restart-tag">restart required</span></span>
+                </label>
+
+                <label>Nested archive depth</label>
+                <div class="inline">
+                  <input type="number" [(ngModel)]="postprocForm.max_nested_archive_depth" min="0" max="10" />
+                  <span class="help">layers inside the outer archive · 0 = outer only</span>
+                  <span class="restart-tag">restart required</span>
+                </div>
+
+                <label>Jobs in post-processing</label>
+                <div class="inline">
+                  <input type="number" [(ngModel)]="postprocForm.max_post_processing_jobs" min="1" max="64" />
+                  <span class="restart-tag">restart required</span>
+                </div>
+
+                <label>Repair workers</label>
+                <div class="inline">
+                  <input type="number" [(ngModel)]="postprocForm.max_repair_workers" min="1" max="64" />
+                  <span class="restart-tag">restart required</span>
+                </div>
+
+                <label>Extract workers</label>
+                <div class="inline">
+                  <input type="number" [(ngModel)]="postprocForm.max_extract_workers" min="1" max="64" />
+                  <span class="restart-tag">restart required</span>
+                </div>
+
+                <label>Defer par2 volumes</label>
+                <label class="toggle">
+                  <input type="checkbox" [(ngModel)]="postprocForm.par2_defer_volumes" />
+                  <span>Fetch recovery volumes only when damage needs them</span>
+                </label>
+
+                <label>Trust in-flight verify</label>
+                <label class="toggle">
+                  <input type="checkbox" [(ngModel)]="postprocForm.par2_trust_inflight_verify" />
+                  <span>Skip the disk verify pass when the download already proved every file</span>
+                </label>
+              </div>
             </div>
           </div>
 
           <div class="panel">
-            <h3>Extraction</h3>
-            <div class="body prose-secondary">
-              System <code>unrar</code> and <code>7z</code> are detected at startup. Run
-              <code>--smoke-test</code> to verify the runtime tools.
+            <h3>Scripts</h3>
+            <div class="body">
+              <div class="form">
+                <label>Scripts directory</label>
+                <input type="text" [(ngModel)]="postprocForm.scripts_dir" placeholder="(none)" />
+
+                <label>On success</label>
+                <input type="text" [(ngModel)]="postprocForm.script_success" placeholder="(none)" />
+
+                <label>On failure</label>
+                <input type="text" [(ngModel)]="postprocForm.script_failure" placeholder="(none)" />
+
+                <label>Timeout</label>
+                <div class="inline">
+                  <input type="number" [(ngModel)]="postprocForm.script_timeout_secs" min="1" />
+                  <span class="help">seconds</span>
+                </div>
+
+                <label>Output kept</label>
+                <div class="inline">
+                  <input type="number" [(ngModel)]="postprocForm.script_max_output_bytes" min="0" />
+                  <span class="help">bytes</span>
+                </div>
+              </div>
             </div>
           </div>
 
           <div class="panel">
             <h3>Cleanup</h3>
             <div class="body prose-secondary">
-              On success, .rar / .par2 are removed from the output directory; sample files under 50
-              MB are pruned. On failure, partial files are kept for retry.
+              On success, .rar / .par2 are removed from the output directory. File-deletion rules
+              (glob patterns and unwanted extensions) are set per category under
+              <a (click)="tab = 'categories'" style="cursor:pointer">Categories</a>. On failure,
+              partial files are kept for retry.
             </div>
+          </div>
+
+          <div class="form-actions">
+            <button class="btn primary" (click)="savePostproc()" [disabled]="!canSave('postproc')">
+              Save post-processing
+            </button>
           </div>
         }
 
-        <!-- =========== PATHS & DISK (read-only preview) =========== -->
+        <!-- =========== PATHS & DISK =========== -->
         @if (tab === 'paths') {
           @if (loadFailure('diskGuards'); as message) {
             <div class="load-error" role="alert">
@@ -736,53 +934,62 @@ function emptyCategory(): CategoryConfig {
               <button class="btn sm" (click)="loadDiskGuards()">Retry</button>
             </div>
           }
+          @if (loadFailure('paths'); as message) {
+            <div class="load-error" role="alert">
+              {{ message }}. Saving is paused until the paths load.
+              <button class="btn sm" (click)="loadDirs()">Retry</button>
+            </div>
+          }
           <div class="section-head">
             <div>
               <h2>Paths &amp; disk</h2>
-              <div class="sub">Where rustnzb reads and writes. Set via CLI / TOML / env.</div>
+              <div class="sub">
+                Where rustnzb reads and writes. A changed path applies to new jobs only: queued and
+                history entries keep their paths, and nothing is moved.
+              </div>
             </div>
           </div>
 
           <div class="panel">
             <h3>Directories</h3>
-            <div class="body dir-table">
-              <div class="dir-row">
-                <span class="dir-label">Data dir</span>
-                <code class="dir-val">{{ dirs()?.data_dir ?? '…' }}</code>
-                <span class="dir-hint"
-                  >SQLite, queue state, job blobs · set via <code>RUSTNZB_DATA_DIR</code> or
-                  <code>--data-dir</code></span
-                >
+            <div class="body">
+              <div class="form">
+                <label for="complete-dir">Complete (downloads)</label>
+                <div>
+                  <input id="complete-dir" type="text" [(ngModel)]="pathsForm.complete_dir" />
+                  <div class="setting-description">Finished jobs land here, in a folder per category.</div>
+                </div>
+
+                <label for="incomplete-dir">Incomplete / temp</label>
+                <div>
+                  <input id="incomplete-dir" type="text" [(ngModel)]="pathsForm.incomplete_dir" />
+                  <div class="setting-description">Working area for jobs while they download.</div>
+                </div>
+
+                <label for="watch-dir">Watch dir</label>
+                <div>
+                  <input id="watch-dir" type="text" [(ngModel)]="pathsForm.watch_dir" placeholder="(not configured)" />
+                  <div class="setting-description">
+                    <code>.nzb</code> files dropped here are enqueued. <span class="restart-tag">restart required</span>
+                  </div>
+                </div>
+
+                <label>Data dir</label>
+                <div>
+                  <code>{{ dirs()?.data_dir ?? '…' }}</code>
+                  <div class="setting-description">
+                    Read-only here: holds the database and this config. Set it with
+                    <code>RUSTNZB_DATA_DIR</code> or <code>--data-dir</code>.
+                  </div>
+                </div>
               </div>
-              <div class="dir-row">
-                <span class="dir-label">Downloads</span>
-                <code class="dir-val">{{ dirs()?.complete_dir ?? '…' }}</code>
-                <span class="dir-hint">configured per category</span>
+              <div class="dim" style="margin-top:10px">
+                Each directory must already exist inside the container and be writable by rustnzb;
+                it is checked on save and never created. Category folders are set under
+                <a (click)="tab = 'categories'" style="cursor:pointer">Categories</a>.
               </div>
-              <div class="dir-row">
-                <span class="dir-label">Incomplete</span>
-                <code class="dir-val">{{ dirs()?.incomplete_dir ?? '…' }}</code>
-                <span class="dir-hint">in-progress download working area</span>
-              </div>
-              <div class="dir-row">
-                <span class="dir-label">Watch dir</span>
-                @if (dirs()?.watch_dir) {
-                  <code class="dir-val">{{ dirs()!.watch_dir }}</code>
-                  <span class="dir-hint"><code>.nzb</code> drops auto-enqueue</span>
-                } @else {
-                  <span class="dir-val dim">— not configured</span>
-                  <span class="dir-hint">set <code>watch_dir</code> in config to enable</span>
-                }
-              </div>
-              <div class="dir-row">
-                <span class="dir-label">Temp</span>
-                <code class="dir-val">{{ dirs() ? dirs()!.data_dir + '/tmp' : '…' }}</code>
-                <span class="dir-hint">transient working files</span>
-              </div>
-              <div class="dir-row">
-                <span class="dir-label">Logs</span>
-                <code class="dir-val">{{ dirs() ? dirs()!.data_dir + '/logs' : '…' }}</code>
-                <span class="dir-hint">per-job log files</span>
+              <div class="form-actions">
+                <button class="btn primary" (click)="savePaths()" [disabled]="!canSave('paths')">Save paths</button>
               </div>
             </div>
           </div>
@@ -1456,6 +1663,34 @@ function emptyCategory(): CategoryConfig {
           </div>
 
           <div class="panel">
+            <h3>Network <span class="restart-tag">restart required</span></h3>
+            <div class="body">
+              @if (loadFailure('network'); as message) {
+                <div class="load-error" role="alert">
+                  {{ message }}. Saving is paused until the settings load.
+                  <button class="btn sm" (click)="loadDirs()">Retry</button>
+                </div>
+              }
+              <div class="form">
+                <label for="listen-addr">Listen address</label>
+                <input id="listen-addr" type="text" [(ngModel)]="networkForm.listen_addr" placeholder="0.0.0.0" />
+
+                <label for="listen-port">Port</label>
+                <input id="listen-port" type="number" [(ngModel)]="networkForm.port" min="1" max="65535" />
+              </div>
+              <div class="dim" style="margin-top:10px">
+                Read when rustnzb starts. In Docker, the container port mapping must follow a port
+                change. A <code>--port</code>, <code>--listen-addr</code> or environment override still
+                wins over the saved value. Serving under a base URL (sub-path) is not supported; put
+                rustnzb at the root of its host.
+              </div>
+              <div class="form-actions">
+                <button class="btn primary" (click)="saveNetwork()" [disabled]="!canSave('network')">Save network</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
             <h3>OpenAPI / Swagger</h3>
             <div class="body">
               <a href="/swagger-ui" target="_blank">Open <code>/swagger-ui</code></a>
@@ -1890,6 +2125,28 @@ function emptyCategory(): CategoryConfig {
       .backup-summary .dav-warn {
         margin-bottom: 0;
       }
+      .restart-banner {
+        background: rgba(234, 179, 8, 0.1);
+        border: 1px solid var(--warn, #eab308);
+        border-radius: 6px;
+        padding: 8px 12px;
+        margin-bottom: 14px;
+        font-size: 13px;
+      }
+      .restart-tag {
+        display: inline-block;
+        font-size: 11px;
+        padding: 0 6px;
+        border-radius: 4px;
+        border: 1px solid var(--line);
+        color: var(--mute);
+        white-space: nowrap;
+      }
+      .path-warn {
+        margin-top: 6px;
+        font-size: 12px;
+        color: var(--warn, #b45309);
+      }
       .load-error {
         display: flex;
         flex-wrap: wrap;
@@ -2162,6 +2419,27 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
 
   // Directory paths (from /api/config)
   dirs = signal<GeneralDirs | null>(null);
+  pathsForm: PathsForm = { complete_dir: '', incomplete_dir: '', watch_dir: '' };
+  postprocForm: PostprocForm = {
+    direct_unpack: true,
+    max_nested_archive_depth: 5,
+    max_post_processing_jobs: 2,
+    max_repair_workers: 1,
+    max_extract_workers: 1,
+    scripts_dir: '',
+    script_success: '',
+    script_failure: '',
+    script_timeout_secs: 300,
+    script_max_output_bytes: 65536,
+    par2_defer_volumes: true,
+    par2_trust_inflight_verify: true,
+  };
+  networkForm: NetworkForm = { listen_addr: '', port: 8080 };
+  /** Saved settings that take effect only after a restart. */
+  restartPending = signal<string[]>([]);
+  categoryCleanupText = '';
+  categoryExtText = '';
+  private editingCategoryOriginalOutput: string | null = null;
 
   // Backup & restore
   backupIncludeSecrets = false;
@@ -2222,6 +2500,12 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
         return JSON.stringify({ enabled: this.schedule.enabled, rules: this.schedule.rules });
       case 'dav':
         return JSON.stringify(this.davConfig);
+      case 'paths':
+        return JSON.stringify(this.pathsForm);
+      case 'postproc':
+        return JSON.stringify(this.postprocForm);
+      case 'network':
+        return JSON.stringify(this.networkForm);
     }
   }
 
@@ -2287,11 +2571,126 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     });
   }
 
+  /** GET the config document behind the paths, post-processing and network forms. */
   loadDirs(): void {
-    this.api.get<{ general: GeneralDirs }>('/config').subscribe({
-      next: (cfg) => this.dirs.set(cfg.general),
-      error: (err) => showHttpError(this.toast, err, 'Failed to load directory paths'),
+    for (const key of CONFIG_FORM_KEYS) this.setLoad(key, { status: 'loading' });
+    this.api.get<{ general: GeneralDirs; par2?: Par2Settings }>('/config').subscribe({
+      next: (cfg) => {
+        if (!cfg?.general) {
+          for (const key of CONFIG_FORM_KEYS) this.setLoad(key, { status: 'failed', message: 'Failed to load settings' });
+          return;
+        }
+        this.applyConfig(cfg.general, cfg.par2);
+        for (const key of CONFIG_FORM_KEYS) {
+          this.baselines[key] = this.formSnapshot(key);
+          this.setLoad(key, { status: 'loaded' });
+        }
+      },
+      error: (err) => {
+        const message = httpErrorMessage(err, 'Failed to load settings');
+        for (const key of CONFIG_FORM_KEYS) this.setLoad(key, { status: 'failed', message });
+      },
     });
+    this.loadRestartPending();
+  }
+
+  private applyConfig(g: GeneralDirs, par2?: Par2Settings): void {
+    this.dirs.set(g);
+    this.pathsForm = {
+      complete_dir: g.complete_dir ?? '',
+      incomplete_dir: g.incomplete_dir ?? '',
+      watch_dir: g.watch_dir ?? '',
+    };
+    const p = this.postprocForm;
+    this.postprocForm = {
+      direct_unpack: g.direct_unpack ?? p.direct_unpack,
+      max_nested_archive_depth: g.max_nested_archive_depth ?? p.max_nested_archive_depth,
+      max_post_processing_jobs: g.max_post_processing_jobs ?? p.max_post_processing_jobs,
+      max_repair_workers: g.max_repair_workers ?? p.max_repair_workers,
+      max_extract_workers: g.max_extract_workers ?? p.max_extract_workers,
+      scripts_dir: g.scripts_dir ?? '',
+      script_success: g.script_success ?? '',
+      script_failure: g.script_failure ?? '',
+      script_timeout_secs: g.script_timeout_secs ?? p.script_timeout_secs,
+      script_max_output_bytes: g.script_max_output_bytes ?? p.script_max_output_bytes,
+      par2_defer_volumes: par2?.defer_volumes ?? p.par2_defer_volumes,
+      par2_trust_inflight_verify: par2?.trust_inflight_verify ?? p.par2_trust_inflight_verify,
+    };
+    this.networkForm = { listen_addr: g.listen_addr ?? '', port: g.port ?? this.networkForm.port };
+  }
+
+  loadRestartPending(): void {
+    this.api.get<{ restart_required: string[] }>('/config/restart-pending').subscribe({
+      next: (r) => this.restartPending.set(r?.restart_required ?? []),
+      error: () => this.restartPending.set([]),
+    });
+  }
+
+  /** PUT part of the general settings; the server checks paths and reports what waits for a restart. */
+  private saveGeneral(key: FormKey, body: Record<string, unknown>, saved: string, fallback: string): void {
+    if (!this.canSave(key)) return;
+    const sent = this.formSnapshot(key);
+    this.api.put<GeneralUpdateResponse>('/config/general', body).subscribe({
+      next: (r) => {
+        this.baselines[key] = sent;
+        this.restartPending.set(r?.restart_required ?? []);
+        this.toast.success(saved);
+      },
+      error: (err) => showHttpError(this.toast, err, fallback),
+    });
+  }
+
+  savePaths(): void {
+    const f = this.pathsForm;
+    const complete = f.complete_dir.trim();
+    const incomplete = f.incomplete_dir.trim();
+    if (!complete || !incomplete) {
+      this.toast.info('The complete and incomplete directories are required');
+      return;
+    }
+    this.saveGeneral(
+      'paths',
+      { complete_dir: complete, incomplete_dir: incomplete, watch_dir: f.watch_dir.trim() },
+      'Paths saved. New jobs use them; existing jobs keep their paths.',
+      'Failed to save paths',
+    );
+  }
+
+  savePostproc(): void {
+    const f = this.postprocForm;
+    this.saveGeneral(
+      'postproc',
+      {
+        direct_unpack: f.direct_unpack,
+        max_nested_archive_depth: Number(f.max_nested_archive_depth),
+        max_post_processing_jobs: Number(f.max_post_processing_jobs),
+        max_repair_workers: Number(f.max_repair_workers),
+        max_extract_workers: Number(f.max_extract_workers),
+        scripts_dir: f.scripts_dir.trim(),
+        script_success: f.script_success.trim(),
+        script_failure: f.script_failure.trim(),
+        script_timeout_secs: Number(f.script_timeout_secs),
+        script_max_output_bytes: Number(f.script_max_output_bytes),
+        par2_defer_volumes: f.par2_defer_volumes,
+        par2_trust_inflight_verify: f.par2_trust_inflight_verify,
+      },
+      'Post-processing settings saved',
+      'Failed to save post-processing settings',
+    );
+  }
+
+  saveNetwork(): void {
+    const port = Number(this.networkForm.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      this.toast.info('Port must be between 1 and 65535');
+      return;
+    }
+    this.saveGeneral(
+      'network',
+      { listen_addr: this.networkForm.listen_addr.trim(), port },
+      'Network settings saved. They apply after a restart.',
+      'Failed to save network settings',
+    );
   }
 
   // ======================== SERVERS ========================
@@ -2460,11 +2859,24 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
   addCategory(): void {
     this.editingCategory = emptyCategory();
     this.editingCategoryOriginalName = null;
+    this.editingCategoryOriginalOutput = null;
+    this.categoryCleanupText = '';
+    this.categoryExtText = '';
   }
 
   editCategory(c: CategoryConfig): void {
     this.editingCategory = { ...c };
     this.editingCategoryOriginalName = c.name;
+    this.editingCategoryOriginalOutput = c.output_dir || null;
+    this.categoryCleanupText = (c.cleanup_patterns ?? []).join(', ');
+    this.categoryExtText = (c.unwanted_extensions ?? []).join(', ');
+  }
+
+  /** True when the edited category's folder differs from the saved one, so the *arr warning shows. */
+  categoryOutputChanged(): boolean {
+    if (!this.editingCategory) return false;
+    const next = this.editingCategory.output_dir?.trim() || null;
+    return next !== this.editingCategoryOriginalOutput;
   }
 
   cancelCategoryEdit(): void {
@@ -2475,7 +2887,9 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
   saveCategory(): void {
     if (!this.editingCategory || !this.canSave('categories')) return;
     const cat = { ...this.editingCategory };
-    if (!cat.output_dir) cat.output_dir = null;
+    cat.output_dir = cat.output_dir?.trim() || null;
+    cat.cleanup_patterns = splitList(this.categoryCleanupText);
+    cat.unwanted_extensions = splitList(this.categoryExtText);
 
     if (this.editingCategoryOriginalName) {
       const encoded = encodeURIComponent(this.editingCategoryOriginalName);

@@ -1921,12 +1921,12 @@ fn parse_and_prepare(
     })
 }
 
-/// Settings a restore persists but this process reads only at start-up, so the
-/// operator knows a restart is needed for them to take effect. The live
-/// settings — servers, categories, speed limit, disk guard, retention,
-/// concurrency, notifications and post-processing scripts — are applied at once
-/// and are not listed.
-fn restart_required(
+/// Settings this process reads only at start-up, so the operator knows a
+/// restart is needed for them to take effect. The live settings — servers,
+/// categories, download directories (new jobs only), speed limit, disk guard,
+/// retention, concurrency, notifications and post-processing scripts — are
+/// applied at once and are not listed.
+pub(crate) fn restart_required(
     previous: &nzb_web::nzb_core::config::AppConfig,
     next: &nzb_web::nzb_core::config::AppConfig,
 ) -> Vec<String> {
@@ -1940,11 +1940,6 @@ fn restart_required(
     check("general.listen_addr", a.listen_addr != b.listen_addr);
     check("general.port", a.port != b.port);
     check("general.data_dir", a.data_dir != b.data_dir);
-    check(
-        "general.incomplete_dir",
-        a.incomplete_dir != b.incomplete_dir,
-    );
-    check("general.complete_dir", a.complete_dir != b.complete_dir);
     check("general.watch_dir", a.watch_dir != b.watch_dir);
     check("general.log_level", a.log_level != b.log_level);
     check(
@@ -2118,6 +2113,12 @@ pub async fn h_config_backup_restore(
 fn apply_restored_runtime(state: &Arc<AppState>) {
     let config = state.config();
     state.queue_manager.update_servers(config.servers.clone());
+    state
+        .queue_manager
+        .set_incomplete_dir(config.general.incomplete_dir.clone());
+    state
+        .queue_manager
+        .set_complete_dir(config.general.complete_dir.clone());
     state
         .queue_manager
         .set_categories(config.categories.clone());
@@ -2671,6 +2672,7 @@ pub async fn h_category_add(
     Json(cat): Json<CategoryConfig>,
 ) -> Result<impl IntoResponse, ApiError> {
     cat.validate().map_err(ApiError::bad_request)?;
+    validate_category_output_dir(&state, &cat, None)?;
     state.update_config_with(|config| {
         if config.categories.iter().any(|c| c.name == cat.name) {
             return Err(ApiError::conflict(format!(
@@ -2708,6 +2710,13 @@ pub async fn h_category_update(
     Json(cat): Json<CategoryConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     cat.validate().map_err(ApiError::bad_request)?;
+    let previous = state
+        .config()
+        .categories
+        .iter()
+        .find(|c| c.name == name)
+        .and_then(|c| c.output_dir.clone());
+    validate_category_output_dir(&state, &cat, previous.as_deref())?;
     state.update_config_with(|config| {
         let idx = config
             .categories
@@ -2721,6 +2730,29 @@ pub async fn h_category_update(
         Ok::<_, ApiError>(())
     })?;
     Ok(Json(serde_json::json!({"status": true})))
+}
+
+/// Check a category's output folder the way the general directories are
+/// checked, when it is new or changed. A relative folder is resolved below
+/// the complete directory, as enqueue resolves it. An unchanged folder is not
+/// re-checked, so editing another field never fails on it.
+fn validate_category_output_dir(
+    state: &AppState,
+    cat: &CategoryConfig,
+    previous: Option<&std::path::Path>,
+) -> Result<(), ApiError> {
+    let Some(output_dir) = cat.output_dir.as_deref() else {
+        return Ok(());
+    };
+    if previous == Some(output_dir) {
+        return Ok(());
+    }
+    let root = nzb_web::nzb_core::path::category_output_root(
+        &state.queue_manager.complete_dir(),
+        output_dir,
+    )
+    .ok_or_else(|| general_field_error("output_dir", "category output path is unsafe"))?;
+    validate_writable_dir("output_dir", &root)
 }
 
 /// DELETE /api/config/categories/{name} -- Delete a category.
@@ -3793,6 +3825,291 @@ pub struct UpdateGeneralBody {
     pub max_nested_archive_depth: Option<u8>,
     pub direct_unpack: Option<bool>,
     pub early_failure_check: Option<bool>,
+    /// Address the HTTP server binds. Read at startup: restart required.
+    pub listen_addr: Option<String>,
+    /// Port the HTTP server binds. Read at startup: restart required.
+    pub port: Option<u16>,
+    /// `[par2] defer_volumes`; applies to new downloads at once.
+    pub par2_defer_volumes: Option<bool>,
+    /// `[par2] trust_inflight_verify`; applies at once.
+    pub par2_trust_inflight_verify: Option<bool>,
+}
+
+/// Response of `PUT /api/config/general`.
+#[derive(Serialize, ToSchema)]
+pub struct GeneralUpdateResponse {
+    pub status: bool,
+    /// Every saved setting that waits for a restart, this save's and earlier
+    /// ones (see `GET /api/config/restart-pending`).
+    pub restart_required: Vec<String>,
+}
+
+/// Response of `GET /api/config/restart-pending`.
+#[derive(Serialize, ToSchema)]
+pub struct RestartPendingResponse {
+    /// Config keys saved since startup that take effect only after a restart.
+    pub restart_required: Vec<String>,
+}
+
+/// Keys saved since this process started that it reads only at startup.
+fn pending_restart_keys(state: &AppState) -> Vec<String> {
+    restart_required(&state.startup_config(), &state.config())
+}
+
+/// GET /api/config/restart-pending -- Settings waiting for a restart.
+#[utoipa::path(
+    get,
+    path = "/api/config/restart-pending",
+    tag = "config",
+    summary = "List saved settings that wait for a restart",
+    responses(
+        (status = 200, description = "Keys changed since startup that apply after a restart", body = RestartPendingResponse),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
+pub async fn h_restart_pending(State(state): State<Arc<AppState>>) -> Json<RestartPendingResponse> {
+    Json(RestartPendingResponse {
+        restart_required: pending_restart_keys(&state),
+    })
+}
+
+/// Where each `[general]` and `[par2]` setting can be changed, for the
+/// settings audit (WI-2079). A test fails when a new setting is added
+/// without a row here, so nothing becomes TOML-only by accident.
+/// `Ok(route)` is the API the settings UI uses; `Err(reason)` is a setting
+/// deliberately left out of the UI, with the reason.
+#[cfg(test)]
+pub(crate) const SETTINGS_AUDIT: &[(&str, Result<&str, &str>)] = &[
+    (
+        "general.listen_addr",
+        Ok("PUT /api/config/general (restart required)"),
+    ),
+    (
+        "general.port",
+        Ok("PUT /api/config/general (restart required)"),
+    ),
+    (
+        "general.api_key",
+        Ok("POST /api/config/sabnzbd-api-key/rotate"),
+    ),
+    (
+        "general.incomplete_dir",
+        Ok("PUT /api/config/general (new jobs only)"),
+    ),
+    (
+        "general.complete_dir",
+        Ok("PUT /api/config/general (new jobs only)"),
+    ),
+    (
+        "general.data_dir",
+        Err(
+            "holds the database and the config itself; moving it needs the files moved first, so it stays CLI/env/TOML only and is shown read-only",
+        ),
+    ),
+    ("general.speed_limit_bps", Ok("PUT /api/config/speed-limit")),
+    ("general.cache_size", Err("dead setting: nothing reads it")),
+    (
+        "general.log_level",
+        Err(
+            "the tracing filter is built at startup from --log-level / RUSTNZB_LOG_LEVEL / RUST_LOG; the debug-logging toggle covers the runtime need",
+        ),
+    ),
+    (
+        "general.log_level_before_debug",
+        Err("internal state of the debug-logging toggle"),
+    ),
+    (
+        "general.log_file",
+        Err(
+            "logging starts before the config can be edited; read at startup, with --log-file / RUSTNZB_LOG_FILE winning",
+        ),
+    ),
+    (
+        "general.history_retention",
+        Ok("PUT /api/config/history-retention"),
+    ),
+    (
+        "general.max_active_downloads",
+        Ok("PUT /api/config/max-active-downloads"),
+    ),
+    (
+        "general.max_post_processing_jobs",
+        Ok("PUT /api/config/general (restart required)"),
+    ),
+    (
+        "general.max_repair_workers",
+        Ok("PUT /api/config/general (restart required)"),
+    ),
+    (
+        "general.max_extract_workers",
+        Ok("PUT /api/config/general (restart required)"),
+    ),
+    (
+        "general.min_free_space_bytes",
+        Ok("PUT /api/config/disk-guards"),
+    ),
+    (
+        "general.watch_dir",
+        Ok("PUT /api/config/general (restart required)"),
+    ),
+    ("general.rss_history_limit", Ok("PUT /api/config/general")),
+    (
+        "general.direct_unpack",
+        Ok("PUT /api/config/general (restart required)"),
+    ),
+    (
+        "general.max_nested_archive_depth",
+        Ok("PUT /api/config/general (restart required)"),
+    ),
+    ("general.abort_hopeless", Ok("PUT /api/config/disk-guards")),
+    (
+        "general.early_failure_check",
+        Ok("PUT /api/config/general (restart required)"),
+    ),
+    (
+        "general.required_completion_pct",
+        Ok("PUT /api/config/general (restart required)"),
+    ),
+    (
+        "general.article_timeout_secs",
+        Ok("PUT /api/config/general (restart required)"),
+    ),
+    (
+        "general.auto_sort_remaining_pct",
+        Ok("PUT /api/config/general"),
+    ),
+    (
+        "general.rss_downloaded_item_expiry_days",
+        Ok("PUT /api/config/general"),
+    ),
+    ("general.duplicate_policy", Ok("PUT /api/config/general")),
+    (
+        "general.local_import_dir",
+        Err(
+            "security boundary for SABnzbd addlocalfile: widening it from the web UI would let a stolen session read arbitrary files, so it stays TOML/env only",
+        ),
+    ),
+    (
+        "general.queue_complete_pers",
+        Err("follow-up: SABnzbd queue-complete action persistence; only SABnzbd clients use it"),
+    ),
+    ("general.scripts_dir", Ok("PUT /api/config/general")),
+    ("general.script_success", Ok("PUT /api/config/general")),
+    ("general.script_failure", Ok("PUT /api/config/general")),
+    ("general.script_timeout_secs", Ok("PUT /api/config/general")),
+    (
+        "general.script_max_output_bytes",
+        Ok("PUT /api/config/general"),
+    ),
+    (
+        "general.fetch_allow_private",
+        Err(
+            "SSRF guard: opening server-side fetches to the LAN from the web UI would let a stolen session pivot into the network, so it stays TOML/env only",
+        ),
+    ),
+    (
+        "general.fetch_allowed_hosts",
+        Err("SSRF guard, as fetch_allow_private"),
+    ),
+    (
+        "general.group_max_headers",
+        Err("follow-up: newsgroup browsing settings get their own panel"),
+    ),
+    (
+        "general.shutdown_timeout_secs",
+        Err("follow-up: process lifecycle setting, rarely changed; restart required"),
+    ),
+    (
+        "par2.defer_volumes",
+        Ok("PUT /api/config/general (par2_defer_volumes)"),
+    ),
+    (
+        "par2.trust_inflight_verify",
+        Ok("PUT /api/config/general (par2_trust_inflight_verify)"),
+    ),
+];
+
+/// The uid this process runs as, for "not writable by uid N" errors.
+fn process_identity() -> String {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        format!("uid {uid}")
+    }
+    #[cfg(not(unix))]
+    {
+        "this process".to_string()
+    }
+}
+
+/// Check, in this process's view of the filesystem (inside the container),
+/// that a download directory exists and that a test file can be created in it
+/// and removed again. The directory is never created: a missing one is
+/// usually a volume that is not mounted, and creating it would hide that.
+pub(crate) fn validate_writable_dir(field: &str, path: &std::path::Path) -> Result<(), ApiError> {
+    let shown = path.display();
+    if path.as_os_str().is_empty() {
+        return Err(general_field_error(field, "must not be empty"));
+    }
+    if !path.is_absolute() {
+        return Err(general_field_error(
+            field,
+            &format!("`{shown}` must be an absolute path"),
+        ));
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(general_field_error(
+                field,
+                &format!("`{shown}` is not a directory"),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(general_field_error(
+                field,
+                &format!(
+                    "`{shown}` does not exist in the container (not mounted?); rustnzb does not create it"
+                ),
+            ));
+        }
+        Err(error) => {
+            return Err(general_field_error(
+                field,
+                &format!(
+                    "`{shown}` cannot be read by {}: {error}",
+                    process_identity()
+                ),
+            ));
+        }
+    }
+    let probe = path.join(format!(
+        ".rustnzb-write-test-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Err(error) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        return Err(general_field_error(
+            field,
+            &format!(
+                "`{shown}` is not writable by {}: {error}",
+                process_identity()
+            ),
+        ));
+    }
+    std::fs::remove_file(&probe).map_err(|error| {
+        general_field_error(
+            field,
+            &format!(
+                "a test file in `{shown}` could not be removed by {}: {error}",
+                process_identity()
+            ),
+        )
+    })
 }
 
 /// Upper bound for `max_active_downloads`; `0` still means unlimited.
@@ -3826,6 +4143,17 @@ fn validate_max_active_downloads(value: usize) -> Result<(), ApiError> {
 /// Reject out-of-range values before anything is applied, so a bad request
 /// never half-updates the config or the live queue manager.
 fn validate_general_update(body: &UpdateGeneralBody) -> Result<(), ApiError> {
+    if body.port == Some(0) {
+        return Err(general_field_error("port", "must be between 1 and 65535"));
+    }
+    if let Some(addr) = body.listen_addr.as_deref()
+        && addr.trim().parse::<std::net::IpAddr>().is_err()
+    {
+        return Err(general_field_error(
+            "listen_addr",
+            "must be an IP address such as 0.0.0.0, 127.0.0.1 or ::",
+        ));
+    }
     if let Some(policy) = body.duplicate_policy.as_deref()
         && policy
             .parse::<nzb_web::nzb_core::config::DuplicatePolicy>()
@@ -3890,7 +4218,7 @@ fn validate_general_update(body: &UpdateGeneralBody) -> Result<(), ApiError> {
     description = "Applies only the fields present in the body. Settings with their own endpoints (`speed_limit_bps`, `min_free_space_bytes`, `abort_hopeless`) are not accepted here. Changing settings the engine reads at startup is persisted immediately but takes effect on the next process start.",
     request_body = UpdateGeneralBody,
     responses(
-        (status = 200, description = "General settings updated", body = SimpleResponse),
+        (status = 200, description = "General settings updated", body = GeneralUpdateResponse),
         (status = 400, description = "A field is unknown or out of range", body = ApiError),
         (status = 401, description = "Not authenticated", body = ApiError),
     ),
@@ -3898,12 +4226,35 @@ fn validate_general_update(body: &UpdateGeneralBody) -> Result<(), ApiError> {
 pub async fn h_general_update(
     State(state): State<Arc<AppState>>,
     body: Result<Json<UpdateGeneralBody>, JsonRejection>,
-) -> Result<Json<SimpleResponse>, ApiError> {
+) -> Result<Json<GeneralUpdateResponse>, ApiError> {
     // Map extractor failures (unknown field, wrong type) to a 400 that names
     // the offending field, instead of axum's plain-text 422.
     let Json(body) =
         body.map_err(|rejection| ApiError::from((StatusCode::BAD_REQUEST, rejection.body_text())))?;
     validate_general_update(&body)?;
+    // A changed download directory must exist in the container and be
+    // writable before it is saved. It applies to new jobs only: queued and
+    // history entries keep the paths they were created with.
+    let current = state.config();
+    for (field, value, existing) in [
+        (
+            "complete_dir",
+            body.complete_dir.as_deref(),
+            &current.general.complete_dir,
+        ),
+        (
+            "incomplete_dir",
+            body.incomplete_dir.as_deref(),
+            &current.general.incomplete_dir,
+        ),
+    ] {
+        if let Some(dir) = value
+            && std::path::Path::new(dir) != existing.as_path()
+        {
+            validate_writable_dir(field, std::path::Path::new(dir))?;
+        }
+    }
+    let dirs_changed = body.complete_dir.is_some() || body.incomplete_dir.is_some();
     if body.cache_size.is_some() {
         tracing::warn!("general.cache_size is unused; the submitted value was ignored");
     }
@@ -4010,6 +4361,20 @@ pub async fn h_general_update(
         if let Some(enabled) = body.early_failure_check {
             config.general.early_failure_check = enabled;
         }
+        if let Some(addr) = body.listen_addr.as_deref() {
+            config.general.listen_addr = addr.trim().to_string();
+        }
+        if let Some(port) = body.port {
+            config.general.port = port;
+        }
+        if let Some(enabled) = body.par2_defer_volumes {
+            state.queue_manager.set_defer_par2_volumes(enabled);
+            config.par2.defer_volumes = enabled;
+        }
+        if let Some(enabled) = body.par2_trust_inflight_verify {
+            state.queue_manager.set_trust_inflight_verify(enabled);
+            config.par2.trust_inflight_verify = enabled;
+        }
 
         state.queue_manager.set_postproc_scripts(
             config.general.scripts_dir.clone(),
@@ -4024,7 +4389,20 @@ pub async fn h_general_update(
 
         Ok::<_, ApiError>(())
     })?;
-    Ok(Json(SimpleResponse { status: true }))
+    if dirs_changed {
+        // The effective value: an override keeps winning over the file.
+        let config = state.config();
+        state
+            .queue_manager
+            .set_complete_dir(config.general.complete_dir.clone());
+        state
+            .queue_manager
+            .set_incomplete_dir(config.general.incomplete_dir.clone());
+    }
+    Ok(Json(GeneralUpdateResponse {
+        status: true,
+        restart_required: pending_restart_keys(&state),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -4939,9 +5317,38 @@ mod tests {
     #[cfg(feature = "webdav")]
     use super::resolve_secret;
     use super::{
-        MAX_RSS_REGEX_LEN, compile_rss_regex, proxy_url_unchanged, restart_required,
-        sanitize_server_config,
+        MAX_RSS_REGEX_LEN, SETTINGS_AUDIT, compile_rss_regex, proxy_url_unchanged,
+        restart_required, sanitize_server_config,
     };
+
+    /// Every `[general]` and `[par2]` key has a row in the settings audit,
+    /// and every row names a real key.
+    #[test]
+    fn settings_audit_covers_every_general_and_par2_setting() {
+        let mut config = nzb_web::nzb_core::config::AppConfig::default();
+        // Skipped when unset; give it a value so the key is serialized.
+        config.general.log_level_before_debug = Some("info".into());
+        let value = serde_json::to_value(&config).unwrap();
+        let mut keys: Vec<String> = Vec::new();
+        for section in ["general", "par2"] {
+            for key in value[section].as_object().unwrap().keys() {
+                keys.push(format!("{section}.{key}"));
+            }
+        }
+        keys.sort();
+        let mut audited: Vec<String> = SETTINGS_AUDIT.iter().map(|(k, _)| k.to_string()).collect();
+        audited.sort();
+        assert_eq!(
+            keys, audited,
+            "update SETTINGS_AUDIT and docs/settings-audit.md"
+        );
+        for (key, entry) in SETTINGS_AUDIT {
+            let text = match entry {
+                Ok(route) | Err(route) => route,
+            };
+            assert!(!text.trim().is_empty(), "{key} needs a route or a reason");
+        }
+    }
 
     use nzb_web::nzb_core::config::ServerConfig;
 

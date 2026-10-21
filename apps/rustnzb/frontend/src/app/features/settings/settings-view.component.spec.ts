@@ -9,6 +9,7 @@ import {
   MAX_BACKUP_BYTES,
   SettingsViewComponent,
   filenameFromDisposition,
+  splitList,
 } from './settings-view.component';
 
 const BACKUP_REPORT = {
@@ -46,7 +47,20 @@ function makeComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {})
         '/config/debug-logging': { enabled: false, effective: 'info', overridden: false },
         '/config/sabnzbd-api-key': { api_key: 'key' },
         '/status': { webdav_available: false, webdav_enabled: false },
-        '/config': { general: { data_dir: '/data', incomplete_dir: '/incomplete', complete_dir: '/complete', watch_dir: null } },
+        '/config': {
+          general: {
+            data_dir: '/data',
+            incomplete_dir: '/incomplete',
+            complete_dir: '/complete',
+            watch_dir: null,
+            listen_addr: '0.0.0.0',
+            port: 8080,
+            direct_unpack: true,
+            scripts_dir: null,
+          },
+          par2: { defer_volumes: true, trust_inflight_verify: true },
+        },
+        '/config/restart-pending': { restart_required: [] },
       };
       return of(values[path]);
     }),
@@ -670,5 +684,97 @@ describe('filenameFromDisposition', () => {
     expect(filenameFromDisposition('attachment; filename=backup.toml')).toBe('backup.toml');
     expect(filenameFromDisposition(null)).toBeNull();
     expect(filenameFromDisposition('inline')).toBeNull();
+  });
+
+  describe('editable paths, post-processing and network (WI-2079)', () => {
+    it('fills the path and network forms from /config, with data_dir read-only', () => {
+      const { component } = makeComponent();
+      component.ngOnInit();
+      expect(component.pathsForm).toEqual({ complete_dir: '/complete', incomplete_dir: '/incomplete', watch_dir: '' });
+      expect(component.networkForm).toEqual({ listen_addr: '0.0.0.0', port: 8080 });
+      expect(component.canSave('paths')).toBe(true);
+      expect('data_dir' in component.pathsForm).toBe(false);
+    });
+
+    it('saves paths through the general settings API and marks the form saved', () => {
+      const { component, api } = makeComponent();
+      component.ngOnInit();
+      component.pathsForm.complete_dir = ' /mnt/media ';
+      expect(component.unsavedSections()).toContain('paths');
+      component.savePaths();
+      expect(api.put).toHaveBeenCalledWith('/config/general', {
+        complete_dir: '/mnt/media',
+        incomplete_dir: '/incomplete',
+        watch_dir: '',
+      });
+      expect(component.unsavedSections()).not.toContain('paths');
+    });
+
+    it('blocks saving when the config failed to load (WI-1707 guard)', () => {
+      const { component, api } = makeComponent({
+        get: vi.fn((path: string) =>
+          path === '/config' ? throwError(() => ({ status: 500, error: { human_readable: 'boom' } })) : of({ restart_required: [] }),
+        ),
+      });
+      component.loadDirs();
+      expect(component.canSave('paths')).toBe(false);
+      expect(component.canSave('network')).toBe(false);
+      expect(component.loadFailure('postproc')).toBeTruthy();
+      component.savePaths();
+      component.saveNetwork();
+      component.savePostproc();
+      expect(api.put).not.toHaveBeenCalled();
+    });
+
+    it('shows a pending restart from the save response', () => {
+      const { component, snack } = makeComponent({
+        put: vi.fn(() => of({ status: true, restart_required: ['general.port'] })),
+      });
+      component.ngOnInit();
+      component.networkForm.port = 9191;
+      component.saveNetwork();
+      expect(component.restartPending()).toEqual(['general.port']);
+      expect(snack.success).toHaveBeenCalled();
+    });
+
+    it('refuses an out-of-range port before calling the API', () => {
+      const { component, api } = makeComponent();
+      component.ngOnInit();
+      component.networkForm.port = 0;
+      component.saveNetwork();
+      expect(api.put).not.toHaveBeenCalled();
+    });
+
+    it('surfaces the server path error (e.g. not mounted)', () => {
+      const { component, snack } = makeComponent({
+        put: vi.fn(() =>
+          throwError(() => ({ status: 400, error: { human_readable: 'invalid `complete_dir`: `/x` does not exist in the container' } })),
+        ),
+      });
+      component.ngOnInit();
+      component.pathsForm.complete_dir = '/x';
+      component.savePaths();
+      expect(snack.open).toHaveBeenCalled();
+      expect(component.unsavedSections()).toContain('paths');
+    });
+
+    it('warns about *arr path mappings only when a category folder changes, and sends cleanup rules', () => {
+      const { component, api } = makeComponent();
+      component.ngOnInit();
+      component.editCategory({ name: 'tv', output_dir: '/tv', post_processing: 3, cleanup_patterns: ['*.nfo'] });
+      expect(component.categoryOutputChanged()).toBe(false);
+      component.editingCategory!.output_dir = '/media/tv';
+      expect(component.categoryOutputChanged()).toBe(true);
+      component.categoryExtText = 'exe, lnk';
+      component.saveCategory();
+      expect(api.put).toHaveBeenCalledWith(
+        '/config/categories/tv',
+        expect.objectContaining({ output_dir: '/media/tv', cleanup_patterns: ['*.nfo'], unwanted_extensions: ['exe', 'lnk'] }),
+      );
+    });
+
+    it('splits comma and newline lists', () => {
+      expect(splitList(' a, b\n,c ,, ')).toEqual(['a', 'b', 'c']);
+    });
   });
 });
