@@ -241,6 +241,6 @@ Tracked as Vogt `WI-2`. `gh-posture` also fails on this project with a
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — prerequisites and full task list
 - [docs/RELEASING.md](docs/RELEASING.md) — release process
 - [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — confirmed user-visible limits
-- [docs/PERFORMANCE_STATUS.md](docs/PERFORMANCE_STATUS.md) — perf baseline and gate
+- [docs/internal/PERFORMANCE_STATUS.md](docs/internal/PERFORMANCE_STATUS.md) — perf baseline and gate
 - [e2e/USER_JOURNEYS.md](e2e/USER_JOURNEYS.md) — browser coverage
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
