@@ -145,6 +145,10 @@ pub struct GeneralConfig {
     /// History retention: how many NZBs to keep in history.
     /// `None` or `Some(0)` both mean keep all; see [`normalize_history_retention`].
     pub history_retention: Option<usize>,
+    /// Keep the History row when an *arr removes a job through the SABnzbd
+    /// API (the files are still deleted as asked). Off restores SABnzbd's
+    /// behaviour of dropping the row too.
+    pub keep_history_on_arr_delete: bool,
     /// Max number of NZBs downloading simultaneously (default 1).
     /// `0` means unlimited: every queued job may download at once.
     pub max_active_downloads: usize,
@@ -347,6 +351,7 @@ impl Default for GeneralConfig {
             log_level_before_debug: None,
             log_file: None,
             history_retention: None, // keep all
+            keep_history_on_arr_delete: true,
             max_active_downloads: 1,
             max_post_processing_jobs: default_max_post_processing_jobs(),
             max_repair_workers: default_max_repair_workers(),

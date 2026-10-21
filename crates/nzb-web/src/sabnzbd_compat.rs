@@ -64,6 +64,18 @@ pub struct SabApiRequest {
     pub sort: Option<String>,
     /// Sort direction for `mode=queue&name=sort` (`asc` or `desc`).
     pub dir: Option<String>,
+    /// The calling client's name, from its `User-Agent` (see
+    /// [`client_name_from_headers`]). Never read from the request itself.
+    #[serde(skip)]
+    pub client: Option<String>,
+}
+
+/// The client's product name from its `User-Agent`: `Sonarr/4.0.9 (...)`
+/// gives `Sonarr`. Used to label History rows an *arr removed.
+fn client_name_from_headers(headers: &HeaderMap) -> Option<String> {
+    let agent = headers.get(axum::http::header::USER_AGENT)?.to_str().ok()?;
+    let product = agent.split_whitespace().next()?.split('/').next()?.trim();
+    (!product.is_empty()).then(|| product.chars().take(64).collect())
 }
 
 /// Validate API key. Returns Err with JSON response on failure.
@@ -145,6 +157,7 @@ pub async fn h_sabnzbd_api_get(
     if let Some(key) = api_key_from_headers(&headers) {
         req.apikey = Some(key);
     }
+    req.client = client_name_from_headers(&headers);
     if let Some(resp) = keyless_response(
         &state,
         req.mode.as_deref().unwrap_or(""),
@@ -570,6 +583,7 @@ pub async fn h_sabnzbd_api_post(
     // An explicit `X-Api-Key` header outranks a key carried in the URL or the
     // body: it is the channel that keeps the secret out of access logs.
     let header_apikey = api_key_from_headers(request.headers());
+    query_req.client = client_name_from_headers(request.headers());
     let mut cat = query_req.cat.clone();
     let mut priority = query_req.priority.clone();
     let mut name = query_req.name.clone();
@@ -950,6 +964,7 @@ async fn dispatch_post(
                 pp: query_req.pp,
                 sort: query_req.sort,
                 dir: query_req.dir,
+                client: query_req.client,
             };
             Ok(dispatch_mode(
                 state,
@@ -1869,9 +1884,7 @@ fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Val
 
     // Filter, count and total over the light pre-blob columns; only the
     // returned page is loaded in full.
-    let summaries = qm
-        .history_summaries(&HistoryFilter::default())
-        .unwrap_or_default();
+    let summaries = arr_history_summaries(qm);
     let postprocessing: Vec<_> = qm
         .get_jobs()
         .into_iter()
@@ -1934,6 +1947,7 @@ fn history_summary_of(entry: &HistoryEntry) -> HistorySummary {
 /// field the SAB history filters read; the page is rebuilt from full rows.
 fn summary_entry(summary: &HistorySummary) -> HistoryEntry {
     HistoryEntry {
+        client_removal: None,
         id: summary.id.clone(),
         name: summary.name.clone(),
         category: summary.category.clone(),
@@ -2110,6 +2124,11 @@ fn sab_query_bool(value: &str) -> bool {
 /// `_api_history_delete`. `del_files=1` additionally removes the entry's
 /// completed output directory from disk, matching real SABnzbd -- RustNZB
 /// otherwise never frees that space on history delete.
+///
+/// With `general.keep_history_on_arr_delete` (the default) the History row
+/// is kept, marked as removed by the calling client, and drops out of the
+/// SABnzbd history the *arrs poll. An *arr's "Remove Completed" is a disk
+/// cleanup; it should not erase rustnzb's own record of the download.
 fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
     let target = req.value.as_deref().unwrap_or("");
     if target.is_empty() {
@@ -2118,25 +2137,15 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
 
     let qm = &state.queue_manager;
     let del_files = req.del_files.as_deref().is_some_and(sab_query_bool);
+    let keep_rows = state.config().general.keep_history_on_arr_delete;
+    let entries = if keep_rows {
+        arr_history_summaries(qm)
+    } else {
+        history_summaries(qm)
+    };
 
-    if target.eq_ignore_ascii_case("all") {
-        let entries = history_summaries(qm);
-        return match qm.history_clear() {
-            Ok(()) => {
-                if del_files {
-                    delete_history_files(qm, &entries, &[]);
-                }
-                Json(serde_json::json!({ "status": true }))
-            }
-            Err(error) => Json(serde_json::json!({
-                "status": false,
-                "error": error.to_string()
-            })),
-        };
-    }
-
-    // `value=failed` / `value=completed` clear every entry with that status
-    // (SABnzbd `_api_history_delete`).
+    // `value=all` clears everything; `value=failed` / `value=completed` clear
+    // every entry with that status (SABnzbd `_api_history_delete`).
     let status_filter = if target.eq_ignore_ascii_case("failed") {
         Some(JobStatus::Failed)
     } else if target.eq_ignore_ascii_case("completed") {
@@ -2144,55 +2153,96 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
     } else {
         None
     };
-    if let Some(status) = status_filter {
-        let entries = history_summaries(qm);
-        let (removed, kept): (Vec<_>, Vec<_>) = entries
+    let removed: Vec<HistorySummary> = if target.eq_ignore_ascii_case("all") {
+        entries.clone()
+    } else if let Some(status) = status_filter {
+        entries
             .iter()
+            .filter(|entry| entry.status == status)
             .cloned()
-            .partition(|entry| entry.status == status);
-        let mut removed_ok = Vec::new();
-        for entry in &removed {
-            if let Err(error) = qm.history_remove(&entry.id) {
-                if del_files {
-                    delete_history_files(qm, &removed_ok, &kept);
-                }
-                return Json(serde_json::json!({
-                    "status": false,
-                    "error": error.to_string()
-                }));
+            .collect()
+    } else {
+        let mut matched: Vec<HistorySummary> = Vec::new();
+        for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+            let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+            if let Some(entry) = entries
+                .iter()
+                .find(|entry| job_id_matches(&entry.id, search_id))
+                && !matched.iter().any(|seen| seen.id == entry.id)
+            {
+                matched.push(entry.clone());
             }
-            removed_ok.push(entry.clone());
         }
-        if del_files {
-            delete_history_files(qm, &removed, &kept);
+        matched
+    };
+    let bulk = status_filter.is_some() || target.eq_ignore_ascii_case("all");
+
+    let mut removed_ok: Vec<HistorySummary> = Vec::new();
+    let mut error = None;
+    if keep_rows {
+        let ids: Vec<String> = removed.iter().map(|entry| entry.id.clone()).collect();
+        let removed_by = req.client.as_deref().unwrap_or("SABnzbd API client");
+        match qm.history_mark_client_removed(&ids, removed_by, del_files) {
+            Ok(_) => {
+                tracing::info!(
+                    count = ids.len(),
+                    client = removed_by,
+                    del_files,
+                    "History entries removed via arr API (mode=history); rows kept"
+                );
+                removed_ok = removed.clone();
+            }
+            Err(e) => error = Some(e),
         }
-        return Json(serde_json::json!({ "status": true }));
+    } else if target.eq_ignore_ascii_case("all") {
+        match qm.history_clear() {
+            Ok(()) => removed_ok = removed.clone(),
+            Err(e) => error = Some(e),
+        }
+    } else {
+        for entry in &removed {
+            match qm.history_remove(&entry.id) {
+                Ok(()) => {
+                    tracing::info!(id = %entry.id, "Entry removed from history via arr API (mode=history)");
+                    removed_ok.push(entry.clone());
+                }
+                // A bulk clear stops at the first failure; a list of ids
+                // skips the one that failed, as it always has.
+                Err(e) if bulk => {
+                    error = Some(e);
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
     }
 
-    let entries = history_summaries(qm);
-    let mut removed = Vec::new();
-    for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
-        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
-        if let Some(entry) = entries
-            .iter()
-            .find(|entry| job_id_matches(&entry.id, search_id))
-            && qm.history_remove(&entry.id).is_ok()
-        {
-            tracing::info!(id = %entry.id, "Entry removed from history via arr API (mode=history)");
-            removed.push(entry.clone());
-        }
-    }
-    let removed_ids: Vec<String> = removed.iter().map(|entry| entry.id.clone()).collect();
-    let kept: Vec<_> = entries
-        .iter()
-        .filter(|entry| !removed_ids.contains(&entry.id))
-        .cloned()
-        .collect();
     if del_files {
-        delete_history_files(qm, &removed, &kept);
+        let kept: Vec<_> = entries
+            .iter()
+            .filter(|entry| !removed.iter().any(|gone| gone.id == entry.id))
+            .cloned()
+            .collect();
+        delete_history_files(qm, &removed_ok, &kept);
     }
 
-    Json(serde_json::json!({ "status": !removed_ids.is_empty() }))
+    match error {
+        Some(error) => Json(serde_json::json!({
+            "status": false,
+            "error": error.to_string()
+        })),
+        None if bulk => Json(serde_json::json!({ "status": true })),
+        None => Json(serde_json::json!({ "status": !removed_ok.is_empty() })),
+    }
+}
+
+/// The history rows the *arrs see: every row but those an *arr already
+/// removed and rustnzb kept. Empty on a DB error, like [`history_summaries`].
+fn arr_history_summaries(qm: &crate::queue_manager::QueueManager) -> Vec<HistorySummary> {
+    let removed = qm.history_client_removed_ids().unwrap_or_default();
+    let mut summaries = history_summaries(qm);
+    summaries.retain(|entry| !removed.contains(&entry.id));
+    summaries
 }
 
 /// Remove the output directories of `removed`, but never a directory that a
@@ -3360,6 +3410,7 @@ mod tests {
     ) -> HistoryEntry {
         let completed_at = chrono::Utc::now() - chrono::Duration::seconds(seconds_ago);
         HistoryEntry {
+            client_removal: None,
             id: id.into(),
             name: name.into(),
             category: category.into(),
@@ -3685,6 +3736,7 @@ mod tests {
     fn history_reports_active_download_time_to_arr_clients() {
         let now = chrono::Utc::now();
         let entry = HistoryEntry {
+            client_removal: None,
             id: "history-active-time".into(),
             name: "queued item".into(),
             category: "sonarr".into(),
@@ -4092,6 +4144,7 @@ mod tests {
             .single()
             .expect("valid fixture time");
         let entry = HistoryEntry {
+            client_removal: None,
             id: "contract-history-job".into(),
             name: "SAB history fixture".into(),
             category: "tv".into(),
@@ -5577,6 +5630,7 @@ mod tests {
 
     fn insert_history_fixture(test_state: &TestState, id: &str, output_dir: std::path::PathBuf) {
         let entry = HistoryEntry {
+            client_removal: None,
             id: id.into(),
             name: id.into(),
             category: "tv".into(),
@@ -5637,6 +5691,7 @@ mod tests {
     #[tokio::test]
     async fn history_delete_removes_retained_incomplete_work_dir() {
         let test_state = test_state();
+        set_keep_history_on_arr_delete(&test_state, false);
         let incomplete = test_state.state.queue_manager.incomplete_dir();
         for (id, del_files) in [("sab-failed-keep", None), ("sab-failed-del", Some("1"))] {
             insert_history_status(&test_state, id, JobStatus::Failed, 10);
@@ -5687,6 +5742,7 @@ mod tests {
     #[tokio::test]
     async fn history_delete_failed_keeps_directory_shared_with_completed_entry() {
         let test_state = test_state();
+        set_keep_history_on_arr_delete(&test_state, false);
         let shared = test_state
             .state
             .config()
@@ -5753,6 +5809,7 @@ mod tests {
     async fn history_delete_by_status_removes_only_matching_entries() {
         for (value, kept) in [("failed", "job-done"), ("completed", "job-failed")] {
             let test_state = test_state();
+            set_keep_history_on_arr_delete(&test_state, false);
             insert_history_status(&test_state, "job-done", JobStatus::Completed, 1);
             insert_history_status(&test_state, "job-failed", JobStatus::Failed, 2);
 
@@ -5912,6 +5969,137 @@ mod tests {
             );
         }
         assert_eq!(test_state.state.queue_manager.get_jobs().len(), 2);
+    }
+
+    fn set_keep_history_on_arr_delete(test_state: &TestState, keep: bool) {
+        test_state
+            .state
+            .update_config_with(|config| -> anyhow::Result<()> {
+                config.general.keep_history_on_arr_delete = keep;
+                Ok(())
+            })
+            .expect("update keep_history_on_arr_delete");
+    }
+
+    fn sab_history_ids(test_state: &TestState) -> Vec<String> {
+        let response = dispatch_mode(&test_state.state, "history", &SabApiRequest::default()).0;
+        response["history"]["slots"]
+            .as_array()
+            .expect("history slots")
+            .iter()
+            .map(|slot| slot["nzo_id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// An *arr's "Remove Completed" (`del_files=1`) deletes the files but,
+    /// by default, keeps rustnzb's History row, marked with the client, and
+    /// hides it from the SABnzbd history the *arrs poll.
+    #[tokio::test]
+    async fn arr_history_delete_keeps_the_row_and_removes_the_files() {
+        let test_state = test_state();
+        let complete = test_state.state.config().general.complete_dir.clone();
+        let output_dir = complete.join("tv").join("arr-removed");
+        std::fs::create_dir_all(&output_dir).expect("create fixture output dir");
+        std::fs::write(output_dir.join("file.mkv"), b"data").expect("write fixture file");
+        insert_history_fixture(&test_state, "arr-removed", output_dir.clone());
+        insert_history_fixture(
+            &test_state,
+            "arr-other",
+            complete.join("tv").join("arr-other"),
+        );
+        assert_eq!(sab_history_ids(&test_state).len(), 2);
+
+        let req = SabApiRequest {
+            value: Some("SABnzbd_nzo_arr-removed".into()),
+            del_files: Some("1".into()),
+            client: Some("Sonarr".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert!(!output_dir.exists(), "files are deleted as asked");
+
+        let entry = test_state
+            .state
+            .queue_manager
+            .history_get("arr-removed")
+            .expect("read history")
+            .expect("the History row is kept");
+        let removal = entry.client_removal.expect("row is marked");
+        assert_eq!(removal.removed_by, "Sonarr");
+        assert!(removal.files_deleted);
+        assert!(
+            history_ids(&test_state).contains(&"arr-removed".to_string()),
+            "rustnzb's own history still lists the row"
+        );
+        let sab_ids = sab_history_ids(&test_state);
+        assert_eq!(sab_ids.len(), 1, "the *arrs no longer see it: {sab_ids:?}");
+        assert!(!sab_ids[0].contains("arr-removed"));
+
+        // A repeat delete finds nothing left to remove for the *arr.
+        let again = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(again["status"], serde_json::json!(false));
+    }
+
+    /// With the setting off, an *arr delete drops the row too, as SABnzbd
+    /// does.
+    #[tokio::test]
+    async fn arr_history_delete_with_keep_off_removes_row_and_files() {
+        let test_state = test_state();
+        set_keep_history_on_arr_delete(&test_state, false);
+        let output_dir = test_state
+            .state
+            .config()
+            .general
+            .complete_dir
+            .join("tv")
+            .join("arr-gone");
+        std::fs::create_dir_all(&output_dir).expect("create fixture output dir");
+        insert_history_fixture(&test_state, "arr-gone", output_dir.clone());
+
+        let req = SabApiRequest {
+            value: Some("arr-gone".into()),
+            del_files: Some("1".into()),
+            client: Some("Radarr".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert!(!output_dir.exists());
+        assert!(history_ids(&test_state).is_empty());
+    }
+
+    /// `value=completed` in keep mode marks every visible completed row.
+    #[tokio::test]
+    async fn arr_history_delete_by_status_keeps_rows() {
+        let test_state = test_state();
+        insert_history_status(&test_state, "job-done", JobStatus::Completed, 1);
+        insert_history_status(&test_state, "job-failed", JobStatus::Failed, 2);
+        let req = SabApiRequest {
+            value: Some("completed".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert_eq!(history_ids(&test_state).len(), 2);
+        let sab_ids = sab_history_ids(&test_state);
+        assert_eq!(sab_ids.len(), 1);
+        assert!(sab_ids[0].contains("job-fail"));
+    }
+
+    /// The User-Agent product names the client.
+    #[test]
+    fn client_name_comes_from_the_user_agent() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(client_name_from_headers(&headers), None);
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            "Sonarr/4.0.9.2244 (ubuntu 22.04)".parse().unwrap(),
+        );
+        assert_eq!(
+            client_name_from_headers(&headers).as_deref(),
+            Some("Sonarr")
+        );
     }
 
     /// Without `del_files`, history delete only removes the DB record, as

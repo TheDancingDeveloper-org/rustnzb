@@ -46,6 +46,7 @@ async fn history_json_is_gzip_encoded_when_offered_and_plain_otherwise() {
         let completed_at = chrono::Utc::now() - chrono::Duration::minutes(i);
         qm.with_db(|db| {
             db.history_insert(&nzb_web::nzb_core::models::HistoryEntry {
+                client_removal: None,
                 id: format!("compression-{i}"),
                 name: format!("Some.Release.Name.2026.{i:03}.1080p.WEB-DL"),
                 category: "tv".into(),
