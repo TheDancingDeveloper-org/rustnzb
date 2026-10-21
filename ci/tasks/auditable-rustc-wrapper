@@ -1,0 +1,17 @@
+#!/bin/sh
+# RUSTC_WORKSPACE_WRAPPER shim for cross builds that export global rustflags.
+#
+# cargo-xwin exports CARGO_ENCODED_RUSTFLAGS so its cargo invocation applies
+# the MSVC linker flavour. Cargo also puts those flags on rustc's command line,
+# so the compiler still sees them for the Windows target. cargo-auditable,
+# however, inherits the environment into the nested `cargo metadata` it runs to
+# read the dependency list, and that metadata probes the host target. The MSVC
+# linker flavour is invalid there:
+#
+#   error: linker flavor `lld-link` is incompatible with the current target
+#
+# Drop the environment copy for cargo-auditable only; the target flags already
+# arrive in rustc's argv.
+set -eu
+unset CARGO_ENCODED_RUSTFLAGS RUSTFLAGS
+exec "${CARGO_AUDITABLE_BIN:?CARGO_AUDITABLE_BIN is not set}" "$@"
