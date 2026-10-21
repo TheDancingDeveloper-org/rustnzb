@@ -14,6 +14,8 @@ release workflow already produces.
 | `homebrew/update-formula.sh` | Refresh the formula for a release | Verifies both Linux tarballs against the release `SHA256SUMS` before writing. |
 | `scoop/bucket/rustnzb.json` | Scoop manifest | Template, pinned to the `v1.5.0` NSIS installer. Not published. |
 | `winget/manifests/t/…` | winget manifest set | Template, pinned to the `v1.5.0` NSIS installer. Not published. |
+| `appimage/build-appimage.sh` | Linux AppImages (x86_64, aarch64) | Built by the release workflows from the Linux tarballs and attached to the release. Not GPG-signed. |
+| `macos/build-dmg.sh` | macOS app bundle + dmg | Dry run: the `macos-dmg` job is off unless `RUSTNZB_MACOS_DMG=true` and a macOS runner exists. Unsigned, not notarised. |
 | `distribution/render-windows-manifests.sh` | Regenerate Scoop + winget from one checksum file | Writes both channels in one pass; verifies the installer when given `--assets-dir`. |
 
 Everything is pinned to the last **stable** release (`v1.5.0`). Pre-release
@@ -109,8 +111,11 @@ heuristic. See [docs/RELEASING.md](../docs/RELEASING.md#sboms-and-dependency-acc
 
 ## Not yet covered
 
-- **macOS**: no dmg and no macOS binary, so no Homebrew-on-macOS formula.
-- **AppImage**: not built.
+- **macOS release asset**: the dmg job is a dry run with no runner yet, so
+  there is still no macOS binary on the release and no Homebrew-on-macOS
+  formula. The dmg is unsigned by decision; see
+  [docs/RELEASING.md](../docs/RELEASING.md#appimage-and-macos-dmg) for how
+  users open it.
 - **Copying cosign signatures to the mirrors**: undecided; the signature and
   certificate stay on the GitHub release next to `SHA256SUMS-<tag>.txt`.
 - **Publishing from CI**: deliberately absent. Every channel here is an

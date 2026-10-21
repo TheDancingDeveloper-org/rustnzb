@@ -124,8 +124,9 @@ PGID=1000
 
 Download the latest release from [GitHub Releases](https://github.com/TheDancingDeveloper-org/rustnzb/releases):
 
-- **Linux** — `tar.gz` (x86_64, aarch64) or `.deb` (amd64, arm64, installs a systemd service)
+- **Linux** — `tar.gz` (x86_64, aarch64), `.deb` (amd64, arm64, installs a systemd service) or AppImage (x86_64, aarch64: `chmod +x rustnzb-*.AppImage` and run it; without FUSE, add `--appimage-extract-and-run`)
 - **Windows** — NSIS installer
+- **macOS** — no release dmg yet. Builds from `packaging/macos/build-dmg.sh` are unsigned: Control-click the app → **Open** the first time, or run `xattr -dr com.apple.quarantine /Applications/rustnzb.app`
 - SHA256 checksums are attached to every release
 
 ### From source
