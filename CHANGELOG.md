@@ -13,31 +13,62 @@ also carries generated release notes with the merged pull requests.
 
 ## [Unreleased]
 
+## [1.7.0-beta.4] - 2026-10-21
+
 ### Added
 
-- **config:** Back up and restore every setting as one TOML file, with a masked
-  export by default and a validated import
-- **packaging:** Homebrew formula and Scoop/winget manifest templates, rendered from release checksums
-- Embed dependency data in release binaries with cargo-auditable
-- **packaging:** Linux AppImages on the release, and an opt-in, unsigned macOS dmg dry run
-- **ledger:** Prune damage-ledger rows for removed jobs and expired holes
-- **queue:** Leave held PAR2 volumes out of queue size and record volumes fetched in history
-- **dispatch:** Hold PAR2 recovery volumes until the slice map shows damage
-- **queue:** Judge hopeless jobs by damaged slices against recovery slices
-- **benchnzb:** Measure slice-verify cost per article against yEnc decode
-- **dispatch:** Complete the slice map for late indexes, restarts and obfuscated files
-- **dispatch:** Verify PAR2 slices in flight and emit the per-job slice map
-- Wire the damage ledger into the download path
-- **par2:** PAR2 set to SliceLayout and shared 16 KiB file matcher
+- **par2:** Build and verify a per-job slice map while downloading, covering
+  late indexes, restarts and obfuscated files
+- **par2:** In-flight repair fold driven by the download engine, with a bounded
+  disk-prefix fallback
+- **par2:** Hold recovery volumes until damage is detected, then fetch only
+  enough to cover it
+- **par2:** Parity-aware hopeless detection
+- **par2:** `trust_inflight_verify` switch, verified recovery packets and
+  bounded retention
+- **queue:** Wire the damage ledger into the download path and prune rows for
+  removed jobs and expired holes
+- **api:** Bulk delete and retry for history entries
+- **ui:** History multi-select, bulk delete/retry, clear-by-status, and undo
+  toasts for destructive actions
+- **schedule:** Time-of-day pause, speed cap and server rotation
+- **config:** Back up and restore every setting as one TOML file
+- **ui:** Global keyboard shortcuts and a `?` help sheet
+- **ui:** Drop `.nzb` files or paste a URL anywhere to add a job
+- **ui:** Warn before leaving Settings with unsaved changes
+- **ui:** PWA web manifest with icons and a theme colour
+- **ui:** English i18n catalog and a locale switch
+- **notify:** Complete post-processing script environment and background alerts
+- **sab:** Accept the API key from an `X-Api-Key` header
+- **api:** OpenAPI annotations for the native API
+- **packaging:** Linux AppImages and an opt-in unsigned macOS dmg dry run
+- **packaging:** Homebrew, Scoop and winget manifests
+- **build:** Embed dependency data in release binaries with cargo-auditable
+- **docs:** Configuration reference, SABnzbd migration guide and README
+  screenshots
+
+### Changed
+
+- **queue:** Leave held PAR2 volumes out of queue size and record volumes
+  fetched in history
+- **ui:** Bundle Inter locally, follow the OS theme and announce async results
+- **webdav:** Drop the PAR2 volume fields from DAV history entries
+- **schedule:** Keep overlapping holds, windows and manual resumes independent,
+  and make a speed cap of 0 mean unlimited
+- **toolchain:** Rust 1.95
+- **docs:** Move internal docs and `promtail.yml` under `docs/internal`
 
 ### Fixed
 
-- **queue:** Collapse the parity-tier if for the Rust 1.95 clippy lint
-- **mock-nntp:** Use is_multiple_of for the new 1.95 clippy lint
-- **webdav:** Drop par2 volume fields from the DAV history entry
-- **desktop:** Sync the desktop lock file with nzb-core 0.2.21
-- Batch ledger writes and confirm holes through the engine
-- **ui:** Surface the remaining silently swallowed fetch errors
+- **schedule:** Load pause state without writing it back on boot, restore window
+  bookkeeping after a restart, and edge-trigger the pause
+- **config:** Keep indexer keys out of a masked backup
+- **api:** Only accept terminal statuses for a status-wide history delete
+- **ui:** Surface fetch errors with a Retry action instead of empty states
+- **ui:** Let a file dropped on a queue row reach the page-wide drop handler,
+  and keep shortcuts working while a toast is open
+- **db:** Migrate a fresh database in one transaction
+- **desktop:** Refresh `Cargo.lock` to match the workspace crates
 
 ### Performance
 
@@ -49,6 +80,8 @@ also carries generated release notes with the merged pull requests.
 - **history:** Aggregate the panel's statistics, categories and page count in
   SQLite over covering indexes (a cold all-time load drops from ~380 ms to
   ~20 ms; a 7-day failure-reason scan from ~32 ms to ~3 ms)
+- **dispatch:** Run yEnc decode and file writes on the blocking pool so
+  downloads no longer stall the async runtime
 
 ## [1.7.0-beta.1] - 2026-10-18
 
@@ -285,7 +318,8 @@ Tagged on the same commit as 1.5.0-beta.1, with no further changes.
 Releases before 1.5.0 (1.0.0 to 1.4.7) are described on the
 [GitHub Releases page](https://github.com/TheDancingDeveloper-org/rustnzb/releases).
 
-[Unreleased]: https://github.com/TheDancingDeveloper-org/rustnzb/compare/v1.7.0-beta.1...HEAD
+[Unreleased]: https://github.com/TheDancingDeveloper-org/rustnzb/compare/v1.7.0-beta.4...HEAD
+[1.7.0-beta.4]: https://github.com/TheDancingDeveloper-org/rustnzb/compare/v1.7.0-beta.1...v1.7.0-beta.4
 [1.7.0-beta.1]: https://github.com/TheDancingDeveloper-org/rustnzb/compare/v1.6.0-beta.3...v1.7.0-beta.1
 [1.6.0-beta.3]: https://github.com/TheDancingDeveloper-org/rustnzb/compare/v1.6.0-beta.2...v1.6.0-beta.3
 [1.6.0-beta.2]: https://github.com/TheDancingDeveloper-org/rustnzb/compare/v1.6.0-beta.1...v1.6.0-beta.2
