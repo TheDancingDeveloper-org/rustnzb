@@ -62,6 +62,7 @@ async fn upload_nzb_downloads_via_mock_server_and_reaches_history() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut observed_transfer = false;
+    let mut observed_open_socket = false;
     let history_entry = loop {
         let status: serde_json::Value = client
             .get(format!("{}/api/status", app.base_url))
@@ -72,13 +73,20 @@ async fn upload_nzb_downloads_via_mock_server_and_reaches_history() {
             .json()
             .await
             .expect("status response should be JSON");
-        observed_transfer |= status["nntp_connections"]
+        let connections = status["nntp_connections"]
             .as_array()
-            .is_some_and(|connections| {
-                connections
-                    .iter()
-                    .any(|connection| connection["connected"].as_u64().unwrap_or(0) > 0)
-            });
+            .expect("nntp_connections should be an array");
+        for connection in connections {
+            let connected = connection["connected"].as_u64().unwrap_or(0);
+            let active = connection["active"].as_u64().unwrap_or(0);
+            let limit = connection["limit"].as_u64().unwrap_or(0);
+            assert!(
+                active <= connected && connected <= limit,
+                "status row out of range: {connection}"
+            );
+            observed_transfer |= active > 0;
+            observed_open_socket |= connected > 0;
+        }
 
         let history: serde_json::Value = client
             .get(format!("{}/api/history?limit=10", app.base_url))
@@ -110,7 +118,14 @@ async fn upload_nzb_downloads_via_mock_server_and_reaches_history() {
         observed_transfer,
         "API never exposed the in-flight transfer"
     );
+    assert!(
+        observed_open_socket,
+        "API never exposed an open NNTP socket"
+    );
 
+    // WI-2086: once the job is done nothing is transferring, but the
+    // workers keep their sockets open for the next job, and the pool panel
+    // reports them as connected rather than pretending the pool is empty.
     let idle_status: serde_json::Value = client
         .get(format!("{}/api/status", app.base_url))
         .bearer_auth(&access)
@@ -120,13 +135,16 @@ async fn upload_nzb_downloads_via_mock_server_and_reaches_history() {
         .json()
         .await
         .expect("idle status response should be JSON");
+    let idle_rows = idle_status["nntp_connections"].as_array().unwrap();
     assert!(
-        idle_status["nntp_connections"]
-            .as_array()
-            .unwrap()
+        idle_rows.iter().all(|connection| connection["active"] == 0),
+        "idle API status still reports transfers in flight: {idle_status}"
+    );
+    assert!(
+        idle_rows
             .iter()
-            .all(|connection| connection["connected"] == 0),
-        "idle API status still reports connections in use: {idle_status}"
+            .any(|connection| connection["connected"].as_u64().unwrap_or(0) > 0),
+        "idle API status hides the open sockets the workers still hold: {idle_status}"
     );
 
     let queue_after_history: serde_json::Value = client

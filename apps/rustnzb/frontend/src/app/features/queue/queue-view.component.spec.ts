@@ -189,23 +189,31 @@ describe('QueueViewComponent', () => {
     expect(component.speedLimitLabel()).toBe('Paused');
   });
 
-  it('holds a just-finished connection count for five seconds', () => {
+  it('shows exactly what the latest status poll reported, with nothing held over', () => {
     const { component } = makeComponent();
-    component.status.set({ nntp_connections: [] } as never);
+    component.status.set({
+      nntp_connections: [{ server_id: 'backup', connected: 7, active: 7, limit: 10 }],
+    } as never);
+    expect(component.connectionFor('backup')).toEqual({ connected: 7, active: 7 });
 
-    component.updateConnectionHold([{ server_id: 'backup', connected: 7 }], 1_000);
-    component.status.set({ nntp_connections: [{ server_id: 'backup', connected: 0, limit: 10 }] } as never);
+    component.status.set({
+      nntp_connections: [{ server_id: 'backup', connected: 7, active: 0, limit: 10 }],
+    } as never);
+    expect(component.connectionFor('backup')).toEqual({ connected: 7, active: 0 });
 
-    expect(component.displayConnectionCount('backup', 5_999)).toEqual({ count: 7, recent: true });
-    expect(component.displayConnectionCount('backup', 6_000)).toEqual({ count: 0, recent: false });
+    component.status.set({
+      nntp_connections: [{ server_id: 'backup', connected: 0, active: 0, limit: 10 }],
+    } as never);
+    expect(component.connectionFor('backup')).toEqual({ connected: 0, active: 0 });
+    expect(component.connectionFor('never-reported')).toEqual({ connected: 0, active: 0 });
   });
 
-  it('prefers the live connection count over a held value', () => {
+  it('never shows more active sockets than connected ones', () => {
     const { component } = makeComponent();
-    component.updateConnectionHold([{ server_id: 'backup', connected: 7 }], 1_000);
-    component.status.set({ nntp_connections: [{ server_id: 'backup', connected: 3, limit: 10 }] } as never);
-
-    expect(component.displayConnectionCount('backup', 2_000)).toEqual({ count: 3, recent: false });
+    component.status.set({
+      nntp_connections: [{ server_id: 'srv', connected: 2, active: 5, limit: 10 }],
+    } as never);
+    expect(component.connectionFor('srv')).toEqual({ connected: 2, active: 2 });
   });
 
   it('labels a job held by the disk-space guard', () => {
@@ -671,7 +679,7 @@ describe('QueueViewComponent', () => {
     it('refreshes nntp_connections on each poll tick', () => {
       let connected = 1;
       const { component } = startPolling(() =>
-        of({ nntp_connections: [{ server_id: 'server_1', connected, limit: 100 }] }),
+        of({ nntp_connections: [{ server_id: 'server_1', connected, active: connected, limit: 100 }] }),
       );
       expect(component.status()?.nntp_connections?.[0].connected).toBe(1);
 
@@ -679,6 +687,47 @@ describe('QueueViewComponent', () => {
       vi.advanceTimersByTime(2000);
 
       expect(component.status()?.nntp_connections?.[0].connected).toBe(100);
+      component.ngOnDestroy();
+    });
+
+    it('repaints the connection pool panel on every tick, including a drop to zero (WI-2086)', () => {
+      // Backend samples as a download runs, winds down, and the sockets close.
+      const samples = [
+        { connected: 4, active: 4 },
+        { connected: 4, active: 2 },
+        { connected: 4, active: 0 },
+        { connected: 0, active: 0 },
+        { connected: 3, active: 3 },
+      ];
+      let sample = 0;
+      const { component, get } = startPolling(() =>
+        of({ nntp_connections: [{ server_id: 'server_1', limit: 4, ...samples[sample] }] }),
+      );
+      component.servers.set([
+        {
+          id: 'server_1',
+          name: 'Primary',
+          host: 'news.example',
+          port: 563,
+          connections: 4,
+          priority: 0,
+          enabled: true,
+          ssl: true,
+        },
+      ]);
+      get.mockClear();
+
+      const panel = () => {
+        const row = component.visibleServersWithConns()[0];
+        return { connected: row.connected, active: row.active, total: component.connsConnected() };
+      };
+      expect(panel()).toEqual({ connected: 4, active: 4, total: 4 });
+
+      for (sample = 1; sample < samples.length; sample++) {
+        vi.advanceTimersByTime(2000);
+        expect(get.mock.calls.filter(([path]) => path === '/status')).toHaveLength(sample);
+        expect(panel()).toEqual({ ...samples[sample], total: samples[sample].connected });
+      }
       component.ngOnDestroy();
     });
 

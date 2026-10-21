@@ -416,11 +416,51 @@ pub struct PostProcessingStatus {
     pub max_extractions: usize,
 }
 
+/// Per-server NNTP socket usage, as the queue view's connection pool shows it.
+///
+/// `connected` is the number of sockets actually open to the provider, busy
+/// or idle: the same figure the SABnzbd `fullstatus` reports as
+/// `serveractiveconn` (WI-2081). `active` is the subset transferring an
+/// article at the instant of the request. Both are sampled fresh on every
+/// call; nothing is cached, so two polls two seconds apart can differ.
 #[derive(Serialize, ToSchema)]
 pub struct NntpConnectionStatus {
     pub server_id: String,
+    /// Open sockets (connected and authenticated), whether or not busy.
     pub connected: usize,
+    /// Sockets transferring an article right now. Always `<= connected`.
+    pub active: usize,
+    /// Configured connection limit for the server.
     pub limit: usize,
+}
+
+/// Merge the open-socket and transferring-socket snapshots into the
+/// per-server rows `/api/status` returns.
+///
+/// `open` is `(server_id, open_sockets, limit)` and `active` is
+/// `(server_id, transferring, limit)`; both come from the same pool, so the
+/// server ids match, but the merge tolerates a server missing from either
+/// side. `active` is clamped to `connected`: the two counters are separate
+/// atomics and can be read a hair apart.
+fn nntp_connection_status(
+    open: Vec<(String, usize, usize)>,
+    active: Vec<(String, usize, usize)>,
+) -> Vec<NntpConnectionStatus> {
+    let active: std::collections::HashMap<String, usize> = active
+        .into_iter()
+        .map(|(server_id, transferring, _)| (server_id, transferring))
+        .collect();
+    open.into_iter()
+        .map(|(server_id, connected, limit)| {
+            let active = active.get(&server_id).copied().unwrap_or(0).min(connected);
+            NntpConnectionStatus {
+                server_id,
+                connected,
+                active,
+                limit,
+            }
+        })
+        .collect()
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1739,15 +1779,10 @@ pub async fn h_status(
         webdav_enabled: dav.is_some(),
         #[cfg(not(feature = "webdav"))]
         webdav_enabled: false,
-        nntp_connections: qm
-            .connected_snapshot()
-            .into_iter()
-            .map(|(server_id, connected, limit)| NntpConnectionStatus {
-                server_id,
-                connected,
-                limit,
-            })
-            .collect(),
+        // Open sockets drive the pool panel (WI-2081 semantics); the
+        // transferring subset rides along so the UI can show both. Read
+        // straight from the pool's atomics on every request.
+        nntp_connections: nntp_connection_status(qm.connection_snapshot(), qm.connected_snapshot()),
     }))
 }
 
@@ -3288,6 +3323,63 @@ fn toggle_log_level(
         Some(prior) => (prior.to_string(), None),
         None if crate::filter_is_debug(current) || current.is_empty() => ("info".to_string(), None),
         None => (current.to_string(), None),
+    }
+}
+
+#[cfg(test)]
+mod nntp_connection_status_tests {
+    use super::nntp_connection_status;
+
+    fn rows(v: &[(&str, usize, usize)]) -> Vec<(String, usize, usize)> {
+        v.iter()
+            .map(|(id, n, l)| (id.to_string(), *n, *l))
+            .collect()
+    }
+
+    #[test]
+    fn reports_open_sockets_as_connected_and_transfers_as_active() {
+        let out = nntp_connection_status(
+            rows(&[("srv1", 4, 10), ("srv2", 0, 5)]),
+            rows(&[("srv1", 3, 10), ("srv2", 0, 5)]),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            (
+                out[0].server_id.as_str(),
+                out[0].connected,
+                out[0].active,
+                out[0].limit
+            ),
+            ("srv1", 4, 3, 10)
+        );
+        assert_eq!(
+            (
+                out[1].server_id.as_str(),
+                out[1].connected,
+                out[1].active,
+                out[1].limit
+            ),
+            ("srv2", 0, 0, 5)
+        );
+    }
+
+    #[test]
+    fn idle_open_sockets_stay_connected_with_zero_active() {
+        // The pre-WI-2086 handler reported the transferring count as
+        // `connected`, so an idle pool with open sockets read 0/limit.
+        let out = nntp_connection_status(rows(&[("srv1", 8, 8)]), rows(&[("srv1", 0, 8)]));
+        assert_eq!((out[0].connected, out[0].active), (8, 0));
+    }
+
+    #[test]
+    fn active_is_clamped_to_connected_and_missing_servers_default_to_zero() {
+        let out = nntp_connection_status(
+            rows(&[("srv1", 2, 10), ("srv3", 1, 1)]),
+            rows(&[("srv1", 5, 10), ("srv2", 1, 1)]),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].connected, out[0].active), (2, 2));
+        assert_eq!((out[1].connected, out[1].active), (1, 0));
     }
 }
 
