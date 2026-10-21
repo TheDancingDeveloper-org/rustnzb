@@ -13,6 +13,28 @@ also carries generated release notes with the merged pull requests.
 
 ## [Unreleased]
 
+## [1.7.0-beta.5] - 2026-10-21
+
+### Added
+
+- **ui:** *arr-removed History rows show a "Files removed by" badge, and
+  Settings gains a "Keep History when an *arr removes a job" toggle
+
+### Changed
+
+- **sab:** An *arr "Remove Completed" deletes the files but keeps the History
+  row, marked with the client, time and file removal. Set
+  `general.keep_history_on_arr_delete = false` for the previous behaviour
+
+### Fixed
+
+- **db:** Adding an NZB no longer scans the whole History table; duplicate
+  lookups use indexes (migration v22)
+- **queue:** The connection pool panel refreshes on the queue poll while
+  downloading
+- **dispatch:** The connection count reports open sockets rather than worker
+  slots, and idle sockets the server closed are dropped
+
 ## [1.7.0-beta.4] - 2026-10-21
 
 ### Added
