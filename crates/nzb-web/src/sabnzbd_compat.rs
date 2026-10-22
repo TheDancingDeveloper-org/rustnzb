@@ -5686,8 +5686,8 @@ mod tests {
         assert!(!output_dir.exists());
     }
 
-    /// A failed job keeps its partial download in `incomplete/` for retry.
-    /// Deleting its history entry, with or without `del_files`, must free it.
+    /// A partial download left in `incomplete/` by an older version must be
+    /// freed when its history entry is deleted, with or without `del_files`.
     #[tokio::test]
     async fn history_delete_removes_retained_incomplete_work_dir() {
         let test_state = test_state();
@@ -6039,6 +6039,32 @@ mod tests {
         // A repeat delete finds nothing left to remove for the *arr.
         let again = handle_history_delete(&test_state.state, &req).0;
         assert_eq!(again["status"], serde_json::json!(false));
+    }
+
+    /// An *arr's removeFailed keeps the History row but must still free the
+    /// failed job's leftover partial download (WI-2173).
+    #[tokio::test]
+    async fn arr_history_delete_keeping_rows_removes_failed_partials() {
+        let test_state = test_state();
+        let incomplete = test_state.state.queue_manager.incomplete_dir();
+        insert_history_status(&test_state, "arr-failed", JobStatus::Failed, 10);
+        let work_dir = incomplete.join("arr-failed");
+        std::fs::create_dir_all(&work_dir).expect("create leftover work dir");
+        std::fs::write(work_dir.join("partial.rar"), b"partial").expect("write partial");
+
+        let req = SabApiRequest {
+            value: Some("SABnzbd_nzo_arr-failed".into()),
+            client: Some("Sonarr".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert!(!work_dir.exists(), "leftover partial download is removed");
+        assert!(
+            history_ids(&test_state).contains(&"arr-failed".to_string()),
+            "the History row is kept"
+        );
+        assert!(incomplete.is_dir(), "the incomplete root itself is kept");
     }
 
     /// With the setting off, an *arr delete drops the row too, as SABnzbd
