@@ -1205,6 +1205,9 @@ impl Database {
 
     /// Find queued and history jobs that an incoming NZB matches by name
     /// (ignoring ASCII case) or, when `digest` is given, by content digest.
+    /// Failed and trashed history jobs never match: as in SABnzbd, an arr
+    /// re-grabbing a release whose earlier attempt failed or was removed is
+    /// admitted rather than refused into a retry loop.
     pub fn find_duplicate_candidates(
         &self,
         name: &str,
@@ -2161,9 +2164,11 @@ const DUPLICATE_CANDIDATES_SQL: &str = "
     UNION
     SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'history'
     FROM history WHERE LOWER(name) = LOWER(?1) AND trash = 0
+        AND status <> 'Failed' COLLATE NOCASE
     UNION
     SELECT id, name, LOWER(name) = LOWER(?1), COALESCE(nzb_digest = ?2, 0), 'history'
-    FROM history WHERE nzb_digest = ?2 AND trash = 0";
+    FROM history WHERE nzb_digest = ?2 AND trash = 0
+        AND status <> 'Failed' COLLATE NOCASE";
 
 /// Source of [`HISTORY_LIST_COLUMNS`].
 const HISTORY_LIST_FROM: &str = "history h LEFT JOIN history_list_meta m ON m.id = h.id

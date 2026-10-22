@@ -7240,6 +7240,49 @@ mod global_pause_tests {
     }
 
     #[tokio::test]
+    async fn skip_policy_admits_a_regrab_of_a_failed_history_job() {
+        // WI-2165: an arr re-grabs a release whose earlier attempt failed.
+        // SABnzbd admits it; refusing it sent Sonarr into a retry loop.
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Skip);
+        let failed = HistoryEntry {
+            client_removal: None,
+            id: "failed-regrab".into(),
+            name: "Show.S01E16".into(),
+            category: "Default".into(),
+            status: JobStatus::Failed,
+            total_bytes: 100,
+            downloaded_bytes: 10,
+            added_at: Utc::now(),
+            completed_at: Utc::now(),
+            download_time_secs: None,
+            output_dir: tempdir.path().join("complete").join("Show.S01E16"),
+            stages: Vec::new(),
+            error_message: Some("incomplete".into()),
+            failure_code: Some(JobFailureCode::ArticlesUnavailable),
+            post_processing: None,
+            delete_archives: None,
+            server_stats: Vec::new(),
+            nzb_data: Some(DUPLICATE_NZB.to_vec()),
+            retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
+        };
+        manager.db.lock().history_insert(&failed).unwrap();
+
+        admit_duplicate_candidate(&manager, &tempdir, "Show.S01E16", DUPLICATE_NZB)
+            .expect("a failed history job does not block a re-grab");
+        assert_eq!(manager.queue_size(), 1);
+
+        // The re-grab is now queued, so a further copy is refused.
+        let refused = admit_duplicate_candidate(&manager, &tempdir, "Show.S01E16", DUPLICATE_NZB);
+        assert!(matches!(
+            refused,
+            Err(crate::nzb_core::NzbError::DuplicateNzb(ref message)) if message.contains("queue job")
+        ));
+    }
+
+    #[tokio::test]
     async fn history_retry_is_not_refused_by_its_own_history_row() {
         let (manager, tempdir) = manager();
         manager.set_duplicate_policy(DuplicatePolicy::Skip);
