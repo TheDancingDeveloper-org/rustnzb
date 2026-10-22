@@ -2074,6 +2074,9 @@ async fn pool_worker(
             .await
         };
 
+        if matches!(reconnect_needed, WorkerExit::PeerClosed) {
+            conn.mark_peer_closed();
+        }
         let _ = conn.quit().await;
         conn_slot.mark_closed();
         match reconnect_needed {

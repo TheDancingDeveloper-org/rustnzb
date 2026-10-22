@@ -196,6 +196,8 @@ pub enum ConnectionState {
     Busy,
     /// An unrecoverable error occurred; reconnection required.
     Error,
+    /// The server closed an idle connection. A normal disconnect, not a fault.
+    PeerClosed,
 }
 
 // ---------------------------------------------------------------------------
@@ -2257,7 +2259,11 @@ impl NntpConnection {
 
     /// Send QUIT and close the connection gracefully.
     pub async fn quit(&mut self) -> NntpResult<()> {
-        info!(server = %self.server_id, state = ?self.state, "NNTP disconnecting (QUIT)");
+        if self.state == ConnectionState::PeerClosed {
+            debug!(server = %self.server_id, "NNTP disconnecting (QUIT) after server idle close");
+        } else {
+            info!(server = %self.server_id, state = ?self.state, "NNTP disconnecting (QUIT)");
+        }
         if self.transport.is_some() {
             // Best-effort: send QUIT, ignore errors
             if let Err(e) = self.send_command("QUIT").await {
@@ -2526,6 +2532,12 @@ impl NntpConnection {
     }
 
     /// Returns `true` if the connection has an active transport.
+    /// Record that the server closed this idle connection, so the disconnect
+    /// that follows is reported as a normal close rather than an error.
+    pub fn mark_peer_closed(&mut self) {
+        self.state = ConnectionState::PeerClosed;
+    }
+
     pub fn is_connected(&self) -> bool {
         self.transport.is_some() && self.state != ConnectionState::Disconnected
     }
