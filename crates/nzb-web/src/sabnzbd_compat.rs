@@ -876,6 +876,24 @@ async fn dispatch_post(
                     // outcome -- mirroring the history-retry path.
                     let nzb_bytes = data.clone();
                     if let Err(error) = qm.add_job(job, Some(nzb_bytes)) {
+                        if let crate::nzb_core::NzbError::DuplicateNzb(_) = error {
+                            // A refused duplicate is answered the way SABnzbd
+                            // answers one: `status: true` with an empty
+                            // `nzo_ids` list, not `status: false` + `error`.
+                            // Sonarr/Radarr treat `status: false` as a
+                            // transient download-client error and re-grab the
+                            // same release on every RSS sync (WI-2165); an
+                            // empty `nzo_ids` raises their
+                            // DownloadClientRejectedReleaseException, which
+                            // marks the grab failed and blocklists the release.
+                            tracing::warn!(
+                                name = %job_name,
+                                id = %job_id,
+                                %error,
+                                "Duplicate NZB refused via arr API"
+                            );
+                            return Ok(Json(sab_duplicate_refusal()));
+                        }
                         tracing::error!(
                             name = %job_name,
                             id = %job_id,
@@ -1910,6 +1928,12 @@ fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Val
         history_update,
         |ids| qm.history_get_listed(ids).unwrap_or_default(),
     ))
+}
+
+/// The addfile response for an NZB refused as a duplicate: what SABnzbd
+/// returns, `status: true` with no `nzo_ids`, which the arrs blocklist.
+fn sab_duplicate_refusal() -> serde_json::Value {
+    serde_json::json!({ "status": true, "nzo_ids": [] })
 }
 
 #[cfg(test)]
@@ -3282,6 +3306,16 @@ fn format_timeleft(bytes_left: u64, speed_bps: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_refusal_matches_sabnzbd_so_arrs_blocklist_it() {
+        // WI-2165: `status: false` made Sonarr retry forever; an empty
+        // `nzo_ids` with `status: true` is a rejected release it blocklists.
+        let response = sab_duplicate_refusal();
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert_eq!(response["nzo_ids"], serde_json::json!([]));
+        assert!(response.get("error").is_none());
+    }
     use std::path::Path;
 
     use arc_swap::ArcSwap;

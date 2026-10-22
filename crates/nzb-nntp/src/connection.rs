@@ -2531,13 +2531,13 @@ impl NntpConnection {
         Ok(())
     }
 
-    /// Returns `true` if the connection has an active transport.
     /// Record that the server closed this idle connection, so the disconnect
     /// that follows is reported as a normal close rather than an error.
     pub fn mark_peer_closed(&mut self) {
         self.state = ConnectionState::PeerClosed;
     }
 
+    /// Returns `true` if the connection has an active transport.
     pub fn is_connected(&self) -> bool {
         self.transport.is_some() && self.state != ConnectionState::Disconnected
     }
