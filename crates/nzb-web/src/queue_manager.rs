@@ -7273,6 +7273,9 @@ mod global_pause_tests {
         admit_duplicate_candidate(&manager, &tempdir, "Show.S01E16", DUPLICATE_NZB)
             .expect("a failed history job does not block a re-grab");
         assert_eq!(manager.queue_size(), 1);
+        // The re-grab is added as a new job; the old Failed row is kept.
+        let kept = manager.db.lock().history_get("failed-regrab").unwrap();
+        assert_eq!(kept.map(|entry| entry.status), Some(JobStatus::Failed));
 
         // The re-grab is now queued, so a further copy is refused.
         let refused = admit_duplicate_candidate(&manager, &tempdir, "Show.S01E16", DUPLICATE_NZB);
@@ -7280,6 +7283,47 @@ mod global_pause_tests {
             refused,
             Err(crate::nzb_core::NzbError::DuplicateNzb(ref message)) if message.contains("queue job")
         ));
+    }
+
+    #[tokio::test]
+    async fn skip_policy_admits_a_regrab_of_a_deleted_history_job() {
+        // WI-2165: a completed job the user deleted from history no longer
+        // blocks the arr from grabbing the release again.
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Skip);
+        let deleted = HistoryEntry {
+            client_removal: None,
+            id: "deleted-regrab".into(),
+            name: "Show.S01E17".into(),
+            category: "Default".into(),
+            status: JobStatus::Completed,
+            total_bytes: 100,
+            downloaded_bytes: 100,
+            added_at: Utc::now(),
+            completed_at: Utc::now(),
+            download_time_secs: None,
+            output_dir: tempdir.path().join("complete").join("Show.S01E17"),
+            stages: Vec::new(),
+            error_message: None,
+            failure_code: None,
+            post_processing: None,
+            delete_archives: None,
+            server_stats: Vec::new(),
+            nzb_data: Some(DUPLICATE_NZB.to_vec()),
+            retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
+        };
+        {
+            let db = manager.db.lock();
+            db.history_insert(&deleted).unwrap();
+            db.history_trash(&["deleted-regrab".to_string()], Utc::now())
+                .unwrap();
+        }
+
+        admit_duplicate_candidate(&manager, &tempdir, "Show.S01E17", DUPLICATE_NZB)
+            .expect("a deleted history job does not block a re-grab");
+        assert_eq!(manager.queue_size(), 1);
     }
 
     #[tokio::test]
