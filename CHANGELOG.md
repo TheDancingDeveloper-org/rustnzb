@@ -13,6 +13,14 @@ also carries generated release notes with the merged pull requests.
 
 ## [Unreleased]
 
+## [1.7.0-beta.6] - 2026-10-22
+
+### Fixed
+
+- **status:** `/api/status` reports open (`connected`) and transferring
+  (`active`) connections, and the GUI pool updates on every refresh
+- **ui:** History lists all rows by default; stat cards keep the 7-day window
+
 ## [1.7.0-beta.5] - 2026-10-21
 
 ### Added
