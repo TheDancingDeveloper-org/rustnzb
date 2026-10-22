@@ -36,23 +36,14 @@ use nzb_dispatch::{
     BandwidthConfig, BandwidthLimiter, DispatchEngine, DispatchHandle, ProgressUpdate,
 };
 
-fn cleanup_terminal_work_dir(
-    job_id: &str,
-    work_dir: &std::path::Path,
-    final_status: JobStatus,
-    retain_for_retry: bool,
-) {
+fn cleanup_terminal_work_dir(job_id: &str, work_dir: &std::path::Path, final_status: JobStatus) {
     if !work_dir.exists() {
         return;
     }
 
     let cleanup_result = match final_status {
-        // Failed downloads can be retried from their retained NZB history, so
-        // retaining raw articles only leaks disk without improving recovery.
-        JobStatus::Failed if retain_for_retry => {
-            info!(job_id, work_dir = %work_dir.display(), "Retaining partial job files for missing-article retry");
-            return;
-        }
+        // A failed job is final: a history retry re-downloads from the stored
+        // NZB, so keeping raw articles would only leak disk (WI-2173).
         JobStatus::Failed => std::fs::remove_dir_all(work_dir),
         // A successful job must not lose files if an output move failed. Only
         // remove the directory after the move/pipeline has left it empty.
@@ -4381,19 +4372,7 @@ impl QueueManager {
 
         if history_persisted {
             self.notify_terminal(state, final_status);
-            let retain_for_retry = final_status == JobStatus::Failed
-                && state.nzb_data.is_some()
-                && state
-                    .job
-                    .files
-                    .iter()
-                    .any(|file| file.articles.iter().any(|article| article.downloaded));
-            cleanup_terminal_work_dir(
-                &state.job.id,
-                &state.job.work_dir,
-                final_status,
-                retain_for_retry,
-            );
+            cleanup_terminal_work_dir(&state.job.id, &state.job.work_dir, final_status);
         } else {
             warn!(
                 job_id = %state.job.id,
@@ -4930,9 +4909,8 @@ impl QueueManager {
             // Remove from order
             self.job_order.lock().retain(|jid| jid != id);
 
-            // Try to clean up work directory. A terminal job whose history
-            // row already exists may have retained its partial download for
-            // retry; deleting that history entry removes it instead.
+            // Try to clean up work directory. Once a terminal job's history
+            // row exists, that row's cleanup owns the directory.
             if !history_already_persisted && state.job.work_dir.exists() {
                 let _ = std::fs::remove_dir_all(&state.job.work_dir);
             }
@@ -6115,14 +6093,25 @@ impl QueueManager {
         removed_by: &str,
         files_deleted: bool,
     ) -> crate::nzb_core::Result<usize> {
-        let marked = self.db.lock().history_mark_client_removed(
-            ids,
-            removed_by,
-            Utc::now(),
-            files_deleted,
-        )?;
+        let (marked, leftovers) = {
+            let db = self.db.lock();
+            let leftovers: Vec<std::path::PathBuf> = ids
+                .iter()
+                .filter_map(|id| db.history_get(id).ok().flatten())
+                .filter(|entry| entry.status == JobStatus::Failed)
+                .flat_map(|entry| self.history_work_dirs(&db, &entry.id, entry.status))
+                .collect();
+            let marked =
+                db.history_mark_client_removed(ids, removed_by, Utc::now(), files_deleted)?;
+            (marked, leftovers)
+        };
         if marked > 0 {
             self.history_changed();
+        }
+        // The row stays for rustnzb's own record, but a failed job's partial
+        // download is of no use to anyone once the *arr has dropped it.
+        for work_dir in leftovers {
+            self.remove_unreferenced_work_dir(&work_dir, "history entry removed by client");
         }
         Ok(marked)
     }
@@ -6234,16 +6223,11 @@ impl QueueManager {
     }
 
     /// Canonical incomplete directories still referenced by a queue job or a
-    /// history row. With `only_named`, retry checkpoints are parsed only when
-    /// they mention that directory name, which keeps a single delete cheap.
+    /// non-failed history row.
     ///
-    /// Fails closed: any error reading the queue, the history, or one row's
-    /// retry checkpoint is returned rather than treated as "nothing references
+    /// Fails closed: any error reading the queue or the history is returned rather than treated as "nothing references
     /// these directories", because callers use the result to decide deletion.
-    fn referenced_work_dirs(
-        &self,
-        only_named: Option<&std::ffi::OsStr>,
-    ) -> crate::nzb_core::Result<HashSet<std::path::PathBuf>> {
+    fn referenced_work_dirs(&self) -> crate::nzb_core::Result<HashSet<std::path::PathBuf>> {
         let incomplete = self.incomplete_dir();
         // Terminal jobs linger in the queue view briefly after their history
         // row is written; their directory belongs to that row, not the queue.
@@ -6254,7 +6238,6 @@ impl QueueManager {
             .filter(|state| !matches!(state.job.status, JobStatus::Completed | JobStatus::Failed))
             .map(|state| state.job.work_dir.clone())
             .collect();
-        let needle = only_named.map(|name| name.to_string_lossy().into_owned().into_bytes());
         {
             let db = self.db.lock();
             paths.extend(db.queue_list()?.into_iter().map(|job| job.work_dir));
@@ -6262,19 +6245,12 @@ impl QueueManager {
             let trashed = db.history_trashed_summaries()?;
             // A trashed row still owns its directory until its undo window
             // closes, so it counts as a reference exactly like a visible one.
+            // Failed rows own nothing: a failed job's partial download is
+            // deleted when it fails, so any left over (from older versions)
+            // is reclaimable.
             for entry in visible.iter().chain(trashed.iter()) {
-                paths.push(incomplete.join(&entry.id));
                 if entry.status != JobStatus::Failed {
-                    continue;
-                }
-                let Some(data) = db.history_get_retry_data(&entry.id)? else {
-                    continue;
-                };
-                let mentioned = needle.as_ref().is_none_or(|needle| {
-                    !needle.is_empty() && data.windows(needle.len()).any(|window| window == needle)
-                });
-                if mentioned && let Some(work_dir) = retry_checkpoint_work_dir(&data) {
-                    paths.push(work_dir);
+                    paths.push(incomplete.join(&entry.id));
                 }
             }
         }
@@ -6294,7 +6270,7 @@ impl QueueManager {
         let Some(work_dir) = incomplete_child_dir(&root, candidate) else {
             return;
         };
-        let Ok(referenced) = self.referenced_work_dirs(work_dir.file_name()) else {
+        let Ok(referenced) = self.referenced_work_dirs() else {
             warn!(
                 work_dir = %work_dir.display(),
                 "Keeping work directory: its references could not be read"
@@ -6334,7 +6310,7 @@ impl QueueManager {
         let Ok(entries) = std::fs::read_dir(&root) else {
             return;
         };
-        let Ok(referenced) = self.referenced_work_dirs(None) else {
+        let Ok(referenced) = self.referenced_work_dirs() else {
             warn!("Skipping orphan sweep: queue or history could not be read");
             return;
         };

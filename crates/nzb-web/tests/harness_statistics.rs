@@ -60,14 +60,13 @@ async fn history_retry_does_not_count_carried_over_bytes_again() {
     assert_eq!(first.downloads, 1);
     assert!(first.bytes_downloaded > 0);
 
-    // The retry reuses the partial download: the present article is already
-    // on disk, so the retry fetches nothing new before failing again.
+    // The failed attempt deleted its partial download, so the retry fetches
+    // the present article again before failing again.
     let entry = qm.history_get(&id).unwrap().unwrap();
     let retry_data = qm.history_get_retry_data(&id).unwrap();
     let retry = qm
         .prepare_retry_job(&entry, &fixture.xml, retry_data.as_deref())
         .unwrap();
-    assert!(retry.downloaded_bytes > 0, "retry carries the checkpoint");
     let retry_id = retry.id.clone();
     qm.add_job(retry, Some(fixture.xml)).unwrap();
     assert!(
@@ -82,8 +81,9 @@ async fn history_retry_does_not_count_carried_over_bytes_again() {
     let after = qm.global_statistics(&[]).lifetime;
     assert_eq!(after.downloads, 2);
     assert_eq!(
-        after.bytes_downloaded, first.bytes_downloaded,
-        "bytes carried over from the failed attempt are already in its statistics row"
+        after.bytes_downloaded,
+        2 * first.bytes_downloaded,
+        "each attempt counts the bytes it fetched once"
     );
     // The history row still reports the job's cumulative progress.
     let retried = qm.history_get(&retry_id).unwrap().unwrap();

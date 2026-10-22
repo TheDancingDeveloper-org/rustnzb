@@ -1,9 +1,9 @@
 //! Retained incomplete work directories must not leak forever.
 //!
-//! A failed job keeps its partial download in `incomplete/` so a history
-//! retry can reuse it. Deleting that history entry, removing the queue job,
-//! or restarting with directories nothing references must reclaim the space,
-//! without ever reaching outside the incomplete root.
+//! A failed job deletes its partial download from `incomplete/` as soon as it
+//! fails (WI-2173). Leftovers from older versions are reclaimed when the
+//! history entry is deleted or at startup, and removing a queue job reclaims
+//! its directory, without ever reaching outside the incomplete root.
 
 mod harness;
 
@@ -58,9 +58,13 @@ async fn submit_and_fail(engine: &TestEngine, xml: Vec<u8>) -> (String, PathBuf)
     );
     let work_dir = engine.incomplete_dir.join(&id);
     assert!(
-        work_dir.join("present.bin").exists(),
-        "a failed job keeps its partial download for retry"
+        !work_dir.exists(),
+        "a finally failed job must not retain its partial download"
     );
+    assert!(engine.incomplete_dir.is_dir(), "incomplete root survives");
+    // Stand-in for a partial download an older version retained.
+    std::fs::create_dir_all(&work_dir).unwrap();
+    std::fs::write(work_dir.join("present.bin"), b"partial payload").unwrap();
     (id, work_dir)
 }
 
@@ -86,58 +90,6 @@ async fn clearing_history_removes_retained_work_dirs() {
     engine.queue_manager.history_clear().unwrap();
 
     assert!(!work_dir.exists());
-    assert!(engine.incomplete_dir.is_dir());
-}
-
-/// An undoable delete keeps its retained partial download until the undo
-/// window closes. Otherwise a startup sweep, or the purge's own reclaim, could
-/// destroy the reason the user deleted instead of clearing.
-#[tokio::test]
-async fn trashed_history_entry_keeps_work_dir_until_the_undo_window_closes() {
-    let (engine, xml) = failing_engine("hist-undo").await;
-    let (id, work_dir) = submit_and_fail(&engine, xml).await;
-    let qm = &engine.queue_manager;
-
-    qm.history_trash(
-        std::slice::from_ref(&id),
-        chrono::Utc::now() + chrono::Duration::seconds(60),
-    )
-    .unwrap();
-    assert!(
-        work_dir.join("present.bin").exists(),
-        "a trashed entry still owns its work dir"
-    );
-    assert!(
-        qm.history_get(&id).unwrap().is_none(),
-        "but it is gone from every history read"
-    );
-
-    // The startup-style sweep must not reclaim it while the undo is possible.
-    engine.queue_manager.with_db(|db| {
-        let trashed = db.history_trashed_ids().unwrap();
-        assert_eq!(trashed, vec![id.clone()]);
-    });
-
-    // Restoring brings the row back and leaves the work dir alone.
-    let restored = qm
-        .history_restore(std::slice::from_ref(&id), chrono::Utc::now())
-        .unwrap();
-    assert_eq!(restored, vec![id.clone()]);
-    assert!(qm.history_get(&id).unwrap().is_some());
-    assert!(work_dir.join("present.bin").exists());
-
-    // Trash it again and let the window close: the purge drops the row and
-    // reclaims the directory it was holding.
-    qm.history_trash(
-        std::slice::from_ref(&id),
-        chrono::Utc::now() - chrono::Duration::seconds(1),
-    )
-    .unwrap();
-    assert_eq!(qm.history_purge_expired(chrono::Utc::now()).unwrap(), 1);
-    assert!(
-        !work_dir.exists(),
-        "the expired entry's work dir is reclaimed"
-    );
     assert!(engine.incomplete_dir.is_dir());
 }
 
@@ -221,6 +173,7 @@ async fn startup_sweeps_unreferenced_incomplete_dirs_only() {
     let complete = state.path().join("complete");
     // Work directories are named after job ids (UUIDs).
     let kept_history = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+    let failed_history = "4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a";
     let retried_history = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f";
     let reused_partial = incomplete.join("2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e");
     let orphan_one = incomplete.join("0b7c7f0e-3a51-4c4e-9a43-1f6f0c2b8d11");
@@ -240,7 +193,12 @@ async fn startup_sweeps_unreferenced_incomplete_dirs_only() {
         let db = Database::open(&database_path).unwrap();
         db.queue_insert(&queued).unwrap();
         db.queue_store_nzb_data(&queued.id, &fixture.xml).unwrap();
-        db.history_insert(&history_entry(kept_history, &complete))
+        let mut completed = history_entry(kept_history, &complete);
+        completed.status = JobStatus::Completed;
+        completed.error_message = None;
+        completed.failure_code = None;
+        db.history_insert(&completed).unwrap();
+        db.history_insert(&history_entry(failed_history, &complete))
             .unwrap();
         // A retry reused another job's partial dir; its checkpoint names it.
         let mut retried = history_entry(retried_history, &complete);
@@ -260,6 +218,7 @@ async fn startup_sweeps_unreferenced_incomplete_dirs_only() {
 
     dir_with_file(&queued.work_dir);
     dir_with_file(&incomplete.join(kept_history));
+    dir_with_file(&incomplete.join(failed_history));
     dir_with_file(&reused_partial);
     dir_with_file(&orphan_one);
     dir_with_file(&orphan_two.join("nested"));
@@ -284,7 +243,14 @@ async fn startup_sweeps_unreferenced_incomplete_dirs_only() {
         "queue job dir kept"
     );
     assert!(incomplete.join(kept_history).join("data.bin").exists());
-    assert!(reused_partial.join("data.bin").exists());
+    assert!(
+        !incomplete.join(failed_history).exists(),
+        "a failed row's leftover partial download is reclaimed"
+    );
+    assert!(
+        !reused_partial.exists(),
+        "so is the directory a failed retry checkpoint names"
+    );
     assert!(
         user_folder.join("data.bin").exists(),
         "only job-id named directories are swept"
