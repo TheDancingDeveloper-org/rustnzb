@@ -13,6 +13,16 @@ also carries generated release notes with the merged pull requests.
 
 ## [Unreleased]
 
+## [1.7.0-beta.7] - 2026-10-22
+
+### Fixed
+
+- **queue:** failed jobs' partial files are deleted on final failure, and
+  deleting history removes leftovers
+- **admission:** re-grabs of failed or deleted jobs are admitted; only queued
+  or completed duplicates are refused, with SABnzbd's refusal response
+- **nntp:** a server idle close is logged as a normal disconnect
+
 ## [1.7.0-beta.6] - 2026-10-22
 
 ### Fixed
