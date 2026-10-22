@@ -385,6 +385,18 @@ async fn handle_addurl(
             // enqueue succeeds (rustnzb#129).
             let nzb_bytes = data.to_vec();
             if let Err(error) = qm.add_job(job, Some(nzb_bytes)) {
+                if let crate::nzb_core::NzbError::DuplicateNzb(_) = error {
+                    // Answer a refused duplicate as addfile does (WI-2165):
+                    // `status: false` makes arrs re-grab the release on every
+                    // RSS sync; an empty `nzo_ids` makes them blocklist it.
+                    tracing::warn!(
+                        name = %job_name,
+                        id = %job_id,
+                        %error,
+                        "Duplicate NZB refused via URL (arr API)"
+                    );
+                    return Ok(Json(sab_duplicate_refusal()));
+                }
                 tracing::error!(
                     name = %job_name,
                     id = %job_id,
@@ -6397,6 +6409,52 @@ mod tests {
             .map(|job| job.name)
             .collect();
         (value, names)
+    }
+
+    /// A duplicate sent through `addurl` gets the same SABnzbd-style refusal
+    /// as addfile, `status: true` with no `nzo_ids`, so the arr blocklists
+    /// the release instead of re-grabbing it (WI-2165).
+    #[tokio::test]
+    async fn addurl_duplicate_gets_sabnzbd_refusal() {
+        let TestState { state, _tempdir } = test_state();
+        {
+            let mut config = (*state.config()).clone();
+            config.general.fetch_allowed_hosts = vec!["127.0.0.1".into()];
+            state.config.store(std::sync::Arc::new(config));
+        }
+        state
+            .queue_manager
+            .set_duplicate_policy(crate::nzb_core::config::DuplicatePolicy::Skip);
+        let state = Arc::new(state);
+        let mut responses = Vec::new();
+        for _ in 0..2 {
+            let url = spawn_nzb_server(SAMPLE_NZB).await;
+            let req = SabApiRequest {
+                mode: Some("addurl".into()),
+                name: Some(url),
+                apikey: Some("contract-api-key".into()),
+                ..SabApiRequest::default()
+            };
+            let response = h_sabnzbd_api_get(State(state.clone()), Query(req), HeaderMap::new())
+                .await
+                .expect("addurl over GET")
+                .into_response();
+            responses.push(json_body(response).await);
+        }
+        assert_eq!(
+            responses[0]["status"],
+            serde_json::json!(true),
+            "first={}",
+            responses[0]
+        );
+        assert_eq!(responses[0]["nzo_ids"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            responses[1],
+            sab_duplicate_refusal(),
+            "second={}",
+            responses[1]
+        );
+        assert_eq!(state.queue_manager.get_jobs().len(), 1);
     }
 
     /// `mode=addurl&name=<URL>` used the whole URL as the job name, which
