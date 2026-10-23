@@ -396,7 +396,7 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         )
         // These bodies are a few short strings, and the unauthenticated
         // login paths should not hold the 200 MB upload limit's worth of
-        // memory per request while a guess waits for the locked lane.
+        // memory per request while a guess waits for a hashing slot.
         .layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT));
 
     // Native REST API (protected by auth middleware)
@@ -687,9 +687,6 @@ fn build_api_router(state: Arc<AppState>) -> Router {
                 {
                     auth::LoginOutcome::Ok => Ok(next.run(request).await),
                     auth::LoginOutcome::Invalid => Err(ApiError::unauthorized()),
-                    auth::LoginOutcome::Throttled { retry_after } => {
-                        Ok(auth::LoginOutcome::too_many_requests(retry_after))
-                    }
                 }
             }
         },
