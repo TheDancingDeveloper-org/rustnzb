@@ -113,3 +113,11 @@ nzb-news = { path = "crates/nzb-news" }
 nzb-core = { path = "crates/nzb-core" }
 nzb-postproc = { path = "crates/nzb-postproc" }
 nzb-decode = { path = "crates/nzb-decode" }
+
+# Argon2 is deliberately expensive; unoptimised it makes every test login take
+# about a second. Optimise just the hashing crates in dev and test builds.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

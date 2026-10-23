@@ -179,14 +179,63 @@ impl TokenStore {
 
 // --- Credential Store ---
 
-#[derive(Serialize, Deserialize, Clone)]
+/// Credentials as the user supplies them. Only the username and an Argon2id
+/// hash of the password are ever stored; the plaintext is not kept.
+#[derive(Clone)]
 pub struct StoredCredentials {
     pub username: String,
     pub password: String,
 }
 
+/// The stored account: the username and the Argon2id PHC string of the
+/// password. Deliberately neither `Debug` nor returned from the store, so the
+/// hash cannot reach a log line or a response.
+struct Account {
+    username: String,
+    password_hash: String,
+}
+
+/// On-disk layout of `credentials.json`. Files written before WI-2278 hold a
+/// plaintext `password`; loading migrates them to `password_hash`.
+#[derive(Serialize, Deserialize)]
+struct CredentialsFile {
+    username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password_hash: Option<String>,
+    #[serde(default, skip_serializing)]
+    password: Option<String>,
+}
+
+/// Why a credential change was refused.
+#[derive(Debug)]
+pub enum ChangeCredentialsError {
+    NotConfigured,
+    WrongPassword,
+    Empty,
+    Io(std::io::Error),
+}
+
+fn hash_password(password: &str) -> Result<String, std::io::Error> {
+    use argon2::password_hash::PasswordHasher;
+    argon2::Argon2::default()
+        .hash_password(password.as_bytes())
+        .map(|hash| hash.to_string())
+        .map_err(|error| std::io::Error::other(format!("failed to hash password: {error}")))
+}
+
+/// Verify `password` against an Argon2id PHC string. The comparison of the
+/// derived hash is constant time (argon2 compares the output with `ctutils`).
+fn verify_password(password: &str, password_hash: &str) -> bool {
+    use argon2::password_hash::{PasswordVerifier, phc::PasswordHash};
+    PasswordHash::new(password_hash).is_ok_and(|parsed| {
+        argon2::Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok()
+    })
+}
+
 pub struct CredentialStore {
-    credentials: RwLock<Option<StoredCredentials>>,
+    account: RwLock<Option<Account>>,
     #[cfg(not(unix))]
     file_path: PathBuf,
     #[cfg(unix)]
@@ -207,94 +256,214 @@ impl CredentialStore {
         let directory = File::open(&config_dir).unwrap_or_else(|error| {
             panic!("credential store data directory must be readable: {error}")
         });
-        let credentials = if file_path.exists() {
-            match std::fs::read_to_string(&file_path) {
-                Ok(contents) => serde_json::from_str(&contents).ok(),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-        Self {
-            credentials: RwLock::new(credentials),
+        let file: Option<CredentialsFile> = std::fs::read_to_string(&file_path)
+            .ok()
+            .and_then(|contents| serde_json::from_str(&contents).ok());
+        let store = Self {
+            account: RwLock::new(None),
             #[cfg(not(unix))]
             file_path,
             #[cfg(unix)]
             directory,
+        };
+        if let Some(file) = file {
+            store.load(file);
         }
+        store
+    }
+
+    /// Install the loaded file, migrating a plaintext password to a hash and
+    /// rewriting the file so the plaintext leaves the disk at startup.
+    fn load(&self, file: CredentialsFile) {
+        let password_hash = match (file.password_hash, file.password) {
+            (Some(hash), _) => hash,
+            (None, Some(plaintext)) => {
+                let hash = match hash_password(&plaintext) {
+                    Ok(hash) => hash,
+                    Err(error) => {
+                        tracing::error!("Could not migrate the stored web login password: {error}");
+                        return;
+                    }
+                };
+                match self.persist_account(&file.username, &hash) {
+                    Ok(()) => {
+                        tracing::info!("Migrated the stored web login password to an Argon2id hash")
+                    }
+                    Err(error) => tracing::warn!(
+                        "Could not rewrite credentials.json with the hashed password \
+                         (plaintext stays on disk until the next successful write): {error}"
+                    ),
+                }
+                hash
+            }
+            (None, None) => return,
+        };
+        *self.account.write() = Some(Account {
+            username: file.username,
+            password_hash,
+        });
     }
 
     pub fn has_credentials(&self) -> bool {
-        self.credentials.read().is_some()
+        self.account.read().is_some()
     }
 
-    pub fn get_credentials(&self) -> Option<StoredCredentials> {
-        self.credentials.read().clone()
+    /// The configured username, if any. The password hash is never exposed.
+    pub fn username(&self) -> Option<String> {
+        self.account.read().as_ref().map(|a| a.username.clone())
     }
 
+    fn persist_account(&self, username: &str, password_hash: &str) -> Result<(), std::io::Error> {
+        let file = CredentialsFile {
+            username: username.to_owned(),
+            password_hash: Some(password_hash.to_owned()),
+            password: None,
+        };
+        let json = serde_json::to_string_pretty(&file).map_err(std::io::Error::other)?;
+        self.persist(json.as_bytes())
+    }
+
+    /// Write `json` to a temporary file in the data directory, fsync it,
+    /// rename it over `credentials.json` and fsync the directory, so a crash
+    /// leaves either the old file or the new one. Both are owner-only.
     fn persist(&self, json: &[u8]) -> Result<(), std::io::Error> {
         #[cfg(unix)]
         {
             // The directory handle is opened from the canonical data
-            // directory at startup. The fixed filename never comes from a
-            // request or configuration value, and O_NOFOLLOW prevents a
-            // pre-existing credentials symlink from redirecting the write.
+            // directory at startup. The fixed filenames never come from a
+            // request or configuration value, and O_NOFOLLOW | O_EXCL prevent
+            // a planted symlink from redirecting the write.
+            let dir = self.directory.as_raw_fd();
+            let tmp = c"credentials.json.tmp";
+            // A stale temp file from an interrupted write is removed first;
+            // writes are serialized by the account lock.
+            unsafe { libc::unlinkat(dir, tmp.as_ptr(), 0) };
             let flags =
-                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-            let fd = unsafe {
-                libc::openat(
-                    self.directory.as_raw_fd(),
-                    c"credentials.json".as_ptr(),
-                    flags,
-                    0o600,
-                )
-            };
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+            let fd = unsafe { libc::openat(dir, tmp.as_ptr(), flags, 0o600) };
             if fd < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             let mut file = unsafe { File::from_raw_fd(fd) };
-            file.write_all(json)?;
-            if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
-                return Err(std::io::Error::last_os_error());
+            let written = (|| {
+                file.write_all(json)?;
+                if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                file.sync_all()
+            })();
+            drop(file);
+            if let Err(error) = written {
+                unsafe { libc::unlinkat(dir, tmp.as_ptr(), 0) };
+                return Err(error);
             }
-            file.sync_all()
+            if unsafe { libc::renameat(dir, tmp.as_ptr(), dir, c"credentials.json".as_ptr()) } != 0
+            {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::unlinkat(dir, tmp.as_ptr(), 0) };
+                return Err(error);
+            }
+            self.directory.sync_all()
         }
 
         #[cfg(not(unix))]
-        std::fs::write(&self.file_path, json)
+        {
+            let tmp = self.file_path.with_extension("json.tmp");
+            std::fs::write(&tmp, json)?;
+            std::fs::rename(&tmp, &self.file_path)
+        }
     }
 
+    /// Replace the credentials, hashing the new password.
     pub fn set_credentials(&self, creds: StoredCredentials) -> Result<(), std::io::Error> {
-        let json = serde_json::to_string_pretty(&creds).map_err(std::io::Error::other)?;
-        self.persist(json.as_bytes())?;
-        *self.credentials.write() = Some(creds);
+        let password_hash = hash_password(&creds.password)?;
+        let mut account = self.account.write();
+        self.persist_account(&creds.username, &password_hash)?;
+        *account = Some(Account {
+            username: creds.username,
+            password_hash,
+        });
         Ok(())
     }
 
     /// Set credentials exactly once. The check and write are serialized so
     /// two first-boot setup requests cannot race into different accounts.
     pub fn initialize_credentials(&self, creds: StoredCredentials) -> Result<(), std::io::Error> {
-        let mut current = self.credentials.write();
+        let password_hash = hash_password(&creds.password)?;
+        let mut current = self.account.write();
         if current.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "credentials already configured",
             ));
         }
-        let json = serde_json::to_string_pretty(&creds).map_err(std::io::Error::other)?;
-        self.persist(json.as_bytes())?;
-        *current = Some(creds);
+        self.persist_account(&creds.username, &password_hash)?;
+        *current = Some(Account {
+            username: creds.username,
+            password_hash,
+        });
         Ok(())
     }
 
-    pub fn validate(&self, username: &str, password: &str) -> bool {
-        match &*self.credentials.read() {
-            Some(creds) => {
-                constant_time_eq(username.as_bytes(), creds.username.as_bytes())
-                    && constant_time_eq(password.as_bytes(), creds.password.as_bytes())
-            }
-            None => false,
+    /// Verify `current_password`, then replace the username and/or password.
+    /// A `None` field keeps its current value (the password keeps its hash).
+    pub fn change_credentials(
+        &self,
+        current_password: &str,
+        new_username: Option<String>,
+        new_password: Option<String>,
+    ) -> Result<(), ChangeCredentialsError> {
+        let (username, current_hash) = match &*self.account.read() {
+            Some(account) => (account.username.clone(), account.password_hash.clone()),
+            None => return Err(ChangeCredentialsError::NotConfigured),
+        };
+        if !verify_password(current_password, &current_hash) {
+            return Err(ChangeCredentialsError::WrongPassword);
         }
+        let username = new_username.unwrap_or(username);
+        if username.is_empty() || new_password.as_deref().is_some_and(str::is_empty) {
+            return Err(ChangeCredentialsError::Empty);
+        }
+        let password_hash = match new_password {
+            Some(password) => hash_password(&password).map_err(ChangeCredentialsError::Io)?,
+            None => current_hash.clone(),
+        };
+        let mut account = self.account.write();
+        // Refuse if another change landed while the password was verified.
+        if account.as_ref().map(|a| a.password_hash.as_str()) != Some(current_hash.as_str()) {
+            return Err(ChangeCredentialsError::WrongPassword);
+        }
+        self.persist_account(&username, &password_hash)
+            .map_err(ChangeCredentialsError::Io)?;
+        *account = Some(Account {
+            username,
+            password_hash,
+        });
+        Ok(())
+    }
+
+    /// Check a username and password. The username comparison is constant
+    /// time, and the Argon2 verification runs even when the username is wrong
+    /// so timing does not reveal which part failed. Argon2 is deliberately
+    /// slow: async callers use [`CredentialStore::validate_async`].
+    pub fn validate(&self, username: &str, password: &str) -> bool {
+        let (username_ok, password_hash) = match &*self.account.read() {
+            Some(account) => (
+                constant_time_eq(username.as_bytes(), account.username.as_bytes()),
+                account.password_hash.clone(),
+            ),
+            None => return false,
+        };
+        let password_ok = verify_password(password, &password_hash);
+        username_ok & password_ok
+    }
+
+    /// [`CredentialStore::validate`] on the blocking thread pool, so the
+    /// Argon2 work does not stall the async runtime.
+    pub async fn validate_async(self: Arc<Self>, username: String, password: String) -> bool {
+        tokio::task::spawn_blocking(move || self.validate(&username, &password))
+            .await
+            .unwrap_or(false)
     }
 }
 
@@ -380,12 +549,16 @@ pub async fn h_auth_setup(
             .into_response();
     }
 
-    match state
-        .credential_store
-        .initialize_credentials(StoredCredentials {
+    let store = state.credential_store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        store.initialize_credentials(StoredCredentials {
             username: req.username,
             password: req.password,
-        }) {
+        })
+    })
+    .await
+    .unwrap_or_else(|error| Err(std::io::Error::other(error)));
+    match result {
         Ok(_) => {
             // Create tokens for the new user so they're immediately logged in
             let tokens = state.token_store.create_tokens();
@@ -430,39 +603,30 @@ pub async fn h_auth_change_credentials(
     State(state): State<ApiState>,
     Json(req): Json<ChangeCredentialsRequest>,
 ) -> impl IntoResponse {
-    let current_creds = match state.credential_store.get_credentials() {
-        Some(c) => c,
-        None => {
-            return (StatusCode::NOT_FOUND, "no credentials configured").into_response();
-        }
-    };
+    let store = state.credential_store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        store.change_credentials(&req.current_password, req.new_username, req.new_password)
+    })
+    .await
+    .unwrap_or_else(|error| Err(ChangeCredentialsError::Io(std::io::Error::other(error))));
 
-    // Verify current password
-    if !constant_time_eq(
-        req.current_password.as_bytes(),
-        current_creds.password.as_bytes(),
-    ) {
-        return (StatusCode::UNAUTHORIZED, "current password is incorrect").into_response();
-    }
-
-    let new_creds = StoredCredentials {
-        username: req.new_username.unwrap_or(current_creds.username),
-        password: req.new_password.unwrap_or(current_creds.password),
-    };
-    if new_creds.username.is_empty() || new_creds.password.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "username and password cannot be empty",
-        )
-            .into_response();
-    }
-
-    match state.credential_store.set_credentials(new_creds) {
-        Ok(_) => {
+    match result {
+        Ok(()) => {
             state.token_store.revoke_all();
             StatusCode::OK.into_response()
         }
-        Err(e) => (
+        Err(ChangeCredentialsError::NotConfigured) => {
+            (StatusCode::NOT_FOUND, "no credentials configured").into_response()
+        }
+        Err(ChangeCredentialsError::WrongPassword) => {
+            (StatusCode::UNAUTHORIZED, "current password is incorrect").into_response()
+        }
+        Err(ChangeCredentialsError::Empty) => (
+            StatusCode::BAD_REQUEST,
+            "username and password cannot be empty",
+        )
+            .into_response(),
+        Err(ChangeCredentialsError::Io(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to save credentials: {e}"),
         )
@@ -495,7 +659,9 @@ pub async fn h_auth_login(
 
     if !state
         .credential_store
-        .validate(&req.username, &req.password)
+        .clone()
+        .validate_async(req.username, req.password)
+        .await
     {
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
@@ -613,32 +779,147 @@ mod tests {
         store.revoke_session_of("not-a-token");
     }
 
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions())
+            & 0o777
+    }
+
+    fn alice() -> StoredCredentials {
+        StoredCredentials {
+            username: "alice".into(),
+            password: "correct horse".into(),
+        }
+    }
+
     #[test]
-    fn credential_store_persists_owner_only_credentials_and_validates_in_constant_time() {
+    fn credential_store_persists_an_owner_only_argon2id_hash() {
         let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
         let store = CredentialStore::new(temp.path().to_path_buf());
         assert!(!store.has_credentials());
-        store
-            .set_credentials(StoredCredentials {
-                username: "alice".into(),
-                password: "correct horse".into(),
-            })
-            .unwrap();
+        store.set_credentials(alice()).unwrap();
         assert!(store.validate("alice", "correct horse"));
-        assert!(!store.validate("alice", "wrong"));
-        assert!(!constant_time_eq(b"same", b"different"));
 
-        #[cfg(unix)]
-        assert_eq!(
-            std::os::unix::fs::PermissionsExt::mode(
-                &std::fs::metadata(temp.path().join("credentials.json"))
-                    .unwrap()
-                    .permissions(),
-            ) & 0o777,
-            0o600,
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("correct horse"), "{contents}");
+        let file: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert!(file.get("password").is_none());
+        assert!(
+            file["password_hash"]
+                .as_str()
+                .unwrap()
+                .starts_with("$argon2id$v=19$")
         );
+        assert!(!temp.path().join("credentials.json.tmp").exists());
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600);
 
         let reloaded = CredentialStore::new(temp.path().to_path_buf());
         assert!(reloaded.validate("alice", "correct horse"));
+        assert_eq!(reloaded.username().as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn hashing_salts_each_password() {
+        let first = hash_password("same").unwrap();
+        let second = hash_password("same").unwrap();
+        assert_ne!(first, second);
+        assert!(verify_password("same", &first));
+        assert!(verify_password("same", &second));
+        assert!(!verify_password("same", "not a phc string"));
+    }
+
+    #[test]
+    fn validate_rejects_a_wrong_password_or_username() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(temp.path().to_path_buf());
+        assert!(!store.validate("alice", "correct horse"));
+        store.set_credentials(alice()).unwrap();
+        assert!(!store.validate("alice", "wrong"));
+        assert!(!store.validate("alice", ""));
+        assert!(!store.validate("alice", "correct horse "));
+        assert!(!store.validate("bob", "correct horse"));
+        assert!(!store.validate("", ""));
+        assert!(!constant_time_eq(b"same", b"different"));
+        assert!(!constant_time_eq(b"same", b"sane"));
+        assert!(constant_time_eq(b"same", b"same"));
+    }
+
+    #[test]
+    fn plaintext_credentials_are_migrated_at_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
+        std::fs::write(&path, r#"{"username":"alice","password":"correct horse"}"#).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+
+        let store = CredentialStore::new(temp.path().to_path_buf());
+        assert!(store.validate("alice", "correct horse"));
+        assert!(!store.validate("alice", "wrong"));
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("correct horse"), "{contents}");
+        assert!(contents.contains("$argon2id$"));
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600);
+
+        // The migrated file loads as a hash and is not rewritten again.
+        let reloaded = CredentialStore::new(temp.path().to_path_buf());
+        assert!(reloaded.validate("alice", "correct horse"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    #[test]
+    fn change_credentials_verifies_the_current_password() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(temp.path().to_path_buf());
+        assert!(matches!(
+            store.change_credentials("x", None, None),
+            Err(ChangeCredentialsError::NotConfigured)
+        ));
+        store.set_credentials(alice()).unwrap();
+
+        assert!(matches!(
+            store.change_credentials("wrong", None, Some("new".into())),
+            Err(ChangeCredentialsError::WrongPassword)
+        ));
+        assert!(matches!(
+            store.change_credentials("correct horse", None, Some(String::new())),
+            Err(ChangeCredentialsError::Empty)
+        ));
+        assert!(store.validate("alice", "correct horse"));
+
+        // Renaming keeps the existing password.
+        store
+            .change_credentials("correct horse", Some("bob".into()), None)
+            .unwrap();
+        assert!(store.validate("bob", "correct horse"));
+        assert!(!store.validate("alice", "correct horse"));
+
+        store
+            .change_credentials("correct horse", None, Some("battery staple".into()))
+            .unwrap();
+        assert!(store.validate("bob", "battery staple"));
+        assert!(!store.validate("bob", "correct horse"));
+
+        let reloaded = CredentialStore::new(temp.path().to_path_buf());
+        assert!(reloaded.validate("bob", "battery staple"));
+        #[cfg(unix)]
+        assert_eq!(mode(&temp.path().join("credentials.json")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_does_not_follow_a_planted_temp_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("stolen");
+        std::os::unix::fs::symlink(&target, temp.path().join("credentials.json.tmp")).unwrap();
+        let store = CredentialStore::new(temp.path().to_path_buf());
+        store.set_credentials(alice()).unwrap();
+        assert!(!target.exists());
+        assert!(store.validate("alice", "correct horse"));
     }
 }
