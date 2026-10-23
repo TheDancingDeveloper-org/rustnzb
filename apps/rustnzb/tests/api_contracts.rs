@@ -221,6 +221,13 @@ async fn basic_status(app: &ContractApp, client: &reqwest::Client, password: &st
         .as_u16()
 }
 
+/// Wrong passwords the server currently counts against `client`.
+fn failures(app: &ContractApp, client: [u8; 4]) -> u32 {
+    app.state
+        .credential_store
+        .failed_attempts(std::net::IpAddr::from(client))
+}
+
 async fn login_status(app: &ContractApp, client: &reqwest::Client, password: &str) -> u16 {
     password_login(app, client, password)
         .await
@@ -242,15 +249,15 @@ async fn wrong_passwords_are_delayed_but_the_correct_password_is_not() {
     assert_eq!(status, 401);
     assert!(took >= FIRST_DELAY * 2, "{took:?}");
 
-    // The correct password is answered without a delay (the next wrong one
-    // would wait 2 s) and resets the count.
-    let (status, took) = timed(basic_status(&app, &client, "password")).await;
-    assert_eq!(status, 200);
-    assert!(took < FIRST_DELAY * 4, "{took:?}");
+    // The correct password gets in on both paths and resets the count. (The
+    // unit tests in nzb-web time it; here the shared test load would make an
+    // upper bound flaky.)
+    assert_eq!(failures(&app, [127, 0, 0, 1]), 2);
+    assert_eq!(basic_status(&app, &client, "password").await, 200);
+    assert_eq!(failures(&app, [127, 0, 0, 1]), 0);
     assert_eq!(login_status(&app, &client, "password").await, 200);
-    let (status, took) = timed(login_status(&app, &client, "wrong")).await;
-    assert_eq!(status, 401);
-    assert!(took < FIRST_DELAY * 2, "{took:?}");
+    assert_eq!(login_status(&app, &client, "wrong").await, 401);
+    assert_eq!(failures(&app, [127, 0, 0, 1]), 1);
 }
 
 #[cfg(target_os = "linux")]
@@ -263,11 +270,11 @@ async fn failed_logins_are_counted_per_client_address() {
         assert_eq!(login_status(&app, &attacker, "wrong").await, 401);
     }
 
-    // Another address has its own count: its first failure gets the first
-    // delay, and it logs in normally on both password paths.
-    let (status, took) = timed(login_status(&app, &operator, "wrong")).await;
-    assert_eq!(status, 401);
-    assert!(took < FIRST_DELAY * 2, "{took:?}");
+    // Another address has its own count, and it logs in normally on both
+    // password paths.
+    assert_eq!(login_status(&app, &operator, "wrong").await, 401);
+    assert_eq!(failures(&app, [127, 0, 0, 2]), 2);
+    assert_eq!(failures(&app, [127, 0, 0, 3]), 1);
     assert_eq!(login_status(&app, &operator, "password").await, 200);
     assert_eq!(basic_status(&app, &operator, "password").await, 200);
 }
@@ -326,6 +333,7 @@ async fn x_forwarded_for_names_the_client_only_behind_a_trusted_proxy() {
     let (status, took) = login(&app, "203.0.113.2").await;
     assert_eq!(status, 401);
     assert!(took >= FIRST_DELAY * 2, "{took:?}");
+    assert_eq!(failures(&app, [127, 0, 0, 1]), 2);
 
     // Trusted: each forwarded client has its own count, and an address the
     // client prepends itself is not believed.
@@ -334,12 +342,13 @@ async fn x_forwarded_for_names_the_client_only_behind_a_trusted_proxy() {
     })
     .await;
     assert_eq!(login(&app, "203.0.113.1").await.0, 401);
-    let (status, took) = login(&app, "203.0.113.2").await;
-    assert_eq!(status, 401);
-    assert!(took < FIRST_DELAY * 2, "{took:?}");
+    assert_eq!(login(&app, "203.0.113.2").await.0, 401);
     let (status, took) = login(&app, "203.0.113.2, 203.0.113.1").await;
     assert_eq!(status, 401);
     assert!(took >= FIRST_DELAY * 2, "{took:?}");
+    assert_eq!(failures(&app, [203, 0, 113, 1]), 2);
+    assert_eq!(failures(&app, [203, 0, 113, 2]), 1);
+    assert_eq!(failures(&app, [127, 0, 0, 1]), 0);
 }
 
 #[tokio::test]
@@ -383,10 +392,10 @@ async fn change_credentials_shares_the_login_failure_delay() {
     assert_eq!(status, 401);
     assert!(took >= FIRST_DELAY * 2, "{took:?}");
 
-    // The correct current password goes through without a delay.
-    let (status, took) = change("password").await;
-    assert_eq!(status, 200);
-    assert!(took < FIRST_DELAY * 4, "{took:?}");
+    // The correct current password goes through and clears the count.
+    assert_eq!(failures(&app, [127, 0, 0, 1]), 2);
+    assert_eq!(change("password").await.0, 200);
+    assert_eq!(failures(&app, [127, 0, 0, 1]), 0);
     assert_eq!(login_status(&app, &client, "rotated").await, 200);
 }
 
