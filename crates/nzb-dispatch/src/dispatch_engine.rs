@@ -20,6 +20,7 @@ use crate::bandwidth::BandwidthLimiter;
 use crate::download_engine::{ConnectionTracker, ProgressUpdate, WorkerPool, build_job_submission};
 use nzb_core::config::ServerConfig;
 use nzb_core::models::NzbJob;
+use nzb_nntp::budget::BudgetRegistry;
 use parking_lot::Mutex;
 
 /// Article-dispatch engine: accepts jobs, drives NNTP fetches, emits progress.
@@ -160,7 +161,23 @@ impl DispatchHandle {
         bandwidth: Arc<BandwidthLimiter>,
         article_timeout_secs: u64,
     ) -> Self {
-        let tracker = Arc::new(ConnectionTracker::new());
+        Self::with_budgets(
+            servers,
+            bandwidth,
+            article_timeout_secs,
+            Arc::new(BudgetRegistry::default()),
+        )
+    }
+
+    /// Like [`Self::new`], drawing connection permits from `budgets` so the
+    /// downloader shares each server's allowance with other consumers.
+    pub fn with_budgets(
+        servers: Arc<Mutex<Vec<ServerConfig>>>,
+        bandwidth: Arc<BandwidthLimiter>,
+        article_timeout_secs: u64,
+        budgets: Arc<BudgetRegistry>,
+    ) -> Self {
+        let tracker = Arc::new(ConnectionTracker::with_budgets(budgets));
         for server in servers.lock().iter() {
             tracker.set_limit(&server.id, &server.name, server.connections as usize);
         }

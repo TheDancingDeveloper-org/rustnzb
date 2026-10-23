@@ -46,6 +46,7 @@ use nzb_core::models::NzbJob;
 use nzb_decode::FileAssembler;
 use nzb_decode::yenc::decode_yenc;
 use nzb_nntp::Pipeline;
+use nzb_nntp::budget::{BudgetPermit, BudgetRegistry, BudgetTier, ServerBudget};
 use nzb_nntp::connection::{ConnectionState, NntpConnection};
 use nzb_nntp::error::NntpError;
 
@@ -177,51 +178,75 @@ fn refused(server: &ServerConfig) -> nzb_core::Outcome {
 }
 
 // ---------------------------------------------------------------------------
-// Global connection tracking — semaphore-backed permit pools
+// Global connection tracking — permits from the shared per-server budget
 // ---------------------------------------------------------------------------
 
-/// Tracks the per-server NNTP connection budget. Each server has a
-/// `tokio::sync::Semaphore` whose initial permit count is the configured
-/// `connections` limit. Workers acquire a permit *before* connecting and
-/// hold it for their entire lifetime; the permit's `Drop` releases the slot
-/// synchronously back to the pool. This makes over-allocation a type-level
-/// impossibility — once `limit` permits are out, the next acquire awaits.
+/// Tracks the downloader's share of each server's NNTP connection budget.
+/// Each server has a [`ServerBudget`] (from a [`BudgetRegistry`] shared with
+/// the WebDAV side) whose allowance is the configured `connections` limit.
+/// Workers acquire a [`BudgetTier::Download`] permit *before* connecting and
+/// hold it for their entire lifetime; the permit's `Drop` releases it
+/// synchronously back to the budget. Once the allowance is out, across the
+/// downloader and every other consumer of the budget, the next acquire
+/// awaits.
 ///
 /// **Limit changes at runtime** are handled differently for grow vs shrink:
 ///
-/// - **Grow** (e.g. 5 → 10): the existing semaphore is given the additional
-///   permits via `add_permits`; existing slot holders are unaffected.
-/// - **Shrink** (e.g. 10 → 5): the entire `ServerSlot` is replaced with a
-///   fresh one. Old permit holders continue to reference the orphaned
-///   semaphore via their `Arc`; their drops release back to it (a no-op
-///   since nothing else points at it). Workers detect the replacement via
-///   [`ConnectionTracker::slot_is_current`] and exit on the next iteration.
+/// - **Grow** (e.g. 5 → 10): the budget's allowance is raised in place;
+///   existing slot holders are unaffected.
+/// - **Shrink** (e.g. 10 → 5): the budget's allowance is lowered and the
+///   `ServerSlot` is replaced with a new generation. Old permit holders keep
+///   counting against the budget until they drop, so the provider never sees
+///   more than the new limit plus the workers still winding down, and no new
+///   permit is granted until the total is back under the limit. Workers
+///   detect the replacement via [`ConnectionTracker::slot_is_current`] and
+///   exit on the next iteration.
 pub struct ConnectionTracker {
     pools: Mutex<HashMap<String, ServerSlot>>,
+    budgets: Arc<BudgetRegistry>,
+    next_generation: AtomicU64,
 }
 
 #[derive(Clone)]
 struct ServerSlot {
     name: String,
     limit: usize,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    budget: Arc<ServerBudget>,
+    /// Changes whenever the slot is replaced (shrink, rename, re-add).
+    generation: u64,
+    /// Download permits held by this generation's workers.
+    held: Arc<AtomicUsize>,
     connected: Arc<AtomicUsize>,
     /// Sockets currently open (connected and authenticated), busy or idle.
     open: Arc<AtomicUsize>,
 }
 
 impl ConnectionTracker {
+    /// A tracker with its own budgets, shared with nothing else.
     pub fn new() -> Self {
+        Self::with_budgets(Arc::new(BudgetRegistry::default()))
+    }
+
+    /// A tracker drawing from `budgets`, shared with other consumers of the
+    /// same servers.
+    pub fn with_budgets(budgets: Arc<BudgetRegistry>) -> Self {
         Self {
             pools: Mutex::new(HashMap::new()),
+            budgets,
+            next_generation: AtomicU64::new(0),
         }
+    }
+
+    /// The budgets this tracker draws from.
+    pub fn budgets(&self) -> &Arc<BudgetRegistry> {
+        &self.budgets
     }
 
     /// Set or update the per-server connection limit.
     ///
-    /// - First call for a `server_id`: creates a fresh semaphore with `limit` permits.
+    /// - First call for a `server_id`: sets the server's budget to `limit`.
     /// - Subsequent call with the same `limit` and `server_name`: no-op.
-    /// - Grow (`limit > current`): adds permits in place.
+    /// - Grow (`limit > current`): raises the budget in place.
     /// - Shrink or rename: replaces the slot. Old permit holders detach
     ///   naturally via [`slot_is_current`].
     pub fn set_limit(&self, server_id: &str, server_name: &str, limit: usize) {
@@ -233,7 +258,7 @@ impl ConnectionTracker {
             Some(slot) if limit > slot.limit && slot.name == server_name => {
                 let added = limit - slot.limit;
                 let old = slot.limit;
-                slot.semaphore.add_permits(added);
+                self.budgets.ensure(server_id, limit);
                 slot.limit = limit;
                 info!(
                     server_id,
@@ -255,7 +280,9 @@ impl ConnectionTracker {
                     ServerSlot {
                         name: server_name.to_string(),
                         limit,
-                        semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
+                        budget: self.budgets.ensure(server_id, limit),
+                        generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+                        held: Arc::new(AtomicUsize::new(0)),
                         connected: Arc::new(AtomicUsize::new(0)),
                         open: Arc::new(AtomicUsize::new(0)),
                     },
@@ -268,7 +295,7 @@ impl ConnectionTracker {
                         old_limit = prev,
                         new_limit = limit,
                         renamed,
-                        "Connection pool replaced (shrink or rename); old permits orphaned"
+                        "Connection pool replaced (shrink or rename); old slots wind down"
                     );
                 } else {
                     info!(
@@ -301,14 +328,13 @@ impl ConnectionTracker {
         if server_slot.limit == 0 {
             return None;
         }
-        let permit = Arc::clone(&server_slot.semaphore)
-            .acquire_owned()
-            .await
-            .ok()?;
+        let permit = server_slot.budget.acquire(BudgetTier::Download).await;
+        server_slot.held.fetch_add(1, Ordering::Relaxed);
         Some(ConnectionSlot {
             server_id: server_id.to_string(),
             server_name: server_slot.name,
-            semaphore_origin: server_slot.semaphore,
+            generation: server_slot.generation,
+            held: server_slot.held,
             connected: server_slot.connected,
             is_connected: false,
             open: server_slot.open,
@@ -317,8 +343,8 @@ impl ConnectionTracker {
         })
     }
 
-    /// Returns true if `slot` was acquired from the *current* semaphore for
-    /// its server. False if the limit was changed (semaphore replaced) or
+    /// Returns true if `slot` was acquired from the *current* slot for its
+    /// server. False if the limit was shrunk (slot replaced) or
     /// the server was removed — the worker should exit at its next safe
     /// checkpoint.
     pub fn slot_is_current(&self, slot: &ConnectionSlot) -> bool {
@@ -331,7 +357,7 @@ impl ConnectionTracker {
         let pools = self.pools.lock();
         match pools.get(&slot.server_id) {
             Some(server_slot) => {
-                if Arc::ptr_eq(&server_slot.semaphore, &slot.semaphore_origin) {
+                if server_slot.generation == slot.generation {
                     SlotStatus::Current
                 } else {
                     SlotStatus::PoolReplaced
@@ -342,16 +368,14 @@ impl ConnectionTracker {
     }
 
     /// `(server_id, active, limit)` triples for the live pool. `active` is
-    /// derived from the semaphore's available permits and is always
-    /// `<= limit` by construction.
+    /// the download permits held by the current generation, which the
+    /// budget keeps `<= limit`.
     pub fn snapshot(&self) -> Vec<(String, usize, usize)> {
         let pools = self.pools.lock();
         pools
             .iter()
             .map(|(id, slot)| {
-                let active = slot
-                    .limit
-                    .saturating_sub(slot.semaphore.available_permits());
+                let active = slot.held.load(Ordering::Relaxed).min(slot.limit);
                 (id.clone(), active, slot.limit)
             })
             .collect()
@@ -390,15 +414,12 @@ impl ConnectionTracker {
             .collect()
     }
 
-    /// Total currently-held permits across all servers in the live pool.
-    /// Permits held against orphaned (replaced) semaphores are NOT counted —
-    /// they'll go away as the holding workers exit.
+    /// Total download permits held across all servers in the live pool.
+    /// Permits held by replaced slots are NOT counted — they'll go away as
+    /// the holding workers exit.
     pub fn total(&self) -> usize {
         let pools = self.pools.lock();
-        pools
-            .values()
-            .map(|s| s.limit.saturating_sub(s.semaphore.available_permits()))
-            .sum()
+        pools.values().map(|s| s.held.load(Ordering::Relaxed)).sum()
     }
 }
 
@@ -411,9 +432,9 @@ impl Default for ConnectionTracker {
 /// Why a `ConnectionSlot` may no longer match its server's live pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotStatus {
-    /// Slot is still attached to the current semaphore for its server.
+    /// Slot is still attached to the current slot for its server.
     Current,
-    /// The semaphore was replaced (set_limit shrunk or rebuilt the pool).
+    /// The slot was replaced (set_limit shrunk or rebuilt the pool).
     /// Old permit holders should exit at their next safe checkpoint.
     PoolReplaced,
     /// The server has been removed entirely from the tracker.
@@ -421,21 +442,22 @@ pub enum SlotStatus {
 }
 
 /// RAII handle for one acquired NNTP connection slot. The underlying
-/// semaphore permit is released synchronously on drop. Workers should hold
+/// budget permit is released synchronously on drop. Workers should hold
 /// a `ConnectionSlot` for their entire lifetime — across reconnects, even
 /// across temporary connect failures — and only drop it when exiting.
 pub struct ConnectionSlot {
     server_id: String,
     server_name: String,
-    /// The Arc identity of the semaphore the permit was issued by.
-    /// Used by `ConnectionTracker::slot_is_current` to detect a stale slot
-    /// after a `set_limit` shrink (which replaces the semaphore).
-    semaphore_origin: Arc<tokio::sync::Semaphore>,
+    /// The slot generation the permit was issued under. Used by
+    /// `ConnectionTracker::slot_is_current` to detect a stale slot after a
+    /// `set_limit` shrink (which replaces the slot).
+    generation: u64,
+    held: Arc<AtomicUsize>,
     connected: Arc<AtomicUsize>,
     is_connected: bool,
     open: Arc<AtomicUsize>,
     is_open: bool,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: BudgetPermit,
 }
 
 impl ConnectionSlot {
@@ -484,6 +506,7 @@ impl Drop for ConnectionSlot {
     fn drop(&mut self) {
         self.mark_inactive();
         self.mark_closed();
+        self.held.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1896,8 +1919,8 @@ async fn await_worker_shutdown(mut handles: Vec<JoinHandle<()>>, timeout: Durati
 /// items from the shared queue until `worker_shutdown` is flipped (server
 /// reconciled away, limit shrunk) or the pool shuts down.
 ///
-/// The worker acquires its connection slot (a semaphore permit from the
-/// per-server pool) **before** the first connect attempt and holds it for
+/// The worker acquires its connection slot (a download permit from the
+/// per-server budget) **before** the first connect attempt and holds it for
 /// the entire lifetime of the worker, across every reconnect. This bounds
 /// concurrent connections to `server.connections` by construction.
 async fn pool_worker(
@@ -1938,7 +1961,7 @@ async fn pool_worker(
             return;
         }
 
-        // If the limit was shrunk under us, the semaphore will have been
+        // If the limit was shrunk under us, the slot will have been
         // replaced. Drop our (now-orphaned) slot and exit cleanly.
         match pool.conn_tracker.slot_status(&conn_slot) {
             SlotStatus::Current => {}
@@ -5304,7 +5327,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ConnectionTracker (Phase 4 — semaphore-backed slots)
+    // ConnectionTracker (budget-backed slots)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -5361,19 +5384,25 @@ mod tests {
         let s = t.acquire("srv1").await.unwrap();
         assert!(t.slot_is_current(&s));
 
-        // Shrink to 1 — old semaphore is replaced.
+        // Shrink to 1 — the slot is replaced.
         t.set_limit("srv1", "Server 1", 1);
         assert!(
             !t.slot_is_current(&s),
             "after shrink, the previously-acquired slot must be marked stale"
         );
 
-        // The new pool starts empty (1 permit available, 0 in use). Old
-        // permit holder is no longer counted in `total()` because its
-        // semaphore is orphaned.
+        // The new generation starts empty. The old holder is no longer
+        // counted in `total()`, but it still holds the server's only
+        // connection, so the new generation waits for it to wind down.
         assert_eq!(t.total(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), t.acquire("srv1"))
+                .await
+                .is_err(),
+            "the shrunk budget must count the stale slot until it drops"
+        );
+        drop(s);
 
-        // We can still acquire from the new pool.
         let new_slot = t.acquire("srv1").await.unwrap();
         assert!(t.slot_is_current(&new_slot));
         assert_eq!(t.total(), 1);
@@ -5460,6 +5489,132 @@ mod tests {
         a.mark_open();
         drop(a);
         assert_eq!(t.open_snapshot(), vec![("srv1".into(), 0, 3)]);
+    }
+
+    fn dav_budgets(playback_reserve_pct: u8) -> Arc<BudgetRegistry> {
+        Arc::new(BudgetRegistry::new(nzb_nntp::budget::BudgetPolicy {
+            playback_reserve_pct,
+            repair_reserve_pct: 0,
+        }))
+    }
+
+    #[tokio::test]
+    async fn download_and_dav_together_never_exceed_connections() {
+        use nzb_nntp::ConnectionPool;
+        use nzb_nntp::testutil::{MockConfig, MockNntpServer, test_config};
+
+        let mock = MockNntpServer::start(MockConfig::default()).await;
+        let config = test_config(mock.port()); // connections = 4
+        let budgets = dav_budgets(25);
+        let tracker = Arc::new(ConnectionTracker::with_budgets(Arc::clone(&budgets)));
+        tracker.set_limit(&config.id, &config.name, config.connections as usize);
+        let budget = budgets.get(&config.id).unwrap();
+        let dav = Arc::new(ConnectionPool::with_budget(
+            Arc::new(config.clone()),
+            Arc::clone(&budget),
+            BudgetTier::Playback,
+        ));
+
+        let peak = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let monitor = tokio::spawn({
+            let (budget, peak, stop) = (Arc::clone(&budget), Arc::clone(&peak), Arc::clone(&stop));
+            async move {
+                while !stop.load(Ordering::Relaxed) {
+                    peak.fetch_max(budget.held_total(), Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let downloads_done = Arc::new(AtomicUsize::new(0));
+        let reads_done = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let (tracker, id, done) = (
+                Arc::clone(&tracker),
+                config.id.clone(),
+                Arc::clone(&downloads_done),
+            );
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..20 {
+                    let _slot = tracker.acquire(&id).await.unwrap();
+                    tokio::task::yield_now().await;
+                    done.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+            let (dav, done) = (Arc::clone(&dav), Arc::clone(&reads_done));
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..20 {
+                    let conn = dav.acquire().await.unwrap();
+                    tokio::task::yield_now().await;
+                    dav.release(conn);
+                    done.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(20), task)
+                .await
+                .expect("a consumer starved")
+                .unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        monitor.await.unwrap();
+
+        assert_eq!(downloads_done.load(Ordering::Relaxed), 120);
+        assert_eq!(reads_done.load(Ordering::Relaxed), 120);
+        assert!(peak.load(Ordering::Relaxed) <= 4, "budget exceeded");
+        // The only permits left are the DAV pool's idle sockets.
+        assert_eq!(budget.held_total(), dav.idle_count());
+        assert!(budget.held(BudgetTier::Download) == 0);
+    }
+
+    #[tokio::test]
+    async fn dav_playback_gets_a_connection_while_downloads_saturate() {
+        use nzb_nntp::ConnectionPool;
+        use nzb_nntp::testutil::{MockConfig, MockNntpServer, test_config};
+
+        let mock = MockNntpServer::start(MockConfig::default()).await;
+        let config = test_config(mock.port()); // connections = 4
+        let budgets = dav_budgets(25);
+        let tracker = Arc::new(ConnectionTracker::with_budgets(Arc::clone(&budgets)));
+        tracker.set_limit(&config.id, &config.name, config.connections as usize);
+
+        // The downloader takes everything it may: 3 of 4, one kept for
+        // playback. A fourth worker queues.
+        let mut slots = Vec::new();
+        for _ in 0..3 {
+            slots.push(tracker.acquire(&config.id).await.unwrap());
+        }
+        let queued = tokio::spawn({
+            let (tracker, id) = (Arc::clone(&tracker), config.id.clone());
+            async move { tracker.acquire(&id).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!queued.is_finished(), "download took the playback reserve");
+
+        let budget = budgets.get(&config.id).unwrap();
+        let dav = ConnectionPool::with_budget(
+            Arc::new(config),
+            Arc::clone(&budget),
+            BudgetTier::Playback,
+        );
+        let conn = tokio::time::timeout(Duration::from_secs(5), dav.acquire())
+            .await
+            .expect("playback starved behind the downloader")
+            .unwrap();
+        assert_eq!(budget.held_total(), 4);
+
+        // Once playback is done and its socket closed, the queued download
+        // gets the permit.
+        dav.discard(conn);
+        drop(slots.pop());
+        let _slot = tokio::time::timeout(Duration::from_secs(5), queued)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(tracker.total(), 3);
     }
 
     #[test]

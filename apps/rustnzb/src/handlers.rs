@@ -5412,7 +5412,16 @@ pub async fn h_dav_config_set(
     if dav.auto_send_all {
         dav.category_rules.clear();
     }
+    if dav.playback_reserve_pct > 100 {
+        return Err(ApiError::bad_request(
+            "playback_reserve_pct must be between 0 and 100",
+        ));
+    }
     state.update_config_with(|config| {
+        // Clients that predate the setting leave it as it was.
+        if !fields.contains_key("playback_reserve_pct") {
+            dav.playback_reserve_pct = config.dav.playback_reserve_pct;
+        }
         dav.password = resolve_secret(fields, "password", config.dav.password.clone());
         dav.api_key = resolve_secret(fields, "api_key", config.dav.api_key.clone());
         config.dav = dav;

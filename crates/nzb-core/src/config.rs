@@ -569,7 +569,7 @@ impl Default for NotificationConfig {
 }
 
 /// DAV pipeline auto-send configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct DavConfig {
     /// Whether the WebDAV media library is mounted at runtime.
@@ -592,6 +592,28 @@ pub struct DavConfig {
     /// don't support Basic but accept a custom header).
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Percent of each server's `connections` set aside for WebDAV playback
+    /// while the library is enabled (rounded up; the downloader always keeps
+    /// at least one). The downloader and WebDAV share one allowance per
+    /// server, so this is what keeps playback responsive during a download.
+    pub playback_reserve_pct: u8,
+}
+
+/// Default for [`DavConfig::playback_reserve_pct`].
+pub const DEFAULT_DAV_PLAYBACK_RESERVE_PCT: u8 = 25;
+
+impl Default for DavConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_send_all: false,
+            category_rules: Vec::new(),
+            username: None,
+            password: None,
+            api_key: None,
+            playback_reserve_pct: DEFAULT_DAV_PLAYBACK_RESERVE_PCT,
+        }
+    }
 }
 
 impl AppConfig {
@@ -654,6 +676,9 @@ impl AppConfig {
             if !seen_ids.insert(server.id.as_str()) {
                 problems.push(format!("{label}: duplicate server id"));
             }
+        }
+        if self.dav.playback_reserve_pct > 100 {
+            problems.push("dav.playback_reserve_pct must be between 0 and 100".to_string());
         }
         for (i, rule) in self.schedule.rules.iter().enumerate() {
             if let Some(problem) = crate::schedule::rule_problem(rule) {
@@ -1090,6 +1115,10 @@ ssl = false
         assert!(cfg.dav.username.is_none());
         assert!(cfg.dav.password.is_none());
         assert!(cfg.dav.api_key.is_none());
+        assert_eq!(
+            cfg.dav.playback_reserve_pct,
+            DEFAULT_DAV_PLAYBACK_RESERVE_PCT
+        );
     }
 
     #[test]
@@ -1123,6 +1152,7 @@ ssl = false
         assert!(dav.username.is_none());
         assert!(dav.password.is_none());
         assert!(dav.api_key.is_none());
+        assert_eq!(dav.playback_reserve_pct, DEFAULT_DAV_PLAYBACK_RESERVE_PCT);
     }
 
     #[test]

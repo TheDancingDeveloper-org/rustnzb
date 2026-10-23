@@ -1912,6 +1912,9 @@ pub struct QueueManager {
     early_failure_check: bool,
     /// Canonical article dispatcher owned by `nzb-dispatch`.
     dispatch: Arc<dyn DispatchEngine>,
+    /// Per-server connection budgets the dispatcher draws from. Every other
+    /// NNTP consumer of the same servers (WebDAV) must draw from these too.
+    server_budgets: Arc<nzb_nntp::budget::BudgetRegistry>,
     /// Minimum effective completion percentage, including usable PAR2 capacity.
     required_completion_pct: f64,
 }
@@ -2006,10 +2009,12 @@ impl QueueManager {
 
         let configured_servers = servers.clone();
         let servers_arc = Arc::new(Mutex::new(servers));
-        let dispatch: Arc<dyn DispatchEngine> = Arc::new(DispatchHandle::new(
+        let server_budgets = Arc::new(nzb_nntp::budget::BudgetRegistry::default());
+        let dispatch: Arc<dyn DispatchEngine> = Arc::new(DispatchHandle::with_budgets(
             Arc::clone(&servers_arc),
             Arc::clone(&bandwidth),
             article_timeout_secs,
+            Arc::clone(&server_budgets),
         ));
         dispatch.start();
 
@@ -2053,6 +2058,7 @@ impl QueueManager {
             direct_unpack_enabled: AtomicBool::new(direct_unpack),
             max_nested_archive_depth,
             dispatch,
+            server_budgets,
             abort_hopeless,
             early_failure_check,
             required_completion_pct: required_completion_pct.clamp(100.0, 200.0),
@@ -5479,6 +5485,12 @@ impl QueueManager {
             );
             self.start_next_queued();
         }
+    }
+
+    /// The per-server connection budgets shared by the downloader and any
+    /// other NNTP consumer of the configured servers.
+    pub fn server_budgets(&self) -> Arc<nzb_nntp::budget::BudgetRegistry> {
+        Arc::clone(&self.server_budgets)
     }
 
     /// Get the configured server list, before the schedule's overlay.
