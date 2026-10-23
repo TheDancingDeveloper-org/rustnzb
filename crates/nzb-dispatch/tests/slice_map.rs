@@ -22,8 +22,11 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 /// How a test bends the standard scenario run.
 #[derive(Default)]
 struct Twist {
-    /// Refuse the PAR2 index on every server for this many attempts, so it
-    /// lands after the data (each refusal round costs a confirm delay).
+    /// Refuse the PAR2 index on every server for this many attempts, then
+    /// hold its real response until every data article has finished, so it
+    /// lands after the data. The hold is what orders it: refusal rounds cost
+    /// a confirm delay each, but a loaded host can take longer than that to
+    /// download the data (WI-2286).
     index_refusals: usize,
     /// Rename every data file in the NZB, as an obfuscated post does.
     obfuscate: bool,
@@ -60,8 +63,14 @@ async fn run(scenario: DamageScenario) -> (ScenarioFixture, SliceMapSummary) {
 async fn run_with(scenario: DamageScenario, twist: Twist) -> Run {
     let fixture = scenario.fixture();
     let mut server_configs = fixture.server_configs();
+    let (index_gate, index_gate_rx) = tokio::sync::watch::channel(false);
     if twist.index_refusals > 0 {
         for config in &mut server_configs {
+            for segment in &fixture.release.par2_index.segments {
+                config
+                    .article_holds
+                    .insert(segment.message_id.clone(), index_gate_rx.clone());
+            }
             let sequences = config
                 .article_response_sequences
                 .get_or_insert_with(Default::default);
@@ -154,6 +163,27 @@ async fn run_with(scenario: DamageScenario, twist: Twist) -> Run {
         }
     }
 
+    // Data articles still to finish before the held index may be served.
+    let data_ids: BTreeSet<String> = job
+        .files
+        .iter()
+        .filter(|f| !f.filename.to_lowercase().ends_with(".par2"))
+        .map(|f| f.id.clone())
+        .collect();
+    let mut data_pending = job
+        .files
+        .iter()
+        .filter(|f| data_ids.contains(&f.id))
+        .flat_map(|f| &f.articles)
+        .filter(|a| !a.downloaded)
+        .count();
+    let release_index = |pending: usize| {
+        if pending == 0 {
+            index_gate.send_replace(true);
+        }
+    };
+    release_index(data_pending);
+
     let (tx, mut rx) = mpsc::channel(10_000);
     pool.submit_job(&job, tx);
     let deadline = Instant::now() + EVENT_TIMEOUT;
@@ -166,9 +196,21 @@ async fn run_with(scenario: DamageScenario, twist: Twist) -> Run {
         match event {
             ProgressUpdate::ArticleComplete {
                 file_id,
-                file_complete: true,
+                file_complete,
                 ..
-            } => completion_order.push(file_id),
+            } => {
+                if data_ids.contains(&file_id) {
+                    data_pending -= 1;
+                    release_index(data_pending);
+                }
+                if file_complete {
+                    completion_order.push(file_id);
+                }
+            }
+            ProgressUpdate::ArticleFailed { file_id, .. } if data_ids.contains(&file_id) => {
+                data_pending -= 1;
+                release_index(data_pending);
+            }
             ProgressUpdate::JobFinished {
                 slice_map,
                 repair_fold,
@@ -528,12 +570,13 @@ async fn late_index_with_defer_reads_the_prefix_once() {
     );
     let fold = run.fold.clone().expect("damage seen, so a fold exists");
     let f = fold.lock();
-    // The index is refused twice on every server, so data lands and verifies
-    // before the set installs and a fold can open. At least one slice is
-    // therefore folded from disk, not from the worker that verified it. How
-    // many more the rest of the download folds from its own bytes is a race
-    // between the workers and the prefix feed, so only the floor is asserted;
-    // `assert_deferred_fold` pins the invariant that matters, no re-reads.
+    // The index is held on every server until all the data has finished, so
+    // data lands and verifies before the set installs and a fold can open.
+    // At least one slice is therefore folded from disk, not from the worker
+    // that verified it. How many more the rest of the download folds from its
+    // own bytes is a race between the workers and the prefix feed, so only the
+    // floor is asserted; `assert_deferred_fold` pins the invariant that
+    // matters, no re-reads.
     assert!(
         f.disk_reads() > 0,
         "a late index must send the prefix through the disk feed: {f:?}"

@@ -165,6 +165,11 @@ pub struct MockConfig {
     /// article lookup resumes. This models a stale session returning `400`
     /// followed by a successful fetch on a replacement connection.
     pub article_response_sequences: Option<ArticleResponseSequences>,
+    /// Hold ARTICLE responses for these message-ids until the gate reads
+    /// `true`. One-shot `article_response_sequences` entries are still
+    /// answered at once; only the real response waits. Lets a test order an
+    /// article after others without betting on timing.
+    pub article_holds: HashMap<String, tokio::sync::watch::Receiver<bool>>,
     /// Cross-connection auth rate limiter. After `max_attempts` AUTHINFO PASS
     /// attempts within the `window`, all subsequent auths return 481.
     pub auth_rate_limit: Option<AuthRateLimit>,
@@ -216,6 +221,7 @@ impl Default for MockConfig {
             response_delay: None,
             article_response_overrides: HashMap::new(),
             article_response_sequences: None,
+            article_holds: HashMap::new(),
             auth_rate_limit: None,
             capabilities_unsupported: false,
             capabilities_mode_reader: false,
@@ -667,6 +673,14 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                         .article_response_sequences
                         .as_ref()
                         .and_then(|state| state.lock().get_mut(mid).and_then(VecDeque::pop_front));
+                    if sequenced.is_none()
+                        && let Some(gate) = config.article_holds.get(mid)
+                    {
+                        let mut gate = gate.clone();
+                        if gate.wait_for(|open| *open).await.is_err() {
+                            return;
+                        }
+                    }
                     if let Some((code, message)) = sequenced {
                         let resp = format!("{code} {message}\r\n");
                         mwrite!(conn, resp.as_bytes());
