@@ -40,6 +40,7 @@ created and removed in it. Otherwise the save is refused with, for example,
 | `general.data_dir` | Holds the database and the config itself; moving it needs the files moved first. Shown read-only; set with `RUSTNZB_DATA_DIR` / `--data-dir`. |
 | `general.local_import_dir` | Security boundary for SABnzbd `addlocalfile`; widening it from the UI would let a stolen session read arbitrary files. |
 | `general.fetch_allow_private`, `general.fetch_allowed_hosts` | SSRF guard; opening server-side fetches to the LAN from the UI would let a stolen session pivot into the network. |
+| `general.trusted_proxies` | Trust boundary of the failed-login throttle: listing an address lets it name any client in `X-Forwarded-For`, so a stolen session could switch off per-client throttling from the UI. Set in `config.toml`. |
 | `general.log_level` | The tracing filter is built at startup from `--log-level` / `RUSTNZB_LOG_LEVEL` / `RUST_LOG`; the debug-logging toggle covers the runtime need. |
 | `general.log_level_before_debug` | Internal state of the debug-logging toggle. |
 | `general.cache_size` | Dead setting: nothing reads it. |

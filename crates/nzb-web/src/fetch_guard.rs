@@ -91,21 +91,10 @@ impl FetchPolicy {
 /// Parse `addr` or `addr/prefix` into a network. Returns `None` for
 /// anything that is not an IP address (treated as a hostname).
 fn parse_network(entry: &str) -> Option<(IpAddr, u8)> {
-    let (addr, prefix) = match entry.split_once('/') {
-        Some((addr, prefix)) => (addr, Some(prefix)),
-        None => (entry, None),
-    };
-    let addr = addr.trim_start_matches('[').trim_end_matches(']');
-    let ip: IpAddr = addr.parse().ok()?;
-    let max = if ip.is_ipv4() { 32 } else { 128 };
-    let prefix = match prefix {
-        Some(p) => p.parse::<u8>().ok().filter(|p| *p <= max)?,
-        None => max,
-    };
-    Some((ip, prefix))
+    crate::nzb_core::config::parse_ip_network(entry)
 }
 
-fn network_contains(net: IpAddr, prefix: u8, ip: IpAddr) -> bool {
+pub(crate) fn network_contains(net: IpAddr, prefix: u8, ip: IpAddr) -> bool {
     let ip = match (net, ip) {
         // Let an IPv4 network match an IPv4-mapped IPv6 address.
         (IpAddr::V4(_), IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {

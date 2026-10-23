@@ -263,6 +263,30 @@ pub struct GeneralConfig {
     /// Default: 30.
     #[serde(default = "default_shutdown_timeout_secs")]
     pub shutdown_timeout_secs: u64,
+    /// Reverse proxies whose `X-Forwarded-For` header is believed, as IP
+    /// addresses or CIDR blocks. Failed web logins are throttled per client
+    /// address; behind a proxy every request comes from the proxy, so list
+    /// it here to throttle the real clients separately. Empty (the default)
+    /// ignores `X-Forwarded-For`.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+}
+
+/// Parse `addr` or `addr/prefix` (IPv4 or IPv6, optionally in brackets) into
+/// a network address and prefix length. `None` if it is not one.
+pub fn parse_ip_network(entry: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (addr, prefix) = match entry.split_once('/') {
+        Some((addr, prefix)) => (addr, Some(prefix)),
+        None => (entry, None),
+    };
+    let addr = addr.trim_start_matches('[').trim_end_matches(']');
+    let ip: std::net::IpAddr = addr.parse().ok()?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let prefix = match prefix {
+        Some(p) => p.parse::<u8>().ok().filter(|p| *p <= max)?,
+        None => max,
+    };
+    Some((ip, prefix))
 }
 
 fn default_shutdown_timeout_secs() -> u64 {
@@ -379,6 +403,7 @@ impl Default for GeneralConfig {
             fetch_allowed_hosts: Vec::new(),
             group_max_headers: default_group_max_headers(),
             shutdown_timeout_secs: default_shutdown_timeout_secs(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -638,6 +663,13 @@ impl AppConfig {
         }
         if self.general.listen_addr.trim().is_empty() {
             problems.push("general.listen_addr must not be empty".to_string());
+        }
+        for (i, entry) in self.general.trusted_proxies.iter().enumerate() {
+            if parse_ip_network(entry.trim()).is_none() {
+                problems.push(format!(
+                    "general.trusted_proxies[{i}] ({entry}) must be an IP address or CIDR block"
+                ));
+            }
         }
         let mut seen_ids = std::collections::HashSet::new();
         for (i, server) in self.servers.iter().enumerate() {
@@ -1152,6 +1184,25 @@ ssl = false
         let example = include_str!("../../../apps/rustnzb/config.example.toml");
         let config: AppConfig = toml::from_str(example).unwrap();
         assert!(config.validate().is_empty(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn validate_checks_each_trusted_proxy_entry() {
+        let mut cfg = AppConfig::default();
+        cfg.general.trusted_proxies = vec![
+            "172.18.0.5".into(),
+            "10.0.0.0/8".into(),
+            "fd00::/8".into(),
+            "caddy".into(),
+            "10.0.0.0/33".into(),
+        ];
+        assert_eq!(
+            cfg.validate(),
+            vec![
+                "general.trusted_proxies[3] (caddy) must be an IP address or CIDR block",
+                "general.trusted_proxies[4] (10.0.0.0/33) must be an IP address or CIDR block",
+            ]
+        );
     }
 
     #[test]

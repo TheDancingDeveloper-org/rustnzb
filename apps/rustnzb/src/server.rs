@@ -25,6 +25,9 @@ use nzb_web::error::ApiError;
 use nzb_web::sabnzbd_compat;
 use nzb_web::state::AppState;
 
+/// Largest request body the `/api/auth/*` endpoints accept.
+pub const AUTH_BODY_LIMIT: usize = 16 * 1024;
+
 /// The served OpenAPI document: every native `/api/...` route, grouped by area.
 ///
 /// The SABnzbd compatibility layer (`/sabnzbd/api` and `/api?mode=...`) is a
@@ -390,7 +393,11 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         .route(
             "/auth/change_credentials",
             post(auth::h_auth_change_credentials),
-        );
+        )
+        // These bodies are a few short strings, and the unauthenticated
+        // login paths should not hold the 200 MB upload limit's worth of
+        // memory per request while a guess waits for the locked lane.
+        .layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT));
 
     // Native REST API (protected by auth middleware)
     let api_routes = Router::new()
@@ -672,7 +679,7 @@ fn build_api_router(state: Arc<AppState>) -> Router {
                 let Some((u, p)) = user_pass.split_once(':') else {
                     return Err(ApiError::unauthorized());
                 };
-                let client = auth::client_ip(request.extensions());
+                let client = auth::client_ip(&auth_state, request.extensions(), &headers);
                 match credential_store
                     .clone()
                     .check_login(client, u.to_owned(), p.to_owned())
@@ -724,7 +731,6 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
     serve(state, router).await
 }
 
-/// Start the HTTP server with a pre-built (possibly augmented) router.
 /// The service `serve` runs: the router with each connection's peer address
 /// recorded, which the failed-login throttle keys on (`auth::client_ip`).
 /// Tests serve through this too, so they exercise the same per-client path.
@@ -734,6 +740,7 @@ pub fn into_make_service(
     router.into_make_service_with_connect_info::<std::net::SocketAddr>()
 }
 
+/// Start the HTTP server with a pre-built (possibly augmented) router.
 pub async fn serve(state: Arc<AppState>, router: Router) -> anyhow::Result<()> {
     let config = state.config();
     let addr = format!("{}:{}", config.general.listen_addr, config.general.port);

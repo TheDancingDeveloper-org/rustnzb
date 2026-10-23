@@ -65,6 +65,13 @@ script_max_output_bytes = 1048576
 # fetch_allow_private = false
 # fetch_allowed_hosts = ["prowlarr", "192.168.1.0/24", "172.16.0.0/12"]
 
+# Reverse proxies (IPs or CIDRs) whose X-Forwarded-For header is believed.
+# Failed web logins are throttled per client address; behind a proxy such as
+# Caddy every request comes from the proxy, so list its address here (for
+# example the Caddy container's address or its Docker network) to throttle
+# each real client on its own. Empty ignores X-Forwarded-For.
+# trusted_proxies = ["172.18.0.0/16"]
+
 # Most headers kept per group when fetching (oldest pruned first). 0 keeps all.
 # group_max_headers = 100000
 
