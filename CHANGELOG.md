@@ -13,6 +13,31 @@ also carries generated release notes with the merged pull requests.
 
 ## [Unreleased]
 
+## [1.7.0-beta.8] - 2026-10-23
+
+**Rollback warning:** beta.7 and earlier cannot read the hashed
+`credentials.json` and would reopen first-boot setup. Restore the
+pre-upgrade backup or set a new password immediately after downgrading. See
+[docs/releases/v1.7.0-beta.8.md](docs/releases/v1.7.0-beta.8.md).
+
+### Security
+
+- **auth:** the web-login password is stored as an Argon2id hash, migrated
+  from plaintext at startup and verified in constant time
+- **auth:** wrong passwords are delayed per client; `X-Forwarded-For` is
+  trusted only from `general.trusted_proxies`, which reverse-proxied
+  installs must set
+
+### Changed
+
+- **nntp:** the downloader and WebDAV share one tiered connection budget per
+  server; `dav.playback_reserve_pct` (default 25) keeps a WebDAV playback
+  reserve
+
+### Fixed
+
+- **ci:** crate-export resolves inline-table workspace inheritance
+
 ## [1.7.0-beta.7] - 2026-10-22
 
 ### Fixed

@@ -97,7 +97,7 @@ nzb-web = { version = "0.4.25", path = "crates/nzb-web", features = ["groups-db"
 nzb-nntp = { version = "0.2.27", path = "crates/nzb-nntp" }
 nzb-core = { version = "0.2.23", path = "crates/nzb-core", features = ["groups-db"] }
 nzb-decode = { version = "0.1.9", path = "crates/nzb-decode" }
-nzb-news = { version = "0.1.15", path = "crates/nzb-news" }
+nzb-news = { version = "0.1.16", path = "crates/nzb-news" }
 nzb-dispatch = { version = "0.2.9", path = "crates/nzb-dispatch" }
 nzb-postproc = { version = "0.2.11", path = "crates/nzb-postproc" }
 mock-nntp-server = { path = "crates/mock-nntp-server" }

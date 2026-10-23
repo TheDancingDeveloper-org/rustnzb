@@ -3,6 +3,10 @@ name = "mock-nntp-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Scriptable mock NNTP server with yEnc and PAR2 fixtures, for testing Usenet download clients"
+license = "MIT"
+repository = "https://github.com/TheDancingDeveloper-org/mock-nntp-server"
+publish = true
 
 [dependencies]
 anyhow = { workspace = true }
