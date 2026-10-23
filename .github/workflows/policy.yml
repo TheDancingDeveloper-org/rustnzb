@@ -27,3 +27,6 @@ jobs:
       - name: Verify migration policies
         shell: bash
         run: bash ci/migration-policy.sh
+      - name: Test the crate export rewrite
+        shell: bash
+        run: sh ci/tests/crate-export.sh
