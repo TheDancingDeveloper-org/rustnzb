@@ -168,6 +168,48 @@ async fn protected_routes_reject_missing_credentials_and_preserve_auth_contracts
 }
 
 #[tokio::test]
+async fn repeated_failed_logins_are_throttled_with_retry_after() {
+    use base64::Engine;
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let login = |password: &'static str| {
+        client
+            .post(format!("{}/api/auth/login", app.base_url))
+            .json(&serde_json::json!({"username":"admin","password":password}))
+            .send()
+    };
+
+    // A success between failures resets the count, so it is never throttled.
+    for _ in 0..4 {
+        assert_eq!(login("wrong").await.unwrap().status(), 401);
+    }
+    assert_eq!(login("password").await.unwrap().status(), 200);
+    for _ in 0..5 {
+        assert_eq!(login("wrong").await.unwrap().status(), 401);
+    }
+
+    // The fifth failure locks the client out of both password paths.
+    let throttled = login("password").await.unwrap();
+    assert_eq!(throttled.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = throttled.headers()[reqwest::header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=30).contains(&retry_after), "{retry_after}");
+
+    let basic = base64::engine::general_purpose::STANDARD.encode("admin:password");
+    let status = client
+        .get(format!("{}/api/status", app.base_url))
+        .header("Authorization", format!("Basic {basic}"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
 async fn first_boot_only_exposes_setup_and_setup_is_single_use() {
     let app = start_app(false).await;
     let client = reqwest::Client::new();
