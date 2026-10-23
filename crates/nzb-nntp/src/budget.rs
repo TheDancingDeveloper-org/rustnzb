@@ -8,20 +8,29 @@
 //! Permits are handed out by tier, highest first:
 //!
 //! 1. [`BudgetTier::Playback`]: a demand read for media someone is watching.
-//! 2. [`BudgetTier::Download`]: the downloader, DAV ingest and read-ahead.
-//! 3. [`BudgetTier::Repair`]: repairing a gap in a file.
+//! 2. [`BudgetTier::Import`]: WebDAV ingest reading an NZB's files to list
+//!    them in the library.
+//! 3. [`BudgetTier::Download`]: the downloader and read-ahead.
+//! 4. [`BudgetTier::Repair`]: repairing a gap in a file.
 //!
 //! Two floors protect the lower-capacity tiers:
 //!
-//! - The **playback floor** is set aside: Download and Repair never take the
-//!   last `playback_floor - held(Playback)` free permits. A download permit
-//!   is held for a worker's lifetime and cannot be preempted, so playback is
-//!   only responsive if its share is kept free in advance.
+//! - The **playback floor** is the WebDAV share and is set aside: Download
+//!   and Repair never take the last `playback_floor - held(Playback, Import)`
+//!   free permits. A busy download worker cannot be preempted, so WebDAV is
+//!   only responsive if its share is kept free in advance. Playback and
+//!   Import share the floor; Playback is served first.
 //! - The **repair floor** is guaranteed against Download while repair is
 //!   active (a repair permit is held or one is waited for). Repair gets
 //!   freed permits ahead of Download until it holds its floor, and Download
 //!   leaves the unmet part of the floor free. With no repair work the floor
 //!   costs Download nothing.
+//!
+//! Nothing caps a tier from above: a tier may borrow every permit the others
+//! leave free. Holders give borrowed permits back by asking
+//! [`ServerBudget::wanted_elsewhere`] when they finish with a socket (and,
+//! while idle, whenever [`ServerBudget::contended`] fires): it is true only
+//! when the permit would actually be granted to a waiter at another tier.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -42,20 +51,29 @@ pub const DEFAULT_REPAIR_RESERVE_PCT: u8 = 25;
 pub enum BudgetTier {
     /// A read for media being played right now.
     Playback,
-    /// Bulk download, DAV ingest and read-ahead.
+    /// WebDAV ingest: the reads that build an imported NZB's file listing.
+    Import,
+    /// Bulk download and read-ahead.
     Download,
     /// Repair of a missing or damaged range.
     Repair,
 }
 
 impl BudgetTier {
-    const COUNT: usize = 3;
+    const COUNT: usize = 4;
+    const ALL: [BudgetTier; Self::COUNT] = [
+        BudgetTier::Playback,
+        BudgetTier::Import,
+        BudgetTier::Download,
+        BudgetTier::Repair,
+    ];
 
     fn idx(self) -> usize {
         match self {
             BudgetTier::Playback => 0,
-            BudgetTier::Download => 1,
-            BudgetTier::Repair => 2,
+            BudgetTier::Import => 1,
+            BudgetTier::Download => 2,
+            BudgetTier::Repair => 3,
         }
     }
 }
@@ -63,8 +81,8 @@ impl BudgetTier {
 /// How a server's connections are split between the tiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetPolicy {
-    /// Percent of `connections` set aside for playback. 0 when WebDAV
-    /// streaming is off.
+    /// Percent of `connections` set aside for WebDAV playback and import.
+    /// 0 when WebDAV streaming is off.
     pub playback_reserve_pct: u8,
     /// Percent of `connections` guaranteed to repair against download.
     pub repair_reserve_pct: u8,
@@ -122,8 +140,14 @@ impl State {
     }
 
     fn unmet_playback(&self) -> usize {
-        self.playback_floor
-            .saturating_sub(self.held[BudgetTier::Playback.idx()])
+        let dav = self.held[BudgetTier::Playback.idx()] + self.held[BudgetTier::Import.idx()];
+        self.playback_floor.saturating_sub(dav)
+    }
+
+    fn prune(&mut self) {
+        for queue in &mut self.waiters {
+            queue.retain(|tx| !tx.is_closed());
+        }
     }
 
     fn unmet_repair(&self) -> usize {
@@ -146,6 +170,11 @@ impl State {
         if self.waiting(BudgetTier::Playback) {
             return Some(BudgetTier::Playback);
         }
+        // Import may use the WebDAV floor, so it makes progress while
+        // downloads take everything else.
+        if self.waiting(BudgetTier::Import) && free > self.unmet_repair() {
+            return Some(BudgetTier::Import);
+        }
         let repair_below_floor = self.held[BudgetTier::Repair.idx()] < self.repair_floor;
         if self.waiting(BudgetTier::Repair) && repair_below_floor && free > unmet_playback {
             return Some(BudgetTier::Repair);
@@ -163,6 +192,8 @@ impl State {
 /// The connection allowance for one server, shared by every consumer.
 pub struct ServerBudget {
     state: Mutex<State>,
+    /// Fired when a waiter queues and cannot be served from free permits.
+    contended: tokio::sync::Notify,
 }
 
 impl ServerBudget {
@@ -177,6 +208,7 @@ impl ServerBudget {
                 held: [0; BudgetTier::COUNT],
                 waiters: Default::default(),
             }),
+            contended: tokio::sync::Notify::new(),
         })
     }
 
@@ -184,13 +216,18 @@ impl ServerBudget {
     /// in line; a permit already granted to it is returned.
     pub async fn acquire(self: &Arc<Self>, tier: BudgetTier) -> BudgetPermit {
         loop {
-            let rx = {
+            let (rx, unserved) = {
                 let mut state = self.state.lock();
                 let (tx, rx) = oneshot::channel();
                 state.waiters[tier.idx()].push_back(tx);
                 self.dispatch(&mut state);
-                rx
+                (rx, state.waiting(tier))
             };
+            if unserved {
+                // Not served from free permits: idle holders may want to
+                // give theirs back.
+                self.contended.notify_waiters();
+            }
             // The sender is only dropped without sending when the waiter is
             // pruned as closed, which cannot happen while `rx` is alive.
             if let Ok(permit) = rx.await {
@@ -227,18 +264,36 @@ impl ServerBudget {
     }
 
     /// Whether a consumer at a tier other than `tier` is waiting for a
-    /// permit. A pool uses this to close a socket rather than park it idle,
-    /// so its permit passes to the waiter.
+    /// permit.
     pub fn others_waiting(&self, tier: BudgetTier) -> bool {
         let state = self.state.lock();
-        [
-            BudgetTier::Playback,
-            BudgetTier::Download,
-            BudgetTier::Repair,
-        ]
-        .into_iter()
-        .filter(|t| *t != tier)
-        .any(|t| state.waiters[t.idx()].iter().any(|tx| !tx.is_closed()))
+        BudgetTier::ALL
+            .into_iter()
+            .filter(|t| *t != tier)
+            .any(|t| state.waiters[t.idx()].iter().any(|tx| !tx.is_closed()))
+    }
+
+    /// Whether returning one permit held at `tier` would hand it to a
+    /// waiter at another tier, under the tier order and the floors. A holder
+    /// asks this before parking an idle socket: when it is false, keeping
+    /// the socket open for reuse costs no one anything.
+    pub fn wanted_elsewhere(&self, tier: BudgetTier) -> bool {
+        let mut state = self.state.lock();
+        if state.held[tier.idx()] == 0 {
+            return false;
+        }
+        state.prune();
+        state.held[tier.idx()] -= 1;
+        let next = state.next_grantable();
+        state.held[tier.idx()] += 1;
+        next.is_some_and(|t| t != tier)
+    }
+
+    /// Completes when a waiter queues and cannot be served from free
+    /// permits. Idle holders wait on this (alongside their own poll) to
+    /// check [`Self::wanted_elsewhere`] promptly.
+    pub async fn contended(&self) {
+        self.contended.notified().await;
     }
 
     /// `(playback_floor, repair_floor)` in permits.
@@ -249,9 +304,7 @@ impl ServerBudget {
 
     /// Hand free permits to waiters, highest priority first.
     fn dispatch(self: &Arc<Self>, state: &mut State) {
-        for queue in &mut state.waiters {
-            queue.retain(|tx| !tx.is_closed());
-        }
+        state.prune();
         while let Some(tier) = state.next_grantable() {
             let Some(tx) = state.waiters[tier.idx()].pop_front() else {
                 break;
@@ -544,6 +597,108 @@ mod tests {
         assert!(try_acquire(&budget, BudgetTier::Playback).await.is_none());
         drop(b);
         assert!(try_acquire(&budget, BudgetTier::Playback).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn import_uses_the_dav_floor_while_downloads_saturate() {
+        let budget = ServerBudget::new(4, policy(25, 0));
+        let mut downloads = Vec::new();
+        for _ in 0..3 {
+            downloads.push(try_acquire(&budget, BudgetTier::Download).await.unwrap());
+        }
+        // The fourth download waits for the floor; import may take it.
+        let queued = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.acquire(BudgetTier::Download).await }
+        });
+        tokio::time::sleep(SHORT).await;
+        let import = try_acquire(&budget, BudgetTier::Import)
+            .await
+            .expect("import starved behind saturating downloads");
+        // Holding the floor, import is not asked to give it to a download.
+        assert!(!budget.wanted_elsewhere(BudgetTier::Import));
+        // Playback outranks import for the floor.
+        let playback = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.acquire(BudgetTier::Playback).await }
+        });
+        tokio::time::sleep(SHORT).await;
+        assert!(budget.wanted_elsewhere(BudgetTier::Import));
+        drop(import);
+        let permit = tokio::time::timeout(SHORT * 4, playback)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(permit.tier(), BudgetTier::Playback);
+        assert!(!queued.is_finished());
+        queued.abort();
+    }
+
+    #[tokio::test]
+    async fn wanted_elsewhere_only_when_the_waiter_could_be_granted() {
+        let budget = ServerBudget::new(4, policy(25, 0));
+        // Playback holds its floor; downloads hold the rest and one more
+        // download waits.
+        let playback = try_acquire(&budget, BudgetTier::Playback).await.unwrap();
+        let mut downloads = Vec::new();
+        for _ in 0..3 {
+            downloads.push(try_acquire(&budget, BudgetTier::Download).await.unwrap());
+        }
+        let queued = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.acquire(BudgetTier::Download).await }
+        });
+        tokio::time::sleep(SHORT).await;
+        // Returning playback's floor permit would not let the download in.
+        assert!(!budget.wanted_elsewhere(BudgetTier::Playback));
+        // A same-tier waiter never asks a holder to yield.
+        assert!(!budget.wanted_elsewhere(BudgetTier::Download));
+
+        // Playback borrowed past its floor: the borrowed permit is wanted.
+        drop(downloads.pop());
+        let queued_permit = tokio::time::timeout(SHORT * 4, queued)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(queued_permit);
+        let borrowed = try_acquire(&budget, BudgetTier::Playback).await.unwrap();
+        let queued = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.acquire(BudgetTier::Download).await }
+        });
+        tokio::time::sleep(SHORT).await;
+        assert!(budget.wanted_elsewhere(BudgetTier::Playback));
+        drop(borrowed);
+        tokio::time::timeout(SHORT * 4, queued)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(playback);
+    }
+
+    #[tokio::test]
+    async fn contended_fires_when_a_waiter_cannot_be_served() {
+        let budget = ServerBudget::new(1, policy(0, 0));
+        let held = budget.acquire(BudgetTier::Download).await;
+        let watch = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.contended().await }
+        });
+        tokio::time::sleep(SHORT).await;
+        let waiter = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.acquire(BudgetTier::Playback).await }
+        });
+        tokio::time::timeout(SHORT * 4, watch)
+            .await
+            .expect("no contention signal")
+            .unwrap();
+        assert!(budget.wanted_elsewhere(BudgetTier::Download));
+        drop(held);
+        tokio::time::timeout(SHORT * 4, waiter)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
