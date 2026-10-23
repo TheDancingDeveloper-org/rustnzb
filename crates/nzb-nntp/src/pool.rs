@@ -10,6 +10,8 @@
 //! pool and any other consumer of the same budget stay within the provider's
 //! allowance together. A released socket is closed instead of parked only
 //! when a waiter at another tier could actually take its permit.
+//! A reader waiting for the budget also takes a socket parked in its own
+//! pool by a reader at the same tier, which the budget would not hand on.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -99,6 +101,9 @@ pub struct ConnectionPool {
     ramp_up_delay: Duration,
     /// Shared per-server budget and the tier this pool draws from.
     budget: Option<(Arc<ServerBudget>, BudgetTier)>,
+    /// Fired when a socket is parked, so an `acquire` waiting for the
+    /// budget can take it instead.
+    idle_ready: tokio::sync::Notify,
 }
 
 impl ConnectionPool {
@@ -115,20 +120,23 @@ impl ConnectionPool {
             ramp_up_delay,
             config,
             budget: None,
+            idle_ready: tokio::sync::Notify::new(),
         }
     }
 
     /// Create a pool whose sockets also count against `budget`, taking
-    /// permits at `tier`. The pool's own limit stays `connections`.
+    /// permits at `tier`. The pool's own limit stays `connections`. While
+    /// the pool exists the budget counts it as a second consumer
+    /// ([`ServerBudget::has_pools`]).
     pub fn with_budget(
         config: Arc<ServerConfig>,
         budget: Arc<ServerBudget>,
         tier: BudgetTier,
     ) -> Self {
-        Self {
-            budget: Some((budget, tier)),
-            ..Self::new(config)
-        }
+        budget.attach_pool();
+        let mut pool = Self::new(config);
+        pool.budget = Some((budget, tier));
+        pool
     }
 
     /// Acquire a connected, ready connection from the pool.
@@ -174,96 +182,55 @@ impl ConnectionPool {
                 ))
             })?;
 
-        // Try to reuse an idle connection
-        let maybe_idle = { self.idle.lock().pop() };
-        // A broken idle socket hands its budget permit to its replacement.
-        let mut carried_budget = None;
-
-        if let Some(mut pooled) = maybe_idle {
-            // The drop guard stays disarmed until the connection is actually
-            // handed out: if it is discarded below, the owned `permit` is
-            // what carries the slot (to the new connection, or back to the
-            // semaphore on error). Arming it here would free a second permit
-            // when `pooled` drops on the fall-through path.
-            // Health check: if the connection is in a bad state, discard and make new
-            if pooled.conn.state == ConnectionState::Ready && pooled.conn.is_connected() {
-                // If idle too long, do a quick liveness check
-                if pooled.last_used.elapsed() > IDLE_TIMEOUT {
-                    info!(
-                        server = %self.config.name,
-                        conn_id = %pooled.conn.server_id,
-                        idle_secs = pooled.last_used.elapsed().as_secs(),
-                        "Pool: idle connection stale — health checking"
-                    );
-                    // Real round-trip (DATE); any reply = alive, I/O error = dead
-                    match pooled.conn.ping().await {
-                        Ok(()) => {
-                            // Connection is alive
-                            debug!(
-                                server = %self.config.name,
-                                conn_id = %pooled.conn.server_id,
-                                "Pool: health check passed, reusing"
-                            );
-                            pooled.last_used = Instant::now();
-                            permit.forget(); // slot is now checked out
-                            pooled.semaphore = Some(Arc::clone(&self.semaphore));
-                            return Ok(pooled);
-                        }
-                        Err(e) => {
-                            warn!(
-                                server = %self.config.name,
-                                conn_id = %pooled.conn.server_id,
-                                error = %e,
-                                "Pool: idle connection FAILED health check — creating new"
-                            );
-                            // Fall through to create a new one
-                        }
+        // Reuse a parked socket, or wait for a budget permit to open one.
+        // While waiting, a socket parked in this pool by a reader at the same
+        // tier is taken as soon as it is parked: the budget would not hand
+        // that reader's permit to a same-tier waiter, so without this a
+        // second concurrent reader would wait for some other consumer.
+        // The budget wait is kept across wake-ups so the place in line holds.
+        let mut budget_wait = None;
+        let budget_permit = loop {
+            let parked = self.idle_ready.notified();
+            tokio::pin!(parked);
+            parked.as_mut().enable();
+            let maybe_idle = { self.idle.lock().pop() };
+            if let Some(pooled) = maybe_idle {
+                match self.check_idle(pooled).await {
+                    Ok(mut pooled) => {
+                        permit.forget(); // slot is now checked out
+                        pooled.semaphore = Some(Arc::clone(&self.semaphore));
+                        return Ok(pooled);
                     }
-                } else {
-                    debug!(
-                        server = %self.config.name,
-                        conn_id = %pooled.conn.server_id,
-                        idle_secs = pooled.last_used.elapsed().as_secs(),
-                        "Pool: reusing idle connection"
-                    );
-                    permit.forget();
-                    pooled.semaphore = Some(Arc::clone(&self.semaphore));
-                    return Ok(pooled);
+                    // A broken idle socket hands its budget permit to its
+                    // replacement.
+                    Err(Some(carried)) => break Some(carried),
+                    Err(None) if self.budget.is_none() => break None,
+                    Err(None) => {}
                 }
-            } else {
-                warn!(
-                    server = %self.config.name,
-                    conn_id = %pooled.conn.server_id,
-                    state = ?pooled.conn.state,
-                    connected = pooled.conn.is_connected(),
-                    "Pool: idle connection in bad state — creating new"
-                );
             }
-            // Connection is broken — fall through to create new
-            carried_budget = pooled.budget_permit.take();
-        }
-
-        let budget_permit = match (carried_budget, &self.budget) {
-            (Some(carried), _) => Some(carried),
-            (None, Some((budget, tier))) => Some(
-                tokio::time::timeout_at(deadline, budget.acquire(*tier))
-                    .await
-                    .map_err(|_| {
-                        warn!(
-                            server = %self.config.name,
-                            tier = ?tier,
-                            held = budget.held_total(),
-                            total = budget.total(),
-                            "Pool acquire TIMED OUT waiting for the shared connection budget"
-                        );
-                        NntpError::Timeout(format!(
-                            "Timed out waiting for the connection budget of {}",
-                            self.config.name
-                        ))
-                    })?,
-            ),
-            (None, None) => None,
+            let Some((budget, tier)) = &self.budget else {
+                break None;
+            };
+            let wait = budget_wait.get_or_insert_with(|| Box::pin(budget.acquire(*tier)));
+            tokio::select! {
+                permit = wait => break Some(permit),
+                () = &mut parked => {}
+                () = tokio::time::sleep_until(deadline) => {
+                    warn!(
+                        server = %self.config.name,
+                        tier = ?tier,
+                        held = budget.held_total(),
+                        total = budget.total(),
+                        "Pool acquire TIMED OUT waiting for the shared connection budget"
+                    );
+                    return Err(NntpError::Timeout(format!(
+                        "Timed out waiting for the connection budget of {}",
+                        self.config.name
+                    )));
+                }
+            }
         };
+        drop(budget_wait);
 
         // Create a new connection
         info!(
@@ -279,6 +246,66 @@ impl ConnectionPool {
             semaphore: Some(Arc::clone(&self.semaphore)),
             budget_permit,
         })
+    }
+
+    /// Health-check a socket taken from the idle list. Returns it ready for
+    /// use, or, when it is broken, the budget permit it held.
+    async fn check_idle(
+        &self,
+        mut pooled: PooledConnection,
+    ) -> Result<PooledConnection, Option<BudgetPermit>> {
+        // The drop guard stays disarmed until the connection is actually
+        // handed out: if it is discarded here, the caller's owned slot
+        // permit is what carries the slot (to the new connection, or back
+        // to the semaphore on error).
+        if pooled.conn.state == ConnectionState::Ready && pooled.conn.is_connected() {
+            // If idle too long, do a quick liveness check
+            if pooled.last_used.elapsed() > IDLE_TIMEOUT {
+                info!(
+                    server = %self.config.name,
+                    conn_id = %pooled.conn.server_id,
+                    idle_secs = pooled.last_used.elapsed().as_secs(),
+                    "Pool: idle connection stale — health checking"
+                );
+                // Real round-trip (DATE); any reply = alive, I/O error = dead
+                match pooled.conn.ping().await {
+                    Ok(()) => {
+                        debug!(
+                            server = %self.config.name,
+                            conn_id = %pooled.conn.server_id,
+                            "Pool: health check passed, reusing"
+                        );
+                        pooled.last_used = Instant::now();
+                        return Ok(pooled);
+                    }
+                    Err(e) => {
+                        warn!(
+                            server = %self.config.name,
+                            conn_id = %pooled.conn.server_id,
+                            error = %e,
+                            "Pool: idle connection FAILED health check — creating new"
+                        );
+                    }
+                }
+            } else {
+                debug!(
+                    server = %self.config.name,
+                    conn_id = %pooled.conn.server_id,
+                    idle_secs = pooled.last_used.elapsed().as_secs(),
+                    "Pool: reusing idle connection"
+                );
+                return Ok(pooled);
+            }
+        } else {
+            warn!(
+                server = %self.config.name,
+                conn_id = %pooled.conn.server_id,
+                state = ?pooled.conn.state,
+                connected = pooled.conn.is_connected(),
+                "Pool: idle connection in bad state — creating new"
+            );
+        }
+        Err(pooled.budget_permit.take())
     }
 
     /// Return a connection to the pool after use.
@@ -312,6 +339,8 @@ impl ConnectionPool {
             };
             // Restore the semaphore permit so the next acquire() can proceed.
             self.semaphore.add_permits(1);
+            // A reader of this pool waiting for the budget takes it.
+            self.idle_ready.notify_one();
             debug!(
                 server = %self.config.name,
                 idle_count = idle_after,
@@ -528,6 +557,14 @@ impl ConnectionPool {
             "Pool: new connection ready"
         );
         Ok(conn)
+    }
+}
+
+impl Drop for ConnectionPool {
+    fn drop(&mut self) {
+        if let Some((budget, _)) = &self.budget {
+            budget.detach_pool();
+        }
     }
 }
 
@@ -871,6 +908,76 @@ mod tests {
         assert_eq!(permit.tier(), BudgetTier::Playback);
         assert_eq!(pool.idle_count(), 0);
         manager.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_pool_concurrent_readers_share_a_parked_socket_under_download_saturation() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let budget = ServerBudget::new(
+            4,
+            crate::budget::BudgetPolicy {
+                playback_reserve_pct: 25,
+                repair_reserve_pct: 0,
+            },
+        );
+        // Busy downloads hold all they may, and one more waits for a permit
+        // the whole time, so no download permit frees up.
+        let mut downloads = Vec::new();
+        for _ in 0..3 {
+            downloads.push(budget.acquire(BudgetTier::Download).await);
+        }
+        let queued = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.acquire(BudgetTier::Download).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        for tier in [BudgetTier::Playback, BudgetTier::Import] {
+            let before = server.accepted_connections();
+            let pool = Arc::new(ConnectionPool::with_budget(
+                Arc::new(test_config(server.port())),
+                Arc::clone(&budget),
+                tier,
+            ));
+            let manager = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.manage_idle(Duration::from_secs(60)).await }
+            });
+            // Four readers at once, as a stream reads segments in parallel.
+            // The floor is one permit, so they take turns on one socket.
+            let readers: Vec<_> = (0..4)
+                .map(|r| {
+                    let pool = Arc::clone(&pool);
+                    tokio::spawn(async move {
+                        for i in 0..10 {
+                            let conn = tokio::time::timeout(Duration::from_secs(2), pool.acquire())
+                                .await
+                                .unwrap_or_else(|_| panic!("{tier:?} reader {r} read {i} starved"))
+                                .unwrap();
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                            pool.release(conn);
+                        }
+                    })
+                })
+                .collect();
+            for reader in readers {
+                tokio::time::timeout(Duration::from_secs(10), reader)
+                    .await
+                    .expect("readers did not finish")
+                    .unwrap();
+            }
+            assert_eq!(
+                server.accepted_connections() - before,
+                1,
+                "{tier:?} readers must take turns on the parked socket, not reconnect"
+            );
+            assert_eq!(budget.held(BudgetTier::Download), 3);
+            assert!(budget.held_total() <= 4);
+            manager.abort();
+            pool.close_idle_older_than(Duration::ZERO).await;
+        }
+        assert!(!queued.is_finished());
+        queued.abort();
     }
 
     #[tokio::test]

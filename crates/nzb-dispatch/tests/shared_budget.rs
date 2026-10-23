@@ -262,6 +262,92 @@ async fn import_and_playback_progress_and_reuse_sockets_while_downloads_saturate
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_playback_readers_take_turns_on_the_floor_while_downloads_saturate() {
+    let slow = MockNntpServer::start(MockConfig {
+        hang_after_command: Some("ARTICLE".into()),
+        ..MockConfig::default()
+    })
+    .await;
+    let dav_mock = MockNntpServer::start(MockConfig::default()).await;
+    let config = server(slow.port());
+    let budgets = dav_budgets();
+    let pool = downloader(&config, &budgets);
+    pool.start();
+    let budget = budgets.get("srv").unwrap();
+    let (peak, stop) = watch_peak(&budget);
+
+    let dir = tempfile::tempdir().unwrap();
+    let ids: Vec<String> = (0..8).map(|i| format!("a{i}@test")).collect();
+    let (tx, _rx) = mpsc::channel(64);
+    pool.submit_job(&job("busy", dir.path(), &ids), tx);
+    wait_until("three workers are fetching", || {
+        budget.held(BudgetTier::Download) == 3
+            && pool.active_connection_snapshot() == vec![("srv".into(), 3, 4)]
+    })
+    .await;
+
+    let mut dav_config = config.clone();
+    dav_config.port = dav_mock.port();
+    let playback = dav_pool(&dav_config, &budget, BudgetTier::Playback);
+    let manager = tokio::spawn({
+        let playback = Arc::clone(&playback);
+        async move { playback.manage_idle(Duration::from_secs(60)).await }
+    });
+
+    // Several segments read at once through one pool, with only the
+    // one-permit floor free: each reader picks up the socket the previous
+    // one parked instead of waiting for a busy download.
+    let readers: Vec<_> = (0..4)
+        .map(|r| {
+            let playback = Arc::clone(&playback);
+            tokio::spawn(async move { reads(&playback, 10, &format!("playback {r}")).await })
+        })
+        .collect();
+    for reader in readers {
+        reader.await.unwrap();
+    }
+    assert_eq!(
+        dav_mock.accepted_connections(),
+        1,
+        "concurrent readers must share the parked socket, not reconnect"
+    );
+    assert_eq!(budget.held(BudgetTier::Download), 3);
+    stop.store(true, Ordering::Relaxed);
+    assert!(peak.load(Ordering::Relaxed) <= 4, "budget exceeded");
+    manager.abort();
+    pool.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_webdav_idle_workers_keep_their_sockets() {
+    let mock = MockNntpServer::start(MockConfig::default()).await;
+    let config = server(mock.port());
+    // No WebDAV: no reserve and no pool sharing the budget.
+    let budgets = Arc::new(BudgetRegistry::default());
+    let pool = downloader(&config, &budgets);
+    pool.set_idle_release(Duration::from_millis(100));
+    pool.start();
+    let budget = budgets.get("srv").unwrap();
+    wait_until("every worker is connected", || {
+        budget.held(BudgetTier::Download) == 4
+            && pool.connection_snapshot() == vec![("srv".into(), 4, 4)]
+    })
+    .await;
+    let logins = mock.accepted_connections();
+
+    // Idle well past the release delay: nothing is closed or reopened.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(budget.held(BudgetTier::Download), 4);
+    assert_eq!(pool.connection_snapshot(), vec![("srv".into(), 4, 4)]);
+    assert_eq!(
+        mock.accepted_connections(),
+        logins,
+        "an idle worker closed its socket and reconnected without WebDAV"
+    );
+    pool.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn idle_workers_give_their_permits_back_and_reconnect_for_work() {
     let mock = MockNntpServer::start(MockConfig {
         articles: HashMap::from([(MESSAGE_ID.to_string(), encoded_payload())]),
@@ -274,6 +360,8 @@ async fn idle_workers_give_their_permits_back_and_reconnect_for_work() {
     pool.set_idle_release(Duration::from_millis(200));
     pool.start();
     let budget = budgets.get("srv").unwrap();
+    // WebDAV is on: its pool shares the budget.
+    let _dav = dav_pool(&config, &budget, BudgetTier::Playback);
 
     // With nothing queued, the workers close their sockets and hold none
     // of the allowance. The fourth worker, queued at startup, may get a
