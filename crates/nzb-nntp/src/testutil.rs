@@ -230,6 +230,7 @@ impl Default for MockConfig {
 /// An in-process mock NNTP server for testing.
 pub struct MockNntpServer {
     pub addr: SocketAddr,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
     _shutdown: tokio::sync::watch::Sender<bool>,
 }
 
@@ -245,25 +246,37 @@ impl MockNntpServer {
         let addr = listener.local_addr().unwrap();
         let config = Arc::new(config);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    result = listener.accept() => {
-                        if let Ok((stream, _)) = result {
-                            let cfg = config.clone();
-                            tokio::spawn(handle_connection(stream, cfg));
+        tokio::spawn({
+            let accepted = Arc::clone(&accepted);
+            async move {
+                loop {
+                    tokio::select! {
+                        result = listener.accept() => {
+                            if let Ok((stream, _)) = result {
+                                accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let cfg = config.clone();
+                                tokio::spawn(handle_connection(stream, cfg));
+                            }
                         }
+                        _ = shutdown_rx.changed() => break,
                     }
-                    _ = shutdown_rx.changed() => break,
                 }
             }
         });
 
         Self {
             addr,
+            accepted,
             _shutdown: shutdown_tx,
         }
+    }
+
+    /// Connections accepted so far. Each one is a fresh connect and login,
+    /// so tests use it to check sockets are reused.
+    pub fn accepted_connections(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The port the mock server is listening on.

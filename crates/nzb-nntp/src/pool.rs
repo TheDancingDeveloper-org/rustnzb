@@ -8,7 +8,8 @@
 //! [`BudgetPermit`] from the server's shared [`ServerBudget`] for every
 //! socket it opens and holds it until the socket closes, idle or not, so the
 //! pool and any other consumer of the same budget stay within the provider's
-//! allowance together.
+//! allowance together. A released socket is closed instead of parked only
+//! when a waiter at another tier could actually take its permit.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -287,12 +288,14 @@ impl ConnectionPool {
     pub fn release(&self, mut pooled: PooledConnection) {
         // Disarm the drop guard — we're handling the permit ourselves.
         pooled.semaphore = None;
-        // Another tier is waiting on the shared budget: close the socket so
-        // its permit passes on, rather than hoarding it idle.
-        let yield_budget = self
-            .budget
-            .as_ref()
-            .is_some_and(|(budget, tier)| budget.others_waiting(*tier));
+        // A waiter at another tier could take this socket's budget permit:
+        // close the socket so the permit passes on. Otherwise keep it open
+        // for reuse; parking it costs no one anything.
+        let yield_budget = pooled.budget_permit.is_some()
+            && self
+                .budget
+                .as_ref()
+                .is_some_and(|(budget, tier)| budget.wanted_elsewhere(*tier));
         if yield_budget {
             debug!(
                 server = %self.config.name,
@@ -719,6 +722,69 @@ mod tests {
             .unwrap();
         assert_eq!(budget.held(BudgetTier::Playback), 1);
         pool.release(conn);
+    }
+
+    #[tokio::test]
+    async fn test_pool_reuses_socket_while_an_ungrantable_download_waits() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let budget = ServerBudget::new(
+            4,
+            crate::budget::BudgetPolicy {
+                playback_reserve_pct: 25,
+                repair_reserve_pct: 0,
+            },
+        );
+        // Downloads hold all they may and one more waits for the floor.
+        let mut downloads = Vec::new();
+        for _ in 0..3 {
+            downloads.push(budget.acquire(BudgetTier::Download).await);
+        }
+        let queued = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.acquire(BudgetTier::Download).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let pool = ConnectionPool::with_budget(
+            Arc::new(test_config(server.port())),
+            Arc::clone(&budget),
+            BudgetTier::Playback,
+        );
+        for _ in 0..20 {
+            let conn = pool.acquire().await.unwrap();
+            pool.release(conn);
+        }
+        assert_eq!(
+            server.accepted_connections(),
+            1,
+            "playback reconnected although the waiting download could not take its permit"
+        );
+        assert!(!queued.is_finished());
+        queued.abort();
+    }
+
+    #[tokio::test]
+    async fn test_pool_closes_borrowed_socket_for_a_grantable_waiter() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let budget = open_budget(1);
+        let pool = ConnectionPool::with_budget(
+            Arc::new(test_config(server.port())),
+            Arc::clone(&budget),
+            BudgetTier::Playback,
+        );
+        let conn = pool.acquire().await.unwrap();
+        let queued = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.acquire(BudgetTier::Download).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pool.release(conn);
+        assert_eq!(pool.idle_count(), 0, "the borrowed socket was parked");
+        let permit = tokio::time::timeout(Duration::from_secs(5), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(permit.tier(), BudgetTier::Download);
     }
 
     #[tokio::test]
