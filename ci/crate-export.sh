@@ -15,6 +15,10 @@
 #   <crate> = { workspace = true }   ->  <crate> = { path = ".." }
 #       (a nested member such as nzb-decode's ffi/ depending on its parent)
 #   <dep>.workspace = true           ->  <dep> = <[workspace.dependencies] value>
+#   <dep> = { workspace = true, k = v, ... }
+#                                    ->  the workspace value merged with the
+#       local keys: features are added to the workspace features, any other
+#       key (optional, default-features) is set or overridden
 #   { version = "x", path = "../y" } ->  { version = "x" }
 #       (sibling nzb-* crates resolve from crates.io in the standalone repo)
 # Any other workspace inheritance, a sibling path without a version, or a
@@ -24,6 +28,73 @@ crate_export_manifest() {
         function fail(msg) {
             printf "crate-export: %s:%d: %s\n", file, FNR, msg > "/dev/stderr"
             exit 1
+        }
+        # inline_split <inner> <keys> <vals> — split the inside of an inline
+        # table into key/value pairs on the commas outside strings and arrays.
+        function inline_split(s, keys, vals,    n, i, c, depth, q, cur) {
+            n = 0; depth = 0; q = 0; cur = ""
+            s = s ","
+            for (i = 1; i <= length(s); i++) {
+                c = substr(s, i, 1)
+                if (c == "\"") q = !q
+                else if (!q && c == "[") depth++
+                else if (!q && c == "]") depth--
+                if (!q && depth == 0 && c == ",") {
+                    if (cur ~ /=/) {
+                        n++
+                        keys[n] = cur; sub(/[ \t]*=.*/, "", keys[n]); sub(/^[ \t]*/, "", keys[n])
+                        vals[n] = cur; sub(/^[^=]*=[ \t]*/, "", vals[n]); sub(/[ \t]*$/, "", vals[n])
+                    } else if (cur !~ /^[ \t]*$/) fail("cannot parse inline table entry: " cur)
+                    cur = ""
+                    continue
+                }
+                cur = cur c
+            }
+            return n
+        }
+        # feature_union <a> <b> — the array <a> with the items of <b> it lacks.
+        function feature_union(a, b,    na, nb, ia, ib, i, out, seen) {
+            sub(/^\[[ \t]*/, "", a); sub(/[ \t,]*\][ \t]*$/, "", a)
+            sub(/^\[[ \t]*/, "", b); sub(/[ \t,]*\][ \t]*$/, "", b)
+            na = (a == "") ? 0 : split(a, ia, /[ \t]*,[ \t]*/)
+            nb = (b == "") ? 0 : split(b, ib, /[ \t]*,[ \t]*/)
+            out = ""
+            for (i = 1; i <= na; i++) if (!(ia[i] in seen)) { seen[ia[i]] = 1; out = out (out == "" ? "" : ", ") ia[i] }
+            for (i = 1; i <= nb; i++) if (!(ib[i] in seen)) { seen[ib[i]] = 1; out = out (out == "" ? "" : ", ") ib[i] }
+            return "[" out "]"
+        }
+        # ws_value <name> — the [workspace.dependencies] value for <name>,
+        # checked to be a single-line registry dependency.
+        function ws_value(name,    val) {
+            if (!(name in ws)) fail(name " inherits from the workspace but [workspace.dependencies] has no " name)
+            val = ws[name]
+            if (val ~ /path[ \t]*=/) fail(name ": the workspace entry is a path dependency")
+            if (val ~ /^\{/ && val !~ /\}/) fail(name ": multi-line workspace entries are not supported")
+            return val
+        }
+        # inline_inherit <name> <inner> — <name> = { workspace = true, ... }
+        # resolved against the workspace entry.
+        function inline_inherit(name, inner,    val, wn, wk, wv, ln, lk, lv, i, j, found, out) {
+            val = ws_value(name)
+            ln = inline_split(inner, lk, lv)
+            if (ln == 1) return name " = " val
+            if (val ~ /^"/) { wn = 1; wk[1] = "version"; wv[1] = val }
+            else {
+                sub(/^\{[ \t]*/, "", val); sub(/[ \t]*\}[ \t]*$/, "", val)
+                wn = inline_split(val, wk, wv)
+            }
+            for (i = 1; i <= ln; i++) {
+                if (lk[i] == "workspace") continue
+                found = 0
+                for (j = 1; j <= wn; j++) if (wk[j] == lk[i]) {
+                    found = 1
+                    wv[j] = (lk[i] == "features") ? feature_union(wv[j], lv[i]) : lv[i]
+                }
+                if (!found) { wn++; wk[wn] = lk[i]; wv[wn] = lv[i] }
+            }
+            out = ""
+            for (j = 1; j <= wn; j++) out = out (j > 1 ? ", " : "") wk[j] " = " wv[j]
+            return name " = { " out " }"
         }
         FNR == NR {
             if ($0 ~ /^\[/) { inws = ($0 ~ /^\[workspace\.dependencies\][ \t]*$/); next }
@@ -43,11 +114,13 @@ crate_export_manifest() {
             }
             if (line ~ /^[A-Za-z0-9_-]+\.workspace[ \t]*=[ \t]*true[ \t]*$/) {
                 name = line; sub(/\..*/, "", name)
-                if (!(name in ws)) fail(name " inherits from the workspace but [workspace.dependencies] has no " name)
-                val = ws[name]
-                if (val ~ /path[ \t]*=/) fail(name ": the workspace entry is a path dependency")
-                if (val ~ /^\{/ && val !~ /\}/) fail(name ": multi-line workspace entries are not supported")
-                print name " = " val
+                print name " = " ws_value(name)
+                next
+            }
+            if (line ~ /^[A-Za-z0-9_-]+[ \t]*=[ \t]*\{(.*,)?[ \t]*workspace[ \t]*=[ \t]*true[ \t]*(,.*)?\}[ \t]*$/) {
+                name = line; sub(/[ \t]*=.*/, "", name)
+                inner = line; sub(/^[^{]*\{[ \t]*/, "", inner); sub(/[ \t]*\}[ \t]*$/, "", inner)
+                print inline_inherit(name, inner)
                 next
             }
             if (line ~ /workspace[ \t]*=[ \t]*true/) fail("unsupported workspace inheritance: " line)
