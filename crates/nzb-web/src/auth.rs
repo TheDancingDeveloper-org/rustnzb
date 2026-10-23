@@ -214,6 +214,10 @@ pub enum ChangeCredentialsError {
     WrongPassword,
     Empty,
     Io(std::io::Error),
+    /// A wrong current password while locked out.
+    Throttled {
+        retry_after: Duration,
+    },
 }
 
 fn hash_password(password: &str) -> Result<String, std::io::Error> {
@@ -245,9 +249,17 @@ const LOCKED_HASH: &str = "";
 /// blocking threads that unauthenticated requests can claim.
 const HASHING_PERMITS: usize = 3;
 
+/// How long a wrong password from a locked-out client holds the locked lane
+/// (see [`CredentialStore::guarded_check`]). This bounds guessing while
+/// locked out to about one attempt per hold across all locked clients.
+const LOCKED_FAILURE_HOLD: Duration = Duration::from_secs(1);
+
 pub struct CredentialStore {
     account: RwLock<Option<Account>>,
     hashing: Arc<tokio::sync::Semaphore>,
+    /// One attempt at a time from locked-out clients.
+    locked_lane: Arc<tokio::sync::Semaphore>,
+    locked_failure_hold: Duration,
     throttle: LoginThrottle,
     #[cfg(not(unix))]
     file_path: PathBuf,
@@ -277,6 +289,8 @@ impl CredentialStore {
         let store = Self {
             account: RwLock::new(None),
             hashing: Arc::new(tokio::sync::Semaphore::new(HASHING_PERMITS)),
+            locked_lane: Arc::new(tokio::sync::Semaphore::new(1)),
+            locked_failure_hold: LOCKED_FAILURE_HOLD,
             throttle: LoginThrottle::default(),
             #[cfg(not(unix))]
             file_path: file_path.clone(),
@@ -509,7 +523,7 @@ impl CredentialStore {
     /// Check a username and password. The username comparison is constant
     /// time, and the Argon2 verification runs even when the username is wrong
     /// so timing does not reveal which part failed. Argon2 is deliberately
-    /// slow: async callers use [`CredentialStore::validate_async`].
+    /// slow: async callers use [`CredentialStore::check_login`].
     pub fn validate(&self, username: &str, password: &str) -> bool {
         let (username_ok, password_hash) = match &*self.account.read() {
             Some(account) => (
@@ -525,7 +539,8 @@ impl CredentialStore {
     /// Run Argon2 work (`f`) on the blocking thread pool, at most
     /// [`HASHING_PERMITS`] at a time. The permit moves into the blocking task,
     /// so a client that disconnects does not free its slot early. Returns
-    /// `None` if the task panicked.
+    /// `None` if the task panicked. This applies no failure throttling: a
+    /// password check goes through [`CredentialStore::guarded_check`].
     pub async fn run_hashing<T, F>(self: &Arc<Self>, f: F) -> Option<T>
     where
         T: Send + 'static,
@@ -541,52 +556,168 @@ impl CredentialStore {
         .ok()
     }
 
-    /// [`CredentialStore::validate`] through [`CredentialStore::run_hashing`],
-    /// so the Argon2 work neither stalls the async runtime nor runs unbounded.
-    /// This applies no failure throttling; logins use
-    /// [`CredentialStore::check_login`].
-    pub async fn validate_async(self: Arc<Self>, username: String, password: String) -> bool {
-        self.run_hashing(move |store| store.validate(&username, &password))
-            .await
-            .unwrap_or(false)
+    /// The one path every password guess takes (the login endpoint, HTTP
+    /// Basic auth and the current password of a credential change), so they
+    /// share the failed-attempt throttle and cannot diverge.
+    ///
+    /// `check` verifies the password on the blocking pool, under the
+    /// [`HASHING_PERMITS`] cap, and says how the throttle should count it.
+    /// A client that is locked out (per address or globally) is still
+    /// verified, so the correct password always gets in, but its attempts go
+    /// one at a time through the locked lane, and each wrong one holds that
+    /// lane for [`LOCKED_FAILURE_HOLD`]. While locked out, guessing is
+    /// limited to about one attempt per hold across all locked clients. The
+    /// operator is only ever delayed, never refused. A wrong guess made while
+    /// locked out is answered as [`Guarded::Throttled`].
+    ///
+    /// The lockout is checked again once a hashing slot is held, so a burst
+    /// that queued before the lockout began is moved to the locked lane
+    /// instead of each attempt getting a free verification. Returns `None` if
+    /// the check panicked.
+    pub async fn guarded_check<T, F>(
+        self: &Arc<Self>,
+        client: Option<IpAddr>,
+        check: F,
+    ) -> Option<Guarded<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&CredentialStore) -> (T, Verdict) + Send + 'static,
+    {
+        let mut lane = None;
+        let hashing = loop {
+            if lane.is_none() && self.throttle.check(client, Instant::now()).is_err() {
+                // The lane is taken before a hashing slot, never while one is
+                // held, so the two semaphores cannot deadlock.
+                lane = Some(self.locked_lane.clone().acquire_owned().await.ok()?);
+            }
+            let permit = self.hashing.clone().acquire_owned().await.ok()?;
+            if lane.is_some() || self.throttle.check(client, Instant::now()).is_ok() {
+                break permit;
+            }
+            drop(permit);
+        };
+
+        // The work runs in its own task holding both permits, so a client
+        // that disconnects frees neither the hashing slot nor the lane early.
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let store = self.clone();
+        let hold = self.locked_failure_hold;
+        tokio::spawn(async move {
+            let locked = lane.is_some();
+            let checked = tokio::task::spawn_blocking(move || {
+                // The result is recorded before the hashing slot is freed, so
+                // the next attempt's re-check already sees this failure.
+                let _hashing = hashing;
+                let (value, verdict) = check(&store);
+                let now = Instant::now();
+                let outcome = match verdict {
+                    Verdict::Accepted => {
+                        store.throttle.record_success(client);
+                        Guarded::Done(value)
+                    }
+                    Verdict::Neutral => Guarded::Done(value),
+                    Verdict::Rejected => {
+                        store.throttle.record_failure(client, now);
+                        match store.throttle.check(client, now) {
+                            Err(retry_after) if locked => Guarded::Throttled { retry_after },
+                            _ => Guarded::Done(value),
+                        }
+                    }
+                };
+                (outcome, verdict)
+            })
+            .await;
+            let Ok((outcome, verdict)) = checked else {
+                return;
+            };
+            let _ = reply.send(outcome);
+            if lane.is_some() && verdict == Verdict::Rejected {
+                tokio::time::sleep(hold).await;
+            }
+            drop(lane);
+        });
+        response.await.ok()
     }
 
     /// Check a password login (the login endpoint or HTTP Basic auth) from
-    /// `client`, applying the failed-login throttle. A throttled client is
-    /// refused before any Argon2 work. A success clears the client's failure
-    /// count and is never counted against the global budget.
+    /// `client` through [`CredentialStore::guarded_check`]. A success clears
+    /// the client's failure count and is never counted.
     pub async fn check_login(
         self: Arc<Self>,
         client: Option<IpAddr>,
         username: String,
         password: String,
     ) -> LoginOutcome {
-        if let Err(retry_after) = self.throttle.check(client, Instant::now()) {
-            return LoginOutcome::Throttled { retry_after };
-        }
-        let outcome = self
-            .run_hashing(move |store| {
-                // Re-check once a permit is held: a burst of concurrent
-                // attempts that all passed the first check while queued is
-                // stopped here instead of each costing a verification.
-                if let Err(retry_after) = store.throttle.check(client, Instant::now()) {
-                    return LoginOutcome::Throttled { retry_after };
-                }
+        let checked = self
+            .guarded_check(client, move |store| {
                 if store.validate(&username, &password) {
-                    LoginOutcome::Ok
+                    (LoginOutcome::Ok, Verdict::Accepted)
                 } else {
-                    LoginOutcome::Invalid
+                    (LoginOutcome::Invalid, Verdict::Rejected)
                 }
             })
-            .await
-            .unwrap_or(LoginOutcome::Invalid);
-        match outcome {
-            LoginOutcome::Ok => self.throttle.record_success(client),
-            LoginOutcome::Invalid => self.throttle.record_failure(client, Instant::now()),
-            LoginOutcome::Throttled { .. } => {}
+            .await;
+        match checked {
+            Some(Guarded::Done(outcome)) => outcome,
+            Some(Guarded::Throttled { retry_after }) => LoginOutcome::Throttled { retry_after },
+            None => LoginOutcome::Invalid,
         }
-        outcome
     }
+
+    /// [`CredentialStore::change_credentials`] through
+    /// [`CredentialStore::guarded_check`]: the current password is a guess
+    /// like a login and is throttled the same way.
+    pub async fn check_change_credentials(
+        self: &Arc<Self>,
+        client: Option<IpAddr>,
+        current_password: String,
+        new_username: Option<String>,
+        new_password: Option<String>,
+    ) -> Result<(), ChangeCredentialsError> {
+        let checked = self
+            .guarded_check(client, move |store| {
+                let result =
+                    store.change_credentials(&current_password, new_username, new_password);
+                let verdict = match &result {
+                    Err(ChangeCredentialsError::WrongPassword) => Verdict::Rejected,
+                    Err(ChangeCredentialsError::NotConfigured) => Verdict::Neutral,
+                    // The current password was right; the change failed later.
+                    _ => Verdict::Accepted,
+                };
+                (result, verdict)
+            })
+            .await;
+        match checked {
+            Some(Guarded::Done(result)) => result,
+            Some(Guarded::Throttled { retry_after }) => {
+                Err(ChangeCredentialsError::Throttled { retry_after })
+            }
+            None => Err(ChangeCredentialsError::Io(std::io::Error::other(
+                "credential change task failed",
+            ))),
+        }
+    }
+}
+
+/// How [`CredentialStore::guarded_check`] counts one password check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The password was correct: the client's failures are cleared.
+    Accepted,
+    /// The password was wrong: a failure is recorded.
+    Rejected,
+    /// No password was checked (for example, nothing is configured).
+    Neutral,
+}
+
+/// Result of [`CredentialStore::guarded_check`].
+#[derive(Debug)]
+pub enum Guarded<T> {
+    Done(T),
+    /// A wrong guess while locked out; retry after the given delay.
+    Throttled {
+        retry_after: Duration,
+    },
 }
 
 /// Result of [`CredentialStore::check_login`].
@@ -594,7 +725,7 @@ impl CredentialStore {
 pub enum LoginOutcome {
     Ok,
     Invalid,
-    /// Too many recent failures; retry after the given delay.
+    /// A wrong password while locked out; retry after the given delay.
     Throttled {
         retry_after: Duration,
     },
@@ -615,7 +746,9 @@ impl LoginOutcome {
 
 /// The peer address axum records when the server is run with
 /// `into_make_service_with_connect_info::<SocketAddr>()`. Behind a reverse
-/// proxy this is the proxy's address, so every client shares one bucket.
+/// proxy this is the proxy's address, so every client shares one bucket;
+/// a locked bucket only slows guessing and never refuses the correct
+/// password (see [`CredentialStore::guarded_check`]).
 pub fn client_ip(extensions: &http::Extensions) -> Option<IpAddr> {
     extensions
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
@@ -668,7 +801,9 @@ struct ThrottleState {
 }
 
 /// Failed-login backoff: an exponential lockout per client address plus a
-/// global cap on failures per minute. Only failures are counted.
+/// global cap on failures per minute. Only failures are counted. A lockout
+/// moves the client's attempts to the paced locked lane; it never refuses a
+/// correct password (see [`CredentialStore::guarded_check`]).
 #[derive(Default)]
 pub struct LoginThrottle {
     state: parking_lot::Mutex<ThrottleState>,
@@ -856,7 +991,7 @@ pub struct ChangeCredentialsRequest {
         (status = 400, description = "A new username or password is empty", body = String, content_type = "text/plain"),
         (status = 401, description = "Current password is incorrect", body = String, content_type = "text/plain"),
         (status = 404, description = "No credentials configured", body = String, content_type = "text/plain"),
-        (status = 429, description = "Too many failed attempts from this client or overall; see Retry-After", body = String, content_type = "text/plain"),
+        (status = 429, description = "Wrong password while this client (or every client) is locked out after repeated failures; see Retry-After. The correct password is still accepted", body = String, content_type = "text/plain"),
         (status = 500, description = "Credentials could not be saved", body = String, content_type = "text/plain"),
     ),
 )]
@@ -865,36 +1000,15 @@ pub async fn h_auth_change_credentials(
     extensions: http::Extensions,
     Json(req): Json<ChangeCredentialsRequest>,
 ) -> impl IntoResponse {
-    // The current password is a password guess like a login, so it shares
-    // the login throttle; otherwise this endpoint would bypass it.
-    let client = client_ip(&extensions);
-    if let Err(retry_after) = state
-        .credential_store
-        .throttle
-        .check(client, Instant::now())
-    {
-        return LoginOutcome::too_many_requests(retry_after);
-    }
     let result = state
         .credential_store
-        .run_hashing(move |store| {
-            store.change_credentials(&req.current_password, req.new_username, req.new_password)
-        })
-        .await
-        .unwrap_or_else(|| {
-            Err(ChangeCredentialsError::Io(std::io::Error::other(
-                "credential change task failed",
-            )))
-        });
-
-    match &result {
-        Ok(()) => state.credential_store.throttle.record_success(client),
-        Err(ChangeCredentialsError::WrongPassword) => state
-            .credential_store
-            .throttle
-            .record_failure(client, Instant::now()),
-        Err(_) => {}
-    }
+        .check_change_credentials(
+            client_ip(&extensions),
+            req.current_password,
+            req.new_username,
+            req.new_password,
+        )
+        .await;
     match result {
         Ok(()) => {
             state.token_store.revoke_all();
@@ -905,6 +1019,9 @@ pub async fn h_auth_change_credentials(
         }
         Err(ChangeCredentialsError::WrongPassword) => {
             (StatusCode::UNAUTHORIZED, "current password is incorrect").into_response()
+        }
+        Err(ChangeCredentialsError::Throttled { retry_after }) => {
+            LoginOutcome::too_many_requests(retry_after)
         }
         Err(ChangeCredentialsError::Empty) => (
             StatusCode::BAD_REQUEST,
@@ -932,7 +1049,7 @@ pub async fn h_auth_change_credentials(
         (status = 200, description = "Credentials accepted; tokens issued", body = TokenResponse),
         (status = 401, description = "Invalid credentials", body = String, content_type = "text/plain"),
         (status = 404, description = "Authentication is not configured", body = String, content_type = "text/plain"),
-        (status = 429, description = "Too many failed attempts from this client or overall; see Retry-After", body = String, content_type = "text/plain"),
+        (status = 429, description = "Wrong password while this client (or every client) is locked out after repeated failures; see Retry-After. The correct password is still accepted", body = String, content_type = "text/plain"),
     ),
 )]
 pub async fn h_auth_login(
@@ -1373,11 +1490,18 @@ mod tests {
         assert!(throttle.check(ip(250), start + GLOBAL_WINDOW).is_ok());
     }
 
-    #[tokio::test]
-    async fn check_login_throttles_failures_but_not_successes() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(CredentialStore::new(temp.path().to_path_buf()));
+    /// A store with a short locked-lane hold so tests run quickly.
+    fn fast_store(temp: &tempfile::TempDir) -> Arc<CredentialStore> {
+        let mut store = CredentialStore::new(temp.path().to_path_buf());
+        store.locked_failure_hold = Duration::from_millis(50);
         store.set_credentials(alice()).unwrap();
+        Arc::new(store)
+    }
+
+    #[tokio::test]
+    async fn check_login_throttles_wrong_guesses_but_never_the_correct_password() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = fast_store(&temp);
         let login = |client, password: &str| {
             store
                 .clone()
@@ -1390,17 +1514,119 @@ mod tests {
             assert_eq!(login(ip(1), "wrong").await, LoginOutcome::Invalid);
         }
         assert_eq!(login(ip(1), "correct horse").await, LoginOutcome::Ok);
-        for _ in 0..CLIENT_FREE_FAILURES - 1 {
+        for _ in 0..CLIENT_FREE_FAILURES {
             assert_eq!(login(ip(1), "wrong").await, LoginOutcome::Invalid);
         }
-        assert_eq!(login(ip(1), "wrong").await, LoginOutcome::Invalid);
 
-        // Locked out: refused before any Argon2 work, even with the right
-        // password; other clients still log in.
+        // Locked out: wrong guesses are refused with a retry delay, other
+        // clients are unaffected, and the correct password still gets in.
         assert!(matches!(
-            login(ip(1), "correct horse").await,
+            login(ip(1), "wrong").await,
             LoginOutcome::Throttled { .. }
         ));
-        assert_eq!(login(ip(2), "correct horse").await, LoginOutcome::Ok);
+        assert_eq!(login(ip(2), "wrong").await, LoginOutcome::Invalid);
+        assert_eq!(login(ip(1), "correct horse").await, LoginOutcome::Ok);
+        // The success cleared the lockout.
+        assert!(store.throttle.check(ip(1), Instant::now()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_global_cap_does_not_block_the_correct_password() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = fast_store(&temp);
+        let now = Instant::now();
+        for n in 0..GLOBAL_MAX_FAILURES {
+            store.throttle.record_failure(ip(n as u8), now);
+        }
+        assert!(store.throttle.check(ip(200), now).is_err());
+
+        assert!(matches!(
+            store
+                .clone()
+                .check_login(ip(200), "alice".into(), "wrong".into())
+                .await,
+            LoginOutcome::Throttled { .. }
+        ));
+        assert_eq!(
+            store
+                .clone()
+                .check_login(ip(201), "alice".into(), "correct horse".into())
+                .await,
+            LoginOutcome::Ok
+        );
+        assert!(
+            store
+                .check_change_credentials(ip(202), "correct horse".into(), Some("bob".into()), None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn change_credentials_shares_the_throttle_and_accepts_the_correct_password() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = fast_store(&temp);
+        let change = |password: &str| {
+            store.check_change_credentials(ip(1), password.into(), None, Some("new".into()))
+        };
+        for _ in 0..CLIENT_FREE_FAILURES {
+            assert!(matches!(
+                change("wrong").await,
+                Err(ChangeCredentialsError::WrongPassword)
+            ));
+        }
+        assert!(matches!(
+            change("wrong").await,
+            Err(ChangeCredentialsError::Throttled { .. })
+        ));
+        // Login from the same client is locked out by the same count.
+        assert!(matches!(
+            store
+                .clone()
+                .check_login(ip(1), "alice".into(), "wrong".into())
+                .await,
+            LoginOutcome::Throttled { .. }
+        ));
+        change("correct horse").await.unwrap();
+        assert!(store.validate("alice", "new"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_concurrent_burst_of_wrong_guesses_is_moved_to_the_locked_lane() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = fast_store(&temp);
+        const BURST: usize = 12;
+        let started = Instant::now();
+        let tasks: Vec<_> = (0..BURST)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store
+                        .check_change_credentials(ip(1), "wrong".into(), None, Some("x".into()))
+                        .await
+                })
+            })
+            .collect();
+        let (mut wrong, mut throttled) = (0, 0);
+        for task in tasks {
+            match task.await.unwrap() {
+                Err(ChangeCredentialsError::WrongPassword) => wrong += 1,
+                Err(ChangeCredentialsError::Throttled { .. }) => throttled += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // Only the free failures, plus attempts already holding a hashing
+        // slot when the lockout began, are verified outside the locked lane.
+        let free = CLIENT_FREE_FAILURES as usize + HASHING_PERMITS - 1;
+        assert!(wrong <= free, "{wrong} unpaced guesses");
+        assert_eq!(wrong + throttled, BURST);
+        // Locked-lane guesses run one at a time, each holding the lane. The
+        // last guess's hold runs after its reply, so it is not counted.
+        let paced = throttled.saturating_sub(1) as u32 * store.locked_failure_hold;
+        assert!(
+            started.elapsed() >= paced,
+            "{:?} < {paced:?}",
+            started.elapsed()
+        );
     }
 }

@@ -10,7 +10,7 @@ use nzb_web::auth::{CredentialStore, StoredCredentials, TokenStore};
 use nzb_web::nzb_core::config::AppConfig;
 use nzb_web::nzb_core::db::Database;
 use nzb_web::{AppState, LogBuffer, QueueManager};
-use rustnzb::server::build_router;
+use rustnzb::server::{build_router, into_make_service};
 
 struct ContractApp {
     base_url: String,
@@ -70,7 +70,7 @@ async fn start_app(with_credentials: bool) -> ContractApp {
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let router_state = state.clone();
     let handle = tokio::spawn(async move {
-        axum::serve(listener, build_router(router_state))
+        axum::serve(listener, into_make_service(build_router(router_state)))
             .await
             .unwrap();
     });
@@ -167,46 +167,129 @@ async fn protected_routes_reject_missing_credentials_and_preserve_auth_contracts
     );
 }
 
-#[tokio::test]
-async fn repeated_failed_logins_are_throttled_with_retry_after() {
-    use base64::Engine;
-    let app = start_app(true).await;
-    let client = reqwest::Client::new();
-    let login = |password: &'static str| {
-        client
-            .post(format!("{}/api/auth/login", app.base_url))
-            .json(&serde_json::json!({"username":"admin","password":password}))
-            .send()
-    };
+/// A client whose connections come from `source`. Every 127.0.0.0/8
+/// address is local on Linux, so each test client can be its own peer.
+fn client_from(source: [u8; 4]) -> reqwest::Client {
+    reqwest::Client::builder()
+        .local_address(std::net::IpAddr::from(source))
+        .build()
+        .unwrap()
+}
 
-    // A success between failures resets the count, so it is never throttled.
-    for _ in 0..4 {
-        assert_eq!(login("wrong").await.unwrap().status(), 401);
-    }
-    assert_eq!(login("password").await.unwrap().status(), 200);
-    for _ in 0..5 {
-        assert_eq!(login("wrong").await.unwrap().status(), 401);
-    }
-
-    // The fifth failure locks the client out of both password paths.
-    let throttled = login("password").await.unwrap();
-    assert_eq!(throttled.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-    let retry_after: u64 = throttled.headers()[reqwest::header::RETRY_AFTER]
+fn retry_after(response: &reqwest::Response) -> u64 {
+    response.headers()[reqwest::header::RETRY_AFTER]
         .to_str()
         .unwrap()
         .parse()
-        .unwrap();
-    assert!((1..=30).contains(&retry_after), "{retry_after}");
+        .unwrap()
+}
 
-    let basic = base64::engine::general_purpose::STANDARD.encode("admin:password");
-    let status = client
+async fn password_login(
+    app: &ContractApp,
+    client: &reqwest::Client,
+    password: &str,
+) -> reqwest::Response {
+    client
+        .post(format!("{}/api/auth/login", app.base_url))
+        .json(&serde_json::json!({"username":"admin","password":password}))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn basic_status(app: &ContractApp, client: &reqwest::Client, password: &str) -> u16 {
+    use base64::Engine;
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("admin:{password}"));
+    client
         .get(format!("{}/api/status", app.base_url))
         .header("Authorization", format!("Basic {basic}"))
         .send()
         .await
         .unwrap()
-        .status();
-    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn repeated_failed_logins_are_throttled_but_the_correct_password_gets_in() {
+    let app = start_app(true).await;
+    let client = client_from([127, 0, 0, 1]);
+
+    // A success between failures resets the count, so it is never throttled.
+    for _ in 0..4 {
+        assert_eq!(password_login(&app, &client, "wrong").await.status(), 401);
+    }
+    assert_eq!(
+        password_login(&app, &client, "password").await.status(),
+        200
+    );
+    for _ in 0..5 {
+        assert_eq!(password_login(&app, &client, "wrong").await.status(), 401);
+    }
+
+    // Locked out: a wrong guess on either password path gets 429 with a
+    // retry delay, but the correct password still logs in.
+    let throttled = password_login(&app, &client, "wrong").await;
+    assert_eq!(throttled.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert!((1..=60).contains(&retry_after(&throttled)));
+    assert_eq!(basic_status(&app, &client, "wrong").await, 429);
+    assert_eq!(basic_status(&app, &client, "password").await, 200);
+    assert_eq!(
+        password_login(&app, &client, "password").await.status(),
+        200
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn failed_logins_are_tracked_per_client_address() {
+    let app = start_app(true).await;
+    let attacker = client_from([127, 0, 0, 2]);
+    let operator = client_from([127, 0, 0, 3]);
+
+    for _ in 0..5 {
+        assert_eq!(password_login(&app, &attacker, "wrong").await.status(), 401);
+    }
+    assert_eq!(password_login(&app, &attacker, "wrong").await.status(), 429);
+    assert_eq!(basic_status(&app, &attacker, "wrong").await, 429);
+
+    // Another address has its own count: its failures are plain 401s and it
+    // logs in normally, on both password paths.
+    assert_eq!(password_login(&app, &operator, "wrong").await.status(), 401);
+    assert_eq!(basic_status(&app, &operator, "wrong").await, 401);
+    assert_eq!(
+        password_login(&app, &operator, "password").await.status(),
+        200
+    );
+    assert_eq!(basic_status(&app, &operator, "password").await, 200);
+
+    // The attacker's address is still locked for wrong guesses.
+    assert_eq!(password_login(&app, &attacker, "wrong").await.status(), 429);
+}
+
+#[tokio::test]
+async fn change_credentials_is_throttled_like_login() {
+    let app = start_app(true).await;
+    let client = client_from([127, 0, 0, 1]);
+    let change = |current: &'static str| {
+        client
+            .post(format!("{}/api/auth/change_credentials", app.base_url))
+            .json(&serde_json::json!({"current_password": current, "new_password": "rotated"}))
+            .send()
+    };
+
+    for _ in 0..5 {
+        assert_eq!(change("wrong").await.unwrap().status(), 401);
+    }
+    let throttled = change("wrong").await.unwrap();
+    assert_eq!(throttled.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert!(retry_after(&throttled) >= 1);
+    // The shared count locks the login endpoint for wrong guesses too.
+    assert_eq!(password_login(&app, &client, "wrong").await.status(), 429);
+
+    // The correct current password still goes through while locked out.
+    assert_eq!(change("password").await.unwrap().status(), 200);
+    assert_eq!(password_login(&app, &client, "rotated").await.status(), 200);
 }
 
 #[tokio::test]
