@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -234,8 +235,20 @@ fn verify_password(password: &str, password_hash: &str) -> bool {
     })
 }
 
+/// Placeholder hash for an account whose stored file could not be loaded or
+/// migrated. It never parses as a PHC string, so every login is refused while
+/// the account still counts as configured and first-boot setup stays closed.
+const LOCKED_HASH: &str = "";
+
+/// Argon2 work (verify or hash) allowed to run at once. Each verification
+/// holds about 19 MiB for its duration, so this bounds the memory and the
+/// blocking threads that unauthenticated requests can claim.
+const HASHING_PERMITS: usize = 3;
+
 pub struct CredentialStore {
     account: RwLock<Option<Account>>,
+    hashing: Arc<tokio::sync::Semaphore>,
+    throttle: LoginThrottle,
     #[cfg(not(unix))]
     file_path: PathBuf,
     #[cfg(unix)]
@@ -244,6 +257,10 @@ pub struct CredentialStore {
 
 impl CredentialStore {
     pub fn new(config_dir: PathBuf) -> Self {
+        Self::open(config_dir, hash_password)
+    }
+
+    fn open(config_dir: PathBuf, hasher: fn(&str) -> Result<String, std::io::Error>) -> Self {
         // Startup creates the configured data directory before constructing
         // this store. Canonicalizing it here confines the credential file to
         // that existing directory and removes traversal or symlinked-parent
@@ -256,32 +273,76 @@ impl CredentialStore {
         let directory = File::open(&config_dir).unwrap_or_else(|error| {
             panic!("credential store data directory must be readable: {error}")
         });
-        let file: Option<CredentialsFile> = std::fs::read_to_string(&file_path)
-            .ok()
-            .and_then(|contents| serde_json::from_str(&contents).ok());
+        let contents = std::fs::read_to_string(&file_path);
         let store = Self {
             account: RwLock::new(None),
+            hashing: Arc::new(tokio::sync::Semaphore::new(HASHING_PERMITS)),
+            throttle: LoginThrottle::default(),
             #[cfg(not(unix))]
-            file_path,
+            file_path: file_path.clone(),
             #[cfg(unix)]
             directory,
         };
-        if let Some(file) = file {
-            store.load(file);
+        match contents {
+            Ok(contents) => match serde_json::from_str::<CredentialsFile>(&contents) {
+                Ok(file) => store.load(file, hasher),
+                Err(error) => store.lock(
+                    String::new(),
+                    &format!("{} is not valid: {error}", file_path.display()),
+                ),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => store.lock(
+                String::new(),
+                &format!("{} cannot be read: {error}", file_path.display()),
+            ),
         }
         store
     }
 
+    /// Keep the account configured but refuse every login. Used when the
+    /// stored file exists but cannot be used, so a damaged or unmigratable
+    /// file never reopens first-boot setup to whoever reaches it first.
+    fn lock(&self, username: String, reason: &str) {
+        tracing::error!(
+            "Web login is disabled: {reason}. Fix or remove credentials.json in the data \
+             directory and restart; removing it reopens first-boot setup."
+        );
+        *self.account.write() = Some(Account {
+            username,
+            password_hash: LOCKED_HASH.to_owned(),
+        });
+    }
+
     /// Install the loaded file, migrating a plaintext password to a hash and
     /// rewriting the file so the plaintext leaves the disk at startup.
-    fn load(&self, file: CredentialsFile) {
+    fn load(&self, file: CredentialsFile, hasher: fn(&str) -> Result<String, std::io::Error>) {
         let password_hash = match (file.password_hash, file.password) {
-            (Some(hash), _) => hash,
+            (Some(hash), plaintext) => {
+                // A file holding both keys (hand-edited or half-migrated)
+                // still carries the plaintext: rewrite it with the hash only.
+                if plaintext.is_some() {
+                    match self.persist_account(&file.username, &hash) {
+                        Ok(()) => tracing::info!(
+                            "Removed a plaintext password left beside the hash in credentials.json"
+                        ),
+                        Err(error) => tracing::warn!(
+                            "Could not remove the plaintext password from credentials.json: {error}"
+                        ),
+                    }
+                }
+                hash
+            }
             (None, Some(plaintext)) => {
-                let hash = match hash_password(&plaintext) {
+                let hash = match hasher(&plaintext) {
                     Ok(hash) => hash,
                     Err(error) => {
-                        tracing::error!("Could not migrate the stored web login password: {error}");
+                        // The plaintext file stays as it is, so the next
+                        // start can retry the migration.
+                        self.lock(
+                            file.username,
+                            &format!("the stored password could not be migrated ({error})"),
+                        );
                         return;
                     }
                 };
@@ -296,7 +357,10 @@ impl CredentialStore {
                 }
                 hash
             }
-            (None, None) => return,
+            (None, None) => {
+                self.lock(file.username, "credentials.json holds no password");
+                return;
+            }
         };
         *self.account.write() = Some(Account {
             username: file.username,
@@ -458,12 +522,207 @@ impl CredentialStore {
         username_ok & password_ok
     }
 
-    /// [`CredentialStore::validate`] on the blocking thread pool, so the
-    /// Argon2 work does not stall the async runtime.
+    /// Run Argon2 work (`f`) on the blocking thread pool, at most
+    /// [`HASHING_PERMITS`] at a time. The permit moves into the blocking task,
+    /// so a client that disconnects does not free its slot early. Returns
+    /// `None` if the task panicked.
+    pub async fn run_hashing<T, F>(self: &Arc<Self>, f: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&CredentialStore) -> T + Send + 'static,
+    {
+        let permit = self.hashing.clone().acquire_owned().await.ok()?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f(&store)
+        })
+        .await
+        .ok()
+    }
+
+    /// [`CredentialStore::validate`] through [`CredentialStore::run_hashing`],
+    /// so the Argon2 work neither stalls the async runtime nor runs unbounded.
+    /// This applies no failure throttling; logins use
+    /// [`CredentialStore::check_login`].
     pub async fn validate_async(self: Arc<Self>, username: String, password: String) -> bool {
-        tokio::task::spawn_blocking(move || self.validate(&username, &password))
+        self.run_hashing(move |store| store.validate(&username, &password))
             .await
             .unwrap_or(false)
+    }
+
+    /// Check a password login (the login endpoint or HTTP Basic auth) from
+    /// `client`, applying the failed-login throttle. A throttled client is
+    /// refused before any Argon2 work. A success clears the client's failure
+    /// count and is never counted against the global budget.
+    pub async fn check_login(
+        self: Arc<Self>,
+        client: Option<IpAddr>,
+        username: String,
+        password: String,
+    ) -> LoginOutcome {
+        if let Err(retry_after) = self.throttle.check(client, Instant::now()) {
+            return LoginOutcome::Throttled { retry_after };
+        }
+        let outcome = self
+            .run_hashing(move |store| {
+                // Re-check once a permit is held: a burst of concurrent
+                // attempts that all passed the first check while queued is
+                // stopped here instead of each costing a verification.
+                if let Err(retry_after) = store.throttle.check(client, Instant::now()) {
+                    return LoginOutcome::Throttled { retry_after };
+                }
+                if store.validate(&username, &password) {
+                    LoginOutcome::Ok
+                } else {
+                    LoginOutcome::Invalid
+                }
+            })
+            .await
+            .unwrap_or(LoginOutcome::Invalid);
+        match outcome {
+            LoginOutcome::Ok => self.throttle.record_success(client),
+            LoginOutcome::Invalid => self.throttle.record_failure(client, Instant::now()),
+            LoginOutcome::Throttled { .. } => {}
+        }
+        outcome
+    }
+}
+
+/// Result of [`CredentialStore::check_login`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginOutcome {
+    Ok,
+    Invalid,
+    /// Too many recent failures; retry after the given delay.
+    Throttled {
+        retry_after: Duration,
+    },
+}
+
+impl LoginOutcome {
+    /// A 429 response with a `Retry-After` header (whole seconds, rounded up).
+    pub fn too_many_requests(retry_after: Duration) -> axum::response::Response {
+        let secs = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(http::header::RETRY_AFTER, secs.max(1).to_string())],
+            "too many failed login attempts; try again later",
+        )
+            .into_response()
+    }
+}
+
+/// The peer address axum records when the server is run with
+/// `into_make_service_with_connect_info::<SocketAddr>()`. Behind a reverse
+/// proxy this is the proxy's address, so every client shares one bucket.
+pub fn client_ip(extensions: &http::Extensions) -> Option<IpAddr> {
+    extensions
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip())
+}
+
+// --- Failed-login throttle ---
+
+/// Failures a client may make within [`CLIENT_FAILURE_WINDOW`] before it is
+/// locked out.
+const CLIENT_FREE_FAILURES: u32 = 5;
+/// A client's failure count resets once it has made no failed attempt for
+/// this long.
+const CLIENT_FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
+/// First per-client lockout; each further failure doubles it.
+const CLIENT_BASE_LOCKOUT: Duration = Duration::from_secs(30);
+/// Upper bound of the exponential per-client lockout.
+const CLIENT_MAX_LOCKOUT: Duration = Duration::from_secs(15 * 60);
+/// Failures from all clients together allowed per [`GLOBAL_WINDOW`]. This
+/// bounds guessing from many addresses (or from behind one proxy).
+const GLOBAL_MAX_FAILURES: u32 = 30;
+const GLOBAL_WINDOW: Duration = Duration::from_secs(60);
+/// Clients tracked at once; beyond this, stale entries are pruned and new
+/// clients are counted by the global budget only.
+const MAX_TRACKED_CLIENTS: usize = 4096;
+
+struct ClientFailures {
+    count: u32,
+    last: Instant,
+}
+
+impl ClientFailures {
+    /// How long the client stays locked out after `count` failures: none for
+    /// the first [`CLIENT_FREE_FAILURES`] - 1, then [`CLIENT_BASE_LOCKOUT`]
+    /// doubling up to [`CLIENT_MAX_LOCKOUT`].
+    fn lockout(&self) -> Duration {
+        if self.count < CLIENT_FREE_FAILURES {
+            return Duration::ZERO;
+        }
+        let exponent = (self.count - CLIENT_FREE_FAILURES).min(16);
+        (CLIENT_BASE_LOCKOUT * (1u32 << exponent)).min(CLIENT_MAX_LOCKOUT)
+    }
+}
+
+#[derive(Default)]
+struct ThrottleState {
+    clients: HashMap<Option<IpAddr>, ClientFailures>,
+    global_window_start: Option<Instant>,
+    global_failures: u32,
+}
+
+/// Failed-login backoff: an exponential lockout per client address plus a
+/// global cap on failures per minute. Only failures are counted.
+#[derive(Default)]
+pub struct LoginThrottle {
+    state: parking_lot::Mutex<ThrottleState>,
+}
+
+impl LoginThrottle {
+    /// `Err(retry_after)` when `client` (or everyone) must wait.
+    fn check(&self, client: Option<IpAddr>, now: Instant) -> Result<(), Duration> {
+        let state = self.state.lock();
+        if let Some(start) = state.global_window_start {
+            let end = start + GLOBAL_WINDOW;
+            if now < end && state.global_failures >= GLOBAL_MAX_FAILURES {
+                return Err(end - now);
+            }
+        }
+        if let Some(entry) = state.clients.get(&client) {
+            let until = entry.last + entry.lockout();
+            if now < until {
+                return Err(until - now);
+            }
+        }
+        Ok(())
+    }
+
+    fn record_failure(&self, client: Option<IpAddr>, now: Instant) {
+        let mut state = self.state.lock();
+        match state.global_window_start {
+            Some(start) if now < start + GLOBAL_WINDOW => state.global_failures += 1,
+            _ => {
+                state.global_window_start = Some(now);
+                state.global_failures = 1;
+            }
+        }
+        if !state.clients.contains_key(&client) && state.clients.len() >= MAX_TRACKED_CLIENTS {
+            state
+                .clients
+                .retain(|_, entry| now.duration_since(entry.last) < CLIENT_FAILURE_WINDOW);
+            if state.clients.len() >= MAX_TRACKED_CLIENTS {
+                return;
+            }
+        }
+        let entry = state.clients.entry(client).or_insert(ClientFailures {
+            count: 0,
+            last: now,
+        });
+        if now.duration_since(entry.last) >= CLIENT_FAILURE_WINDOW {
+            entry.count = 0;
+        }
+        entry.count = entry.count.saturating_add(1);
+        entry.last = now;
+    }
+
+    fn record_success(&self, client: Option<IpAddr>) {
+        self.state.lock().clients.remove(&client);
     }
 }
 
@@ -549,15 +808,16 @@ pub async fn h_auth_setup(
             .into_response();
     }
 
-    let store = state.credential_store.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        store.initialize_credentials(StoredCredentials {
-            username: req.username,
-            password: req.password,
+    let result = state
+        .credential_store
+        .run_hashing(move |store| {
+            store.initialize_credentials(StoredCredentials {
+                username: req.username,
+                password: req.password,
+            })
         })
-    })
-    .await
-    .unwrap_or_else(|error| Err(std::io::Error::other(error)));
+        .await
+        .unwrap_or_else(|| Err(std::io::Error::other("credential setup task failed")));
     match result {
         Ok(_) => {
             // Create tokens for the new user so they're immediately logged in
@@ -596,20 +856,45 @@ pub struct ChangeCredentialsRequest {
         (status = 400, description = "A new username or password is empty", body = String, content_type = "text/plain"),
         (status = 401, description = "Current password is incorrect", body = String, content_type = "text/plain"),
         (status = 404, description = "No credentials configured", body = String, content_type = "text/plain"),
+        (status = 429, description = "Too many failed attempts from this client or overall; see Retry-After", body = String, content_type = "text/plain"),
         (status = 500, description = "Credentials could not be saved", body = String, content_type = "text/plain"),
     ),
 )]
 pub async fn h_auth_change_credentials(
     State(state): State<ApiState>,
+    extensions: http::Extensions,
     Json(req): Json<ChangeCredentialsRequest>,
 ) -> impl IntoResponse {
-    let store = state.credential_store.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        store.change_credentials(&req.current_password, req.new_username, req.new_password)
-    })
-    .await
-    .unwrap_or_else(|error| Err(ChangeCredentialsError::Io(std::io::Error::other(error))));
+    // The current password is a password guess like a login, so it shares
+    // the login throttle; otherwise this endpoint would bypass it.
+    let client = client_ip(&extensions);
+    if let Err(retry_after) = state
+        .credential_store
+        .throttle
+        .check(client, Instant::now())
+    {
+        return LoginOutcome::too_many_requests(retry_after);
+    }
+    let result = state
+        .credential_store
+        .run_hashing(move |store| {
+            store.change_credentials(&req.current_password, req.new_username, req.new_password)
+        })
+        .await
+        .unwrap_or_else(|| {
+            Err(ChangeCredentialsError::Io(std::io::Error::other(
+                "credential change task failed",
+            )))
+        });
 
+    match &result {
+        Ok(()) => state.credential_store.throttle.record_success(client),
+        Err(ChangeCredentialsError::WrongPassword) => state
+            .credential_store
+            .throttle
+            .record_failure(client, Instant::now()),
+        Err(_) => {}
+    }
     match result {
         Ok(()) => {
             state.token_store.revoke_all();
@@ -647,23 +932,31 @@ pub async fn h_auth_change_credentials(
         (status = 200, description = "Credentials accepted; tokens issued", body = TokenResponse),
         (status = 401, description = "Invalid credentials", body = String, content_type = "text/plain"),
         (status = 404, description = "Authentication is not configured", body = String, content_type = "text/plain"),
+        (status = 429, description = "Too many failed attempts from this client or overall; see Retry-After", body = String, content_type = "text/plain"),
     ),
 )]
 pub async fn h_auth_login(
     State(state): State<ApiState>,
+    extensions: http::Extensions,
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
     if !state.credential_store.has_credentials() {
         return (StatusCode::NOT_FOUND, "authentication not configured").into_response();
     }
 
-    if !state
+    match state
         .credential_store
         .clone()
-        .validate_async(req.username, req.password)
+        .check_login(client_ip(&extensions), req.username, req.password)
         .await
     {
-        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        LoginOutcome::Ok => {}
+        LoginOutcome::Invalid => {
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+        LoginOutcome::Throttled { retry_after } => {
+            return LoginOutcome::too_many_requests(retry_after);
+        }
     }
 
     state.token_store.cleanup_expired();
@@ -921,5 +1214,193 @@ mod tests {
         store.set_credentials(alice()).unwrap();
         assert!(!target.exists());
         assert!(store.validate("alice", "correct horse"));
+    }
+
+    fn failing_hasher(_: &str) -> Result<String, std::io::Error> {
+        Err(std::io::Error::other("no entropy"))
+    }
+
+    #[test]
+    fn failed_migration_keeps_the_file_and_refuses_login_without_reopening_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
+        let plaintext = r#"{"username":"alice","password":"correct horse"}"#;
+        std::fs::write(&path, plaintext).unwrap();
+
+        let store = CredentialStore::open(temp.path().to_path_buf(), failing_hasher);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), plaintext);
+        assert!(store.has_credentials(), "setup must stay closed");
+        assert!(!store.validate("alice", "correct horse"));
+        assert!(matches!(
+            store.change_credentials("correct horse", None, Some("new".into())),
+            Err(ChangeCredentialsError::WrongPassword)
+        ));
+        let error = store.initialize_credentials(alice()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), plaintext);
+
+        // The next start with a working hasher migrates the kept file.
+        let retried = CredentialStore::new(temp.path().to_path_buf());
+        assert!(retried.validate("alice", "correct horse"));
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("correct horse")
+        );
+    }
+
+    #[test]
+    fn unusable_credentials_files_fail_closed() {
+        for contents in ["{not json", r#"{"username":"alice"}"#] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("credentials.json");
+            std::fs::write(&path, contents).unwrap();
+            let store = CredentialStore::new(temp.path().to_path_buf());
+            assert!(
+                store.has_credentials(),
+                "{contents}: setup must stay closed"
+            );
+            assert!(!store.validate("alice", ""));
+            assert!(store.initialize_credentials(alice()).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn a_plaintext_password_beside_the_hash_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.json");
+        let hash = hash_password("correct horse").unwrap();
+        let both = serde_json::json!({
+            "username": "alice",
+            "password_hash": hash,
+            "password": "stale plaintext",
+        });
+        std::fs::write(&path, both.to_string()).unwrap();
+
+        let store = CredentialStore::new(temp.path().to_path_buf());
+        assert!(store.validate("alice", "correct horse"));
+        assert!(!store.validate("alice", "stale plaintext"));
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(file.get("password").is_none(), "{file}");
+        assert_eq!(file["password_hash"], hash.as_str());
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hashing_work_is_capped_at_the_permit_count() {
+        use std::sync::atomic::AtomicUsize;
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(CredentialStore::new(temp.path().to_path_buf()));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..12)
+            .map(|_| {
+                let store = store.clone();
+                let running = running.clone();
+                let peak = peak.clone();
+                tokio::spawn(async move {
+                    store
+                        .run_hashing(move |_| {
+                            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(30));
+                            running.fetch_sub(1, Ordering::SeqCst);
+                        })
+                        .await
+                        .unwrap();
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), HASHING_PERMITS);
+    }
+
+    fn ip(last: u8) -> Option<IpAddr> {
+        Some(IpAddr::from([192, 0, 2, last]))
+    }
+
+    #[test]
+    fn throttle_locks_a_client_out_exponentially_after_repeated_failures() {
+        let throttle = LoginThrottle::default();
+        let start = Instant::now();
+        for _ in 0..CLIENT_FREE_FAILURES - 1 {
+            throttle.record_failure(ip(1), start);
+            assert!(throttle.check(ip(1), start).is_ok());
+        }
+        throttle.record_failure(ip(1), start);
+        assert_eq!(throttle.check(ip(1), start), Err(CLIENT_BASE_LOCKOUT));
+        assert!(throttle.check(ip(1), start + CLIENT_BASE_LOCKOUT).is_ok());
+        // Another client is unaffected.
+        assert!(throttle.check(ip(2), start).is_ok());
+
+        let later = start + CLIENT_BASE_LOCKOUT;
+        throttle.record_failure(ip(1), later);
+        assert_eq!(throttle.check(ip(1), later), Err(CLIENT_BASE_LOCKOUT * 2));
+        throttle.record_failure(ip(1), later);
+        assert_eq!(throttle.check(ip(1), later), Err(CLIENT_BASE_LOCKOUT * 4));
+        for _ in 0..20 {
+            throttle.record_failure(ip(1), later);
+        }
+        assert_eq!(throttle.check(ip(1), later), Err(CLIENT_MAX_LOCKOUT));
+
+        // A success clears the client's record.
+        throttle.record_success(ip(1));
+        assert!(throttle.check(ip(1), later).is_ok());
+
+        // Failures older than the window are forgotten.
+        for _ in 0..CLIENT_FREE_FAILURES {
+            throttle.record_failure(ip(3), start);
+        }
+        let quiet = start + CLIENT_FAILURE_WINDOW;
+        throttle.record_failure(ip(3), quiet);
+        assert!(throttle.check(ip(3), quiet).is_ok());
+    }
+
+    #[test]
+    fn throttle_caps_failures_across_all_clients() {
+        let throttle = LoginThrottle::default();
+        let start = Instant::now();
+        for n in 0..GLOBAL_MAX_FAILURES {
+            throttle.record_failure(ip(n as u8), start);
+        }
+        let retry = throttle.check(ip(250), start).unwrap_err();
+        assert_eq!(retry, GLOBAL_WINDOW);
+        assert!(throttle.check(ip(250), start + GLOBAL_WINDOW).is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_login_throttles_failures_but_not_successes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(CredentialStore::new(temp.path().to_path_buf()));
+        store.set_credentials(alice()).unwrap();
+        let login = |client, password: &str| {
+            store
+                .clone()
+                .check_login(client, "alice".into(), password.into())
+        };
+
+        // Successes are never counted: a correct login after a few failures
+        // succeeds and resets the client's count.
+        for _ in 0..CLIENT_FREE_FAILURES - 1 {
+            assert_eq!(login(ip(1), "wrong").await, LoginOutcome::Invalid);
+        }
+        assert_eq!(login(ip(1), "correct horse").await, LoginOutcome::Ok);
+        for _ in 0..CLIENT_FREE_FAILURES - 1 {
+            assert_eq!(login(ip(1), "wrong").await, LoginOutcome::Invalid);
+        }
+        assert_eq!(login(ip(1), "wrong").await, LoginOutcome::Invalid);
+
+        // Locked out: refused before any Argon2 work, even with the right
+        // password; other clients still log in.
+        assert!(matches!(
+            login(ip(1), "correct horse").await,
+            LoginOutcome::Throttled { .. }
+        ));
+        assert_eq!(login(ip(2), "correct horse").await, LoginOutcome::Ok);
     }
 }

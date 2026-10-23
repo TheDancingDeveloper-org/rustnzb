@@ -669,16 +669,21 @@ fn build_api_router(state: Arc<AppState>) -> Router {
                     }
                 };
 
-                if let Some((u, p)) = user_pass.split_once(':')
-                    && credential_store
-                        .clone()
-                        .validate_async(u.to_owned(), p.to_owned())
-                        .await
+                let Some((u, p)) = user_pass.split_once(':') else {
+                    return Err(ApiError::unauthorized());
+                };
+                let client = auth::client_ip(request.extensions());
+                match credential_store
+                    .clone()
+                    .check_login(client, u.to_owned(), p.to_owned())
+                    .await
                 {
-                    return Ok(next.run(request).await);
+                    auth::LoginOutcome::Ok => Ok(next.run(request).await),
+                    auth::LoginOutcome::Invalid => Err(ApiError::unauthorized()),
+                    auth::LoginOutcome::Throttled { retry_after } => {
+                        Ok(auth::LoginOutcome::too_many_requests(retry_after))
+                    }
                 }
-
-                Err(ApiError::unauthorized())
             }
         },
     );
@@ -733,12 +738,16 @@ pub async fn serve(state: Arc<AppState>, router: Router) -> anyhow::Result<()> {
 
     let timeout = shutdown_limit(config.general.shutdown_timeout_secs);
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            let _ = signal_tx.send(());
-        })
-        .into_future();
+    // The peer address feeds the failed-login throttle (auth::client_ip).
+    let server = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = signal_tx.send(());
+    })
+    .into_future();
     tokio::pin!(server);
 
     // Once a signal arrives, give open connections the shutdown timeout to
