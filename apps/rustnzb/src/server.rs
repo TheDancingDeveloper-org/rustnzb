@@ -670,7 +670,10 @@ fn build_api_router(state: Arc<AppState>) -> Router {
                 };
 
                 if let Some((u, p)) = user_pass.split_once(':')
-                    && credential_store.validate(u, p)
+                    && credential_store
+                        .clone()
+                        .validate_async(u.to_owned(), p.to_owned())
+                        .await
                 {
                     return Ok(next.run(request).await);
                 }
