@@ -34,6 +34,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
@@ -194,6 +195,9 @@ pub struct ServerBudget {
     state: Mutex<State>,
     /// Fired when a waiter queues and cannot be served from free permits.
     contended: tokio::sync::Notify,
+    /// Budgeted [`crate::ConnectionPool`]s (the WebDAV side) drawing from
+    /// this budget next to the downloader.
+    pools: AtomicUsize,
 }
 
 impl ServerBudget {
@@ -209,6 +213,7 @@ impl ServerBudget {
                 waiters: Default::default(),
             }),
             contended: tokio::sync::Notify::new(),
+            pools: AtomicUsize::new(0),
         })
     }
 
@@ -287,6 +292,21 @@ impl ServerBudget {
         let next = state.next_grantable();
         state.held[tier.idx()] += 1;
         next.is_some_and(|t| t != tier)
+    }
+
+    /// Whether a budgeted connection pool (the WebDAV side) shares this
+    /// budget with the downloader. When none does, the downloader is the
+    /// only consumer and has no reason to give idle permits back.
+    pub fn has_pools(&self) -> bool {
+        self.pools.load(Ordering::Relaxed) > 0
+    }
+
+    pub(crate) fn attach_pool(&self) {
+        self.pools.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn detach_pool(&self) {
+        self.pools.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Completes when a waiter queues and cannot be served from free
