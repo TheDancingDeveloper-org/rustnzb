@@ -206,6 +206,9 @@ auto_send_all = false
 # username = "plex"
 # password = "change-me"
 # api_key = "optional-api-key"
+# Percent of each server's connections kept free for playback while WebDAV
+# is enabled. The downloader and WebDAV share one allowance per server.
+# playback_reserve_pct = 25
 
 # Notifications for completed, failed and disk-full events. Each target is
 # off until its URL or topic is set. Changes take effect after a restart.

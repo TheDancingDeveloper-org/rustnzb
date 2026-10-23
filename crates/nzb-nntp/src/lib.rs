@@ -6,9 +6,11 @@
 //! - `connection` — Single NNTP connection state machine (TCP/TLS, auth, article fetch)
 //! - `pipeline` — Request pipelining (ARTICLE and STAT commands)
 //! - `pool` — Per-server async connection pool
+//! - `budget` — Per-server connection budget shared by all consumers, with priority tiers
 //! - `server` ��� Server health tracking, penalties, speed measurement
 //! - `downloader` — Download orchestrator (assigns articles to servers with failover)
 
+pub mod budget;
 pub mod capabilities;
 pub mod config;
 pub mod connection;
@@ -23,6 +25,7 @@ pub mod server;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testutil;
 
+pub use budget::{BudgetPermit, BudgetPolicy, BudgetRegistry, BudgetTier, ServerBudget};
 pub use capabilities::NntpCapabilities;
 pub use config::{Article, ListActiveEntry, ServerConfig};
 pub use connection::{

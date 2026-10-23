@@ -608,7 +608,14 @@ async fn main() -> anyhow::Result<()> {
         let data_dir = result.state.config().general.data_dir.clone();
         let dav_enabled = result.state.config().dav.enabled;
         let dav_handle: Option<Arc<rustnzb::dav::DavHandle>> = if dav_enabled {
-            rustnzb::dav::DavHandle::init(&data_dir, servers)
+            // WebDAV shares each server's allowance with the downloader; set
+            // its playback share aside before either side opens sockets.
+            let budgets = result.queue_manager.server_budgets();
+            budgets.set_policy(nzbdav_stream::nzb_nntp::budget::BudgetPolicy {
+                playback_reserve_pct: result.state.config().dav.playback_reserve_pct,
+                ..budgets.policy()
+            });
+            rustnzb::dav::DavHandle::init(&data_dir, servers, budgets)
                 .await
                 .inspect_err(|e| tracing::warn!("WebDAV init failed, running without it: {e}"))
                 .ok()

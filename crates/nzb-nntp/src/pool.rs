@@ -3,6 +3,12 @@
 //! Manages a configurable number of NNTP connections for a single server.
 //! Connections are created on demand up to the configured limit, returned
 //! to the pool after use, and replaced when they become unhealthy.
+//!
+//! A pool built with [`ConnectionPool::with_budget`] also takes a
+//! [`BudgetPermit`] from the server's shared [`ServerBudget`] for every
+//! socket it opens and holds it until the socket closes, idle or not, so the
+//! pool and any other consumer of the same budget stay within the provider's
+//! allowance together.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,6 +17,7 @@ use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
 
+use crate::budget::{BudgetPermit, BudgetTier, ServerBudget};
 use crate::config::ServerConfig;
 
 use crate::connection::{ConnectionState, NntpConnection};
@@ -37,6 +44,8 @@ pub struct PooledConnection {
     pub last_used: Instant,
     /// Semaphore reference for automatic permit release on drop.
     semaphore: Option<Arc<Semaphore>>,
+    /// The shared-budget permit this socket holds while it is open.
+    budget_permit: Option<BudgetPermit>,
 }
 
 impl PooledConnection {
@@ -47,6 +56,7 @@ impl PooledConnection {
             conn,
             last_used: Instant::now(),
             semaphore: None,
+            budget_permit: None,
         }
     }
 }
@@ -86,6 +96,8 @@ pub struct ConnectionPool {
     last_connect: tokio::sync::Mutex<Instant>,
     /// Minimum delay between new connection creations.
     ramp_up_delay: Duration,
+    /// Shared per-server budget and the tier this pool draws from.
+    budget: Option<(Arc<ServerBudget>, BudgetTier)>,
 }
 
 impl ConnectionPool {
@@ -101,6 +113,20 @@ impl ConnectionPool {
             last_connect: tokio::sync::Mutex::new(Instant::now() - Duration::from_secs(60)),
             ramp_up_delay,
             config,
+            budget: None,
+        }
+    }
+
+    /// Create a pool whose sockets also count against `budget`, taking
+    /// permits at `tier`. The pool's own limit stays `connections`.
+    pub fn with_budget(
+        config: Arc<ServerConfig>,
+        budget: Arc<ServerBudget>,
+        tier: BudgetTier,
+    ) -> Self {
+        Self {
+            budget: Some((budget, tier)),
+            ..Self::new(config)
         }
     }
 
@@ -122,7 +148,8 @@ impl ConnectionPool {
         );
 
         // Wait for a connection slot
-        let permit = tokio::time::timeout(ACQUIRE_TIMEOUT, self.semaphore.clone().acquire_owned())
+        let deadline = tokio::time::Instant::now() + ACQUIRE_TIMEOUT;
+        let permit = tokio::time::timeout_at(deadline, self.semaphore.clone().acquire_owned())
             .await
             .map_err(|_| {
                 warn!(
@@ -148,6 +175,8 @@ impl ConnectionPool {
 
         // Try to reuse an idle connection
         let maybe_idle = { self.idle.lock().pop() };
+        // A broken idle socket hands its budget permit to its replacement.
+        let mut carried_budget = None;
 
         if let Some(mut pooled) = maybe_idle {
             // The drop guard stays disarmed until the connection is actually
@@ -210,7 +239,30 @@ impl ConnectionPool {
                 );
             }
             // Connection is broken — fall through to create new
+            carried_budget = pooled.budget_permit.take();
         }
+
+        let budget_permit = match (carried_budget, &self.budget) {
+            (Some(carried), _) => Some(carried),
+            (None, Some((budget, tier))) => Some(
+                tokio::time::timeout_at(deadline, budget.acquire(*tier))
+                    .await
+                    .map_err(|_| {
+                        warn!(
+                            server = %self.config.name,
+                            tier = ?tier,
+                            held = budget.held_total(),
+                            total = budget.total(),
+                            "Pool acquire TIMED OUT waiting for the shared connection budget"
+                        );
+                        NntpError::Timeout(format!(
+                            "Timed out waiting for the connection budget of {}",
+                            self.config.name
+                        ))
+                    })?,
+            ),
+            (None, None) => None,
+        };
 
         // Create a new connection
         info!(
@@ -224,6 +276,7 @@ impl ConnectionPool {
             conn,
             last_used: Instant::now(),
             semaphore: Some(Arc::clone(&self.semaphore)),
+            budget_permit,
         })
     }
 
@@ -234,7 +287,20 @@ impl ConnectionPool {
     pub fn release(&self, mut pooled: PooledConnection) {
         // Disarm the drop guard — we're handling the permit ourselves.
         pooled.semaphore = None;
-        if pooled.conn.state == ConnectionState::Ready && pooled.conn.is_connected() {
+        // Another tier is waiting on the shared budget: close the socket so
+        // its permit passes on, rather than hoarding it idle.
+        let yield_budget = self
+            .budget
+            .as_ref()
+            .is_some_and(|(budget, tier)| budget.others_waiting(*tier));
+        if yield_budget {
+            debug!(
+                server = %self.config.name,
+                "Pool: closing connection on release to hand its budget permit on"
+            );
+            drop(pooled);
+            self.semaphore.add_permits(1);
+        } else if pooled.conn.state == ConnectionState::Ready && pooled.conn.is_connected() {
             pooled.last_used = Instant::now();
             let idle_after = {
                 let mut idle = self.idle.lock();
@@ -296,6 +362,27 @@ impl ConnectionPool {
         if count > 0 {
             debug!(server = %self.config.name, count, "Closed idle connections");
         }
+    }
+
+    /// Close idle connections unused for longer than `max_idle`, returning
+    /// their budget permits. Returns how many were closed.
+    pub async fn close_idle_older_than(&self, max_idle: Duration) -> usize {
+        let stale: Vec<PooledConnection> = {
+            let mut idle = self.idle.lock();
+            let (stale, fresh) = idle
+                .drain(..)
+                .partition(|c: &PooledConnection| c.last_used.elapsed() > max_idle);
+            *idle = fresh;
+            stale
+        };
+        let count = stale.len();
+        for mut c in stale {
+            let _ = c.conn.quit().await;
+        }
+        if count > 0 {
+            debug!(server = %self.config.name, count, "Closed stale idle connections");
+        }
+        count
     }
 
     /// The server configuration for this pool.
@@ -559,6 +646,79 @@ mod tests {
 
         pool.release(c2);
         assert_eq!(pool.available_permits(), 4);
+    }
+
+    fn open_budget(total: usize) -> Arc<ServerBudget> {
+        ServerBudget::new(
+            total,
+            crate::budget::BudgetPolicy {
+                playback_reserve_pct: 0,
+                repair_reserve_pct: 0,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn test_pool_with_budget_holds_permit_while_socket_open() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let budget = open_budget(2);
+        let pool = ConnectionPool::with_budget(
+            Arc::new(test_config(server.port())),
+            Arc::clone(&budget),
+            BudgetTier::Playback,
+        );
+
+        let c1 = pool.acquire().await.unwrap();
+        assert_eq!(budget.held(BudgetTier::Playback), 1);
+        pool.release(c1);
+        assert_eq!(
+            budget.held_total(),
+            1,
+            "an idle socket is still open at the provider"
+        );
+
+        // Reusing the idle socket takes no second permit.
+        let c2 = pool.acquire().await.unwrap();
+        assert_eq!(budget.held_total(), 1);
+        pool.release(c2);
+
+        assert_eq!(pool.close_idle_older_than(Duration::ZERO).await, 1);
+        assert_eq!(budget.held_total(), 0);
+
+        let c3 = pool.acquire().await.unwrap();
+        pool.discard(c3);
+        assert_eq!(budget.held_total(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pool_waits_for_budget_held_by_another_consumer() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let budget = open_budget(1);
+        let pool = Arc::new(ConnectionPool::with_budget(
+            Arc::new(test_config(server.port())),
+            Arc::clone(&budget),
+            BudgetTier::Playback,
+        ));
+        let elsewhere = budget.acquire(BudgetTier::Download).await;
+
+        let waiter = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move { pool.acquire().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "pool opened a socket over the budget"
+        );
+
+        drop(elsewhere);
+        let conn = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.held(BudgetTier::Playback), 1);
+        pool.release(conn);
     }
 
     #[tokio::test]

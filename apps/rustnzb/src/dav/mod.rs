@@ -15,6 +15,7 @@ use nzbdav_dav::store::DatabaseStore;
 use nzbdav_pipeline::queue_item_processor::{PipelineConfig, QueueItemProcessor};
 use nzbdav_stream::UsenetArticleProvider;
 use nzbdav_stream::nzb_nntp::ConnectionPool;
+use nzbdav_stream::nzb_nntp::budget::{BudgetRegistry, BudgetTier};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -30,7 +31,14 @@ pub struct DavHandle {
 }
 
 impl DavHandle {
-    pub async fn init(data_dir: &Path, servers: Vec<ServerConfig>) -> anyhow::Result<Self> {
+    /// Open the DAV library. Its NNTP pools draw from `budgets`, the same
+    /// per-server budgets the downloader uses, so the two together never
+    /// open more than a server's `connections`.
+    pub async fn init(
+        data_dir: &Path,
+        servers: Vec<ServerConfig>,
+        budgets: Arc<BudgetRegistry>,
+    ) -> anyhow::Result<Self> {
         let db_path = data_dir.join("nzbdav.db").to_string_lossy().to_string();
 
         // Open the DAV SQLite DB and seed root directories.
@@ -44,12 +52,26 @@ impl DavHandle {
         // ownership into DatabaseStore.
         let db_for_handle = Arc::clone(&dav_db);
 
-        // Build NNTP pools from rustnzbd's server configs (same nzb-nntp types).
-        let pools: Vec<Arc<ConnectionPool>> = servers
-            .into_iter()
-            .map(|s| Arc::new(ConnectionPool::new(Arc::new(s))))
-            .collect();
-        let provider = Arc::new(UsenetArticleProvider::new(pools));
+        // Build NNTP pools from rustnzbd's server configs (same nzb-nntp
+        // types). Reads served to /dav clients take playback permits; the
+        // ingest pipeline takes download permits like the downloader.
+        let pools_at = |tier: BudgetTier| -> Vec<Arc<ConnectionPool>> {
+            servers
+                .iter()
+                .map(|s| {
+                    let budget = budgets.ensure(&s.id, s.connections as usize);
+                    Arc::new(ConnectionPool::with_budget(
+                        Arc::new(s.clone()),
+                        budget,
+                        tier,
+                    ))
+                })
+                .collect()
+        };
+        let playback_pools = pools_at(BudgetTier::Playback);
+        let ingest_pools = pools_at(BudgetTier::Download);
+        let provider = Arc::new(UsenetArticleProvider::new(playback_pools.clone()));
+        let ingest_provider = Arc::new(UsenetArticleProvider::new(ingest_pools.clone()));
 
         let store = Arc::new(DatabaseStore::new(
             dav_db,
@@ -58,11 +80,15 @@ impl DavHandle {
         ));
 
         let cancel = CancellationToken::new();
+        spawn_idle_reaper(
+            playback_pools.into_iter().chain(ingest_pools).collect(),
+            cancel.clone(),
+        );
         let thread = {
             let db_path = db_path.clone();
             let cancel = cancel.clone();
             let processor = Arc::new(QueueItemProcessor::new(
-                Arc::clone(&provider),
+                ingest_provider,
                 PipelineConfig::default(),
             ));
             std::thread::Builder::new()
@@ -136,6 +162,27 @@ impl Drop for DavHandle {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
+}
+
+/// How long a DAV socket may sit idle before it is closed and its budget
+/// permit handed back to the downloader.
+const DAV_IDLE_CLOSE: Duration = Duration::from_secs(60);
+
+/// Close idle DAV sockets periodically. An idle socket is still open at the
+/// provider, so it keeps its budget permit until it is closed.
+fn spawn_idle_reaper(pools: Vec<Arc<ConnectionPool>>, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(DAV_IDLE_CLOSE / 2);
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                _ = tick.tick() => {}
+            }
+            for pool in &pools {
+                pool.close_idle_older_than(DAV_IDLE_CLOSE).await;
+            }
+        }
+    });
 }
 
 fn open_db(db_path: &str) -> anyhow::Result<SqliteDavDatabase> {

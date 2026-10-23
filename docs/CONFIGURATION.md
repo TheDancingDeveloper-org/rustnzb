@@ -315,6 +315,7 @@ The WebDAV media library, which streams files from Usenet on demand.
 | `category_rules` | `[]` | Categories sent to the library when `auto_send_all` is false. |
 | `username`, `password` | unset | Basic auth for `/dav`. |
 | `api_key` | unset | `X-Api-Key` header accepted instead of Basic auth. |
+| `playback_reserve_pct` | `25` | Percent of each server's `connections` kept free for playback (rounded up; the downloader always keeps at least one). The downloader and `/dav` share one allowance per server, so together they never open more than `connections`. Applies after a restart. |
 
 If `username`, `password` and `api_key` are all unset, `/dav` needs no
 authentication.
