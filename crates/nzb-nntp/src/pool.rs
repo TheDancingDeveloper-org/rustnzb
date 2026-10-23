@@ -388,6 +388,62 @@ impl ConnectionPool {
         count
     }
 
+    /// Close parked sockets while a waiter at another tier could take their
+    /// budget permits. Returns how many were closed.
+    pub async fn yield_idle_to_waiters(&self) -> usize {
+        let Some((budget, tier)) = &self.budget else {
+            return 0;
+        };
+        let mut closed = 0;
+        loop {
+            let conn = {
+                let mut idle = self.idle.lock();
+                if idle.is_empty() || !budget.wanted_elsewhere(*tier) {
+                    break;
+                }
+                idle.remove(0)
+            };
+            let mut conn = conn;
+            // Dropping the connection returns its permit to the waiter.
+            let _ = conn.conn.quit().await;
+            drop(conn);
+            closed += 1;
+        }
+        if closed > 0 {
+            debug!(
+                server = %self.config.name,
+                closed,
+                "Pool: closed idle connections to hand their budget permits on"
+            );
+        }
+        closed
+    }
+
+    /// Look after a budgeted pool's parked sockets until the future is
+    /// dropped: hand a parked socket's permit to a waiter at another tier as
+    /// soon as one could take it, and close sockets idle longer than
+    /// `max_idle`. Spawn it next to the pool and abort it to stop.
+    pub async fn manage_idle(&self, max_idle: Duration) {
+        const POLL: Duration = Duration::from_secs(1);
+        let mut last_sweep = Instant::now();
+        loop {
+            match &self.budget {
+                Some((budget, _)) => {
+                    tokio::select! {
+                        () = budget.contended() => {}
+                        () = tokio::time::sleep(POLL) => {}
+                    }
+                }
+                None => tokio::time::sleep(POLL).await,
+            }
+            self.yield_idle_to_waiters().await;
+            if last_sweep.elapsed() >= max_idle / 2 {
+                self.close_idle_older_than(max_idle).await;
+                last_sweep = Instant::now();
+            }
+        }
+    }
+
     /// The server configuration for this pool.
     pub fn config(&self) -> &ServerConfig {
         &self.config
@@ -785,6 +841,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(permit.tier(), BudgetTier::Download);
+    }
+
+    #[tokio::test]
+    async fn test_pool_manage_idle_hands_a_parked_socket_to_a_waiter() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let budget = open_budget(1);
+        let pool = Arc::new(ConnectionPool::with_budget(
+            Arc::new(test_config(server.port())),
+            Arc::clone(&budget),
+            BudgetTier::Import,
+        ));
+        let conn = pool.acquire().await.unwrap();
+        pool.release(conn);
+        assert_eq!(pool.idle_count(), 1);
+        let manager = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move { pool.manage_idle(Duration::from_secs(60)).await }
+        });
+        // Let the manager start listening for contention.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let permit = tokio::time::timeout(
+            Duration::from_millis(500),
+            budget.acquire(BudgetTier::Playback),
+        )
+        .await
+        .expect("the parked socket kept its permit from a waiting tier");
+        assert_eq!(permit.tier(), BudgetTier::Playback);
+        assert_eq!(pool.idle_count(), 0);
+        manager.abort();
     }
 
     #[tokio::test]
