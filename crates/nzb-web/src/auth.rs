@@ -592,6 +592,12 @@ impl CredentialStore {
         Some(value)
     }
 
+    /// Wrong passwords currently counted against `client` (see
+    /// [`LoginThrottle`]). For tests and diagnostics.
+    pub fn failed_attempts(&self, client: IpAddr) -> u32 {
+        self.throttle.failures(Some(client)).unwrap_or(0)
+    }
+
     /// Check a password login (the login endpoint or HTTP Basic auth) from
     /// `client` through [`CredentialStore::guarded_check`].
     pub async fn check_login(
@@ -812,7 +818,6 @@ impl LoginThrottle {
         self.clients.lock().remove(&client_key(client));
     }
 
-    #[cfg(test)]
     fn failures(&self, client: Option<IpAddr>) -> Option<u32> {
         self.clients
             .lock()
