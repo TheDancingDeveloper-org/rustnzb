@@ -4121,6 +4121,12 @@ pub(crate) const SETTINGS_AUDIT: &[(&str, Result<&str, &str>)] = &[
         Err("SSRF guard, as fetch_allow_private"),
     ),
     (
+        "general.trusted_proxies",
+        Err(
+            "login throttle trust boundary; a stolen session could let any address claim any client",
+        ),
+    ),
+    (
         "general.group_max_headers",
         Err("follow-up: newsgroup browsing settings get their own panel"),
     ),

@@ -117,6 +117,7 @@ The container image (built on the linuxserver.io Alpine base) also reads:
 | `script_max_output_bytes` | `1048576` | Script output kept. |
 | `fetch_allow_private` | `false` | Let URL fetches (add-url, SABnzbd `addurl`, RSS, SABnzbd import) reach private LAN addresses. Loopback and link-local addresses stay blocked. |
 | `fetch_allowed_hosts` | `[]` | Hosts that URL fetches may always reach: IP addresses, CIDR blocks or exact hostnames, such as `["prowlarr", "192.168.1.0/24"]`. |
+| `trusted_proxies` | `[]` | Reverse proxies whose `X-Forwarded-For` header is believed: IP addresses or CIDR blocks. Failed web logins are throttled per client address. Behind a reverse proxy every request arrives from the proxy, so all clients share one throttle until the proxy is listed here. For a reverse-proxied install (for example rustnzb behind Caddy), set it to the proxy's address or its Docker network, such as `["172.18.0.0/16"]`. The client is the rightmost `X-Forwarded-For` address that is not itself a trusted proxy. Leave it empty when rustnzb is reached directly; a listed address can then claim any client address. Read on every login, so a change needs no restart. |
 | `group_max_headers` | `100000` | Headers kept per newsgroup, oldest pruned first. `0` keeps all. |
 | `shutdown_timeout_secs` | `30` | Wait for connections and downloads on SIGINT/SIGTERM before exiting. `0` waits forever. |
 

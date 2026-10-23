@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -254,11 +254,114 @@ const HASHING_PERMITS: usize = 3;
 /// locked out to about one attempt per hold across all locked clients.
 const LOCKED_FAILURE_HOLD: Duration = Duration::from_secs(1);
 
+/// Locked-out attempts that may wait for the locked lane at once. A further
+/// attempt turns the oldest waiter away with a 429, unverified, so the queue,
+/// and the connections and bodies it holds, stays this small.
+const LOCKED_LANE_WAITERS: usize = 8;
+
+/// One attempt at a time from locked-out clients, newest first.
+///
+/// When the lane frees, the most recent waiter goes next, and joining a full
+/// queue turns the oldest waiter away. A fresh attempt, such as the operator
+/// typing the correct password, therefore waits for at most the attempt in
+/// progress, not behind a backlog of queued guesses. Nothing here can tell
+/// the operator from a guesser before Argon2 runs, so a client that keeps
+/// sending faster than the lane drains can still push a waiting attempt out;
+/// that attempt gets a prompt 429 rather than an unbounded wait.
+struct LockedLane {
+    state: parking_lot::Mutex<LaneState>,
+    max_waiters: usize,
+}
+
+#[derive(Default)]
+struct LaneState {
+    busy: bool,
+    /// Oldest at the front, newest at the back.
+    waiting: VecDeque<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// Holding the locked lane; dropping it hands the lane to the newest waiter.
+struct LanePass(Arc<LockedLane>);
+
+impl Drop for LanePass {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// A queued [`LockedLane::enter`]. If the caller is dropped after the lane
+/// was handed to it but before it took the pass, the lane is passed on.
+struct LaneWaiter {
+    lane: Arc<LockedLane>,
+    handed: tokio::sync::oneshot::Receiver<()>,
+    settled: bool,
+}
+
+impl Drop for LaneWaiter {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.handed.close();
+            if self.handed.try_recv().is_ok() {
+                self.lane.release();
+            }
+        }
+    }
+}
+
+impl LockedLane {
+    fn new(max_waiters: usize) -> Self {
+        Self {
+            state: parking_lot::Mutex::new(LaneState::default()),
+            max_waiters,
+        }
+    }
+
+    /// Wait for the lane. `None` if a newer attempt turned this one away.
+    async fn enter(self: &Arc<Self>) -> Option<LanePass> {
+        let handed = {
+            let mut state = self.state.lock();
+            if !state.busy {
+                state.busy = true;
+                return Some(LanePass(self.clone()));
+            }
+            let (hand, handed) = tokio::sync::oneshot::channel();
+            state.waiting.push_back(hand);
+            if state.waiting.len() > self.max_waiters {
+                // Dropping the sender answers the oldest waiter with `None`.
+                state.waiting.pop_front();
+            }
+            handed
+        };
+        let mut waiter = LaneWaiter {
+            lane: self.clone(),
+            handed,
+            settled: false,
+        };
+        let entered = (&mut waiter.handed).await.is_ok();
+        waiter.settled = true;
+        entered.then(|| LanePass(self.clone()))
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock();
+        while let Some(hand) = state.waiting.pop_back() {
+            if hand.send(()).is_ok() {
+                return;
+            }
+        }
+        state.busy = false;
+    }
+
+    #[cfg(test)]
+    fn waiting(&self) -> usize {
+        self.state.lock().waiting.len()
+    }
+}
+
 pub struct CredentialStore {
     account: RwLock<Option<Account>>,
     hashing: Arc<tokio::sync::Semaphore>,
-    /// One attempt at a time from locked-out clients.
-    locked_lane: Arc<tokio::sync::Semaphore>,
+    locked_lane: Arc<LockedLane>,
     locked_failure_hold: Duration,
     throttle: LoginThrottle,
     #[cfg(not(unix))]
@@ -289,7 +392,7 @@ impl CredentialStore {
         let store = Self {
             account: RwLock::new(None),
             hashing: Arc::new(tokio::sync::Semaphore::new(HASHING_PERMITS)),
-            locked_lane: Arc::new(tokio::sync::Semaphore::new(1)),
+            locked_lane: Arc::new(LockedLane::new(LOCKED_LANE_WAITERS)),
             locked_failure_hold: LOCKED_FAILURE_HOLD,
             throttle: LoginThrottle::default(),
             #[cfg(not(unix))]
@@ -563,12 +666,17 @@ impl CredentialStore {
     /// `check` verifies the password on the blocking pool, under the
     /// [`HASHING_PERMITS`] cap, and says how the throttle should count it.
     /// A client that is locked out (per address or globally) is still
-    /// verified, so the correct password always gets in, but its attempts go
-    /// one at a time through the locked lane, and each wrong one holds that
-    /// lane for [`LOCKED_FAILURE_HOLD`]. While locked out, guessing is
-    /// limited to about one attempt per hold across all locked clients. The
-    /// operator is only ever delayed, never refused. A wrong guess made while
-    /// locked out is answered as [`Guarded::Throttled`].
+    /// verified, so the correct password gets in, but its attempts go one at
+    /// a time through the [`LockedLane`], and each wrong one holds that lane
+    /// for [`LOCKED_FAILURE_HOLD`]. While locked out, guessing is limited to
+    /// about one attempt per hold across all locked clients. The lane serves
+    /// the newest attempt first and keeps at most [`LOCKED_LANE_WAITERS`]
+    /// waiting, so a fresh correct attempt waits for about one hold, not for
+    /// a queue of guesses. An attempt turned away from a full lane, and a
+    /// wrong guess made in the lane, are answered as [`Guarded::Throttled`].
+    /// Wrong guesses made in the lane extend the client's own lockout but do
+    /// not count toward the global cap, so one locked client cannot keep
+    /// every other client in the lane.
     ///
     /// The lockout is checked again once a hashing slot is held, so a burst
     /// that queued before the lockout began is moved to the locked lane
@@ -585,10 +693,15 @@ impl CredentialStore {
     {
         let mut lane = None;
         let hashing = loop {
-            if lane.is_none() && self.throttle.check(client, Instant::now()).is_err() {
+            if lane.is_none()
+                && let Err(retry_after) = self.throttle.check(client, Instant::now())
+            {
                 // The lane is taken before a hashing slot, never while one is
-                // held, so the two semaphores cannot deadlock.
-                lane = Some(self.locked_lane.clone().acquire_owned().await.ok()?);
+                // held, so the two cannot deadlock.
+                match self.locked_lane.enter().await {
+                    Some(pass) => lane = Some(pass),
+                    None => return Some(Guarded::Throttled { retry_after }),
+                }
             }
             let permit = self.hashing.clone().acquire_owned().await.ok()?;
             if lane.is_some() || self.throttle.check(client, Instant::now()).is_ok() {
@@ -617,7 +730,7 @@ impl CredentialStore {
                     }
                     Verdict::Neutral => Guarded::Done(value),
                     Verdict::Rejected => {
-                        store.throttle.record_failure(client, now);
+                        store.throttle.record_failure(client, now, !locked);
                         match store.throttle.check(client, now) {
                             Err(retry_after) if locked => Guarded::Throttled { retry_after },
                             _ => Guarded::Done(value),
@@ -744,15 +857,73 @@ impl LoginOutcome {
     }
 }
 
-/// The peer address axum records when the server is run with
-/// `into_make_service_with_connect_info::<SocketAddr>()`. Behind a reverse
-/// proxy this is the proxy's address, so every client shares one bucket;
-/// a locked bucket only slows guessing and never refuses the correct
-/// password (see [`CredentialStore::guarded_check`]).
-pub fn client_ip(extensions: &http::Extensions) -> Option<IpAddr> {
-    extensions
-        .get::<axum::extract::ConnectInfo<SocketAddr>>()
-        .map(|info| info.0.ip())
+/// The client address failed logins are counted against: the peer address
+/// axum records when the server is run with
+/// `into_make_service_with_connect_info::<SocketAddr>()`, or, when that peer
+/// is listed in `general.trusted_proxies`, the client it forwarded for (see
+/// [`forwarded_client`]). Without a trusted proxy, every client behind a
+/// reverse proxy shares the proxy's bucket.
+pub fn client_ip(
+    state: &AppState,
+    extensions: &http::Extensions,
+    headers: &http::HeaderMap,
+) -> Option<IpAddr> {
+    let peer = extensions
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()?
+        .0
+        .ip();
+    Some(forwarded_client(
+        peer,
+        headers,
+        &state.config().general.trusted_proxies,
+    ))
+}
+
+/// The client behind `peer`. `X-Forwarded-For` is believed only when `peer`
+/// is a trusted proxy. It is read right to left, since each proxy appends
+/// the address it received the request from: the first address that is not
+/// itself a trusted proxy is the client. An entry that does not parse stops
+/// the walk at the last trusted hop, so a forged or garbled header can only
+/// ever name an address no more specific than a trusted proxy.
+pub fn forwarded_client(
+    peer: IpAddr,
+    headers: &http::HeaderMap,
+    trusted_proxies: &[String],
+) -> IpAddr {
+    let networks: Vec<(IpAddr, u8)> = trusted_proxies
+        .iter()
+        .filter_map(|entry| crate::nzb_core::config::parse_ip_network(entry.trim()))
+        .collect();
+    let trusted = |ip: IpAddr| {
+        networks
+            .iter()
+            .any(|&(net, prefix)| crate::fetch_guard::network_contains(net, prefix, ip))
+    };
+    let peer = peer.to_canonical();
+    if !trusted(peer) {
+        return peer;
+    }
+    let mut client = peer;
+    for value in headers.get_all("x-forwarded-for").iter().rev() {
+        let Ok(value) = value.to_str() else {
+            return client;
+        };
+        for hop in value.rsplit(',') {
+            let hop = hop.trim();
+            let Some(ip) = hop
+                .parse::<IpAddr>()
+                .ok()
+                .or_else(|| hop.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
+            else {
+                return client;
+            };
+            client = ip.to_canonical();
+            if !trusted(client) {
+                return client;
+            }
+        }
+    }
+    client
 }
 
 // --- Failed-login throttle ---
@@ -828,13 +999,17 @@ impl LoginThrottle {
         Ok(())
     }
 
-    fn record_failure(&self, client: Option<IpAddr>, now: Instant) {
+    /// Count a failure against `client`, and against the global cap when
+    /// `global` (false for a guess made while already locked out).
+    fn record_failure(&self, client: Option<IpAddr>, now: Instant, global: bool) {
         let mut state = self.state.lock();
-        match state.global_window_start {
-            Some(start) if now < start + GLOBAL_WINDOW => state.global_failures += 1,
-            _ => {
-                state.global_window_start = Some(now);
-                state.global_failures = 1;
+        if global {
+            match state.global_window_start {
+                Some(start) if now < start + GLOBAL_WINDOW => state.global_failures += 1,
+                _ => {
+                    state.global_window_start = Some(now);
+                    state.global_failures = 1;
+                }
             }
         }
         if !state.clients.contains_key(&client) && state.clients.len() >= MAX_TRACKED_CLIENTS {
@@ -998,12 +1173,13 @@ pub struct ChangeCredentialsRequest {
 pub async fn h_auth_change_credentials(
     State(state): State<ApiState>,
     extensions: http::Extensions,
+    headers: http::HeaderMap,
     Json(req): Json<ChangeCredentialsRequest>,
 ) -> impl IntoResponse {
     let result = state
         .credential_store
         .check_change_credentials(
-            client_ip(&extensions),
+            client_ip(&state, &extensions, &headers),
             req.current_password,
             req.new_username,
             req.new_password,
@@ -1055,6 +1231,7 @@ pub async fn h_auth_change_credentials(
 pub async fn h_auth_login(
     State(state): State<ApiState>,
     extensions: http::Extensions,
+    headers: http::HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
     if !state.credential_store.has_credentials() {
@@ -1064,7 +1241,11 @@ pub async fn h_auth_login(
     match state
         .credential_store
         .clone()
-        .check_login(client_ip(&extensions), req.username, req.password)
+        .check_login(
+            client_ip(&state, &extensions, &headers),
+            req.username,
+            req.password,
+        )
         .await
     {
         LoginOutcome::Ok => {}
@@ -1446,22 +1627,22 @@ mod tests {
         let throttle = LoginThrottle::default();
         let start = Instant::now();
         for _ in 0..CLIENT_FREE_FAILURES - 1 {
-            throttle.record_failure(ip(1), start);
+            throttle.record_failure(ip(1), start, true);
             assert!(throttle.check(ip(1), start).is_ok());
         }
-        throttle.record_failure(ip(1), start);
+        throttle.record_failure(ip(1), start, true);
         assert_eq!(throttle.check(ip(1), start), Err(CLIENT_BASE_LOCKOUT));
         assert!(throttle.check(ip(1), start + CLIENT_BASE_LOCKOUT).is_ok());
         // Another client is unaffected.
         assert!(throttle.check(ip(2), start).is_ok());
 
         let later = start + CLIENT_BASE_LOCKOUT;
-        throttle.record_failure(ip(1), later);
+        throttle.record_failure(ip(1), later, true);
         assert_eq!(throttle.check(ip(1), later), Err(CLIENT_BASE_LOCKOUT * 2));
-        throttle.record_failure(ip(1), later);
+        throttle.record_failure(ip(1), later, true);
         assert_eq!(throttle.check(ip(1), later), Err(CLIENT_BASE_LOCKOUT * 4));
         for _ in 0..20 {
-            throttle.record_failure(ip(1), later);
+            throttle.record_failure(ip(1), later, true);
         }
         assert_eq!(throttle.check(ip(1), later), Err(CLIENT_MAX_LOCKOUT));
 
@@ -1471,10 +1652,10 @@ mod tests {
 
         // Failures older than the window are forgotten.
         for _ in 0..CLIENT_FREE_FAILURES {
-            throttle.record_failure(ip(3), start);
+            throttle.record_failure(ip(3), start, true);
         }
         let quiet = start + CLIENT_FAILURE_WINDOW;
-        throttle.record_failure(ip(3), quiet);
+        throttle.record_failure(ip(3), quiet, true);
         assert!(throttle.check(ip(3), quiet).is_ok());
     }
 
@@ -1483,7 +1664,7 @@ mod tests {
         let throttle = LoginThrottle::default();
         let start = Instant::now();
         for n in 0..GLOBAL_MAX_FAILURES {
-            throttle.record_failure(ip(n as u8), start);
+            throttle.record_failure(ip(n as u8), start, true);
         }
         let retry = throttle.check(ip(250), start).unwrap_err();
         assert_eq!(retry, GLOBAL_WINDOW);
@@ -1536,7 +1717,7 @@ mod tests {
         let store = fast_store(&temp);
         let now = Instant::now();
         for n in 0..GLOBAL_MAX_FAILURES {
-            store.throttle.record_failure(ip(n as u8), now);
+            store.throttle.record_failure(ip(n as u8), now, true);
         }
         assert!(store.throttle.check(ip(200), now).is_err());
 
@@ -1628,5 +1809,174 @@ mod tests {
             "{:?} < {paced:?}",
             started.elapsed()
         );
+    }
+
+    /// Wait until `lane` has `count` waiters, letting spawned tasks run.
+    async fn until_waiting(lane: &LockedLane, count: usize) {
+        while lane.waiting() != count {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_locked_lane_serves_the_newest_waiter_and_turns_the_oldest_away() {
+        let lane = Arc::new(LockedLane::new(2));
+        let first = lane.enter().await.unwrap();
+        let (order_tx, mut order) = tokio::sync::mpsc::unbounded_channel();
+        for (name, waiting) in [("a", 1), ("b", 2), ("c", 2)] {
+            let joining = lane.clone();
+            let order_tx = order_tx.clone();
+            tokio::spawn(async move {
+                let pass = joining.enter().await;
+                order_tx.send((name, pass.is_some())).unwrap();
+            });
+            if name != "c" {
+                until_waiting(&lane, waiting).await;
+            }
+        }
+        // The third waiter pushed the oldest out of the full queue.
+        assert_eq!(order.recv().await, Some(("a", false)));
+        // Freed, the lane goes to the newest waiter first.
+        drop(first);
+        assert_eq!(order.recv().await, Some(("c", true)));
+        assert_eq!(order.recv().await, Some(("b", true)));
+        assert_eq!(lane.waiting(), 0);
+        assert!(lane.enter().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_waiter_dropped_after_being_handed_the_lane_passes_it_on() {
+        let lane = Arc::new(LockedLane::new(2));
+        let first = lane.enter().await.unwrap();
+        let mut entering = Box::pin(lane.enter());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut entering)
+                .await
+                .is_err()
+        );
+        // The lane is handed to the waiter, which is dropped unpolled.
+        drop(first);
+        drop(entering);
+        tokio::time::timeout(Duration::from_secs(1), lane.enter())
+            .await
+            .expect("the lane was lost")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_correct_login_gets_through_a_queued_flood_quickly() {
+        let temp = tempfile::tempdir().unwrap();
+        // The real one-second hold, so the bound below is the shipped one.
+        let store = CredentialStore::new(temp.path().to_path_buf());
+        store.set_credentials(alice()).unwrap();
+        let store = Arc::new(store);
+        let now = Instant::now();
+        for _ in 0..CLIENT_FREE_FAILURES {
+            store.throttle.record_failure(ip(1), now, true);
+        }
+        let global_before = store.throttle.state.lock().global_failures;
+
+        const FLOOD: usize = 40;
+        let flood: Vec<_> = (0..FLOOD)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store
+                        .check_login(ip(1), "alice".into(), "wrong".into())
+                        .await
+                })
+            })
+            .collect();
+        until_waiting(&store.locked_lane, LOCKED_LANE_WAITERS).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Beyond the queue, the flood was answered at once, unverified.
+        let answered = flood.iter().filter(|task| task.is_finished()).count();
+        assert!(answered >= FLOOD - 1 - LOCKED_LANE_WAITERS, "{answered}");
+
+        // Another client is not locked: the flood did not trip the global
+        // cap, so it logs in without waiting for the lane.
+        let started = Instant::now();
+        assert_eq!(
+            store
+                .clone()
+                .check_login(ip(2), "alice".into(), "correct horse".into())
+                .await,
+            LoginOutcome::Ok
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        // The flooded client's own correct attempt waits for about one
+        // hold, not for the queued guesses.
+        let started = Instant::now();
+        assert_eq!(
+            store
+                .clone()
+                .check_login(ip(1), "alice".into(), "correct horse".into())
+                .await,
+            LoginOutcome::Ok
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        // Guesses made in the lane never counted globally.
+        assert_eq!(store.throttle.state.lock().global_failures, global_before);
+        for task in flood {
+            task.abort();
+        }
+    }
+
+    #[test]
+    fn x_forwarded_for_is_believed_only_from_a_trusted_proxy() {
+        let headers = |values: &[&str]| {
+            let mut headers = http::HeaderMap::new();
+            for value in values {
+                headers.append("x-forwarded-for", value.parse().unwrap());
+            }
+            headers
+        };
+        let addr = |s: &str| s.parse::<IpAddr>().unwrap();
+        let proxy = addr("172.18.0.5");
+        let trusted = vec!["172.18.0.0/16".to_owned(), "10.0.0.1".to_owned()];
+        let client = |peer, values: &[&str], trusted: &[String]| {
+            forwarded_client(peer, &headers(values), trusted)
+        };
+
+        // No trusted proxies: the header is ignored.
+        assert_eq!(client(proxy, &["203.0.113.7"], &[]), proxy);
+        // An untrusted peer cannot claim another address.
+        assert_eq!(
+            client(addr("198.51.100.9"), &["203.0.113.7"], &trusted),
+            addr("198.51.100.9")
+        );
+        // A trusted peer: the rightmost untrusted address is the client, so
+        // an address the client prepended itself is not believed.
+        assert_eq!(
+            client(proxy, &["203.0.113.7"], &trusted),
+            addr("203.0.113.7")
+        );
+        assert_eq!(
+            client(proxy, &["198.51.100.1, 203.0.113.7, 10.0.0.1"], &trusted),
+            addr("203.0.113.7")
+        );
+        assert_eq!(
+            client(proxy, &["198.51.100.1", "203.0.113.7"], &trusted),
+            addr("203.0.113.7")
+        );
+        // An IPv4-mapped peer matches an IPv4 network; ports are dropped.
+        assert_eq!(
+            client(addr("::ffff:172.18.0.5"), &["203.0.113.7:4711"], &trusted),
+            addr("203.0.113.7")
+        );
+        // A garbled entry stops at the last trusted hop.
+        assert_eq!(client(proxy, &["203.0.113.7, nonsense"], &trusted), proxy);
+        assert_eq!(
+            client(proxy, &["203.0.113.7, nonsense, 10.0.0.1"], &trusted),
+            addr("10.0.0.1")
+        );
+        // No header, or only trusted hops: the last trusted address.
+        assert_eq!(client(proxy, &[], &trusted), proxy);
+        assert_eq!(client(proxy, &["10.0.0.1"], &trusted), addr("10.0.0.1"));
     }
 }

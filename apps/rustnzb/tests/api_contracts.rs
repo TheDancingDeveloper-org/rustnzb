@@ -27,9 +27,17 @@ impl Drop for ContractApp {
 }
 
 async fn start_app(with_credentials: bool) -> ContractApp {
+    start_app_with(with_credentials, |_| {}).await
+}
+
+async fn start_app_with(
+    with_credentials: bool,
+    configure: impl FnOnce(&mut AppConfig),
+) -> ContractApp {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
-    let config = AppConfig::default();
+    let mut config = AppConfig::default();
+    configure(&mut config);
     config.save(&config_path).unwrap();
     let logs = LogBuffer::new();
     let queue = QueueManager::new(
@@ -265,6 +273,108 @@ async fn failed_logins_are_tracked_per_client_address() {
 
     // The attacker's address is still locked for wrong guesses.
     assert_eq!(password_login(&app, &attacker, "wrong").await.status(), 429);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_correct_login_completes_while_a_flood_of_guesses_is_queued() {
+    let app = start_app(true).await;
+    let attacker = client_from([127, 0, 0, 2]);
+    let operator = client_from([127, 0, 0, 3]);
+    for _ in 0..5 {
+        assert_eq!(password_login(&app, &attacker, "wrong").await.status(), 401);
+    }
+
+    // Queue a flood of wrong guesses from the locked-out address.
+    let base_url = app.base_url.clone();
+    let flood: Vec<_> = (0..40)
+        .map(|_| {
+            let attacker = attacker.clone();
+            let url = format!("{base_url}/api/auth/login");
+            tokio::spawn(async move {
+                attacker
+                    .post(url)
+                    .json(&serde_json::json!({"username":"admin","password":"wrong"}))
+                    .send()
+                    .await
+                    .map(|response| response.status().as_u16())
+            })
+        })
+        .collect();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // From another address and from the flooded one, the correct password
+    // logs in within a bounded time.
+    for client in [&operator, &attacker] {
+        let started = std::time::Instant::now();
+        assert_eq!(password_login(&app, client, "password").await.status(), 200);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+    for task in flood {
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn x_forwarded_for_names_the_client_only_behind_a_trusted_proxy() {
+    let login = |app: &ContractApp, forwarded_for: &'static str| {
+        reqwest::Client::new()
+            .post(format!("{}/api/auth/login", app.base_url))
+            .header("X-Forwarded-For", forwarded_for)
+            .json(&serde_json::json!({"username":"admin","password":"wrong"}))
+            .send()
+    };
+
+    // Not trusted: every forwarded address shares the peer's count.
+    let app = start_app(true).await;
+    for _ in 0..5 {
+        assert_eq!(login(&app, "203.0.113.1").await.unwrap().status(), 401);
+    }
+    assert_eq!(login(&app, "203.0.113.2").await.unwrap().status(), 429);
+
+    // Trusted: each forwarded client has its own count, and an address the
+    // client prepends itself is not believed.
+    let app = start_app_with(true, |config| {
+        config.general.trusted_proxies = vec!["127.0.0.0/8".into(), "::1".into()];
+    })
+    .await;
+    for _ in 0..5 {
+        assert_eq!(login(&app, "203.0.113.1").await.unwrap().status(), 401);
+    }
+    assert_eq!(login(&app, "203.0.113.1").await.unwrap().status(), 429);
+    assert_eq!(login(&app, "203.0.113.2").await.unwrap().status(), 401);
+    assert_eq!(
+        login(&app, "203.0.113.2, 203.0.113.1")
+            .await
+            .unwrap()
+            .status(),
+        429
+    );
+}
+
+#[tokio::test]
+async fn auth_endpoints_refuse_oversized_bodies() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let padding = "x".repeat(rustnzb::server::AUTH_BODY_LIMIT);
+    for path in ["login", "change_credentials", "refresh", "setup"] {
+        let response = client
+            .post(format!("{}/api/auth/{path}", app.base_url))
+            .header("Content-Type", "application/json")
+            .body(format!(r#"{{"username":"admin","password":"{padding}"}}"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test]
