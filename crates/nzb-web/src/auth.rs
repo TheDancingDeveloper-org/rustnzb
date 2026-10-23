@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -214,10 +214,6 @@ pub enum ChangeCredentialsError {
     WrongPassword,
     Empty,
     Io(std::io::Error),
-    /// A wrong current password while locked out.
-    Throttled {
-        retry_after: Duration,
-    },
 }
 
 fn hash_password(password: &str) -> Result<String, std::io::Error> {
@@ -249,152 +245,9 @@ const LOCKED_HASH: &str = "";
 /// blocking threads that unauthenticated requests can claim.
 const HASHING_PERMITS: usize = 3;
 
-/// How long a wrong password from a locked-out client holds the locked lane
-/// (see [`CredentialStore::guarded_check`]). This bounds guessing while
-/// locked out to about one attempt per hold across all locked clients.
-const LOCKED_FAILURE_HOLD: Duration = Duration::from_secs(1);
-
-/// Clients that may wait for the locked lane at once, one attempt each. A
-/// client joining a full queue is turned away with a 429, unverified, so the
-/// queue, and the connections and bodies it holds, stays this small.
-const LOCKED_LANE_WAITERS: usize = 8;
-
-/// Attempts one client with no failures of its own may have in flight at
-/// once while the global cap applies (see [`CredentialStore::guarded_check`]).
-/// Further attempts from it go to the locked lane.
-const CLEAN_ATTEMPTS_PER_CLIENT: usize = 2;
-
-/// One attempt at a time from locked-out clients, in the order the clients
-/// joined, with one waiting attempt per client.
-///
-/// A newer attempt from a client already waiting replaces its older one,
-/// which is turned away with a 429, and keeps the client's place. A fresh
-/// attempt, such as the operator typing the correct password, therefore
-/// waits behind at most one attempt from each other waiting client, however
-/// fast they send. Nothing here can tell the operator from a guesser on the
-/// same address before Argon2 runs, so a client that keeps sending faster
-/// than the lane drains can still replace its own waiting attempt; that
-/// attempt gets a prompt 429 rather than an unbounded wait.
-struct LockedLane {
-    state: parking_lot::Mutex<LaneState>,
-    max_waiters: usize,
-}
-
-#[derive(Default)]
-struct LaneState {
-    busy: bool,
-    /// One waiter per client, in the order the clients joined.
-    waiting: VecDeque<(Option<IpAddr>, tokio::sync::oneshot::Sender<()>)>,
-}
-
-/// Holding the locked lane; dropping it hands the lane to the next waiter.
-struct LanePass(Arc<LockedLane>);
-
-impl Drop for LanePass {
-    fn drop(&mut self) {
-        self.0.release();
-    }
-}
-
-/// A queued [`LockedLane::enter`]. If the caller is dropped after the lane
-/// was handed to it but before it took the pass, the lane is passed on.
-struct LaneWaiter {
-    lane: Arc<LockedLane>,
-    handed: tokio::sync::oneshot::Receiver<()>,
-    settled: bool,
-}
-
-impl Drop for LaneWaiter {
-    fn drop(&mut self) {
-        if !self.settled {
-            self.handed.close();
-            if self.handed.try_recv().is_ok() {
-                self.lane.release();
-            }
-        }
-    }
-}
-
-impl LockedLane {
-    fn new(max_waiters: usize) -> Self {
-        Self {
-            state: parking_lot::Mutex::new(LaneState::default()),
-            max_waiters,
-        }
-    }
-
-    /// Wait for the lane as `client` (a [`client_key`]). `None` if the queue
-    /// was full or a newer attempt from the same client replaced this one.
-    async fn enter(self: &Arc<Self>, client: Option<IpAddr>) -> Option<LanePass> {
-        let handed = {
-            let mut state = self.state.lock();
-            if !state.busy {
-                state.busy = true;
-                return Some(LanePass(self.clone()));
-            }
-            let (hand, handed) = tokio::sync::oneshot::channel();
-            state.waiting.retain(|(_, waiter)| !waiter.is_closed());
-            if let Some((_, waiter)) = state.waiting.iter_mut().find(|(c, _)| *c == client) {
-                // Dropping the replaced sender answers that waiter with `None`.
-                *waiter = hand;
-            } else if state.waiting.len() < self.max_waiters {
-                state.waiting.push_back((client, hand));
-            } else {
-                return None;
-            }
-            handed
-        };
-        let mut waiter = LaneWaiter {
-            lane: self.clone(),
-            handed,
-            settled: false,
-        };
-        let entered = (&mut waiter.handed).await.is_ok();
-        waiter.settled = true;
-        entered.then(|| LanePass(self.clone()))
-    }
-
-    fn release(&self) {
-        let mut state = self.state.lock();
-        while let Some((_, hand)) = state.waiting.pop_front() {
-            if hand.send(()).is_ok() {
-                return;
-            }
-        }
-        state.busy = false;
-    }
-
-    #[cfg(test)]
-    fn waiting(&self) -> usize {
-        self.state.lock().waiting.len()
-    }
-}
-
-/// One attempt in flight from a client with no failures of its own while the
-/// global cap applies; dropping it frees the client's slot.
-struct CleanSlot {
-    slots: Arc<parking_lot::Mutex<HashMap<Option<IpAddr>, usize>>>,
-    client: Option<IpAddr>,
-}
-
-impl Drop for CleanSlot {
-    fn drop(&mut self) {
-        let mut slots = self.slots.lock();
-        if let Some(count) = slots.get_mut(&self.client) {
-            *count -= 1;
-            if *count == 0 {
-                slots.remove(&self.client);
-            }
-        }
-    }
-}
-
 pub struct CredentialStore {
     account: RwLock<Option<Account>>,
     hashing: Arc<tokio::sync::Semaphore>,
-    locked_lane: Arc<LockedLane>,
-    clean_slots: Arc<parking_lot::Mutex<HashMap<Option<IpAddr>, usize>>>,
-    locked_failure_hold: Duration,
     throttle: LoginThrottle,
     #[cfg(not(unix))]
     file_path: PathBuf,
@@ -424,9 +277,6 @@ impl CredentialStore {
         let store = Self {
             account: RwLock::new(None),
             hashing: Arc::new(tokio::sync::Semaphore::new(HASHING_PERMITS)),
-            locked_lane: Arc::new(LockedLane::new(LOCKED_LANE_WAITERS)),
-            clean_slots: Default::default(),
-            locked_failure_hold: LOCKED_FAILURE_HOLD,
             throttle: LoginThrottle::default(),
             #[cfg(not(unix))]
             file_path: file_path.clone(),
@@ -673,10 +523,11 @@ impl CredentialStore {
     }
 
     /// Run Argon2 work (`f`) on the blocking thread pool, at most
-    /// [`HASHING_PERMITS`] at a time. The permit moves into the blocking task,
-    /// so a client that disconnects does not free its slot early. Returns
-    /// `None` if the task panicked. This applies no failure throttling: a
-    /// password check goes through [`CredentialStore::guarded_check`].
+    /// [`HASHING_PERMITS`] at a time, first come first served (tokio's
+    /// semaphore is fair). The permit moves into the blocking task, so a
+    /// client that disconnects does not free its slot early. Returns `None`
+    /// if the task panicked. This applies no failure delay: a password check
+    /// goes through [`CredentialStore::guarded_check`].
     pub async fn run_hashing<T, F>(self: &Arc<Self>, f: F) -> Option<T>
     where
         T: Send + 'static,
@@ -694,170 +545,75 @@ impl CredentialStore {
 
     /// The one path every password guess takes (the login endpoint, HTTP
     /// Basic auth and the current password of a credential change), so they
-    /// share the failed-attempt throttle and cannot diverge.
+    /// share the failed-login delay and cannot diverge.
     ///
-    /// `check` verifies the password on the blocking pool, under the
-    /// [`HASHING_PERMITS`] cap, and says how the throttle should count it.
-    /// Each client's own failure record (see [`client_key`]) decides its
-    /// path:
-    ///
-    /// - Not throttled: verified directly.
-    /// - No failures of its own, but the global cap is tripped: verified
-    ///   directly, with at most [`CLEAN_ATTEMPTS_PER_CLIENT`] in flight per
-    ///   client. These attempts never queue with locked-out clients, and the
-    ///   locked lane holds at most one hashing slot, so a flood from other
-    ///   addresses cannot delay or displace them. A wrong guess here counts,
-    ///   so the client is no longer clean and its next guess is paced.
-    /// - Locked out, or with failures of its own (or untracked) while the
-    ///   global cap is tripped: still verified, so the correct password gets
-    ///   in, but one at a time through the [`LockedLane`], and each wrong
-    ///   guess holds that lane for [`LOCKED_FAILURE_HOLD`]. While locked out,
-    ///   guessing is limited to about one attempt per hold across all locked
-    ///   clients. The lane keeps one waiting attempt per client, newest
-    ///   first, and serves clients in turn, so a fresh correct attempt waits
-    ///   behind at most one attempt from each other waiting client. An
-    ///   attempt turned away from the lane, and a wrong guess made in it, are
-    ///   answered as [`Guarded::Throttled`]. Wrong guesses made in the lane
-    ///   extend the client's own lockout but do not count toward the global
-    ///   cap.
-    ///
-    /// The throttle is checked again once a hashing slot is held, so a burst
-    /// that queued before the lockout began is moved to the locked lane
-    /// instead of each attempt getting a free verification. Returns `None` if
-    /// the check panicked.
+    /// `check` verifies the password through [`CredentialStore::run_hashing`]
+    /// and says how to count it. Every attempt is verified; none is refused.
+    /// A correct password is answered as soon as it is verified and clears
+    /// the client's failures. A wrong one is answered only after the client's
+    /// failure delay (see [`LoginThrottle`]). The result is recorded in the
+    /// blocking task, so a client that disconnects early is still counted.
+    /// Returns `None` if the check panicked.
     pub async fn guarded_check<T, F>(
         self: &Arc<Self>,
         client: Option<IpAddr>,
         check: F,
-    ) -> Option<Guarded<T>>
+    ) -> Option<T>
     where
         T: Send + 'static,
         F: FnOnce(&CredentialStore) -> (T, Verdict) + Send + 'static,
     {
-        let client = client_key(client);
-        let mut lane = None;
-        let mut clean = None;
-        let hashing = loop {
-            if lane.is_none()
-                && let Err(retry_after) = self.admit(client, &mut clean)
-            {
-                // The lane is taken before a hashing slot, never while one is
-                // held, so the two cannot deadlock.
-                match self.locked_lane.enter(client).await {
-                    Some(pass) => lane = Some(pass),
-                    None => return Some(Guarded::Throttled { retry_after }),
-                }
-            }
-            let permit = self.hashing.clone().acquire_owned().await.ok()?;
-            if lane.is_some() || self.admit(client, &mut clean).is_ok() {
-                break permit;
-            }
-            drop(permit);
-        };
-
-        // The work runs in its own task holding both permits, so a client
-        // that disconnects frees neither the hashing slot nor the lane early.
-        let (reply, response) = tokio::sync::oneshot::channel();
-        let store = self.clone();
-        let hold = self.locked_failure_hold;
-        tokio::spawn(async move {
-            let locked = lane.is_some();
-            let _clean = clean;
-            let checked = tokio::task::spawn_blocking(move || {
-                // The result is recorded before the hashing slot is freed, so
-                // the next attempt's re-check already sees this failure.
-                let _hashing = hashing;
-                let (value, verdict) = check(&store);
-                let now = Instant::now();
-                let outcome = match verdict {
+        let (value, delay) = self
+            .run_hashing(move |store| {
+                let (value, verdict) = check(store);
+                let delay = match verdict {
                     Verdict::Accepted => {
                         store.throttle.record_success(client);
-                        Guarded::Done(value)
+                        Duration::ZERO
                     }
-                    Verdict::Neutral => Guarded::Done(value),
                     Verdict::Rejected => {
-                        store.throttle.record_failure(client, now, !locked);
-                        match store.throttle.check(client, now) {
-                            Err(retry_after) if locked => Guarded::Throttled { retry_after },
-                            _ => Guarded::Done(value),
-                        }
+                        tracing::warn!(
+                            "Failed web login from {}",
+                            client.map_or_else(
+                                || "an unknown address".to_owned(),
+                                |ip| ip.to_string()
+                            )
+                        );
+                        store.throttle.record_failure(client, Instant::now())
                     }
+                    Verdict::Neutral => Duration::ZERO,
                 };
-                (outcome, verdict)
+                (value, delay)
             })
-            .await;
-            let Ok((outcome, verdict)) = checked else {
-                return;
-            };
-            let _ = reply.send(outcome);
-            if lane.is_some() && verdict == Verdict::Rejected {
-                tokio::time::sleep(hold).await;
-            }
-            drop(lane);
-        });
-        response.await.ok()
-    }
-
-    /// Whether `client` may be verified without the locked lane: when it is
-    /// not throttled, or when only the global cap applies and it gets (or
-    /// already holds) a [`CleanSlot`]. Otherwise `Err(retry_after)`.
-    fn admit(&self, client: Option<IpAddr>, clean: &mut Option<CleanSlot>) -> Result<(), Duration> {
-        match self.throttle.gate(client, Instant::now()) {
-            Gate::Open => Ok(()),
-            Gate::Clean { retry_after } => {
-                if clean.is_none() {
-                    *clean = self.clean_slot(client);
-                }
-                clean.as_ref().map(|_| ()).ok_or(retry_after)
-            }
-            Gate::Locked { retry_after } => {
-                *clean = None;
-                Err(retry_after)
-            }
+            .await?;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
-    }
-
-    fn clean_slot(&self, client: Option<IpAddr>) -> Option<CleanSlot> {
-        let mut slots = self.clean_slots.lock();
-        let count = slots.entry(client).or_default();
-        if *count >= CLEAN_ATTEMPTS_PER_CLIENT {
-            return None;
-        }
-        *count += 1;
-        Some(CleanSlot {
-            slots: self.clean_slots.clone(),
-            client,
-        })
+        Some(value)
     }
 
     /// Check a password login (the login endpoint or HTTP Basic auth) from
-    /// `client` through [`CredentialStore::guarded_check`]. A success clears
-    /// the client's failure count and is never counted.
+    /// `client` through [`CredentialStore::guarded_check`].
     pub async fn check_login(
         self: Arc<Self>,
         client: Option<IpAddr>,
         username: String,
         password: String,
     ) -> LoginOutcome {
-        let checked = self
-            .guarded_check(client, move |store| {
-                if store.validate(&username, &password) {
-                    (LoginOutcome::Ok, Verdict::Accepted)
-                } else {
-                    (LoginOutcome::Invalid, Verdict::Rejected)
-                }
-            })
-            .await;
-        match checked {
-            Some(Guarded::Done(outcome)) => outcome,
-            Some(Guarded::Throttled { retry_after }) => LoginOutcome::Throttled { retry_after },
-            None => LoginOutcome::Invalid,
-        }
+        self.guarded_check(client, move |store| {
+            if store.validate(&username, &password) {
+                (LoginOutcome::Ok, Verdict::Accepted)
+            } else {
+                (LoginOutcome::Invalid, Verdict::Rejected)
+            }
+        })
+        .await
+        .unwrap_or(LoginOutcome::Invalid)
     }
 
     /// [`CredentialStore::change_credentials`] through
     /// [`CredentialStore::guarded_check`]: the current password is a guess
-    /// like a login and is throttled the same way.
+    /// like a login and is delayed the same way when wrong.
     pub async fn check_change_credentials(
         self: &Arc<Self>,
         client: Option<IpAddr>,
@@ -865,28 +621,22 @@ impl CredentialStore {
         new_username: Option<String>,
         new_password: Option<String>,
     ) -> Result<(), ChangeCredentialsError> {
-        let checked = self
-            .guarded_check(client, move |store| {
-                let result =
-                    store.change_credentials(&current_password, new_username, new_password);
-                let verdict = match &result {
-                    Err(ChangeCredentialsError::WrongPassword) => Verdict::Rejected,
-                    Err(ChangeCredentialsError::NotConfigured) => Verdict::Neutral,
-                    // The current password was right; the change failed later.
-                    _ => Verdict::Accepted,
-                };
-                (result, verdict)
-            })
-            .await;
-        match checked {
-            Some(Guarded::Done(result)) => result,
-            Some(Guarded::Throttled { retry_after }) => {
-                Err(ChangeCredentialsError::Throttled { retry_after })
-            }
-            None => Err(ChangeCredentialsError::Io(std::io::Error::other(
+        self.guarded_check(client, move |store| {
+            let result = store.change_credentials(&current_password, new_username, new_password);
+            let verdict = match &result {
+                Err(ChangeCredentialsError::WrongPassword) => Verdict::Rejected,
+                Err(ChangeCredentialsError::NotConfigured) => Verdict::Neutral,
+                // The current password was right; the change failed later.
+                _ => Verdict::Accepted,
+            };
+            (result, verdict)
+        })
+        .await
+        .unwrap_or_else(|| {
+            Err(ChangeCredentialsError::Io(std::io::Error::other(
                 "credential change task failed",
-            ))),
-        }
+            )))
+        })
     }
 }
 
@@ -895,20 +645,10 @@ impl CredentialStore {
 pub enum Verdict {
     /// The password was correct: the client's failures are cleared.
     Accepted,
-    /// The password was wrong: a failure is recorded.
+    /// The password was wrong: a failure is recorded and the answer delayed.
     Rejected,
     /// No password was checked (for example, nothing is configured).
     Neutral,
-}
-
-/// Result of [`CredentialStore::guarded_check`].
-#[derive(Debug)]
-pub enum Guarded<T> {
-    Done(T),
-    /// A wrong guess while locked out; retry after the given delay.
-    Throttled {
-        retry_after: Duration,
-    },
 }
 
 /// Result of [`CredentialStore::check_login`].
@@ -916,23 +656,6 @@ pub enum Guarded<T> {
 pub enum LoginOutcome {
     Ok,
     Invalid,
-    /// A wrong password while locked out; retry after the given delay.
-    Throttled {
-        retry_after: Duration,
-    },
-}
-
-impl LoginOutcome {
-    /// A 429 response with a `Retry-After` header (whole seconds, rounded up).
-    pub fn too_many_requests(retry_after: Duration) -> axum::response::Response {
-        let secs = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(http::header::RETRY_AFTER, secs.max(1).to_string())],
-            "too many failed login attempts; try again later",
-        )
-            .into_response()
-    }
 }
 
 /// The client address failed logins are counted against: the peer address
@@ -1004,24 +727,19 @@ pub fn forwarded_client(
     client
 }
 
-// --- Failed-login throttle ---
+// --- Failed-login delay ---
 
-/// Failures a client may make within [`CLIENT_FAILURE_WINDOW`] before it is
-/// locked out.
-const CLIENT_FREE_FAILURES: u32 = 5;
-/// A client's failure count resets once it has made no failed attempt for
-/// this long.
-const CLIENT_FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
-/// First per-client lockout; each further failure doubles it.
-const CLIENT_BASE_LOCKOUT: Duration = Duration::from_secs(30);
-/// Upper bound of the exponential per-client lockout.
-const CLIENT_MAX_LOCKOUT: Duration = Duration::from_secs(15 * 60);
-/// Failures from all clients together allowed per [`GLOBAL_WINDOW`]. This
-/// bounds guessing from many addresses (or from behind one proxy).
-const GLOBAL_MAX_FAILURES: u32 = 30;
-const GLOBAL_WINDOW: Duration = Duration::from_secs(60);
-/// Clients tracked at once; beyond this, stale entries are pruned and new
-/// clients are counted by the global budget only.
+/// How long the answer to a client's first wrong password is held; each
+/// further wrong password from that client doubles it.
+const FAILURE_BASE_DELAY: Duration = Duration::from_millis(500);
+/// Upper bound of the per-client failure delay.
+const FAILURE_MAX_DELAY: Duration = Duration::from_secs(30);
+/// A client's failures are forgotten, and its entry evicted, once it has made
+/// no failed attempt for this long.
+const FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
+/// Clients tracked at once. When the table is full, expired entries are
+/// evicted first, then the least recently failed one, so a new client always
+/// starts with no failures.
 const MAX_TRACKED_CLIENTS: usize = 4096;
 
 /// The address failed logins are counted against: an IPv4 address as is, an
@@ -1034,131 +752,72 @@ fn client_key(client: Option<IpAddr>) -> Option<IpAddr> {
     })
 }
 
-/// How [`LoginThrottle::gate`] routes an attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Gate {
-    /// Not throttled.
-    Open,
-    /// Only the global cap applies: the client has no failures of its own.
-    Clean { retry_after: Duration },
-    /// The client is locked out, or the global cap applies and the client
-    /// has failures of its own or cannot be tracked.
-    Locked { retry_after: Duration },
-}
-
 struct ClientFailures {
     count: u32,
     last: Instant,
 }
 
-impl ClientFailures {
-    /// How long the client stays locked out after `count` failures: none for
-    /// the first [`CLIENT_FREE_FAILURES`] - 1, then [`CLIENT_BASE_LOCKOUT`]
-    /// doubling up to [`CLIENT_MAX_LOCKOUT`].
-    fn lockout(&self) -> Duration {
-        if self.count < CLIENT_FREE_FAILURES {
-            return Duration::ZERO;
-        }
-        let exponent = (self.count - CLIENT_FREE_FAILURES).min(16);
-        (CLIENT_BASE_LOCKOUT * (1u32 << exponent)).min(CLIENT_MAX_LOCKOUT)
-    }
-}
-
-#[derive(Default)]
-struct ThrottleState {
-    clients: HashMap<Option<IpAddr>, ClientFailures>,
-    global_window_start: Option<Instant>,
-    global_failures: u32,
-}
-
-/// Failed-login backoff: an exponential lockout per client address plus a
-/// global cap on failures per minute. Only failures are counted. A lockout
-/// moves the client's attempts to the paced locked lane; it never refuses a
-/// correct password (see [`CredentialStore::guarded_check`]).
-#[derive(Default)]
+/// Per-client delay for wrong passwords: the answer to a wrong password is
+/// held for [`FAILURE_BASE_DELAY`], doubling with each further failure from
+/// the same client up to [`FAILURE_MAX_DELAY`]. Only wrong passwords are
+/// counted and delayed. A correct password is never refused or delayed, and
+/// it clears the client's record. Guessing from many addresses is for the
+/// edge (reverse proxy rate limits or fail2ban) to stop; see "Login
+/// brute-force protection" in docs/CONFIGURATION.md.
 pub struct LoginThrottle {
-    state: parking_lot::Mutex<ThrottleState>,
+    clients: parking_lot::Mutex<HashMap<Option<IpAddr>, ClientFailures>>,
+    base_delay: Duration,
+}
+
+impl Default for LoginThrottle {
+    fn default() -> Self {
+        Self {
+            clients: Default::default(),
+            base_delay: FAILURE_BASE_DELAY,
+        }
+    }
 }
 
 impl LoginThrottle {
-    /// `Err(retry_after)` when `client` (or everyone) must wait.
-    fn check(&self, client: Option<IpAddr>, now: Instant) -> Result<(), Duration> {
-        match self.gate(client, now) {
-            Gate::Open => Ok(()),
-            Gate::Clean { retry_after } | Gate::Locked { retry_after } => Err(retry_after),
-        }
-    }
-
-    /// Which path an attempt from `client` takes (see [`Gate`]).
-    fn gate(&self, client: Option<IpAddr>, now: Instant) -> Gate {
+    /// Count a wrong password from `client` and return how long to hold the
+    /// answer.
+    fn record_failure(&self, client: Option<IpAddr>, now: Instant) -> Duration {
         let client = client_key(client);
-        let state = self.state.lock();
-        let entry = state
-            .clients
-            .get(&client)
-            .filter(|entry| now.duration_since(entry.last) < CLIENT_FAILURE_WINDOW);
-        if let Some(entry) = entry {
-            let until = entry.last + entry.lockout();
-            if now < until {
-                return Gate::Locked {
-                    retry_after: until - now,
-                };
+        let mut clients = self.clients.lock();
+        if !clients.contains_key(&client) && clients.len() >= MAX_TRACKED_CLIENTS {
+            clients.retain(|_, entry| now.duration_since(entry.last) < FAILURE_WINDOW);
+            if clients.len() >= MAX_TRACKED_CLIENTS
+                && let Some(oldest) = clients
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last)
+                    .map(|(key, _)| *key)
+            {
+                clients.remove(&oldest);
             }
         }
-        if let Some(start) = state.global_window_start {
-            let end = start + GLOBAL_WINDOW;
-            if now < end && state.global_failures >= GLOBAL_MAX_FAILURES {
-                let retry_after = end - now;
-                // A client the table has no room to track might have failed
-                // before, so only a client known to be clean skips the lane.
-                let tracked = state.clients.contains_key(&client)
-                    || state.clients.len() < MAX_TRACKED_CLIENTS;
-                return if entry.is_none() && tracked {
-                    Gate::Clean { retry_after }
-                } else {
-                    Gate::Locked { retry_after }
-                };
-            }
-        }
-        Gate::Open
-    }
-
-    /// Count a failure against `client`, and against the global cap when
-    /// `global` (false for a guess made while already locked out).
-    fn record_failure(&self, client: Option<IpAddr>, now: Instant, global: bool) {
-        let client = client_key(client);
-        let mut state = self.state.lock();
-        if global {
-            match state.global_window_start {
-                Some(start) if now < start + GLOBAL_WINDOW => state.global_failures += 1,
-                _ => {
-                    state.global_window_start = Some(now);
-                    state.global_failures = 1;
-                }
-            }
-        }
-        if !state.clients.contains_key(&client) && state.clients.len() >= MAX_TRACKED_CLIENTS {
-            state
-                .clients
-                .retain(|_, entry| now.duration_since(entry.last) < CLIENT_FAILURE_WINDOW);
-            if state.clients.len() >= MAX_TRACKED_CLIENTS {
-                return;
-            }
-        }
-        let entry = state.clients.entry(client).or_insert(ClientFailures {
+        let entry = clients.entry(client).or_insert(ClientFailures {
             count: 0,
             last: now,
         });
-        if now.duration_since(entry.last) >= CLIENT_FAILURE_WINDOW {
+        if now.duration_since(entry.last) >= FAILURE_WINDOW {
             entry.count = 0;
         }
         entry.count = entry.count.saturating_add(1);
         entry.last = now;
+        let doublings = (entry.count - 1).min(16);
+        (self.base_delay * (1u32 << doublings)).min(FAILURE_MAX_DELAY)
     }
 
     fn record_success(&self, client: Option<IpAddr>) {
-        let client = client_key(client);
-        self.state.lock().clients.remove(&client);
+        self.clients.lock().remove(&client_key(client));
+    }
+
+    #[cfg(test)]
+    fn failures(&self, client: Option<IpAddr>) -> Option<u32> {
+        self.clients
+            .lock()
+            .get(&client_key(client))
+            .map(|entry| entry.count)
     }
 }
 
@@ -1290,9 +949,8 @@ pub struct ChangeCredentialsRequest {
     responses(
         (status = 200, description = "Credentials changed; all tokens revoked"),
         (status = 400, description = "A new username or password is empty", body = String, content_type = "text/plain"),
-        (status = 401, description = "Current password is incorrect", body = String, content_type = "text/plain"),
+        (status = 401, description = "Current password is incorrect. Answered after a delay that doubles with each wrong password from the same client (0.5 s up to 30 s); the correct password is never delayed", body = String, content_type = "text/plain"),
         (status = 404, description = "No credentials configured", body = String, content_type = "text/plain"),
-        (status = 429, description = "Wrong password while this client (or every client) is locked out after repeated failures; see Retry-After. The correct password is still accepted", body = String, content_type = "text/plain"),
         (status = 500, description = "Credentials could not be saved", body = String, content_type = "text/plain"),
     ),
 )]
@@ -1322,9 +980,6 @@ pub async fn h_auth_change_credentials(
         Err(ChangeCredentialsError::WrongPassword) => {
             (StatusCode::UNAUTHORIZED, "current password is incorrect").into_response()
         }
-        Err(ChangeCredentialsError::Throttled { retry_after }) => {
-            LoginOutcome::too_many_requests(retry_after)
-        }
         Err(ChangeCredentialsError::Empty) => (
             StatusCode::BAD_REQUEST,
             "username and password cannot be empty",
@@ -1349,9 +1004,8 @@ pub async fn h_auth_change_credentials(
     request_body = LoginRequest,
     responses(
         (status = 200, description = "Credentials accepted; tokens issued", body = TokenResponse),
-        (status = 401, description = "Invalid credentials", body = String, content_type = "text/plain"),
+        (status = 401, description = "Invalid credentials. Answered after a delay that doubles with each wrong password from the same client (0.5 s up to 30 s); the correct password is never delayed", body = String, content_type = "text/plain"),
         (status = 404, description = "Authentication is not configured", body = String, content_type = "text/plain"),
-        (status = 429, description = "Wrong password while this client (or every client) is locked out after repeated failures; see Retry-After. The correct password is still accepted", body = String, content_type = "text/plain"),
     ),
 )]
 pub async fn h_auth_login(
@@ -1377,9 +1031,6 @@ pub async fn h_auth_login(
         LoginOutcome::Ok => {}
         LoginOutcome::Invalid => {
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
-        }
-        LoginOutcome::Throttled { retry_after } => {
-            return LoginOutcome::too_many_requests(retry_after);
         }
     }
 
@@ -1748,443 +1399,220 @@ mod tests {
         Some(IpAddr::from([192, 0, 2, last]))
     }
 
+    fn v6(addr: &str) -> Option<IpAddr> {
+        Some(addr.parse().unwrap())
+    }
+
     #[test]
-    fn throttle_locks_a_client_out_exponentially_after_repeated_failures() {
+    fn wrong_passwords_get_an_increasing_delay_per_client() {
         let throttle = LoginThrottle::default();
         let start = Instant::now();
-        for _ in 0..CLIENT_FREE_FAILURES - 1 {
-            throttle.record_failure(ip(1), start, true);
-            assert!(throttle.check(ip(1), start).is_ok());
-        }
-        throttle.record_failure(ip(1), start, true);
-        assert_eq!(throttle.check(ip(1), start), Err(CLIENT_BASE_LOCKOUT));
-        assert!(throttle.check(ip(1), start + CLIENT_BASE_LOCKOUT).is_ok());
-        // Another client is unaffected.
-        assert!(throttle.check(ip(2), start).is_ok());
-
-        let later = start + CLIENT_BASE_LOCKOUT;
-        throttle.record_failure(ip(1), later, true);
-        assert_eq!(throttle.check(ip(1), later), Err(CLIENT_BASE_LOCKOUT * 2));
-        throttle.record_failure(ip(1), later, true);
-        assert_eq!(throttle.check(ip(1), later), Err(CLIENT_BASE_LOCKOUT * 4));
-        for _ in 0..20 {
-            throttle.record_failure(ip(1), later, true);
-        }
-        assert_eq!(throttle.check(ip(1), later), Err(CLIENT_MAX_LOCKOUT));
-
+        let delays: Vec<_> = (0..8)
+            .map(|_| throttle.record_failure(ip(1), start))
+            .collect();
+        let ms = Duration::from_millis;
+        assert_eq!(
+            delays,
+            [
+                ms(500),
+                ms(1000),
+                ms(2000),
+                ms(4000),
+                ms(8000),
+                ms(16000),
+                FAILURE_MAX_DELAY,
+                FAILURE_MAX_DELAY
+            ]
+        );
+        // Another client starts from the base delay.
+        assert_eq!(throttle.record_failure(ip(2), start), FAILURE_BASE_DELAY);
         // A success clears the client's record.
         throttle.record_success(ip(1));
-        assert!(throttle.check(ip(1), later).is_ok());
-
+        assert_eq!(throttle.failures(ip(1)), None);
+        assert_eq!(throttle.record_failure(ip(1), start), FAILURE_BASE_DELAY);
         // Failures older than the window are forgotten.
-        for _ in 0..CLIENT_FREE_FAILURES {
-            throttle.record_failure(ip(3), start, true);
-        }
-        let quiet = start + CLIENT_FAILURE_WINDOW;
-        throttle.record_failure(ip(3), quiet, true);
-        assert!(throttle.check(ip(3), quiet).is_ok());
+        assert_eq!(
+            throttle.record_failure(ip(2), start + FAILURE_WINDOW),
+            FAILURE_BASE_DELAY
+        );
     }
 
     #[test]
-    fn throttle_caps_failures_across_all_clients() {
+    fn the_client_table_is_bounded_and_evicts_expired_then_least_recent_entries() {
         let throttle = LoginThrottle::default();
         let start = Instant::now();
-        for n in 0..GLOBAL_MAX_FAILURES {
-            throttle.record_failure(ip(n as u8), start, true);
+        let key = |n: usize| v6(&format!("2001:db8:1:{n:x}::1"));
+        let tracked = || throttle.clients.lock().len();
+        for n in 0..MAX_TRACKED_CLIENTS {
+            throttle.record_failure(key(n), start);
         }
-        let retry = throttle.check(ip(250), start).unwrap_err();
-        assert_eq!(retry, GLOBAL_WINDOW);
-        assert!(throttle.check(ip(250), start + GLOBAL_WINDOW).is_ok());
+        assert_eq!(tracked(), MAX_TRACKED_CLIENTS);
+
+        // Once the entries expire, a new client evicts them all.
+        let later = start + FAILURE_WINDOW;
+        assert_eq!(throttle.record_failure(ip(1), later), FAILURE_BASE_DELAY);
+        assert_eq!(tracked(), 1);
+
+        // Full of live entries: the least recently failed client (ip(1)) is
+        // evicted, and the new client starts with no failures.
+        for n in 0..MAX_TRACKED_CLIENTS - 1 {
+            throttle.record_failure(key(n), later + Duration::from_millis(1 + n as u64));
+        }
+        assert_eq!(tracked(), MAX_TRACKED_CLIENTS);
+        let now = later + Duration::from_secs(10);
+        assert_eq!(throttle.record_failure(ip(2), now), FAILURE_BASE_DELAY);
+        assert_eq!(tracked(), MAX_TRACKED_CLIENTS);
+        assert_eq!(throttle.failures(ip(1)), None);
+        assert_eq!(throttle.failures(key(0)), Some(1));
+        assert_eq!(throttle.failures(ip(2)), Some(1));
     }
 
-    /// A store with a short locked-lane hold so tests run quickly.
-    fn fast_store(temp: &tempfile::TempDir) -> Arc<CredentialStore> {
+    #[test]
+    fn ipv6_clients_are_counted_by_their_slash_64() {
+        let throttle = LoginThrottle::default();
+        let now = Instant::now();
+        for n in 0..3 {
+            throttle.record_failure(v6(&format!("2001:db8:1:2::{n:x}")), now);
+        }
+        // Another address in the same /64 shares the count; the next /64 does not.
+        assert_eq!(throttle.failures(v6("2001:db8:1:2:ffff::1")), Some(3));
+        assert_eq!(throttle.failures(v6("2001:db8:1:3::1")), None);
+        // IPv4 is keyed by the whole address, IPv4-mapped IPv6 as IPv4.
+        throttle.record_failure(v6("::ffff:192.0.2.7"), now);
+        assert_eq!(throttle.failures(ip(7)), Some(1));
+        assert_eq!(throttle.failures(ip(8)), None);
+    }
+
+    /// A store holding [`alice`] whose failure delay starts at `base_delay`.
+    fn store_with_delay(temp: &tempfile::TempDir, base_delay: Duration) -> Arc<CredentialStore> {
         let mut store = CredentialStore::new(temp.path().to_path_buf());
-        store.locked_failure_hold = Duration::from_millis(50);
+        store.throttle.base_delay = base_delay;
         store.set_credentials(alice()).unwrap();
         Arc::new(store)
     }
 
     #[tokio::test]
-    async fn check_login_throttles_wrong_guesses_but_never_the_correct_password() {
+    async fn check_login_delays_wrong_passwords_but_never_the_correct_one() {
         let temp = tempfile::tempdir().unwrap();
-        let store = fast_store(&temp);
-        let login = |client, password: &str| {
-            store
-                .clone()
-                .check_login(client, "alice".into(), password.into())
+        let base = Duration::from_millis(100);
+        let store = store_with_delay(&temp, base);
+        let login = |client, password: &'static str| {
+            let store = store.clone();
+            async move {
+                let started = Instant::now();
+                let outcome = store
+                    .check_login(client, "alice".into(), password.into())
+                    .await;
+                (outcome, started.elapsed())
+            }
         };
 
-        // Successes are never counted: a correct login after a few failures
-        // succeeds and resets the client's count.
-        for _ in 0..CLIENT_FREE_FAILURES - 1 {
-            assert_eq!(login(ip(1), "wrong").await, LoginOutcome::Invalid);
+        for n in 0..3 {
+            let (outcome, took) = login(ip(1), "wrong").await;
+            assert_eq!(outcome, LoginOutcome::Invalid);
+            assert!(took >= base * (1 << n), "failure {n} took {took:?}");
         }
-        assert_eq!(login(ip(1), "correct horse").await, LoginOutcome::Ok);
-        for _ in 0..CLIENT_FREE_FAILURES {
-            assert_eq!(login(ip(1), "wrong").await, LoginOutcome::Invalid);
-        }
-
-        // Locked out: wrong guesses are refused with a retry delay, other
-        // clients are unaffected, and the correct password still gets in.
-        assert!(matches!(
-            login(ip(1), "wrong").await,
-            LoginOutcome::Throttled { .. }
-        ));
-        assert_eq!(login(ip(2), "wrong").await, LoginOutcome::Invalid);
-        assert_eq!(login(ip(1), "correct horse").await, LoginOutcome::Ok);
-        // The success cleared the lockout.
-        assert!(store.throttle.check(ip(1), Instant::now()).is_ok());
+        // The correct password is answered without a delay (the next wrong
+        // one would wait 800 ms) and clears the client's failures.
+        let (outcome, took) = login(ip(1), "correct horse").await;
+        assert_eq!(outcome, LoginOutcome::Ok);
+        assert!(took < base * 8, "{took:?}");
+        assert_eq!(store.throttle.failures(ip(1)), None);
     }
 
     #[tokio::test]
-    async fn the_global_cap_does_not_block_the_correct_password() {
+    async fn change_credentials_shares_the_failure_count_and_accepts_the_correct_password() {
         let temp = tempfile::tempdir().unwrap();
-        let store = fast_store(&temp);
-        let now = Instant::now();
-        for n in 0..GLOBAL_MAX_FAILURES {
-            store.throttle.record_failure(ip(n as u8), now, true);
-        }
-        assert!(store.throttle.check(ip(200), now).is_err());
-
-        // A client with no failures of its own is verified directly; once it
-        // has failed, its guesses are paced in the locked lane.
-        let guess = || {
-            store
-                .clone()
-                .check_login(ip(200), "alice".into(), "wrong".into())
-        };
-        assert_eq!(guess().await, LoginOutcome::Invalid);
-        assert!(matches!(guess().await, LoginOutcome::Throttled { .. }));
-        assert_eq!(
-            store
-                .clone()
-                .check_login(ip(201), "alice".into(), "correct horse".into())
-                .await,
-            LoginOutcome::Ok
-        );
-        assert!(
-            store
-                .check_change_credentials(ip(202), "correct horse".into(), Some("bob".into()), None)
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn change_credentials_shares_the_throttle_and_accepts_the_correct_password() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = fast_store(&temp);
-        let change = |password: &str| {
-            store.check_change_credentials(ip(1), password.into(), None, Some("new".into()))
-        };
-        for _ in 0..CLIENT_FREE_FAILURES {
+        let store = store_with_delay(&temp, Duration::from_millis(10));
+        for _ in 0..2 {
             assert!(matches!(
-                change("wrong").await,
+                store
+                    .check_change_credentials(ip(1), "wrong".into(), None, Some("new".into()))
+                    .await,
                 Err(ChangeCredentialsError::WrongPassword)
             ));
         }
-        assert!(matches!(
-            change("wrong").await,
-            Err(ChangeCredentialsError::Throttled { .. })
-        ));
-        // Login from the same client is locked out by the same count.
-        assert!(matches!(
+        assert_eq!(
             store
                 .clone()
                 .check_login(ip(1), "alice".into(), "wrong".into())
                 .await,
-            LoginOutcome::Throttled { .. }
-        ));
-        change("correct horse").await.unwrap();
+            LoginOutcome::Invalid
+        );
+        assert_eq!(store.throttle.failures(ip(1)), Some(3));
+        store
+            .check_change_credentials(ip(1), "correct horse".into(), None, Some("new".into()))
+            .await
+            .unwrap();
+        assert_eq!(store.throttle.failures(ip(1)), None);
         assert!(store.validate("alice", "new"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_concurrent_burst_of_wrong_guesses_is_moved_to_the_locked_lane() {
+    async fn a_correct_login_completes_promptly_under_any_flood_shape() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
         let temp = tempfile::tempdir().unwrap();
-        let store = fast_store(&temp);
-        const BURST: usize = 12;
-        let started = Instant::now();
-        let tasks: Vec<_> = (0..BURST)
-            .map(|_| {
-                let store = store.clone();
-                tokio::spawn(async move {
-                    store
-                        .check_change_credentials(ip(1), "wrong".into(), None, Some("x".into()))
-                        .await
-                })
-            })
-            .collect();
-        let (mut wrong, mut throttled) = (0, 0);
-        for task in tasks {
-            match task.await.unwrap() {
-                Err(ChangeCredentialsError::WrongPassword) => wrong += 1,
-                Err(ChangeCredentialsError::Throttled { .. }) => throttled += 1,
-                other => panic!("unexpected {other:?}"),
-            }
-        }
-        // Only the free failures, plus attempts already holding a hashing
-        // slot when the lockout began, are verified outside the locked lane.
-        let free = CLIENT_FREE_FAILURES as usize + HASHING_PERMITS - 1;
-        assert!(wrong <= free, "{wrong} unpaced guesses");
-        assert_eq!(wrong + throttled, BURST);
-        // The lane keeps one waiting attempt per client, so most of the
-        // burst is turned away unverified; the guesses verified in the lane
-        // run one at a time, each holding it before the next.
-        if throttled >= 2 {
-            assert!(started.elapsed() >= store.locked_failure_hold);
-        }
-    }
-
-    /// Wait until `lane` has `count` waiters, letting spawned tasks run.
-    async fn until_waiting(lane: &LockedLane, count: usize) {
-        while lane.waiting() != count {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn the_locked_lane_serves_clients_in_turn_keeping_each_ones_newest_attempt() {
-        let lane = Arc::new(LockedLane::new(2));
-        let first = lane.enter(ip(9)).await.unwrap();
-        let (order_tx, mut order) = tokio::sync::mpsc::unbounded_channel();
-        for (name, client, waiting) in [("a1", 1, 1), ("b", 2, 2), ("a2", 1, 2), ("c", 3, 2)] {
-            let joining = lane.clone();
-            let order_tx = order_tx.clone();
-            tokio::spawn(async move {
-                let pass = joining.enter(ip(client)).await;
-                order_tx.send((name, pass.is_some())).unwrap();
-            });
-            if name == "a1" || name == "b" {
-                until_waiting(&lane, waiting).await;
-            }
-            if name == "a2" {
-                // The newer attempt from client 1 replaced its older one.
-                assert_eq!(order.recv().await, Some(("a1", false)));
-            }
-        }
-        // The queue is full, so a new client is turned away.
-        assert_eq!(order.recv().await, Some(("c", false)));
-        // Freed, the lane goes to the clients in the order they joined, and
-        // client 1's replacement kept its place ahead of client 2.
-        drop(first);
-        assert_eq!(order.recv().await, Some(("a2", true)));
-        assert_eq!(order.recv().await, Some(("b", true)));
-        assert_eq!(lane.waiting(), 0);
-        assert!(lane.enter(ip(3)).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn a_waiter_dropped_after_being_handed_the_lane_passes_it_on() {
-        let lane = Arc::new(LockedLane::new(2));
-        let first = lane.enter(ip(1)).await.unwrap();
-        let mut entering = Box::pin(lane.enter(ip(2)));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut entering)
-                .await
-                .is_err()
-        );
-        // The lane is handed to the waiter, which is dropped unpolled.
-        drop(first);
-        drop(entering);
-        tokio::time::timeout(Duration::from_secs(1), lane.enter(ip(3)))
-            .await
-            .expect("the lane was lost")
-            .unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_correct_login_gets_through_a_queued_flood_quickly() {
-        let temp = tempfile::tempdir().unwrap();
-        // The real one-second hold, so the bound below is the shipped one.
-        let store = CredentialStore::new(temp.path().to_path_buf());
-        store.set_credentials(alice()).unwrap();
-        let store = Arc::new(store);
+        // The shipped delays.
+        let store = store_with_delay(&temp, FAILURE_BASE_DELAY);
         let now = Instant::now();
-        for _ in 0..CLIENT_FREE_FAILURES {
-            store.throttle.record_failure(ip(1), now, true);
-        }
-        let global_before = store.throttle.state.lock().global_failures;
-
-        const FLOOD: usize = 40;
-        let flood: Vec<_> = (0..FLOOD)
-            .map(|_| {
-                let store = store.clone();
-                tokio::spawn(async move {
-                    store
-                        .check_login(ip(1), "alice".into(), "wrong".into())
-                        .await
-                })
-            })
-            .collect();
-        until_waiting(&store.locked_lane, 1).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // Beyond the one waiting attempt per client, the flood was answered
-        // at once, unverified.
-        let answered = flood.iter().filter(|task| task.is_finished()).count();
-        assert!(answered >= FLOOD - 2, "{answered}");
-
-        // Another client is not locked: the flood did not trip the global
-        // cap, so it logs in without waiting for the lane.
-        let started = Instant::now();
-        assert_eq!(
+        // The client table is full of live entries, and ip(1) has failed often.
+        for n in 0..MAX_TRACKED_CLIENTS {
             store
-                .clone()
-                .check_login(ip(2), "alice".into(), "correct horse".into())
-                .await,
-            LoginOutcome::Ok
-        );
-        assert!(started.elapsed() < Duration::from_secs(3));
-
-        // The flooded client's own correct attempt waits for about one
-        // hold, not for the queued guesses.
-        let started = Instant::now();
-        assert_eq!(
-            store
-                .clone()
-                .check_login(ip(1), "alice".into(), "correct horse".into())
-                .await,
-            LoginOutcome::Ok
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "{:?}",
-            started.elapsed()
-        );
-        // Guesses made in the lane never counted globally.
-        assert_eq!(store.throttle.state.lock().global_failures, global_before);
-        for task in flood {
-            task.abort();
+                .throttle
+                .record_failure(v6(&format!("2001:db8:ffff:{n:x}::1")), now);
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_correct_login_gets_through_a_flood_while_the_global_cap_is_tripped() {
-        let temp = tempfile::tempdir().unwrap();
-        // The real one-second hold, so the bounds below are the shipped ones.
-        let store = CredentialStore::new(temp.path().to_path_buf());
-        store.set_credentials(alice()).unwrap();
-        let store = Arc::new(store);
-        let guess = |client| {
-            let store = store.clone();
-            async move {
-                store
-                    .check_login(client, "alice".into(), "wrong".into())
-                    .await
-            }
-        };
-
-        // Six rotating addresses, five wrong guesses each, trip the global cap.
-        const ROTATING: u8 = 6;
-        for n in 0..ROTATING {
-            for _ in 0..CLIENT_FREE_FAILURES {
-                assert_eq!(guess(ip(100 + n)).await, LoginOutcome::Invalid);
-            }
+        for _ in 0..10 {
+            store.throttle.record_failure(ip(1), now);
         }
-        assert!(store.throttle.check(ip(2), Instant::now()).is_err());
-        assert!(matches!(
-            store.throttle.gate(ip(2), Instant::now()),
-            Gate::Clean { .. }
-        ));
 
-        // Keep flooding: ip(1) is locked out and sends a wrong guess every
-        // 50 ms, and the rotating addresses keep guessing too.
-        for _ in 0..CLIENT_FREE_FAILURES {
-            store.throttle.record_failure(ip(1), Instant::now(), false);
-        }
-        let flooding = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let flooders: Vec<_> = std::iter::once(1)
-            .chain(100..100 + ROTATING)
-            .map(|last| {
-                let flooding = flooding.clone();
-                let store = store.clone();
+        // Eight connections flood from ip(1), eight more from a fresh /64
+        // for every guess.
+        let flooding = Arc::new(AtomicBool::new(true));
+        let fresh = Arc::new(AtomicUsize::new(0));
+        let flood: Vec<_> = (0..16)
+            .map(|task| {
+                let (store, flooding, fresh) = (store.clone(), flooding.clone(), fresh.clone());
                 tokio::spawn(async move {
-                    let mut tasks = Vec::new();
                     while flooding.load(Ordering::SeqCst) {
-                        let store = store.clone();
-                        tasks.push(tokio::spawn(async move {
-                            store
-                                .check_login(ip(last), "alice".into(), "wrong".into())
-                                .await
-                        }));
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    for task in tasks {
-                        task.abort();
-                    }
-                })
-            })
-            .collect();
-        until_waiting(&store.locked_lane, 1 + ROTATING as usize).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // A clean address logs in promptly: it never queues with the flood.
-        let started = Instant::now();
-        assert_eq!(
-            store
-                .clone()
-                .check_login(ip(2), "alice".into(), "correct horse".into())
-                .await,
-            LoginOutcome::Ok
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "{:?}",
-            started.elapsed()
-        );
-
-        // The flooding address's own attempt waits behind at most one attempt
-        // from each other flooding client. Its own flood stops first, since
-        // nothing can tell its correct attempt from its newer guesses.
-        flooding.store(false, Ordering::SeqCst);
-        let rotating_flood: Vec<_> = (0..ROTATING)
-            .map(|n| {
-                let store = store.clone();
-                tokio::spawn(async move {
-                    loop {
+                        let client = if task < 8 {
+                            ip(1)
+                        } else {
+                            let n = fresh.fetch_add(1, Ordering::SeqCst);
+                            v6(&format!("2001:db8:aaaa:{n:x}::1"))
+                        };
                         store
                             .clone()
-                            .check_login(ip(100 + n), "alice".into(), "wrong".into())
+                            .check_login(client, "alice".into(), "wrong".into())
                             .await;
                     }
                 })
             })
             .collect();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let started = Instant::now();
-        assert_eq!(
-            store
-                .clone()
-                .check_login(ip(1), "alice".into(), "correct horse".into())
-                .await,
-            LoginOutcome::Ok
-        );
-        let bound = (u32::from(ROTATING) + 2) * (LOCKED_FAILURE_HOLD + Duration::from_millis(500));
-        assert!(started.elapsed() < bound, "{:?}", started.elapsed());
-        for task in rotating_flood.into_iter().chain(flooders) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The flooding address, a never-seen IPv4 client and a never-seen
+        // /64 all log in, waiting only for a hashing slot.
+        for client in [ip(1), ip(2), v6("2001:db8:bbbb:1::1")] {
+            let started = Instant::now();
+            assert_eq!(
+                store
+                    .clone()
+                    .check_login(client, "alice".into(), "correct horse".into())
+                    .await,
+                LoginOutcome::Ok
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "{client:?}: {:?}",
+                started.elapsed()
+            );
+        }
+        assert!(fresh.load(Ordering::SeqCst) > 0);
+        assert!(store.throttle.clients.lock().len() <= MAX_TRACKED_CLIENTS);
+        flooding.store(false, Ordering::SeqCst);
+        for task in flood {
             task.abort();
         }
-    }
-
-    #[test]
-    fn ipv6_clients_are_throttled_by_their_slash_64() {
-        let throttle = LoginThrottle::default();
-        let now = Instant::now();
-        let v6 = |s: &str| Some(s.parse::<IpAddr>().unwrap());
-        for n in 0..CLIENT_FREE_FAILURES {
-            throttle.record_failure(v6(&format!("2001:db8:1:2::{n:x}")), now, true);
-        }
-        // Another address in the same /64 is locked out too.
-        assert!(throttle.check(v6("2001:db8:1:2:ffff::1"), now).is_err());
-        // The next /64 is not.
-        assert!(throttle.check(v6("2001:db8:1:3::1"), now).is_ok());
-        // IPv4 is keyed by the whole address, IPv4-mapped IPv6 as IPv4.
-        for _ in 0..CLIENT_FREE_FAILURES {
-            throttle.record_failure(v6("::ffff:192.0.2.7"), now, true);
-        }
-        assert!(throttle.check(ip(7), now).is_err());
-        assert!(throttle.check(ip(8), now).is_ok());
     }
 
     #[test]

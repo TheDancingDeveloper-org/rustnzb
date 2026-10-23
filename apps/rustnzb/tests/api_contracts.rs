@@ -184,12 +184,15 @@ fn client_from(source: [u8; 4]) -> reqwest::Client {
         .unwrap()
 }
 
-fn retry_after(response: &reqwest::Response) -> u64 {
-    response.headers()[reqwest::header::RETRY_AFTER]
-        .to_str()
-        .unwrap()
-        .parse()
-        .unwrap()
+/// The server's delay after a client's first wrong password; each further
+/// wrong password from the same client doubles it.
+const FIRST_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Await `request`, returning its status and how long it took.
+async fn timed(request: impl std::future::Future<Output = u16>) -> (u16, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let status = request.await;
+    (status, started.elapsed())
 }
 
 async fn password_login(
@@ -218,61 +221,55 @@ async fn basic_status(app: &ContractApp, client: &reqwest::Client, password: &st
         .as_u16()
 }
 
+async fn login_status(app: &ContractApp, client: &reqwest::Client, password: &str) -> u16 {
+    password_login(app, client, password)
+        .await
+        .status()
+        .as_u16()
+}
+
 #[tokio::test]
-async fn repeated_failed_logins_are_throttled_but_the_correct_password_gets_in() {
+async fn wrong_passwords_are_delayed_but_the_correct_password_is_not() {
     let app = start_app(true).await;
     let client = client_from([127, 0, 0, 1]);
 
-    // A success between failures resets the count, so it is never throttled.
-    for _ in 0..4 {
-        assert_eq!(password_login(&app, &client, "wrong").await.status(), 401);
-    }
-    assert_eq!(
-        password_login(&app, &client, "password").await.status(),
-        200
-    );
-    for _ in 0..5 {
-        assert_eq!(password_login(&app, &client, "wrong").await.status(), 401);
-    }
+    // Each wrong password, on either password path, is answered later than
+    // the one before.
+    let (status, took) = timed(login_status(&app, &client, "wrong")).await;
+    assert_eq!(status, 401);
+    assert!(took >= FIRST_DELAY, "{took:?}");
+    let (status, took) = timed(basic_status(&app, &client, "wrong")).await;
+    assert_eq!(status, 401);
+    assert!(took >= FIRST_DELAY * 2, "{took:?}");
 
-    // Locked out: a wrong guess on either password path gets 429 with a
-    // retry delay, but the correct password still logs in.
-    let throttled = password_login(&app, &client, "wrong").await;
-    assert_eq!(throttled.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-    assert!((1..=60).contains(&retry_after(&throttled)));
-    assert_eq!(basic_status(&app, &client, "wrong").await, 429);
-    assert_eq!(basic_status(&app, &client, "password").await, 200);
-    assert_eq!(
-        password_login(&app, &client, "password").await.status(),
-        200
-    );
+    // The correct password is answered without a delay (the next wrong one
+    // would wait 2 s) and resets the count.
+    let (status, took) = timed(basic_status(&app, &client, "password")).await;
+    assert_eq!(status, 200);
+    assert!(took < FIRST_DELAY * 4, "{took:?}");
+    assert_eq!(login_status(&app, &client, "password").await, 200);
+    let (status, took) = timed(login_status(&app, &client, "wrong")).await;
+    assert_eq!(status, 401);
+    assert!(took < FIRST_DELAY * 2, "{took:?}");
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn failed_logins_are_tracked_per_client_address() {
+async fn failed_logins_are_counted_per_client_address() {
     let app = start_app(true).await;
     let attacker = client_from([127, 0, 0, 2]);
     let operator = client_from([127, 0, 0, 3]);
-
-    for _ in 0..5 {
-        assert_eq!(password_login(&app, &attacker, "wrong").await.status(), 401);
+    for _ in 0..2 {
+        assert_eq!(login_status(&app, &attacker, "wrong").await, 401);
     }
-    assert_eq!(password_login(&app, &attacker, "wrong").await.status(), 429);
-    assert_eq!(basic_status(&app, &attacker, "wrong").await, 429);
 
-    // Another address has its own count: its failures are plain 401s and it
-    // logs in normally, on both password paths.
-    assert_eq!(password_login(&app, &operator, "wrong").await.status(), 401);
-    assert_eq!(basic_status(&app, &operator, "wrong").await, 401);
-    assert_eq!(
-        password_login(&app, &operator, "password").await.status(),
-        200
-    );
+    // Another address has its own count: its first failure gets the first
+    // delay, and it logs in normally on both password paths.
+    let (status, took) = timed(login_status(&app, &operator, "wrong")).await;
+    assert_eq!(status, 401);
+    assert!(took < FIRST_DELAY * 2, "{took:?}");
+    assert_eq!(login_status(&app, &operator, "password").await, 200);
     assert_eq!(basic_status(&app, &operator, "password").await, 200);
-
-    // The attacker's address is still locked for wrong guesses.
-    assert_eq!(password_login(&app, &attacker, "wrong").await.status(), 429);
 }
 
 #[cfg(target_os = "linux")]
@@ -281,11 +278,8 @@ async fn a_correct_login_completes_while_a_flood_of_guesses_is_queued() {
     let app = start_app(true).await;
     let attacker = client_from([127, 0, 0, 2]);
     let operator = client_from([127, 0, 0, 3]);
-    for _ in 0..5 {
-        assert_eq!(password_login(&app, &attacker, "wrong").await.status(), 401);
-    }
 
-    // Queue a flood of wrong guesses from the locked-out address.
+    // Queue a flood of wrong guesses from one address.
     let base_url = app.base_url.clone();
     let flood: Vec<_> = (0..40)
         .map(|_| {
@@ -303,16 +297,12 @@ async fn a_correct_login_completes_while_a_flood_of_guesses_is_queued() {
         .collect();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // From another address and from the flooded one, the correct password
+    // From another address and from the flooding one, the correct password
     // logs in within a bounded time.
     for client in [&operator, &attacker] {
-        let started = std::time::Instant::now();
-        assert_eq!(password_login(&app, client, "password").await.status(), 200);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
-            "{:?}",
-            started.elapsed()
-        );
+        let (status, took) = timed(login_status(&app, client, "password")).await;
+        assert_eq!(status, 200);
+        assert!(took < std::time::Duration::from_secs(3), "{took:?}");
     }
     for task in flood {
         task.abort();
@@ -322,19 +312,20 @@ async fn a_correct_login_completes_while_a_flood_of_guesses_is_queued() {
 #[tokio::test]
 async fn x_forwarded_for_names_the_client_only_behind_a_trusted_proxy() {
     let login = |app: &ContractApp, forwarded_for: &'static str| {
-        reqwest::Client::new()
+        let request = reqwest::Client::new()
             .post(format!("{}/api/auth/login", app.base_url))
             .header("X-Forwarded-For", forwarded_for)
             .json(&serde_json::json!({"username":"admin","password":"wrong"}))
-            .send()
+            .send();
+        timed(async move { request.await.unwrap().status().as_u16() })
     };
 
     // Not trusted: every forwarded address shares the peer's count.
     let app = start_app(true).await;
-    for _ in 0..5 {
-        assert_eq!(login(&app, "203.0.113.1").await.unwrap().status(), 401);
-    }
-    assert_eq!(login(&app, "203.0.113.2").await.unwrap().status(), 429);
+    assert_eq!(login(&app, "203.0.113.1").await.0, 401);
+    let (status, took) = login(&app, "203.0.113.2").await;
+    assert_eq!(status, 401);
+    assert!(took >= FIRST_DELAY * 2, "{took:?}");
 
     // Trusted: each forwarded client has its own count, and an address the
     // client prepends itself is not believed.
@@ -342,18 +333,13 @@ async fn x_forwarded_for_names_the_client_only_behind_a_trusted_proxy() {
         config.general.trusted_proxies = vec!["127.0.0.0/8".into(), "::1".into()];
     })
     .await;
-    for _ in 0..5 {
-        assert_eq!(login(&app, "203.0.113.1").await.unwrap().status(), 401);
-    }
-    assert_eq!(login(&app, "203.0.113.1").await.unwrap().status(), 429);
-    assert_eq!(login(&app, "203.0.113.2").await.unwrap().status(), 401);
-    assert_eq!(
-        login(&app, "203.0.113.2, 203.0.113.1")
-            .await
-            .unwrap()
-            .status(),
-        429
-    );
+    assert_eq!(login(&app, "203.0.113.1").await.0, 401);
+    let (status, took) = login(&app, "203.0.113.2").await;
+    assert_eq!(status, 401);
+    assert!(took < FIRST_DELAY * 2, "{took:?}");
+    let (status, took) = login(&app, "203.0.113.2, 203.0.113.1").await;
+    assert_eq!(status, 401);
+    assert!(took >= FIRST_DELAY * 2, "{took:?}");
 }
 
 #[tokio::test]
@@ -378,28 +364,30 @@ async fn auth_endpoints_refuse_oversized_bodies() {
 }
 
 #[tokio::test]
-async fn change_credentials_is_throttled_like_login() {
+async fn change_credentials_shares_the_login_failure_delay() {
     let app = start_app(true).await;
     let client = client_from([127, 0, 0, 1]);
     let change = |current: &'static str| {
-        client
+        let request = client
             .post(format!("{}/api/auth/change_credentials", app.base_url))
             .json(&serde_json::json!({"current_password": current, "new_password": "rotated"}))
-            .send()
+            .send();
+        timed(async move { request.await.unwrap().status().as_u16() })
     };
 
-    for _ in 0..5 {
-        assert_eq!(change("wrong").await.unwrap().status(), 401);
-    }
-    let throttled = change("wrong").await.unwrap();
-    assert_eq!(throttled.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-    assert!(retry_after(&throttled) >= 1);
-    // The shared count locks the login endpoint for wrong guesses too.
-    assert_eq!(password_login(&app, &client, "wrong").await.status(), 429);
+    let (status, took) = change("wrong").await;
+    assert_eq!(status, 401);
+    assert!(took >= FIRST_DELAY, "{took:?}");
+    // The login endpoint continues the same count.
+    let (status, took) = timed(login_status(&app, &client, "wrong")).await;
+    assert_eq!(status, 401);
+    assert!(took >= FIRST_DELAY * 2, "{took:?}");
 
-    // The correct current password still goes through while locked out.
-    assert_eq!(change("password").await.unwrap().status(), 200);
-    assert_eq!(password_login(&app, &client, "rotated").await.status(), 200);
+    // The correct current password goes through without a delay.
+    let (status, took) = change("password").await;
+    assert_eq!(status, 200);
+    assert!(took < FIRST_DELAY * 4, "{took:?}");
+    assert_eq!(login_status(&app, &client, "rotated").await, 200);
 }
 
 #[tokio::test]

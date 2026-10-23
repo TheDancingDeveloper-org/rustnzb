@@ -264,9 +264,9 @@ pub struct GeneralConfig {
     #[serde(default = "default_shutdown_timeout_secs")]
     pub shutdown_timeout_secs: u64,
     /// Reverse proxies whose `X-Forwarded-For` header is believed, as IP
-    /// addresses or CIDR blocks. Failed web logins are throttled per client
-    /// address; behind a proxy every request comes from the proxy, so list
-    /// it here to throttle the real clients separately. Empty (the default)
+    /// addresses or CIDR blocks. Wrong web-login passwords are delayed per
+    /// client address; behind a proxy every request comes from the proxy, so
+    /// list it here to count the real clients separately. Empty (the default)
     /// ignores `X-Forwarded-For`.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,

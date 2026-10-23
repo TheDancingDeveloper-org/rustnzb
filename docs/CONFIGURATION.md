@@ -117,13 +117,55 @@ The container image (built on the linuxserver.io Alpine base) also reads:
 | `script_max_output_bytes` | `1048576` | Script output kept. |
 | `fetch_allow_private` | `false` | Let URL fetches (add-url, SABnzbd `addurl`, RSS, SABnzbd import) reach private LAN addresses. Loopback and link-local addresses stay blocked. |
 | `fetch_allowed_hosts` | `[]` | Hosts that URL fetches may always reach: IP addresses, CIDR blocks or exact hostnames, such as `["prowlarr", "192.168.1.0/24"]`. |
-| `trusted_proxies` | `[]` | Reverse proxies whose `X-Forwarded-For` header is believed: IP addresses or CIDR blocks. Failed web logins are throttled per client address. Behind a reverse proxy every request arrives from the proxy, so all clients share one throttle until the proxy is listed here. For a reverse-proxied install (for example rustnzb behind Caddy), set it to the proxy's address or its Docker network, such as `["172.18.0.0/16"]`. The client is the rightmost `X-Forwarded-For` address that is not itself a trusted proxy. Leave it empty when rustnzb is reached directly; a listed address can then claim any client address. Read on every login, so a change needs no restart. |
+| `trusted_proxies` | `[]` | Reverse proxies whose `X-Forwarded-For` header is believed: IP addresses or CIDR blocks. Wrong web-login passwords are delayed per client address (see [Login brute-force protection](#login-brute-force-protection)). Behind a reverse proxy every request arrives from the proxy, so all clients share one failure count until the proxy is listed here. For a reverse-proxied install (for example rustnzb behind Caddy), set it to the proxy's address or its Docker network, such as `["172.18.0.0/16"]`. The client is the rightmost `X-Forwarded-For` address that is not itself a trusted proxy. Leave it empty when rustnzb is reached directly; a listed address can then claim any client address. Read on every login, so a change needs no restart. |
 | `group_max_headers` | `100000` | Headers kept per newsgroup, oldest pruned first. `0` keeps all. |
 | `shutdown_timeout_secs` | `30` | Wait for connections and downloads on SIGINT/SIGTERM before exiting. `0` waits forever. |
 
 Scripts run without a shell, with SABnzbd's positional arguments (final
 directory, NZB name, job name, report number, category, group, status 0-3,
 URL) and `SAB_*` / `NZBPP_*` environment variables, described below.
+
+### Login brute-force protection
+
+A wrong web-login password (on `/api/auth/login`, HTTP Basic auth or
+`/api/auth/change_credentials`) is answered after a delay: 0.5 s for a
+client's first wrong password, doubling with each further one up to 30 s. A
+client is an IPv4 address or an IPv6 /64. The count is forgotten after 15
+minutes without a failure, or on a correct password. A correct password is
+never refused or delayed; it waits only for one of the three password-hashing
+slots, first come, first served. Each failure is logged at `warn` as
+`Failed web login from <address>`.
+
+This slows guessing from one address. It does not stop guessing spread over
+many addresses, and it does not cap concurrent connections. Stop those at the
+edge. Behind Caddy, set `trusted_proxies` and rate-limit the auth endpoints
+with the [caddy-ratelimit](https://github.com/mholt/caddy-ratelimit) module,
+for example:
+
+```caddyfile
+rate_limit {
+	zone rustnzb_login {
+		match {
+			path /api/auth/*
+		}
+		key {remote_host}
+		events 10
+		window 1m
+	}
+}
+```
+
+Or ban repeat offenders with fail2ban, reading the rustnzb log:
+
+```ini
+# /etc/fail2ban/filter.d/rustnzb.conf
+[Definition]
+failregex = Failed web login from <HOST>
+```
+
+With HTTP Basic auth, an *arr or script that has a stale password also logs
+failures, so set the ban threshold above what a misconfigured client produces
+before someone notices it.
 
 ### Script environment
 
