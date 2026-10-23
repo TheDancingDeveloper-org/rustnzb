@@ -54,7 +54,8 @@ impl DavHandle {
 
         // Build NNTP pools from rustnzbd's server configs (same nzb-nntp
         // types). Reads served to /dav clients take playback permits; the
-        // ingest pipeline takes download permits like the downloader.
+        // ingest pipeline takes import permits, which share the WebDAV floor
+        // so an import makes progress while downloads take the rest.
         let pools_at = |tier: BudgetTier| -> Vec<Arc<ConnectionPool>> {
             servers
                 .iter()
@@ -69,7 +70,7 @@ impl DavHandle {
                 .collect()
         };
         let playback_pools = pools_at(BudgetTier::Playback);
-        let ingest_pools = pools_at(BudgetTier::Download);
+        let ingest_pools = pools_at(BudgetTier::Import);
         let provider = Arc::new(UsenetArticleProvider::new(playback_pools.clone()));
         let ingest_provider = Arc::new(UsenetArticleProvider::new(ingest_pools.clone()));
 
@@ -168,21 +169,20 @@ impl Drop for DavHandle {
 /// permit handed back to the downloader.
 const DAV_IDLE_CLOSE: Duration = Duration::from_secs(60);
 
-/// Close idle DAV sockets periodically. An idle socket is still open at the
-/// provider, so it keeps its budget permit until it is closed.
+/// Look after idle DAV sockets until `cancel`. An idle socket is still open
+/// at the provider, so it keeps its budget permit until it is closed: as
+/// soon as a waiter at another tier could take the permit, or after
+/// [`DAV_IDLE_CLOSE`].
 fn spawn_idle_reaper(pools: Vec<Arc<ConnectionPool>>, cancel: CancellationToken) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(DAV_IDLE_CLOSE / 2);
-        loop {
+    for pool in pools {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
             tokio::select! {
-                () = cancel.cancelled() => break,
-                _ = tick.tick() => {}
+                () = cancel.cancelled() => {}
+                () = pool.manage_idle(DAV_IDLE_CLOSE) => {}
             }
-            for pool in &pools {
-                pool.close_idle_older_than(DAV_IDLE_CLOSE).await;
-            }
-        }
-    });
+        });
+    }
 }
 
 fn open_db(db_path: &str) -> anyhow::Result<SqliteDavDatabase> {

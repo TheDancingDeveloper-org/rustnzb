@@ -107,6 +107,10 @@ pub trait DispatchEngine: Send + Sync {
     /// provider-side close. Tests shrink this; production uses the default.
     fn set_idle_keepalive(&self, _d: Duration) {}
 
+    /// Override how long an idle worker keeps its socket and its share of
+    /// the server's connection budget. Tests shrink this.
+    fn set_idle_release(&self, _d: Duration) {}
+
     /// `par2.defer_volumes`: hold PAR2 recovery volumes until the job's slice
     /// map shows damage. Applies to jobs submitted afterwards.
     fn set_defer_par2_volumes(&self, _on: bool) {}
@@ -280,6 +284,10 @@ impl DispatchEngine for DispatchHandle {
 
     fn set_idle_keepalive(&self, d: Duration) {
         self.0.set_idle_keepalive(d);
+    }
+
+    fn set_idle_release(&self, d: Duration) {
+        self.0.set_idle_release(d);
     }
 
     fn set_defer_par2_volumes(&self, on: bool) {

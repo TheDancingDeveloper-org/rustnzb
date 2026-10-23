@@ -593,9 +593,10 @@ pub struct DavConfig {
     #[serde(default)]
     pub api_key: Option<String>,
     /// Percent of each server's `connections` set aside for WebDAV playback
-    /// while the library is enabled (rounded up; the downloader always keeps
-    /// at least one). The downloader and WebDAV share one allowance per
-    /// server, so this is what keeps playback responsive during a download.
+    /// and import while the library is enabled (rounded up; the downloader
+    /// always keeps at least one). The downloader and WebDAV share one
+    /// allowance per server, so this is what keeps playback responsive
+    /// during a download. Playback may borrow more while downloads are idle.
     pub playback_reserve_pct: u8,
 }
 

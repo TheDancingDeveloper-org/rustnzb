@@ -99,6 +99,11 @@ const WORKER_IDLE_POLL: Duration = Duration::from_millis(500);
 /// notice at its next fetch, and the open-socket count would stay high.
 /// Tunable per pool via [`WorkerPool::set_idle_keepalive`].
 const DEFAULT_IDLE_KEEPALIVE: Duration = Duration::from_secs(30);
+/// How long a worker with nothing to fetch keeps its socket (and its share
+/// of the server's connection budget) before closing it. A waiter at another
+/// tier that could take the permit gets it sooner, as soon as the worker
+/// sees it. Tunable per pool via [`WorkerPool::set_idle_release`].
+const DEFAULT_IDLE_RELEASE: Duration = Duration::from_secs(30);
 /// Upper bound on one idle keepalive round trip.
 const IDLE_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Message-id used by the idle keepalive `STAT`. The provider answers 430,
@@ -185,10 +190,11 @@ fn refused(server: &ServerConfig) -> nzb_core::Outcome {
 /// Each server has a [`ServerBudget`] (from a [`BudgetRegistry`] shared with
 /// the WebDAV side) whose allowance is the configured `connections` limit.
 /// Workers acquire a [`BudgetTier::Download`] permit *before* connecting and
-/// hold it for their entire lifetime; the permit's `Drop` releases it
-/// synchronously back to the budget. Once the allowance is out, across the
-/// downloader and every other consumer of the budget, the next acquire
-/// awaits.
+/// hold it while they have a socket; an idle worker closes its socket and
+/// gives the permit back, so an idle downloader holds none of the allowance.
+/// The permit's `Drop` releases it synchronously back to the budget. Once the
+/// allowance is out, across the downloader and every other consumer of the
+/// budget, the next acquire awaits.
 ///
 /// **Limit changes at runtime** are handled differently for grow vs shrink:
 ///
@@ -339,7 +345,8 @@ impl ConnectionTracker {
             is_connected: false,
             open: server_slot.open,
             is_open: false,
-            _permit: permit,
+            budget: server_slot.budget,
+            permit: Some(permit),
         })
     }
 
@@ -441,10 +448,12 @@ pub enum SlotStatus {
     ServerRemoved,
 }
 
-/// RAII handle for one acquired NNTP connection slot. The underlying
-/// budget permit is released synchronously on drop. Workers should hold
-/// a `ConnectionSlot` for their entire lifetime — across reconnects, even
-/// across temporary connect failures — and only drop it when exiting.
+/// RAII handle for one worker's NNTP connection slot. Workers hold a
+/// `ConnectionSlot` for their entire lifetime, but its budget permit only
+/// while they have a socket to fetch with: an idle worker closes its socket
+/// and gives the permit back ([`ConnectionSlot::release_permit`]), then
+/// takes one again before reconnecting ([`ConnectionSlot::reacquire_permit`]).
+/// A permit still held is released synchronously on drop.
 pub struct ConnectionSlot {
     server_id: String,
     server_name: String,
@@ -457,7 +466,8 @@ pub struct ConnectionSlot {
     is_connected: bool,
     open: Arc<AtomicUsize>,
     is_open: bool,
-    _permit: BudgetPermit,
+    budget: Arc<ServerBudget>,
+    permit: Option<BudgetPermit>,
 }
 
 impl ConnectionSlot {
@@ -466,6 +476,31 @@ impl ConnectionSlot {
     }
     pub fn server_name(&self) -> &str {
         &self.server_name
+    }
+
+    /// The server budget this slot draws its permit from.
+    pub fn budget(&self) -> &Arc<ServerBudget> {
+        &self.budget
+    }
+
+    /// Whether the slot currently holds a budget permit.
+    pub fn has_permit(&self) -> bool {
+        self.permit.is_some()
+    }
+
+    /// Give the budget permit back. Call only once the socket is closed.
+    pub fn release_permit(&mut self) {
+        if self.permit.take().is_some() {
+            self.held.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Wait for a budget permit, if the slot does not hold one.
+    pub async fn reacquire_permit(&mut self) {
+        if self.permit.is_none() {
+            self.permit = Some(self.budget.acquire(BudgetTier::Download).await);
+            self.held.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn mark_active(&mut self) {
@@ -506,7 +541,7 @@ impl Drop for ConnectionSlot {
     fn drop(&mut self) {
         self.mark_inactive();
         self.mark_closed();
-        self.held.fetch_sub(1, Ordering::Relaxed);
+        self.release_permit();
     }
 }
 
@@ -1306,6 +1341,8 @@ pub struct WorkerPool {
     max_worker_idle: Mutex<Duration>,
     /// How often idle workers probe their socket for a provider-side close.
     idle_keepalive: Mutex<Duration>,
+    /// How long an idle worker keeps its socket and budget permit.
+    idle_release: Mutex<Duration>,
     /// Per-server "last starvation log" timestamp; rate-limits the
     /// "no workable items" diagnostic to once per minute per server.
     starvation_log: Mutex<HashMap<String, Instant>>,
@@ -1343,6 +1380,7 @@ impl WorkerPool {
             created_at: Instant::now(),
             max_worker_idle: Mutex::new(DEFAULT_MAX_WORKER_IDLE),
             idle_keepalive: Mutex::new(DEFAULT_IDLE_KEEPALIVE),
+            idle_release: Mutex::new(DEFAULT_IDLE_RELEASE),
             starvation_log: Mutex::new(HashMap::new()),
             evictions: AtomicU64::new(0),
             defer_par2_volumes: AtomicBool::new(true),
@@ -1377,6 +1415,17 @@ impl WorkerPool {
     /// Read the current idle keepalive interval.
     pub fn idle_keepalive(&self) -> Duration {
         *self.idle_keepalive.lock()
+    }
+
+    /// Override how long an idle worker keeps its socket and budget permit
+    /// before closing it.
+    pub fn set_idle_release(&self, d: Duration) {
+        *self.idle_release.lock() = d;
+    }
+
+    /// Read the current idle release delay.
+    pub fn idle_release(&self) -> Duration {
+        *self.idle_release.lock()
     }
 
     /// Millis elapsed since the pool was constructed. Used as the
@@ -1920,9 +1969,12 @@ async fn await_worker_shutdown(mut handles: Vec<JoinHandle<()>>, timeout: Durati
 /// reconciled away, limit shrunk) or the pool shuts down.
 ///
 /// The worker acquires its connection slot (a download permit from the
-/// per-server budget) **before** the first connect attempt and holds it for
-/// the entire lifetime of the worker, across every reconnect. This bounds
-/// concurrent connections to `server.connections` by construction.
+/// per-server budget) **before** the first connect attempt and holds the
+/// slot for its entire lifetime. It holds the slot's budget permit whenever
+/// it has a socket, across every reconnect, which bounds concurrent
+/// connections to `server.connections` by construction. With nothing to
+/// fetch it closes the socket and gives the permit back (see
+/// [`next_work_item`]), then takes a permit again before reconnecting.
 async fn pool_worker(
     pool: Arc<WorkerPool>,
     primary_server: ServerConfig,
@@ -1944,7 +1996,17 @@ async fn pool_worker(
 
     // Acquire the slot up-front. If the server isn't registered or its limit
     // is zero, the worker has nothing to do — exit.
-    let mut conn_slot = match pool.conn_tracker.acquire(&primary_server.id).await {
+    let acquired = wait_unless_exiting(
+        pool.conn_tracker.acquire(&primary_server.id),
+        &pool,
+        &worker_shutdown,
+        &last_progress,
+    )
+    .await;
+    let Some(acquired) = acquired else {
+        return;
+    };
+    let mut conn_slot = match acquired {
         Some(slot) => slot,
         None => {
             info!(
@@ -1997,6 +2059,21 @@ async fn pool_worker(
             pool.report_provider_outage();
             tokio::time::sleep(WORKER_IDLE_POLL).await;
             continue 'reconnect;
+        }
+
+        // An idle worker gave its permit back; take one again before
+        // opening a socket.
+        if !conn_slot.has_permit()
+            && wait_unless_exiting(
+                conn_slot.reacquire_permit(),
+                &pool,
+                &worker_shutdown,
+                &last_progress,
+            )
+            .await
+            .is_none()
+        {
+            return;
         }
 
         info!(
@@ -2107,16 +2184,25 @@ async fn pool_worker(
                 // Loop back to the top and reconnect — slot is preserved.
                 continue 'reconnect;
             }
-            WorkerExit::PeerClosed => {
-                // The provider closed the idle socket. Stay disconnected
-                // until there is work, so an empty queue holds no sockets
-                // and the provider is not reconnected to only to drop us
-                // again.
-                info!(
-                    worker = %worker_id,
-                    server = %primary_server.name,
-                    "Idle connection closed by the server; reconnecting when work arrives"
-                );
+            WorkerExit::PeerClosed | WorkerExit::Idle => {
+                // The socket is closed (by the provider, or by us with
+                // nothing to fetch). Stay disconnected, without a budget
+                // permit, until there is work, so an empty queue holds no
+                // sockets and none of the server's allowance.
+                if matches!(reconnect_needed, WorkerExit::PeerClosed) {
+                    info!(
+                        worker = %worker_id,
+                        server = %primary_server.name,
+                        "Idle connection closed by the server; reconnecting when work arrives"
+                    );
+                } else {
+                    debug!(
+                        worker = %worker_id,
+                        server = %primary_server.name,
+                        "Idle worker closed its connection; reconnecting when work arrives"
+                    );
+                }
+                conn_slot.release_permit();
                 if !wait_for_workable(&pool, &primary_server, &worker_shutdown).await {
                     return;
                 }
@@ -2141,6 +2227,9 @@ enum WorkerExit {
     /// The idle socket was closed by the server. Reconnect only once there
     /// is work for this server.
     PeerClosed,
+    /// Nothing to fetch: close the socket and give the budget permit back.
+    /// Reconnect only once there is work for this server.
+    Idle,
 }
 
 /// Outcome of [`next_work_item`].
@@ -2150,6 +2239,9 @@ enum NextWork {
     Exit,
     /// The idle keepalive found the socket closed.
     PeerClosed,
+    /// Idle long enough, or another tier could take the budget permit:
+    /// close the socket and give the permit back.
+    Release,
 }
 
 /// Probe an idle connection with a cheap `STAT` of a message-id that cannot
@@ -2172,6 +2264,30 @@ async fn idle_socket_alive(conn: &mut NntpConnection) -> bool {
         .await,
         Ok(Ok(_) | Err(NntpError::ArticleNotFound(_)))
     )
+}
+
+/// Drive `fut` (a wait for a budget permit) until it completes, or return
+/// `None` once the worker should exit. Waiting for the budget is not a
+/// stall, so the heartbeat is kept fresh meanwhile and the watchdog leaves
+/// the worker alone.
+async fn wait_unless_exiting<F: std::future::Future>(
+    fut: F,
+    pool: &Arc<WorkerPool>,
+    worker_shutdown: &Arc<AtomicBool>,
+    last_progress: &Arc<AtomicU64>,
+) -> Option<F::Output> {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            out = &mut fut => return Some(out),
+            _ = tokio::time::sleep(WORKER_IDLE_POLL) => {
+                if worker_shutdown.load(Ordering::Relaxed) || pool.shutdown.load(Ordering::Relaxed) {
+                    return None;
+                }
+                last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// Wait without a socket until `server` has workable items. Returns false if
@@ -2203,14 +2319,21 @@ async fn wait_for_workable(
 ///
 /// `higher_priority_servers` gates which items this server is allowed to take
 /// — see `pop_workable` for the priority model.
+///
+/// While there is nothing to fetch the worker holds a socket and a share of
+/// `budget`. It gives both up ([`NextWork::Release`]) once it has been idle
+/// for the pool's idle-release delay, or sooner when a waiter at another
+/// tier could take its permit.
 async fn next_work_item(
     pool: &Arc<WorkerPool>,
     server_id: &str,
     higher_priority_servers: &[String],
     worker_shutdown: &Arc<AtomicBool>,
     conn: &mut NntpConnection,
+    budget: &Arc<ServerBudget>,
 ) -> NextWork {
     let mut last_probe = Instant::now();
+    let idle_since = Instant::now();
     loop {
         if worker_shutdown.load(Ordering::Relaxed) || pool.shutdown.load(Ordering::Relaxed) {
             return NextWork::Exit;
@@ -2239,6 +2362,14 @@ async fn next_work_item(
             return NextWork::Item(item, ctx);
         }
 
+        // Idle: give the socket and its permit up when they are wanted
+        // elsewhere or have sat unused long enough.
+        if budget.wanted_elsewhere(BudgetTier::Download)
+            || idle_since.elapsed() >= pool.idle_release()
+        {
+            return NextWork::Release;
+        }
+
         // Idle: check the provider has not closed the socket under us.
         if last_probe.elapsed() >= pool.idle_keepalive() {
             if !idle_socket_alive(conn).await {
@@ -2252,6 +2383,7 @@ async fn next_work_item(
         let notified = pool.work_queue.notify.notified();
         tokio::select! {
             _ = notified => {}
+            _ = budget.contended() => {}
             _ = tokio::time::sleep(WORKER_IDLE_POLL) => {}
         }
     }
@@ -2267,6 +2399,7 @@ async fn run_worker_serial(
     last_progress: &Arc<AtomicU64>,
 ) -> WorkerExit {
     let mut consecutive_errors: u32 = 0;
+    let budget = Arc::clone(conn_slot.budget());
 
     loop {
         // Server runtime checks.
@@ -2314,12 +2447,14 @@ async fn run_worker_serial(
             &higher_priority_servers,
             worker_shutdown,
             conn,
+            &budget,
         )
         .await
         {
             NextWork::Item(item, ctx) => (item, ctx),
             NextWork::Exit => return WorkerExit::Exit,
             NextWork::PeerClosed => return WorkerExit::PeerClosed,
+            NextWork::Release => return WorkerExit::Idle,
         };
 
         let result = {
@@ -2546,6 +2681,7 @@ async fn run_worker_pipelined(
     last_progress: &Arc<AtomicU64>,
 ) -> WorkerExit {
     let mut pipeline = Pipeline::new(pipe_depth);
+    let budget = Arc::clone(conn_slot.budget());
     let mut in_flight_items: HashMap<u64, WorkItem> = HashMap::new();
     let mut next_tag: u64 = 0;
     let mut consecutive_errors: u32 = 0;
@@ -2645,12 +2781,14 @@ async fn run_worker_pipelined(
                 &higher_priority_servers,
                 worker_shutdown,
                 conn,
+                &budget,
             )
             .await
             {
                 NextWork::Item(item, ctx) => (item, ctx),
                 NextWork::Exit => return WorkerExit::Exit,
                 NextWork::PeerClosed => return WorkerExit::PeerClosed,
+                NextWork::Release => return WorkerExit::Idle,
             };
             let _ = ctx; // ctx is validated in next_work_item
             let tag = next_tag;
