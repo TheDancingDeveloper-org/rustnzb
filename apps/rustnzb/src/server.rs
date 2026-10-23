@@ -725,6 +725,15 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
 }
 
 /// Start the HTTP server with a pre-built (possibly augmented) router.
+/// The service `serve` runs: the router with each connection's peer address
+/// recorded, which the failed-login throttle keys on (`auth::client_ip`).
+/// Tests serve through this too, so they exercise the same per-client path.
+pub fn into_make_service(
+    router: Router,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, std::net::SocketAddr> {
+    router.into_make_service_with_connect_info::<std::net::SocketAddr>()
+}
+
 pub async fn serve(state: Arc<AppState>, router: Router) -> anyhow::Result<()> {
     let config = state.config();
     let addr = format!("{}:{}", config.general.listen_addr, config.general.port);
@@ -738,16 +747,12 @@ pub async fn serve(state: Arc<AppState>, router: Router) -> anyhow::Result<()> {
 
     let timeout = shutdown_limit(config.general.shutdown_timeout_secs);
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
-    // The peer address feeds the failed-login throttle (auth::client_ip).
-    let server = axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        let _ = signal_tx.send(());
-    })
-    .into_future();
+    let server = axum::serve(listener, into_make_service(router))
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = signal_tx.send(());
+        })
+        .into_future();
     tokio::pin!(server);
 
     // Once a signal arrives, give open connections the shutdown timeout to
