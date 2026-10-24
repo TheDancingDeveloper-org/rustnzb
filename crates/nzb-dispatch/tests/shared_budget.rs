@@ -325,7 +325,7 @@ async fn without_webdav_idle_workers_close_their_sockets() {
     // No WebDAV: no reserve and no pool sharing the budget.
     let budgets = Arc::new(BudgetRegistry::default());
     let pool = downloader(&config, &budgets);
-    pool.set_idle_release(Duration::from_millis(100));
+    pool.set_idle_release(Duration::from_millis(300));
     pool.start();
     let budget = budgets.get("srv").unwrap();
     wait_until("every worker is connected", || {
