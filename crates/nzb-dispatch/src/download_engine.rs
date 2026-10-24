@@ -100,11 +100,11 @@ const WORKER_IDLE_POLL: Duration = Duration::from_millis(500);
 /// Tunable per pool via [`WorkerPool::set_idle_keepalive`].
 const DEFAULT_IDLE_KEEPALIVE: Duration = Duration::from_secs(30);
 /// How long a worker with nothing to fetch keeps its socket (and its share
-/// of the server's connection budget) before closing it, while WebDAV pools
-/// share the budget. A waiter at another tier that could take the permit
-/// gets it sooner, as soon as the worker sees it. Without WebDAV pools the
-/// worker keeps its socket. Tunable per pool via
-/// [`WorkerPool::set_idle_release`].
+/// of the server's connection budget) before closing it. A waiter at another
+/// tier that could take the permit gets it sooner, as soon as the worker sees
+/// it. Closing idle sockets frees the provider's connection slots and keeps
+/// the open-socket count honest when the queue is empty, as SABnzbd does.
+/// Tunable per pool via [`WorkerPool::set_idle_release`].
 const DEFAULT_IDLE_RELEASE: Duration = Duration::from_secs(30);
 /// Upper bound on one idle keepalive round trip.
 const IDLE_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2324,10 +2324,9 @@ async fn wait_for_workable(
 ///
 /// While there is nothing to fetch the worker holds a socket and a share of
 /// `budget`. It gives both up ([`NextWork::Release`]) when a waiter at
-/// another tier could take its permit, or, while WebDAV pools share the
-/// budget, once it has been idle for the pool's idle-release delay. With the
-/// downloader as the only consumer it keeps the socket alive with the
-/// keepalive probe, as before the budget was shared.
+/// another tier could take its permit, or once it has been idle for the
+/// pool's idle-release delay. Until then the keepalive probe notices a socket
+/// the provider closed.
 async fn next_work_item(
     pool: &Arc<WorkerPool>,
     server_id: &str,
@@ -2369,7 +2368,7 @@ async fn next_work_item(
         // Idle: give the socket and its permit up when they are wanted
         // elsewhere or have sat unused long enough.
         if budget.wanted_elsewhere(BudgetTier::Download)
-            || (budget.has_pools() && idle_since.elapsed() >= pool.idle_release())
+            || idle_since.elapsed() >= pool.idle_release()
         {
             return NextWork::Release;
         }
