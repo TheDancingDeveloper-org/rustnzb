@@ -295,8 +295,7 @@ impl ServerBudget {
     }
 
     /// Whether a budgeted connection pool (the WebDAV side) shares this
-    /// budget with the downloader. When none does, the downloader is the
-    /// only consumer and has no reason to give idle permits back.
+    /// budget with the downloader.
     pub fn has_pools(&self) -> bool {
         self.pools.load(Ordering::Relaxed) > 0
     }

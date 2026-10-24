@@ -319,7 +319,7 @@ async fn concurrent_playback_readers_take_turns_on_the_floor_while_downloads_sat
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn without_webdav_idle_workers_keep_their_sockets() {
+async fn without_webdav_idle_workers_close_their_sockets() {
     let mock = MockNntpServer::start(MockConfig::default()).await;
     let config = server(mock.port());
     // No WebDAV: no reserve and no pool sharing the budget.
@@ -329,20 +329,24 @@ async fn without_webdav_idle_workers_keep_their_sockets() {
     pool.start();
     let budget = budgets.get("srv").unwrap();
     wait_until("every worker is connected", || {
-        budget.held(BudgetTier::Download) == 4
-            && pool.connection_snapshot() == vec![("srv".into(), 4, 4)]
+        pool.connection_snapshot() == vec![("srv".into(), 4, 4)]
     })
     .await;
+
+    // With nothing queued, every worker closes its socket after the release
+    // delay, so the pool panel does not show idle sockets as connected.
+    let all_released =
+        || budget.held_total() == 0 && pool.connection_snapshot() == vec![("srv".into(), 0, 4)];
+    wait_until("idle workers closed every socket", all_released).await;
     let logins = mock.accepted_connections();
 
-    // Idle well past the release delay: nothing is closed or reopened.
+    // They stay closed while there is still nothing to fetch.
     tokio::time::sleep(Duration::from_millis(1000)).await;
-    assert_eq!(budget.held(BudgetTier::Download), 4);
-    assert_eq!(pool.connection_snapshot(), vec![("srv".into(), 4, 4)]);
+    assert!(all_released(), "an idle worker reopened a socket");
     assert_eq!(
         mock.accepted_connections(),
         logins,
-        "an idle worker closed its socket and reconnected without WebDAV"
+        "an idle worker reconnected with nothing to fetch"
     );
     pool.shutdown().await;
 }
