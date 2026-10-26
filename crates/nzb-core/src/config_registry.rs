@@ -1106,6 +1106,134 @@ pub fn restart_required(setting: &Setting) -> bool {
     setting.apply == Apply::Restart
 }
 
+/// Check one JSON value against a setting's [`Kind`].
+///
+/// On success the value is the shape `AppConfig` deserializes: numbers stay
+/// numbers, paths and secrets are strings, and a missing optional value is
+/// JSON null. The error names the constraint, not the key.
+pub fn validate_value(kind: &Kind, value: &serde_json::Value) -> Result<serde_json::Value, String> {
+    match kind {
+        Kind::Bool => value
+            .as_bool()
+            .map(serde_json::Value::Bool)
+            .ok_or_else(|| "expected a boolean".to_string()),
+        Kind::U64 { min, max } => bounded_u64(value, *min, *max),
+        Kind::Usize { min, max } => bounded_u64(value, *min, *max),
+        Kind::U16 { min, max } => bounded_u64(value, u64::from(*min), u64::from(*max)),
+        Kind::U8 { min, max } => bounded_u64(value, u64::from(*min), u64::from(*max)),
+        Kind::F64 { min, max } => {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| "expected a number".to_string())?;
+            if !number.is_finite() || number < *min || number > *max {
+                return Err(format!("must be between {min} and {max}"));
+            }
+            Ok(serde_json::json!(number))
+        }
+        Kind::Path { optional } | Kind::String { optional, .. } | Kind::Secret { optional } => {
+            text_value(kind, value, *optional)
+        }
+        Kind::Enum { values } => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| "expected a string".to_string())?;
+            if values.contains(&text) {
+                Ok(serde_json::Value::String(text.to_string()))
+            } else {
+                Err(format!("must be one of {}", values.join(", ")))
+            }
+        }
+        Kind::StringList => {
+            let list = value
+                .as_array()
+                .ok_or_else(|| "expected a list of strings".to_string())?;
+            let mut out = Vec::with_capacity(list.len());
+            for (index, item) in list.iter().enumerate() {
+                let text = item
+                    .as_str()
+                    .ok_or_else(|| format!("item {index} expected a string"))?;
+                out.push(serde_json::Value::String(text.to_string()));
+            }
+            Ok(serde_json::Value::Array(out))
+        }
+    }
+}
+
+fn bounded_u64(value: &serde_json::Value, min: u64, max: u64) -> Result<serde_json::Value, String> {
+    let number = value
+        .as_u64()
+        .ok_or_else(|| "expected an integer".to_string())?;
+    if number < min || number > max {
+        return Err(format!("must be between {min} and {max}"));
+    }
+    Ok(serde_json::json!(number))
+}
+
+fn text_value(
+    kind: &Kind,
+    value: &serde_json::Value,
+    optional: bool,
+) -> Result<serde_json::Value, String> {
+    if value.is_null() {
+        return if optional {
+            Ok(serde_json::Value::Null)
+        } else {
+            Err("must not be null".to_string())
+        };
+    }
+    let text = value
+        .as_str()
+        .ok_or_else(|| "expected a string".to_string())?;
+    if text.is_empty() {
+        return if optional {
+            Ok(serde_json::Value::Null)
+        } else {
+            Err("must not be empty".to_string())
+        };
+    }
+    if let Kind::String {
+        max_len: Some(max), ..
+    } = kind
+        && text.chars().count() > *max
+    {
+        return Err(format!("must be at most {max} characters"));
+    }
+    Ok(serde_json::Value::String(text.to_string()))
+}
+
+/// Replace one dotted leaf inside a JSON object. Missing objects along the
+/// path are created. Returns the previous value, or null when the leaf was
+/// absent.
+pub fn set_leaf(
+    root: &mut serde_json::Value,
+    dotted: &str,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut parts = dotted.split('.').peekable();
+    let mut current = root;
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            let object = current
+                .as_object_mut()
+                .ok_or_else(|| format!("{dotted} is not an object path"))?;
+            let previous = object
+                .insert(part.to_string(), value)
+                .unwrap_or(serde_json::Value::Null);
+            return Ok(previous);
+        }
+        let next = current
+            .as_object_mut()
+            .ok_or_else(|| format!("{dotted} is not an object path"))?
+            .entry(part)
+            .or_insert_with(|| serde_json::json!({}));
+        if !next.is_object() {
+            return Err(format!("{dotted} is not an object path"));
+        }
+        current = next;
+    }
+    Err("empty key".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,5 +1292,26 @@ mod tests {
         );
         assert!(entries.iter().any(|entry| entry["granular"] == false));
         assert!(entries.iter().any(|entry| entry["apply"] == "restart"));
+    }
+
+    #[test]
+    fn validate_value_enforces_type_and_range() {
+        let port = Kind::U16 { min: 1, max: 65535 };
+        assert!(validate_value(&port, &serde_json::json!(8085)).is_ok());
+        assert!(validate_value(&port, &serde_json::json!(0)).is_err());
+        assert!(validate_value(&port, &serde_json::json!("nope")).is_err());
+        let flag = Kind::Bool;
+        assert!(validate_value(&flag, &serde_json::json!(true)).is_ok());
+        let name = Kind::String {
+            optional: false,
+            max_len: Some(4),
+        };
+        assert!(validate_value(&name, &serde_json::json!("abcd")).is_ok());
+        assert!(validate_value(&name, &serde_json::json!("abcde")).is_err());
+        let secret = Kind::Secret { optional: true };
+        assert_eq!(
+            validate_value(&secret, &serde_json::Value::Null).unwrap(),
+            serde_json::Value::Null
+        );
     }
 }

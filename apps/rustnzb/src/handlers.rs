@@ -1996,6 +1996,301 @@ fn etag_of(body: &[u8]) -> String {
     hex::encode(Sha256::digest(body))
 }
 
+/// Body of `PATCH /api/config`.
+#[derive(Deserialize, ToSchema)]
+pub struct ConfigPatchBody {
+    /// Dotted registry keys to the new JSON values.
+    pub settings: serde_json::Map<String, serde_json::Value>,
+    /// Required when a listen address moves off loopback. See WI-2499.
+    #[serde(default)]
+    pub confirm_exposure: bool,
+}
+
+/// What `PATCH /api/config` changed.
+#[derive(Serialize, ToSchema)]
+pub struct ConfigPatchResponse {
+    pub applied: Vec<String>,
+    /// Keys this patch changed that the process reads only at startup.
+    pub restart_required: Vec<String>,
+}
+
+fn effective_entries(state: &AppState) -> Result<Vec<EffectiveSetting>, ApiError> {
+    let effective = state.config();
+    let file = state.file_config();
+    let masked = masked_config(&effective);
+    let effective_value = serde_json::to_value(&masked).map_err(anyhow::Error::from)?;
+    let file_value = serde_json::to_value(&file).map_err(anyhow::Error::from)?;
+    let defaults = nzb_web::nzb_core::config::AppConfig::default();
+    let default_value = serde_json::to_value(&defaults).map_err(anyhow::Error::from)?;
+    let mut entries = Vec::new();
+    for setting in nzb_web::nzb_core::config_registry::settings() {
+        let value = json_at(&effective_value, setting.key);
+        let source = if let Some(over) = state.overrides().get(setting.key) {
+            match over.source {
+                nzb_web::nzb_core::overrides::OverrideSource::Env(_) => "env",
+                nzb_web::nzb_core::overrides::OverrideSource::Cli
+                | nzb_web::nzb_core::overrides::OverrideSource::Desktop => "cli",
+            }
+        } else if json_at(&file_value, setting.key) != json_at(&default_value, setting.key) {
+            "file"
+        } else {
+            "default"
+        };
+        let locked = matches!(source, "env" | "cli");
+        entries.push(EffectiveSetting {
+            key: setting.key.to_string(),
+            value,
+            source: source.to_string(),
+            locked,
+        });
+    }
+    Ok(entries)
+}
+
+fn effective_etag(state: &AppState) -> Result<String, ApiError> {
+    let body = serde_json::to_vec(&effective_entries(state)?).map_err(anyhow::Error::from)?;
+    Ok(format!("\"{}\"", etag_of(&body)))
+}
+
+fn if_match_matches(header: &str, etag: &str) -> bool {
+    header.split(',').any(|part| {
+        let part = part.trim();
+        part == "*" || part == etag
+    })
+}
+
+/// PATCH /api/config -- Change a subset of registry settings.
+///
+/// `If-Match` must carry the `ETag` from `GET /api/config/effective`. A missing
+/// tag is 428; a stale one is 412. A key locked by the environment or the
+/// command line is 409 and names that source. Sensitive keys need step-up.
+#[utoipa::path(
+    patch,
+    path = "/api/config",
+    tag = "config",
+    summary = "Patch settings by registry key",
+    description = "Applies a partial map of registry keys. Values are checked against the registry, path confinement and the listen-address rules. `If-Match` is required and must equal the effective-config ETag. Locked keys are rejected with their source. Sensitive keys need `X-Confirm-Password`.",
+    request_body = ConfigPatchBody,
+    params(
+        ("If-Match" = String, Header, description = "ETag from GET /api/config/effective"),
+    ),
+    responses(
+        (status = 200, description = "Settings saved", body = ConfigPatchResponse),
+        (status = 400, description = "Unknown key or invalid value", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 403, description = "Step-up required or forbidden", body = ApiError),
+        (status = 409, description = "Setting is locked by env or CLI", body = ApiError),
+        (status = 412, description = "If-Match does not match", body = ApiError),
+        (status = 428, description = "If-Match is missing", body = ApiError),
+    ),
+)]
+pub async fn h_config_patch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    method: Option<Extension<AuthMethod>>,
+    body: Result<Json<ConfigPatchBody>, JsonRejection>,
+) -> Result<Json<ConfigPatchResponse>, ApiError> {
+    let Json(body) = body.map_err(|_| ApiError::bad_request("invalid JSON body"))?;
+    let if_match = headers
+        .get(header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(if_match) = if_match else {
+        return Err(ApiError::precondition_required());
+    };
+
+    let registry = nzb_web::nzb_core::config_registry::settings();
+    let mut validated = Vec::new();
+    for (key, value) in &body.settings {
+        let setting = registry
+            .iter()
+            .find(|setting| setting.key == key)
+            .ok_or_else(|| {
+                ApiError::from((StatusCode::BAD_REQUEST, format!("unknown setting: {key}")))
+            })?;
+        // Re-check with the key named. `bad_request` is a static string, so
+        // unknown and invalid values use the message constructor via status.
+        let checked = nzb_web::nzb_core::config_registry::validate_value(&setting.kind, value)
+            .map_err(|message| {
+                ApiError::from((StatusCode::BAD_REQUEST, format!("{key}: {message}")))
+            })?;
+        validated.push((setting, checked));
+    }
+    if validated.is_empty() {
+        return Err(ApiError::bad_request("settings must not be empty"));
+    }
+
+    let file_now = state.file_config();
+    let file_value = serde_json::to_value(&file_now).map_err(anyhow::Error::from)?;
+    let mut changed_sensitive = false;
+    let mut changed_keys = Vec::new();
+    for (setting, value) in &validated {
+        let current = json_at(&file_value, setting.key);
+        let incoming = patch_compare_value(setting, value, &current);
+        if incoming == current {
+            continue;
+        }
+        if let Some(over) = state.overrides().get(setting.key) {
+            return Err(ApiError::conflict(format!(
+                "{key} is locked by {source}",
+                key = setting.key,
+                source = over.source
+            )));
+        }
+        if nzb_web::auth_class::class_of(setting.key) == nzb_web::auth_class::AuthClass::Sensitive {
+            changed_sensitive = true;
+        }
+        changed_keys.push((*setting, value.clone()));
+    }
+
+    if changed_sensitive {
+        ensure_step_up(&state, &headers, method.map(|extension| extension.0)).await?;
+    }
+
+    let confirm_exposure = body.confirm_exposure;
+    // Compare before the write lock. `effective_etag` reads the file layer,
+    // and `update_config_with` holds that lock, so checking inside it deadlocks.
+    let current_etag = effective_etag(&state)?;
+    if !if_match_matches(if_match, &current_etag) {
+        return Err(ApiError::precondition_failed(
+            "If-Match does not match the effective configuration",
+        ));
+    }
+    let (applied, restart_required) = state.update_config_with(|config| {
+        if changed_keys.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut document = serde_json::to_value(&*config).map_err(anyhow::Error::from)?;
+        let mut applied = Vec::new();
+        let mut restart = Vec::new();
+        for (setting, value) in &changed_keys {
+            let previous = json_at(&document, setting.key);
+            if &previous == value {
+                continue;
+            }
+            nzb_web::nzb_core::config_registry::set_leaf(&mut document, setting.key, value.clone())
+                .map_err(|message| {
+                    ApiError::from((
+                        StatusCode::BAD_REQUEST,
+                        format!("{}: {message}", setting.key),
+                    ))
+                })?;
+            applied.push(setting.key.to_string());
+            if matches!(
+                setting.apply,
+                nzb_web::nzb_core::config_registry::Apply::Restart
+            ) {
+                restart.push(setting.key.to_string());
+            }
+        }
+        let mut next: nzb_web::nzb_core::config::AppConfig = serde_json::from_value(document)
+            .map_err(|error| {
+                ApiError::from((
+                    StatusCode::BAD_REQUEST,
+                    format!("settings could not be applied: {error}"),
+                ))
+            })?;
+        next.general.history_retention =
+            normalize_history_retention(next.general.history_retention);
+        let problems = next.validate();
+        if let Some(problem) = problems.into_iter().next() {
+            return Err(ApiError::from((StatusCode::BAD_REQUEST, problem)));
+        }
+        enforce_bind_policy(&state, config, &next, confirm_exposure)?;
+        *config = next;
+        Ok::<_, ApiError>((applied, restart))
+    })?;
+
+    apply_live_patch(&state, &applied);
+    Ok(Json(ConfigPatchResponse {
+        applied,
+        restart_required,
+    }))
+}
+
+/// Secret writes treat the password mask as "leave it", matching the other
+/// settings writers. The compare value is the file value in that case.
+fn patch_compare_value(
+    setting: &nzb_web::nzb_core::config_registry::Setting,
+    incoming: &serde_json::Value,
+    current: &serde_json::Value,
+) -> serde_json::Value {
+    if matches!(
+        setting.kind,
+        nzb_web::nzb_core::config_registry::Kind::Secret { .. }
+    ) && incoming.as_str() == Some(PASSWORD_MASK)
+    {
+        return current.clone();
+    }
+    incoming.clone()
+}
+
+fn enforce_bind_policy(
+    state: &AppState,
+    previous: &nzb_web::nzb_core::config::AppConfig,
+    next: &nzb_web::nzb_core::config::AppConfig,
+    confirm_exposure: bool,
+) -> Result<(), ApiError> {
+    let listen_changed = previous.general.listen_addr != next.general.listen_addr
+        || previous.general.port != next.general.port;
+    if !listen_changed {
+        return Ok(());
+    }
+    let addr = format!("{}:{}", next.general.listen_addr.trim(), next.general.port);
+    if bind_is_loopback(&addr) {
+        return Ok(());
+    }
+    if !state.credential_store.has_credentials() {
+        return Err(ApiError::from((
+            StatusCode::BAD_REQUEST,
+            "refusing a non-loopback listen address while web login is disabled; enable authentication first, or bind 127.0.0.1".to_string(),
+        )));
+    }
+    if !confirm_exposure {
+        return Err(ApiError::from((
+            StatusCode::BAD_REQUEST,
+            "listening on a non-loopback address exposes the API to the network; confirm with confirm_exposure".to_string(),
+        )));
+    }
+    Ok(())
+}
+
+fn apply_live_patch(state: &AppState, applied: &[String]) {
+    let config = state.config();
+    if applied
+        .iter()
+        .any(|key| key == "general.max_active_downloads")
+    {
+        state
+            .queue_manager
+            .set_max_active_downloads(config.general.max_active_downloads);
+    }
+    if applied.iter().any(|key| key == "general.history_retention") {
+        state
+            .queue_manager
+            .set_history_retention(config.general.history_retention);
+    }
+    if applied.iter().any(|key| key == "general.rss_history_limit")
+        && let Some(limit) = config.general.rss_history_limit
+    {
+        let _ = state.queue_manager.rss_items_prune(limit);
+    }
+    if applied
+        .iter()
+        .any(|key| key == "general.auto_sort_remaining_pct")
+    {
+        state
+            .queue_manager
+            .set_auto_sort_remaining_pct(config.general.auto_sort_remaining_pct);
+    }
+    if applied.iter().any(|key| key == "general.speed_limit_bps") {
+        state
+            .queue_manager
+            .set_speed_limit(config.general.speed_limit_bps);
+    }
+}
+
 /// GET /api/config -- The persisted configuration, with secrets masked.
 ///
 /// Server passwords and API keys are replaced with the password mask. A mask
