@@ -3982,6 +3982,9 @@ pub struct UpdateGeneralBody {
     pub listen_addr: Option<String>,
     /// Port the HTTP server binds. Read at startup: restart required.
     pub port: Option<u16>,
+    /// Operator confirmed that a non-loopback listen address exposes the API.
+    #[serde(default)]
+    pub confirm_exposure: bool,
     /// `[par2] defer_volumes`; applies to new downloads at once.
     pub par2_defer_volumes: Option<bool>,
     /// `[par2] trust_inflight_verify`; applies at once.
@@ -4378,13 +4381,20 @@ fn validate_general_update(body: &UpdateGeneralBody) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn bind_is_loopback(addr: &str) -> bool {
+    matches!(
+        addr.trim().parse::<std::net::IpAddr>(),
+        Ok(ip) if ip.is_loopback()
+    )
+}
+
 /// PUT /api/config/general -- Update general settings.
 #[utoipa::path(
     put,
     path = "/api/config/general",
     tag = "config",
     summary = "Update general settings",
-    description = "Applies only the fields present in the body. Settings with their own endpoints (`speed_limit_bps`, `min_free_space_bytes`, `abort_hopeless`) are not accepted here. Changing settings the engine reads at startup is persisted immediately but takes effect on the next process start.",
+    description = "Applies only the fields present in the body. Settings with their own endpoints (`speed_limit_bps`, `min_free_space_bytes`, `abort_hopeless`) are not accepted here. Changing settings the engine reads at startup is persisted immediately but takes effect on the next process start. A non-loopback listen address is refused while web login is disabled, and otherwise requires `confirm_exposure`.",
     request_body = UpdateGeneralBody,
     responses(
         (status = 200, description = "General settings updated", body = GeneralUpdateResponse),
@@ -4424,6 +4434,25 @@ pub async fn h_general_update(
     // writable before it is saved. It applies to new jobs only: queued and
     // history entries keep the paths they were created with.
     let current = state.config();
+    // A non-loopback bind with web login off is reachable by anyone. Refuse
+    // it rather than saving a setting that locks the operator out after
+    // restart. Moving off loopback also needs an explicit confirmation.
+    if let Some(addr) = body.listen_addr.as_deref() {
+        let next = addr.trim();
+        let changed = next != current.general.listen_addr.trim();
+        if changed && !bind_is_loopback(next) {
+            if !state.credential_store.has_credentials() {
+                return Err(ApiError::bad_request(
+                    "refusing a non-loopback listen address while web login is disabled; enable authentication first, or bind 127.0.0.1",
+                ));
+            }
+            if !body.confirm_exposure {
+                return Err(ApiError::bad_request(
+                    "listening on a non-loopback address exposes the API to the network; confirm with confirm_exposure",
+                ));
+            }
+        }
+    }
     for (field, value, existing) in [
         (
             "complete_dir",

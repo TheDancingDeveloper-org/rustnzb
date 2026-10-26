@@ -2150,8 +2150,115 @@ async fn network_settings_are_saved_and_flagged_restart_required() {
             .put(&url)
             .bearer_auth(&access)
             .header("X-Confirm-Password", "password")
-            .json(&serde_json::json!({"port": default.port, "listen_addr": default.listen_addr})),
+            .json(&serde_json::json!({
+                "port": default.port,
+                "listen_addr": default.listen_addr,
+                "confirm_exposure": true
+            })),
     )
     .await;
     assert_eq!(body["restart_required"], serde_json::json!([]));
+}
+
+/// WI-2499: a non-loopback bind needs web login and an explicit confirmation.
+/// Loopback and port changes are accepted and wait for a restart.
+#[tokio::test]
+async fn bind_change_refuses_exposure_without_auth_or_confirmation() {
+    let client = reqwest::Client::new();
+
+    // The protected router is closed until a login exists, so drop the
+    // account after the session is issued and then attempt the bind change.
+    let open = start_app_with(true, |config| {
+        config.general.listen_addr = "127.0.0.1".into();
+    })
+    .await;
+    let (access, _) = login(&open, &client).await;
+    open.state.credential_store.clear_for_test();
+    let (status, body) = call(
+        client
+            .put(format!("{}/api/config/general", open.base_url))
+            .bearer_auth(&access)
+            .header("X-Confirm-Password", "password")
+            .json(&serde_json::json!({
+                "listen_addr": "0.0.0.0",
+                "confirm_exposure": true
+            })),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["human_readable"]
+            .as_str()
+            .unwrap_or("")
+            .contains("web login is disabled"),
+        "{body}"
+    );
+    assert_eq!(open.state.config().general.listen_addr, "127.0.0.1");
+
+    let app = start_app_with(true, |config| {
+        config.general.listen_addr = "127.0.0.1".into();
+    })
+    .await;
+    let (access, _) = login(&app, &client).await;
+    let url = format!("{}/api/config/general", app.base_url);
+    let (status, body) = call(
+        client
+            .put(&url)
+            .bearer_auth(&access)
+            .header("X-Confirm-Password", "password")
+            .json(&serde_json::json!({"listen_addr": "0.0.0.0"})),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["human_readable"]
+            .as_str()
+            .unwrap_or("")
+            .contains("confirm_exposure"),
+        "{body}"
+    );
+    assert_eq!(app.state.config().general.listen_addr, "127.0.0.1");
+
+    let (status, body) = call(
+        client
+            .put(&url)
+            .bearer_auth(&access)
+            .header("X-Confirm-Password", "password")
+            .json(&serde_json::json!({
+                "listen_addr": "0.0.0.0",
+                "confirm_exposure": true
+            })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], true);
+    assert!(
+        body["restart_required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|key| key == "general.listen_addr"),
+        "{body}"
+    );
+    assert_eq!(app.state.config().general.listen_addr, "0.0.0.0");
+
+    let (status, body) = call(
+        client
+            .put(&url)
+            .bearer_auth(&access)
+            .header("X-Confirm-Password", "password")
+            .json(&serde_json::json!({"listen_addr": "::1", "port": 9090})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["restart_required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|key| key == "general.listen_addr"),
+        "{body}"
+    );
+    assert_eq!(app.state.config().general.listen_addr, "::1");
+    assert_eq!(app.state.config().general.port, 9090);
 }

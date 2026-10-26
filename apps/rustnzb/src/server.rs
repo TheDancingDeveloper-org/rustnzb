@@ -646,6 +646,23 @@ fn build_api_router(state: Arc<AppState>) -> Router {
                     {
                         return Ok(next.run(request).await);
                     }
+                    // A listen-address change is the one mutation that must
+                    // explain itself while login is off: binding beyond
+                    // loopback with no web login locks the operator out.
+                    if (path == "/config/general" || path == "/api/config/general")
+                        && let Ok(bytes) =
+                            axum::body::to_bytes(request.into_body(), 64 * 1024).await
+                        && let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        && let Some(addr) = body.get("listen_addr").and_then(|v| v.as_str())
+                        && addr
+                            .trim()
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| !ip.is_loopback())
+                    {
+                        return Err(ApiError::bad_request(
+                            "refusing a non-loopback listen address while web login is disabled; enable authentication first, or bind 127.0.0.1",
+                        ));
+                    }
                     return Err(ApiError::unauthorized());
                 }
 

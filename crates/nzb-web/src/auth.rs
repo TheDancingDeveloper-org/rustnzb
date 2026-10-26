@@ -377,6 +377,13 @@ impl CredentialStore {
         self.account.read().is_some()
     }
 
+    /// Forget the loaded account without touching the file. Only the bind
+    /// lockout test uses this, to reach the handler after a session exists.
+    #[doc(hidden)]
+    pub fn clear_for_test(&self) {
+        *self.account.write() = None;
+    }
+
     /// The configured username, if any. The password hash is never exposed.
     pub fn username(&self) -> Option<String> {
         self.account.read().as_ref().map(|a| a.username.clone())

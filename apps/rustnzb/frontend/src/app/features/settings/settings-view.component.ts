@@ -1692,11 +1692,18 @@ function emptyCategory(): CategoryConfig {
                 <input id="listen-port" type="number" [(ngModel)]="networkForm.port" min="1" max="65535" />
               </div>
               <div class="dim" style="margin-top:10px">
-                Read when rustnzb starts. In Docker, the container port mapping must follow a port
+                Read when rustnzb starts. A change is saved now and takes effect only after a restart.
+                In Docker, the container port mapping must follow a port
                 change. A <code>--port</code>, <code>--listen-addr</code> or environment override still
                 wins over the saved value. Serving under a base URL (sub-path) is not supported; put
                 rustnzb at the root of its host.
               </div>
+              @if (bindExposesNetwork()) {
+                <div class="load-error" role="status">
+                  This address exposes rustnzb to your network. Web login must be enabled, and saving
+                  asks you to confirm.
+                </div>
+              }
               <div class="form-actions">
                 <button class="btn primary" (click)="saveNetwork()" [disabled]="!canSave('network')">Save network</button>
               </div>
@@ -2449,6 +2456,7 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     par2_trust_inflight_verify: true,
   };
   networkForm: NetworkForm = { listen_addr: '', port: 8080 };
+  private loadedListenAddr = '';
   /** Saved settings that take effect only after a restart. */
   restartPending = signal<string[]>([]);
   categoryCleanupText = '';
@@ -2631,6 +2639,7 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
       par2_trust_inflight_verify: par2?.trust_inflight_verify ?? p.par2_trust_inflight_verify,
     };
     this.networkForm = { listen_addr: g.listen_addr ?? '', port: g.port ?? this.networkForm.port };
+    this.loadedListenAddr = this.networkForm.listen_addr;
   }
 
   loadRestartPending(): void {
@@ -2693,18 +2702,57 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     );
   }
 
+  private bindIsLoopback(addr: string): boolean {
+    const value = addr.trim().toLowerCase();
+    return value === '127.0.0.1' || value === '::1' || value === 'localhost';
+  }
+
+  /** True when the address in the form is reachable beyond this host. */
+  bindExposesNetwork(): boolean {
+    const next = this.networkForm.listen_addr.trim();
+    return !!next && !this.bindIsLoopback(next);
+  }
+
+  bindLeavesLoopback(): boolean {
+    return this.bindExposesNetwork() && this.bindIsLoopback(this.loadedListenAddr);
+  }
+
   saveNetwork(): void {
     const port = Number(this.networkForm.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       this.toast.info('Port must be between 1 and 65535');
       return;
     }
-    this.saveGeneral(
-      'network',
-      { listen_addr: this.networkForm.listen_addr.trim(), port },
-      'Network settings saved. They apply after a restart.',
-      'Failed to save network settings',
-    );
+    const addr = this.networkForm.listen_addr.trim();
+    if (!addr) {
+      this.toast.info('Listen address is required');
+      return;
+    }
+    const send = (confirmExposure: boolean) => {
+      this.saveGeneral(
+        'network',
+        { listen_addr: addr, port, confirm_exposure: confirmExposure },
+        'Network settings saved. Restart rustnzb for the new address and port to take effect.',
+        'Failed to save network settings',
+      );
+    };
+    if (this.bindExposesNetwork()) {
+      this.confirmSvc
+        .confirm({
+          title: 'Expose rustnzb on the network?',
+          message:
+            'Listening on ' +
+            addr +
+            ' makes the API reachable beyond this host. Web login must stay enabled. The change applies only after a restart.',
+          confirmLabel: 'Expose and save',
+          danger: true,
+        })
+        .subscribe((ok) => {
+          if (ok) send(true);
+        });
+      return;
+    }
+    send(false);
   }
 
   // ======================== SERVERS ========================

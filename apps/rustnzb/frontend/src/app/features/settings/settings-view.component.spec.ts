@@ -747,6 +747,7 @@ describe('filenameFromDisposition', () => {
         put: vi.fn(() => of({ status: true, restart_required: ['general.port'] })),
       });
       component.ngOnInit();
+      component.networkForm.listen_addr = '127.0.0.1';
       component.networkForm.port = 9191;
       component.saveNetwork();
       expect(component.restartPending()).toEqual(['general.port']);
@@ -759,6 +760,32 @@ describe('filenameFromDisposition', () => {
       component.networkForm.port = 0;
       component.saveNetwork();
       expect(api.put).not.toHaveBeenCalled();
+    });
+
+    it('confirms a non-loopback bind and sends confirm_exposure', () => {
+      const { component, api, confirm } = makeComponent();
+      component.ngOnInit();
+      component.networkForm.listen_addr = '0.0.0.0';
+      component.saveNetwork();
+      expect(confirm.confirm).toHaveBeenCalledWith(expect.objectContaining({ title: 'Expose rustnzb on the network?' }));
+      expect(api.put).toHaveBeenCalledWith('/config/general', {
+        listen_addr: '0.0.0.0',
+        port: 8080,
+        confirm_exposure: true,
+      });
+    });
+
+    it('saves a loopback bind without the exposure confirmation', () => {
+      const { component, api, confirm } = makeComponent();
+      component.ngOnInit();
+      component.networkForm.listen_addr = '127.0.0.1';
+      component.saveNetwork();
+      expect(confirm.confirm).not.toHaveBeenCalled();
+      expect(api.put).toHaveBeenCalledWith('/config/general', {
+        listen_addr: '127.0.0.1',
+        port: 8080,
+        confirm_exposure: false,
+      });
     });
 
     it('surfaces the server path error (e.g. not mounted)', () => {
