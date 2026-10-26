@@ -42,19 +42,23 @@ impl Drop for TestApp {
 }
 
 pub async fn start_test_server(server_configs: Vec<ServerConfig>) -> TestApp {
-    start_test_server_inner(server_configs, false, &[], OverrideSet::default()).await
+    start_test_server_inner(server_configs, false, &[], OverrideSet::default(), false).await
 }
 
 /// Like [`start_test_server`], with `overrides` (CLI, env or desktop values)
 /// applied over the default file layer, as a real startup would apply them.
 pub async fn start_test_server_with_overrides(overrides: OverrideSet) -> TestApp {
-    start_test_server_inner(Vec::new(), false, &[], overrides).await
+    start_test_server_inner(Vec::new(), false, &[], overrides, false).await
+}
+
+pub async fn start_test_server_managed() -> TestApp {
+    start_test_server_inner(Vec::new(), false, &[], OverrideSet::default(), true).await
 }
 
 /// Like [`start_test_server`], with extra categories configured next to
 /// the default one.
 pub async fn start_test_server_with_categories(categories: &[&str]) -> TestApp {
-    start_test_server_inner(Vec::new(), false, categories, OverrideSet::default()).await
+    start_test_server_inner(Vec::new(), false, categories, OverrideSet::default(), false).await
 }
 
 /// Like [`start_test_server`], but points the incomplete directory at a
@@ -64,7 +68,7 @@ pub async fn start_test_server_with_categories(categories: &[&str]) -> TestApp {
 /// permission-based failure would not trigger. Used to exercise the enqueue
 /// failure path (rustnzb#129) without depending on filesystem permissions.
 pub async fn start_test_server_broken_storage() -> TestApp {
-    start_test_server_inner(Vec::new(), true, &[], OverrideSet::default()).await
+    start_test_server_inner(Vec::new(), true, &[], OverrideSet::default(), false).await
 }
 
 async fn start_test_server_inner(
@@ -72,6 +76,7 @@ async fn start_test_server_inner(
     broken_incomplete_dir: bool,
     extra_categories: &[&str],
     overrides: OverrideSet,
+    managed: bool,
 ) -> TestApp {
     let base = AppConfig::default();
     let mut categories = base.categories;
@@ -143,7 +148,8 @@ async fn start_test_server_inner(
             token_store,
             credential_store,
         )
-        .with_overrides(config, overrides),
+        .with_overrides(config, overrides)
+        .set_config_managed(managed),
     );
 
     let router = build_router(state.clone());

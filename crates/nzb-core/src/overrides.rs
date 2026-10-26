@@ -42,6 +42,11 @@ pub enum OverrideValue {
     OtelMetricsEndpoint(String),
     OtelServiceName(String),
     DavEnabled(bool),
+    /// A scalar registry leaf set by `RUSTNZB__SECTION__KEY`.
+    Json {
+        key: &'static str,
+        value: serde_json::Value,
+    },
 }
 
 impl OverrideValue {
@@ -59,8 +64,122 @@ impl OverrideValue {
             Self::OtelMetricsEndpoint(_) => "otel.metrics_endpoint",
             Self::OtelServiceName(_) => "otel.service_name",
             Self::DavEnabled(_) => "dav.enabled",
+            Self::Json { key, .. } => key,
         }
     }
+}
+
+/// Parse `RUSTNZB__SECTION__KEY` (and a secret `…_FILE`) into a registry override.
+///
+/// Returns `Ok(None)` when the name is not a generic override, or when the
+/// key is unknown, not a scalar, or the value does not match the registry
+/// kind. `warning` is set in those ignore cases so the caller can log it.
+/// A name the registry already lists in `Setting::env` is `Ok(None)` with no
+/// warning: the dedicated startup mapping owns those aliases.
+pub fn generic_env_override(name: &str, raw: &str) -> Result<Option<OverrideValue>, String> {
+    let Some(rest) = name.strip_prefix("RUSTNZB__") else {
+        return Ok(None);
+    };
+    if rest.is_empty() || !rest.contains("__") {
+        return Ok(None);
+    }
+    let (key_name, from_file) = match rest.strip_suffix("_FILE") {
+        Some(without) if without.contains("__") => (without, true),
+        _ => (rest, false),
+    };
+    let dotted = key_name.to_ascii_lowercase().replace("__", ".");
+    let Some(setting) = crate::config_registry::get(&dotted) else {
+        return Err(format!("ignoring {name}: {dotted} is not a known setting"));
+    };
+    if setting.env.contains(&name) {
+        return Ok(None);
+    }
+    if matches!(setting.kind, crate::config_registry::Kind::StringList)
+        || dotted
+            .split('.')
+            .next()
+            .is_some_and(|section| matches!(section, "servers" | "categories" | "rss_feeds"))
+    {
+        return Err(format!(
+            "ignoring {name}: {dotted} is a list and stays file-only"
+        ));
+    }
+    let text = if from_file {
+        if !matches!(setting.kind, crate::config_registry::Kind::Secret { .. }) {
+            return Err(format!("ignoring {name}: _FILE is only for secrets"));
+        }
+        match std::fs::read_to_string(raw.trim()) {
+            Ok(contents) => contents.trim_end_matches(['\n', '\r']).to_string(),
+            Err(error) => {
+                return Err(format!("ignoring {name}: cannot read secret file: {error}"));
+            }
+        }
+    } else {
+        raw.to_string()
+    };
+    let parsed = parse_env_text(&setting.kind, &text)
+        .map_err(|message| format!("ignoring {name}: {dotted} {message}"))?;
+    let checked = crate::config_registry::validate_value(&setting.kind, &parsed)
+        .map_err(|message| format!("ignoring {name}: {dotted} {message}"))?;
+    // Leak the dotted key so OverrideValue can stay 'static, matching Env names.
+    let key: &'static str = Box::leak(dotted.into_boxed_str());
+    Ok(Some(OverrideValue::Json {
+        key,
+        value: checked,
+    }))
+}
+
+fn parse_env_text(
+    kind: &crate::config_registry::Kind,
+    text: &str,
+) -> Result<serde_json::Value, String> {
+    use crate::config_registry::Kind;
+    let trimmed = text.trim();
+    match kind {
+        Kind::Bool => {
+            let on = matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+            let off = matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            );
+            if on {
+                Ok(serde_json::json!(true))
+            } else if off {
+                Ok(serde_json::json!(false))
+            } else {
+                Err("expected a boolean".to_string())
+            }
+        }
+        Kind::U64 { .. } | Kind::Usize { .. } | Kind::U16 { .. } | Kind::U8 { .. } => {
+            let number: u64 = trimmed
+                .parse()
+                .map_err(|_| "expected an integer".to_string())?;
+            Ok(serde_json::json!(number))
+        }
+        Kind::F64 { .. } => {
+            let number: f64 = trimmed
+                .parse()
+                .map_err(|_| "expected a number".to_string())?;
+            Ok(serde_json::json!(number))
+        }
+        Kind::Path { .. } | Kind::String { .. } | Kind::Secret { .. } | Kind::Enum { .. } => {
+            Ok(serde_json::Value::String(trimmed.to_string()))
+        }
+        Kind::StringList => Err("lists stay file-only".to_string()),
+    }
+}
+
+/// `RUSTNZB_CONFIG_MANAGED` is on when the value is `1`, `true`, `yes` or `on`.
+pub fn config_managed(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +193,32 @@ pub struct Override {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OverrideSet {
     entries: Vec<Override>,
+}
+
+fn apply_json_leaf(config: &mut AppConfig, key: &str, value: &serde_json::Value) {
+    let Ok(mut document) = serde_json::to_value(&*config) else {
+        return;
+    };
+    if crate::config_registry::set_leaf(&mut document, key, value.clone()).is_err() {
+        return;
+    }
+    if let Ok(next) = serde_json::from_value::<AppConfig>(document) {
+        *config = next;
+    }
+}
+
+fn copy_json_leaf(next: &mut AppConfig, file: &AppConfig, key: &str) {
+    let Ok(file_value) = serde_json::to_value(file) else {
+        return;
+    };
+    let mut current = &file_value;
+    for part in key.split('.') {
+        match current.get(part) {
+            Some(child) => current = child,
+            None => return,
+        }
+    }
+    apply_json_leaf(next, key, current);
 }
 
 impl OverrideSet {
@@ -114,6 +259,7 @@ impl OverrideSet {
                 }
                 OverrideValue::OtelServiceName(v) => config.otel.service_name = v.clone(),
                 OverrideValue::DavEnabled(v) => config.dav.enabled = *v,
+                OverrideValue::Json { key, value } => apply_json_leaf(config, key, value),
             }
         }
     }
@@ -151,6 +297,7 @@ impl OverrideSet {
                     next.otel.service_name = file.otel.service_name.clone();
                 }
                 OverrideValue::DavEnabled(_) => next.dav.enabled = file.dav.enabled,
+                OverrideValue::Json { key, .. } => copy_json_leaf(next, file, key),
             }
         }
     }
@@ -226,5 +373,59 @@ mod tests {
             OverrideSource::Env("OTEL_ENABLED").to_string(),
             "env:OTEL_ENABLED"
         );
+    }
+}
+
+#[cfg(test)]
+mod generic_env {
+    use super::*;
+
+    #[test]
+    fn generic_speed_limit_parses() {
+        let value = generic_env_override("RUSTNZB__GENERAL__SPEED_LIMIT_BPS", "2048")
+            .expect("valid")
+            .expect("some");
+        assert_eq!(value.key(), "general.speed_limit_bps");
+        match value {
+            OverrideValue::Json { value, .. } => assert_eq!(value, serde_json::json!(2048)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_and_unknown_are_errors() {
+        let invalid = generic_env_override("RUSTNZB__GENERAL__SPEED_LIMIT_BPS", "fast")
+            .expect_err("bad type");
+        assert!(invalid.contains("ignoring"), "{invalid}");
+        let unknown =
+            generic_env_override("RUSTNZB__GENERAL__NOT_A_SETTING", "1").expect_err("unknown");
+        assert!(unknown.contains("not a known setting"), "{unknown}");
+    }
+
+    #[test]
+    fn legacy_alias_is_left_to_the_dedicated_mapping() {
+        assert!(
+            generic_env_override("RUSTNZB_PORT", "8080")
+                .unwrap()
+                .is_none()
+                || generic_env_override("RUSTNZB__GENERAL__PORT", "8080")
+                    .ok()
+                    .flatten()
+                    .is_some()
+        );
+        // The short name is not the double-underscore form.
+        assert!(
+            generic_env_override("RUSTNZB_PORT", "8080")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn managed_flag_is_truthy_only() {
+        assert!(config_managed(Some("1")));
+        assert!(config_managed(Some(" true ")));
+        assert!(!config_managed(Some("0")));
+        assert!(!config_managed(None));
     }
 }

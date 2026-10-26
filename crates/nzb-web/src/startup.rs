@@ -117,6 +117,28 @@ pub fn build_overrides(
     set
 }
 
+/// Fold generic `RUSTNZB__SECTION__KEY` variables into `set`.
+///
+/// `names` is every environment name to consider (production passes
+/// `std::env::vars`). Unknown, mistyped and list keys are ignored after a
+/// warning. A key already set by the CLI or a legacy variable is left alone.
+pub fn apply_generic_env(set: &mut OverrideSet, vars: impl IntoIterator<Item = (String, String)>) {
+    use crate::nzb_core::overrides::generic_env_override;
+    for (name, value) in vars {
+        match generic_env_override(&name, &value) {
+            Ok(Some(parsed)) => {
+                if set.get(parsed.key()).is_some() {
+                    continue;
+                }
+                let source_name: &'static str = Box::leak(name.into_boxed_str());
+                set.set(parsed, OverrideSource::Env(source_name));
+            }
+            Ok(None) => {}
+            Err(message) => warn!("{message}"),
+        }
+    }
+}
+
 /// Create a data directory (e.g. `data_dir`/`incomplete_dir`/`complete_dir`), attaching
 /// the failing path and a permission hint to any error so failures are actionable
 /// instead of a bare `Permission denied (os error 13)`.
@@ -299,14 +321,21 @@ pub async fn initialize(
     // The file layer is what gets saved. Overrides from the command line,
     // the environment and the desktop shell apply on top of it, for this
     // process only.
-    let overrides = build_overrides(
+    let mut overrides = build_overrides(
         startup.listen_addr.as_deref(),
         startup.port,
         startup.data_dir.as_deref(),
         startup.from_desktop_shell,
         |name| std::env::var(name).ok(),
     );
+    apply_generic_env(
+        &mut overrides,
+        std::env::vars().filter(|(name, _)| name.starts_with("RUSTNZB__")),
+    );
     let config = overrides.overlay(&file);
+    let managed = crate::nzb_core::overrides::config_managed(
+        std::env::var("RUSTNZB_CONFIG_MANAGED").ok().as_deref(),
+    );
 
     warn_unsafe_categories(&config);
 
@@ -410,7 +439,8 @@ pub async fn initialize(
             token_store,
             credential_store,
         )
-        .with_overrides(file, overrides),
+        .with_overrides(file, overrides)
+        .set_config_managed(managed),
     );
 
     // Always start the RSS monitor so feeds added later via the API are polled.

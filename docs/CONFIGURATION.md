@@ -32,6 +32,33 @@ runs, and is never written to `config.toml`. The web UI shows such a setting
 as locked and names its source (`cli`, `env:NAME`). Remove the flag or
 variable to edit the setting again.
 
+
+## Generic environment overrides
+
+Every scalar registry setting also accepts `RUSTNZB__<SECTION>__<KEY>`,
+upper case with a double underscore between the section and the key. For
+example `RUSTNZB__GENERAL__SPEED_LIMIT_BPS=1048576` sets the bandwidth cap.
+The value is parsed with the same type rules as `PATCH /api/config`. It
+appears in `GET /api/config/effective` as `source=env` and `locked=true`.
+
+An unknown name, a value of the wrong type, or a list section (`servers`,
+`categories`, `rss_feeds`) is ignored with a warning. The process still
+starts. Secrets also accept a file: `RUSTNZB__GENERAL__API_KEY_FILE` is a
+path whose contents become the value. The short names already listed in the
+table above (`RUSTNZB_PORT`, `RUSTNZB_DATA_DIR`, and the rest) stay as they
+are and win when both forms are set.
+
+## Managed mode
+
+`RUSTNZB_CONFIG_MANAGED=1` (also `true`, `yes` or `on`) makes every registry
+setting read-only. `PATCH /api/config` and SABnzbd `mode=set_config` answer
+`409` with the error `managed`. Queue actions such as pause and resume still
+work. `GET /api/config/effective` reports `managed: true` and `locked: true`
+on every setting. Settings the registry marks live, such as
+`general.speed_limit_bps`, still apply immediately when a patch is accepted
+(managed mode simply refuses the patch).
+
+
 Unknown keys are an error. The message names the file and the key. To check a
 file without starting the server:
 

@@ -393,14 +393,18 @@ async fn main() -> anyhow::Result<()> {
     }
     // Command-line and environment overrides apply to this process only. They
     // are never saved, so the file keeps the value the user chose.
-    nzb_web::startup::build_overrides(
+    let mut startup_overrides = nzb_web::startup::build_overrides(
         args.listen_addr.as_deref(),
         args.port,
         args.data_dir.as_deref(),
         false,
         |name| std::env::var(name).ok(),
-    )
-    .apply(&mut config);
+    );
+    nzb_web::startup::apply_generic_env(
+        &mut startup_overrides,
+        std::env::vars().filter(|(name, _)| name.starts_with("RUSTNZB__")),
+    );
+    startup_overrides.apply(&mut config);
 
     // Initialize logging (must happen before startup::initialize)
     let log_buffer = LogBuffer::new();

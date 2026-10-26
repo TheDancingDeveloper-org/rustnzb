@@ -1935,8 +1935,10 @@ pub struct EffectiveSetting {
     pub value: serde_json::Value,
     /// `default`, `file`, `env` or `cli`. Desktop overrides report as `cli`.
     pub source: String,
-    /// True when env or CLI forced the value, so the GUI must not edit it.
+    /// True when env or CLI forced the value, or the process is managed.
     pub locked: bool,
+    /// True when `RUSTNZB_CONFIG_MANAGED` locked every registry write.
+    pub managed: bool,
 }
 
 /// GET /api/config/effective -- Each registry setting's live value and source.
@@ -1980,12 +1982,13 @@ pub async fn h_config_effective(
         } else {
             "default"
         };
-        let locked = matches!(source, "env" | "cli");
+        let locked = state.config_managed() || matches!(source, "env" | "cli");
         entries.push(EffectiveSetting {
             key: setting.key.to_string(),
             value,
             source: source.to_string(),
             locked,
+            managed: state.config_managed(),
         });
     }
     let body = serde_json::to_vec(&entries).map_err(anyhow::Error::from)?;
@@ -2051,12 +2054,13 @@ fn effective_entries_from_file(
         } else {
             "default"
         };
-        let locked = matches!(source, "env" | "cli");
+        let locked = state.config_managed() || matches!(source, "env" | "cli");
         entries.push(EffectiveSetting {
             key: setting.key.to_string(),
             value,
             source: source.to_string(),
             locked,
+            managed: state.config_managed(),
         });
     }
     Ok(entries)
@@ -2113,6 +2117,9 @@ pub async fn h_config_patch(
     method: Option<Extension<AuthMethod>>,
     body: Result<Json<ConfigPatchBody>, JsonRejection>,
 ) -> Result<Json<ConfigPatchResponse>, ApiError> {
+    if state.config_managed() {
+        return Err(ApiError::conflict("managed"));
+    }
     let Json(body) = body.map_err(|_| ApiError::bad_request("invalid JSON body"))?;
     let if_match = headers
         .get(header::IF_MATCH)
