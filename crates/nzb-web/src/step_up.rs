@@ -220,7 +220,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn repeated_wrong_confirm_passwords_are_throttled() {
         let temp = tempfile::tempdir().unwrap();
         let store = Arc::new(CredentialStore::new(temp.path().to_path_buf()));
@@ -236,9 +236,40 @@ mod tests {
         let client = Some(std::net::IpAddr::from([203, 0, 113, 9]));
         let mut headers = HeaderMap::new();
         headers.insert(CONFIRM_HEADER, "wrong".parse().unwrap());
-        let started = Instant::now();
-        for _ in 0..2 {
-            let err = require_step_up(
+        // Auto-advance releases tokio sleeps as virtual time, including the
+        // throttle hold and the blocking-pool park around Argon2. Wall time
+        // is not the assertion: the paused clock is.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let started = tokio::time::Instant::now();
+            for _ in 0..2 {
+                let err = require_step_up(
+                    AuthMethod::Bearer { session: 4 },
+                    &headers,
+                    &step,
+                    &store,
+                    &throttle,
+                    client,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(err.status(), http::StatusCode::FORBIDDEN);
+            }
+            // First failure holds 40ms, the second 80ms.
+            let held = started.elapsed();
+            assert!(
+                held >= Duration::from_millis(120),
+                "wrong passwords must delay the caller, held {held:?}"
+            );
+            assert!(
+                held < Duration::from_millis(130),
+                "delay must be the throttle, not an open-ended wait, held {held:?}"
+            );
+            assert_eq!(throttle.failures(client), Some(2));
+            assert!(!step.fresh(4));
+
+            headers.insert(CONFIRM_HEADER, "correct horse".parse().unwrap());
+            let started = tokio::time::Instant::now();
+            require_step_up(
                 AuthMethod::Bearer { session: 4 },
                 &headers,
                 &step,
@@ -247,28 +278,17 @@ mod tests {
                 client,
             )
             .await
-            .unwrap_err();
-            assert_eq!(err.status(), http::StatusCode::FORBIDDEN);
-        }
-        // First failure holds 40ms, the second 80ms.
-        assert!(started.elapsed() >= Duration::from_millis(110));
-        assert_eq!(throttle.failures(client), Some(2));
-        assert!(!step.fresh(4));
-
-        headers.insert(CONFIRM_HEADER, "correct horse".parse().unwrap());
-        let started = Instant::now();
-        require_step_up(
-            AuthMethod::Bearer { session: 4 },
-            &headers,
-            &step,
-            &store,
-            &throttle,
-            client,
-        )
+            .unwrap();
+            let held = started.elapsed();
+            assert!(
+                held < Duration::from_millis(40),
+                "a correct password clears the delay, held {held:?}"
+            );
+            assert_eq!(throttle.failures(client), None);
+            assert!(step.fresh(4));
+        })
         .await
-        .unwrap();
-        assert!(started.elapsed() < Duration::from_millis(40));
-        assert_eq!(throttle.failures(client), None);
-        assert!(step.fresh(4));
+        .expect("throttle must be observable on the paused clock");
     }
+
 }
