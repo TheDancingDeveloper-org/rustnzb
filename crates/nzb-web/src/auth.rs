@@ -537,6 +537,11 @@ impl CredentialStore {
     /// Password-only check for step-up. The caller already holds a session,
     /// so the username is not part of the proof. Argon2 still runs when no
     /// account is configured, against a dummy hash, so the cost stays.
+    /// Shared delay counter for wrong passwords, including step-up.
+    pub fn login_throttle(&self) -> &LoginThrottle {
+        &self.throttle
+    }
+
     pub fn confirm_password(&self, password: &str) -> bool {
         let hash = self
             .account
@@ -802,7 +807,7 @@ struct ClientFailures {
 /// brute-force protection" in docs/CONFIGURATION.md.
 pub struct LoginThrottle {
     clients: parking_lot::Mutex<HashMap<Option<IpAddr>, ClientFailures>>,
-    base_delay: Duration,
+    pub(crate) base_delay: Duration,
 }
 
 impl Default for LoginThrottle {
@@ -817,7 +822,7 @@ impl Default for LoginThrottle {
 impl LoginThrottle {
     /// Count a wrong password from `client` and return how long to hold the
     /// answer.
-    fn record_failure(&self, client: Option<IpAddr>, now: Instant) -> Duration {
+    pub(crate) fn record_failure(&self, client: Option<IpAddr>, now: Instant) -> Duration {
         let client = client_key(client);
         let mut clients = self.clients.lock();
         if !clients.contains_key(&client) && clients.len() >= MAX_TRACKED_CLIENTS {
@@ -844,11 +849,11 @@ impl LoginThrottle {
         (self.base_delay * (1u32 << doublings)).min(FAILURE_MAX_DELAY)
     }
 
-    fn record_success(&self, client: Option<IpAddr>) {
+    pub(crate) fn record_success(&self, client: Option<IpAddr>) {
         self.clients.lock().remove(&client_key(client));
     }
 
-    fn failures(&self, client: Option<IpAddr>) -> Option<u32> {
+    pub(crate) fn failures(&self, client: Option<IpAddr>) -> Option<u32> {
         self.clients
             .lock()
             .get(&client_key(client))

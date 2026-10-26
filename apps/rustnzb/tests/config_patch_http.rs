@@ -236,3 +236,200 @@ async fn sensitive_setting_requires_step_up() {
         std::path::PathBuf::from("/tmp/rustnzb-patch-data")
     );
 }
+
+async fn api_key(client: &reqwest::Client, base_url: &str, token: &str) -> String {
+    let minted = client
+        .post(format!("{base_url}/api/config/sabnzbd-api-key/rotate"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        minted.status(),
+        StatusCode::FORBIDDEN,
+        "rotate is sensitive and needs a session"
+    );
+    let minted = client
+        .post(format!("{base_url}/api/config/sabnzbd-api-key/rotate"))
+        .bearer_auth(token)
+        .header("X-Confirm-Password", "patch-test-password")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(minted.status(), StatusCode::OK, "{minted:?}");
+    minted.json::<serde_json::Value>().await.unwrap()["api_key"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn api_key_cannot_patch_registry_sensitive_keys() {
+    let app = start_test_server_with_overrides(OverrideSet::default()).await;
+    let client = reqwest::Client::new();
+    let token = access_token(&client, &app.base_url).await;
+    let key = api_key(&client, &app.base_url, &token).await;
+    let before = AppConfig::load(&app.config_path).unwrap();
+    let cases = [
+        ("general.trusted_proxies", serde_json::json!(["10.0.0.0/8"])),
+        (
+            "general.local_import_dir",
+            serde_json::json!("/tmp/rustnzb-patch-import"),
+        ),
+        ("general.step_up_ttl_secs", serde_json::json!(60)),
+        (
+            "notifications.webhook_url",
+            serde_json::json!("https://example.invalid/hook"),
+        ),
+        (
+            "notifications.apprise_api_url",
+            serde_json::json!("https://example.invalid/apprise"),
+        ),
+        (
+            "notifications.apprise_urls",
+            serde_json::json!("https://example.invalid/notify"),
+        ),
+        ("notifications.ntfy_token", serde_json::json!("ntfy-token")),
+    ];
+    for (setting, value) in cases {
+        let tag = etag(&client, &app.base_url, &token).await;
+        let denied = client
+            .patch(format!("{}/api/config", app.base_url))
+            .header("X-Api-Key", &key)
+            .header(reqwest::header::IF_MATCH, &tag)
+            .header("X-Confirm-Password", "patch-test-password")
+            .json(&serde_json::json!({ "settings": { setting: value } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN, "{setting}");
+        let body: serde_json::Value = denied.json().await.unwrap();
+        assert_eq!(error_kind(&body), "step_up_forbidden", "{setting}");
+    }
+    let after = AppConfig::load(&app.config_path).unwrap();
+    assert_eq!(
+        after.general.trusted_proxies,
+        before.general.trusted_proxies
+    );
+    assert_eq!(
+        after.general.local_import_dir,
+        before.general.local_import_dir
+    );
+    assert_eq!(
+        after.general.step_up_ttl_secs,
+        before.general.step_up_ttl_secs
+    );
+    assert_eq!(
+        after.notifications.webhook_url,
+        before.notifications.webhook_url
+    );
+    assert_eq!(
+        after.notifications.apprise_api_url,
+        before.notifications.apprise_api_url
+    );
+    assert_eq!(
+        after.notifications.apprise_urls,
+        before.notifications.apprise_urls
+    );
+    assert_eq!(
+        after.notifications.ntfy_token,
+        before.notifications.ntfy_token
+    );
+}
+
+#[tokio::test]
+async fn loopback_port_change_does_not_need_exposure_confirm() {
+    let app = start_test_server_with_overrides(OverrideSet::default()).await;
+    let client = reqwest::Client::new();
+    let token = access_token(&client, &app.base_url).await;
+
+    let tag = etag(&client, &app.base_url, &token).await;
+    let loopback = client
+        .patch(format!("{}/api/config", app.base_url))
+        .bearer_auth(&token)
+        .header(reqwest::header::IF_MATCH, &tag)
+        .header("X-Confirm-Password", "patch-test-password")
+        .json(&serde_json::json!({
+            "settings": { "general.listen_addr": "127.0.0.1" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        loopback.status(),
+        StatusCode::OK,
+        "{}",
+        loopback.text().await.unwrap()
+    );
+
+    let tag = etag(&client, &app.base_url, &token).await;
+    let current = AppConfig::load(&app.config_path).unwrap().general.port;
+    let port_only = client
+        .patch(format!("{}/api/config", app.base_url))
+        .bearer_auth(&token)
+        .header(reqwest::header::IF_MATCH, &tag)
+        .header("X-Confirm-Password", "patch-test-password")
+        .json(&serde_json::json!({
+            "settings": { "general.port": current.wrapping_add(1) }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        port_only.status(),
+        StatusCode::OK,
+        "{}",
+        port_only.text().await.unwrap()
+    );
+
+    let tag = etag(&client, &app.base_url, &token).await;
+    let exposed = client
+        .patch(format!("{}/api/config", app.base_url))
+        .bearer_auth(&token)
+        .header(reqwest::header::IF_MATCH, &tag)
+        .header("X-Confirm-Password", "patch-test-password")
+        .json(&serde_json::json!({
+            "settings": { "general.listen_addr": "0.0.0.0" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(exposed.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = exposed.json().await.unwrap();
+    assert!(
+        body["human_readable"]
+            .as_str()
+            .unwrap_or("")
+            .contains("confirm_exposure"),
+        "{body}"
+    );
+
+    let tag = etag(&client, &app.base_url, &token).await;
+    let confirmed = client
+        .patch(format!("{}/api/config", app.base_url))
+        .bearer_auth(&token)
+        .header(reqwest::header::IF_MATCH, &tag)
+        .header("X-Confirm-Password", "patch-test-password")
+        .json(&serde_json::json!({
+            "confirm_exposure": true,
+            "settings": { "general.listen_addr": "0.0.0.0" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        confirmed.status(),
+        StatusCode::OK,
+        "{}",
+        confirmed.text().await.unwrap()
+    );
+    assert_eq!(
+        AppConfig::load(&app.config_path)
+            .unwrap()
+            .general
+            .listen_addr,
+        "0.0.0.0"
+    );
+}

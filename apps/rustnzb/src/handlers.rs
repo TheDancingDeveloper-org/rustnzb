@@ -1826,8 +1826,11 @@ pub async fn h_logs(
 async fn ensure_step_up(
     state: &AppState,
     headers: &axum::http::HeaderMap,
+    extensions: Option<&http::Extensions>,
     method: Option<AuthMethod>,
 ) -> Result<(), ApiError> {
+    let client =
+        extensions.and_then(|extensions| nzb_web::auth::client_ip(state, extensions, headers));
     let Some(method) = method else {
         // No credential extension means the route was reached without the
         // auth middleware (tests that call the handler directly). Treat that
@@ -1837,10 +1840,20 @@ async fn ensure_step_up(
             headers,
             &state.step_up,
             &state.credential_store,
+            state.credential_store.login_throttle(),
+            client,
         )
         .await;
     };
-    step_up::require_step_up(method, headers, &state.step_up, &state.credential_store).await
+    step_up::require_step_up(
+        method,
+        headers,
+        &state.step_up,
+        &state.credential_store,
+        state.credential_store.login_throttle(),
+        client,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1949,7 +1962,7 @@ pub async fn h_config_effective(
     let file = state.file_config();
     let masked = masked_config(&effective);
     let effective_value = serde_json::to_value(&masked).map_err(anyhow::Error::from)?;
-    let file_value = serde_json::to_value(&file).map_err(anyhow::Error::from)?;
+    let file_value = serde_json::to_value(file).map_err(anyhow::Error::from)?;
     let defaults = nzb_web::nzb_core::config::AppConfig::default();
     let default_value = serde_json::to_value(&defaults).map_err(anyhow::Error::from)?;
 
@@ -2014,12 +2027,14 @@ pub struct ConfigPatchResponse {
     pub restart_required: Vec<String>,
 }
 
-fn effective_entries(state: &AppState) -> Result<Vec<EffectiveSetting>, ApiError> {
-    let effective = state.config();
-    let file = state.file_config();
+fn effective_entries_from_file(
+    state: &AppState,
+    file: &nzb_web::nzb_core::config::AppConfig,
+) -> Result<Vec<EffectiveSetting>, ApiError> {
+    let effective = state.overrides().overlay(file);
     let masked = masked_config(&effective);
     let effective_value = serde_json::to_value(&masked).map_err(anyhow::Error::from)?;
-    let file_value = serde_json::to_value(&file).map_err(anyhow::Error::from)?;
+    let file_value = serde_json::to_value(file).map_err(anyhow::Error::from)?;
     let defaults = nzb_web::nzb_core::config::AppConfig::default();
     let default_value = serde_json::to_value(&defaults).map_err(anyhow::Error::from)?;
     let mut entries = Vec::new();
@@ -2047,8 +2062,16 @@ fn effective_entries(state: &AppState) -> Result<Vec<EffectiveSetting>, ApiError
     Ok(entries)
 }
 
-fn effective_etag(state: &AppState) -> Result<String, ApiError> {
-    let body = serde_json::to_vec(&effective_entries(state)?).map_err(anyhow::Error::from)?;
+/// ETag of the effective config when the file layer is already in hand.
+///
+/// The file mutex is not reentrant, so a caller that already holds it must
+/// pass that config in rather than reading it again.
+fn etag_for_locked_file(
+    state: &AppState,
+    file: &nzb_web::nzb_core::config::AppConfig,
+) -> Result<String, ApiError> {
+    let body = serde_json::to_vec(&effective_entries_from_file(state, file)?)
+        .map_err(anyhow::Error::from)?;
     Ok(format!("\"{}\"", etag_of(&body)))
 }
 
@@ -2145,19 +2168,20 @@ pub async fn h_config_patch(
     }
 
     if changed_sensitive {
-        ensure_step_up(&state, &headers, method.map(|extension| extension.0)).await?;
+        ensure_step_up(&state, &headers, None, method.map(|extension| extension.0)).await?;
     }
 
     let confirm_exposure = body.confirm_exposure;
-    // Compare before the write lock. `effective_etag` reads the file layer,
-    // and `update_config_with` holds that lock, so checking inside it deadlocks.
-    let current_etag = effective_etag(&state)?;
-    if !if_match_matches(if_match, &current_etag) {
-        return Err(ApiError::precondition_failed(
-            "If-Match does not match the effective configuration",
-        ));
-    }
+    let if_match = if_match.to_string();
     let (applied, restart_required) = state.update_config_with(|config| {
+        // Compare under the write lock, using the file already held. Calling
+        // `effective_etag` here would lock `file` again and deadlock.
+        let current_etag = etag_for_locked_file(&state, config)?;
+        if !if_match_matches(&if_match, &current_etag) {
+            return Err(ApiError::precondition_failed(
+                "If-Match does not match the effective configuration",
+            ));
+        }
         if changed_keys.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -2237,8 +2261,9 @@ fn enforce_bind_policy(
     if !listen_changed {
         return Ok(());
     }
-    let addr = format!("{}:{}", next.general.listen_addr.trim(), next.general.port);
-    if bind_is_loopback(&addr) {
+    // `bind_is_loopback` parses a bare address. A `host:port` string never
+    // parses, which would treat every bind as exposed.
+    if bind_is_loopback(next.general.listen_addr.trim()) {
         return Ok(());
     }
     if !state.credential_store.has_credentials() {
@@ -2371,7 +2396,13 @@ pub async fn h_config_backup_export(
     request: Request,
 ) -> Result<impl IntoResponse, ApiError> {
     if query.secrets {
-        ensure_step_up(&state, request.headers(), method.map(|Extension(m)| m)).await?;
+        ensure_step_up(
+            &state,
+            request.headers(),
+            Some(request.extensions()),
+            method.map(|Extension(m)| m),
+        )
+        .await?;
     }
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let body = config_backup::export(
@@ -2615,7 +2646,13 @@ pub async fn h_config_backup_restore(
     request: Request,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (parts, body) = request.into_parts();
-    ensure_step_up(&state, &parts.headers, method.map(|Extension(m)| m)).await?;
+    ensure_step_up(
+        &state,
+        &parts.headers,
+        Some(&parts.extensions),
+        method.map(|Extension(m)| m),
+    )
+    .await?;
     let body = axum::body::to_bytes(body, MAX_BACKUP_BYTES)
         .await
         .map_err(|_| {
@@ -2735,7 +2772,13 @@ pub async fn h_sab_api_key_rotate(
     method: Option<Extension<AuthMethod>>,
     request: Request,
 ) -> Result<Json<SabApiKeyResponse>, ApiError> {
-    ensure_step_up(&state, request.headers(), method.map(|Extension(m)| m)).await?;
+    ensure_step_up(
+        &state,
+        request.headers(),
+        Some(request.extensions()),
+        method.map(|Extension(m)| m),
+    )
+    .await?;
     // UUID v4 is backed by the operating system's cryptographically secure
     // random source. A simple-form UUID supplies a 32-character token without
     // separators, matching the common SABnzbd API-key format.
@@ -4871,7 +4914,13 @@ pub async fn h_general_update(
         "port" => body.port.is_some(),
         _ => false,
     }) {
-        ensure_step_up(&state, &headers, method.map(|Extension(m)| m)).await?;
+        ensure_step_up(
+            &state,
+            &headers,
+            Some(&parts.extensions),
+            method.map(|Extension(m)| m),
+        )
+        .await?;
     }
     // A changed download directory must exist in the container and be
     // writable before it is saved. It applies to new jobs only: queued and
@@ -6126,7 +6175,7 @@ pub async fn h_dav_config_set(
         password != config.dav.password || api_key != config.dav.api_key
     };
     if secrets_change {
-        ensure_step_up(&state, &headers, method).await?;
+        ensure_step_up(&state, &headers, Some(&parts.extensions), method).await?;
     }
     state.update_config_with(|config| {
         // Clients that predate the setting leave it as it was.

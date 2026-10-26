@@ -6,8 +6,10 @@ name: Release dry run
 # the release tooling (WI-2069). `ci.yml` treats a `packaging/` change the same
 # way: it is exercised here rather than by a Rust build.
 #
-# The build steps, the CROSS_IMAGE digest and the artefact names must stay in
-# step with the `release-assets` job in `.github/workflows/release.yml`.
+# The build steps and the artefact names must stay in step with the
+# `release-assets` job in `.github/workflows/release.yml`. `CROSS_IMAGE` is
+# `vars.RUSTNZB_CROSS_IMAGE`, the same variable that job uses. The job is
+# skipped when that variable is unset.
 
 on:
   pull_request:
@@ -34,12 +36,13 @@ jobs:
     # The build authenticates to repo.indexarr.net with FORGEJO_CARGO_TOKEN.
     # A fork's PR run does not receive secrets, so it cannot run this job.
     if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      vars.RUSTNZB_CROSS_IMAGE != '' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, docker, publish]
     timeout-minutes: 120
     env:
-      CROSS_IMAGE: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:d747454fca94ebfd9dba1f566d9f549c4c9fbedf785c6aba36a0c383d9b9a955
+      CROSS_IMAGE: ${{ vars.RUSTNZB_CROSS_IMAGE }}
     steps:
       - uses: actions/checkout@v7
       - name: Derive the tag the release would use
