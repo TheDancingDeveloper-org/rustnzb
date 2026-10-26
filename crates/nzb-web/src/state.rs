@@ -125,6 +125,26 @@ impl AppState {
         &self.overrides
     }
 
+    /// Replace the allowed-roots policy. Tests use this; production reads
+    /// `RUSTNZB_ALLOWED_ROOTS` once at startup.
+    #[cfg(test)]
+    pub(crate) fn with_path_policy_for_test(mut self, policy: ConfigPathPolicy) -> Self {
+        self.path_policy = policy;
+        self
+    }
+
+    /// Rebuild this state with extra overrides so tests can hit the
+    /// locked-key path. Production overrides are fixed at startup.
+    #[cfg(test)]
+    pub(crate) fn with_extra_overrides_for_test(self, extra: OverrideSet) -> Self {
+        let mut overrides = self.overrides.clone();
+        for entry in extra.iter() {
+            overrides.set(entry.value.clone(), entry.source.clone());
+        }
+        let file = self.file_config();
+        self.with_overrides(file, overrides)
+    }
+
     /// The effective configuration the process started with.
     pub fn startup_config(&self) -> Arc<AppConfig> {
         self.startup_config.clone()
