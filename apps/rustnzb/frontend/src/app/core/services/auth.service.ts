@@ -7,6 +7,12 @@ export interface AuthStatus {
   setup_required: boolean;
 }
 
+export interface SetupStatus {
+  needs_setup: boolean;
+  first_run: boolean;
+  container: boolean;
+}
+
 export interface TokenResponse {
   access_token: string;
   refresh_token: string;
@@ -42,6 +48,22 @@ export class AuthService {
 
   checkAuth(): Observable<AuthStatus> {
     return this.http.get<AuthStatus>(`${this.baseUrl}/status`);
+  }
+
+  setupStatus(): Observable<SetupStatus> {
+    return this.http.get<SetupStatus>('/api/setup/status');
+  }
+
+  firstRun(body: {
+    username: string;
+    password: string;
+    incomplete_dir: string;
+    complete_dir: string;
+    server_host: string;
+  }): Observable<TokenResponse> {
+    return this.http
+      .post<TokenResponse>('/api/setup/first-run', body)
+      .pipe(tap((res) => this.storeTokens(res)));
   }
 
   setup(username: string, password: string): Observable<TokenResponse> {

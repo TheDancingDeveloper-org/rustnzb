@@ -5532,6 +5532,8 @@ pub async fn h_setup_status(State(state): State<Arc<AppState>>) -> impl IntoResp
         "needs_setup": config.servers.is_empty(),
         "has_servers": !config.servers.is_empty(),
         "has_categories": !config.categories.is_empty(),
+        "first_run": !container_mode() && first_run_open(&state),
+        "container": container_mode(),
         "version": env!("RUSTNZB_BUILD_VERSION"),
     }))
 }
@@ -5769,6 +5771,128 @@ pub async fn h_setup_apply(
     }
 
     Ok(Json(serde_json::json!({ "status": true })))
+}
+
+/// Body of `POST /api/setup/first-run`.
+///
+/// Only accepted while no web login exists and no server is configured.
+/// Docker (`RUSTNZB_CONTAINER=1`) never accepts it.
+#[derive(Deserialize, ToSchema)]
+pub struct FirstRunRequest {
+    pub username: String,
+    pub password: String,
+    pub incomplete_dir: String,
+    pub complete_dir: String,
+    pub server_host: String,
+    #[serde(default = "default_nntp_port")]
+    pub server_port: u16,
+    #[serde(default = "default_ssl_on")]
+    pub server_ssl: bool,
+    #[serde(default)]
+    pub server_username: Option<String>,
+    #[serde(default)]
+    pub server_password: Option<String>,
+}
+
+fn default_nntp_port() -> u16 {
+    563
+}
+
+fn default_ssl_on() -> bool {
+    true
+}
+
+fn container_mode() -> bool {
+    std::env::var_os("RUSTNZB_CONTAINER").is_some_and(|value| value == "1")
+}
+
+/// First-run is open only for a non-container install that has no web login
+/// and no news server yet. Either condition afterwards is a lock.
+fn first_run_open(state: &AppState) -> bool {
+    !container_mode()
+        && !state.credential_store.has_credentials()
+        && state.config().servers.is_empty()
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/setup/first-run",
+    tag = "setup",
+    summary = "Finish non-Docker first-run setup",
+    description = "Creates the admin credential and writes the download paths plus one server through the same config commit as PATCH /api/config. Refused once credentials or a server exist, and always refused in a container.",
+    request_body = FirstRunRequest,
+    responses(
+        (status = 200, description = "Account created; tokens issued", body = nzb_web::auth::TokenResponse),
+        (status = 400, description = "A required field is missing or a path is outside the allowed roots", body = ApiError),
+        (status = 403, description = "Setup is locked, or this is a container", body = ApiError),
+    ),
+)]
+pub async fn h_setup_first_run(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<FirstRunRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    if container_mode() || !first_run_open(&state) {
+        return Err(ApiError::from((
+            StatusCode::FORBIDDEN,
+            "first-run setup is not available",
+        )));
+    }
+    if req.username.trim().is_empty()
+        || req.password.is_empty()
+        || req.incomplete_dir.trim().is_empty()
+        || req.complete_dir.trim().is_empty()
+        || req.server_host.trim().is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "username, password, paths and a server host are required",
+        ));
+    }
+
+    // ServerConfig is non_exhaustive, so fields are set on Default rather
+    // than a functional update from another crate.
+    let mut server = ServerConfig::new(uuid::Uuid::new_v4().to_string(), req.server_host.trim());
+    server.name = req.server_host.trim().to_string();
+    server.port = req.server_port;
+    server.ssl = req.server_ssl;
+    server.username = req.server_username.filter(|value| !value.is_empty());
+    server.password = req.server_password.filter(|value| !value.is_empty());
+
+    // Same write path as PATCH: update_config_with validates allowed roots
+    // and commits the file layer. Credentials are stored only after it
+    // succeeds, so a refused path leaves the install unconfigured.
+    state.update_config_with(|config| {
+        config.general.incomplete_dir = std::path::PathBuf::from(req.incomplete_dir.trim());
+        config.general.complete_dir = std::path::PathBuf::from(req.complete_dir.trim());
+        config.servers = vec![server.clone()];
+        Ok::<_, ApiError>(())
+    })?;
+
+    let username = req.username.trim().to_string();
+    let password = req.password;
+    let created = state
+        .credential_store
+        .run_hashing(move |store| {
+            store.initialize_credentials(nzb_web::auth::StoredCredentials { username, password })
+        })
+        .await
+        .unwrap_or_else(|| Err(std::io::Error::other("credential setup task failed")));
+    match created {
+        Ok(()) => {
+            state
+                .queue_manager
+                .update_servers(state.config().servers.clone());
+            let tokens = state.token_store.create_tokens();
+            Ok(Json(tokens))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(ApiError::from((
+            StatusCode::FORBIDDEN,
+            "first-run setup is not available",
+        ))),
+        Err(error) => Err(ApiError::from((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to save credentials: {error}"),
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
