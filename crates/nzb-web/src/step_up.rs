@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use axum::http::HeaderMap;
 use parking_lot::RwLock;
 
-use crate::auth::CredentialStore;
+use crate::auth::{CredentialStore, LoginThrottle};
 use crate::error::ApiError;
 
 /// Header carrying the web password for one sensitive request.
@@ -82,7 +82,10 @@ impl Default for StepUpStore {
 /// * API key → 403 `step_up_forbidden` (the confirm header is ignored).
 /// * HTTP Basic → allowed (the password authenticated this request).
 /// * `X-Confirm-Password` verifies against the stored Argon2 hash. Success
-///   records the session and allows the write.
+///   records the session and allows the write. A wrong password is counted
+///   on `throttle` the same way a failed login is: the answer is held, and
+///   a correct password later clears that client. Callers without a peer
+///   pass `client = None`, which still shares one bucket.
 /// * Otherwise a confirmation younger than the window allows the write.
 /// * Anything else → 403 `step_up_required`.
 pub async fn require_step_up(
@@ -90,6 +93,8 @@ pub async fn require_step_up(
     headers: &HeaderMap,
     step_up: &StepUpStore,
     credentials: &Arc<CredentialStore>,
+    throttle: &LoginThrottle,
+    client: Option<std::net::IpAddr>,
 ) -> Result<(), ApiError> {
     match method {
         AuthMethod::ApiKey => Err(ApiError::step_up_forbidden()),
@@ -105,8 +110,13 @@ pub async fn require_step_up(
                     .await
                     .unwrap_or(false);
                 if ok {
+                    throttle.record_success(client);
                     step_up.record(session);
                     return Ok(());
+                }
+                let delay = throttle.record_failure(client, Instant::now());
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
                 }
                 return Err(ApiError::step_up_required());
             }
@@ -154,19 +164,35 @@ mod tests {
             })
             .unwrap();
         let step = StepUpStore::new(Duration::from_secs(300));
+        let mut throttle = LoginThrottle::default();
+        throttle.base_delay = Duration::ZERO;
         let mut headers = HeaderMap::new();
         headers.insert(CONFIRM_HEADER, "wrong".parse().unwrap());
-        let err = require_step_up(AuthMethod::Bearer { session: 4 }, &headers, &step, &store)
-            .await
-            .unwrap_err();
+        let err = require_step_up(
+            AuthMethod::Bearer { session: 4 },
+            &headers,
+            &step,
+            &store,
+            &throttle,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.status(), http::StatusCode::FORBIDDEN);
         assert!(err.to_string().contains("step-up re-authentication"));
         assert!(!step.fresh(4));
 
         headers.insert(CONFIRM_HEADER, "correct horse".parse().unwrap());
-        require_step_up(AuthMethod::Bearer { session: 4 }, &headers, &step, &store)
-            .await
-            .unwrap();
+        require_step_up(
+            AuthMethod::Bearer { session: 4 },
+            &headers,
+            &step,
+            &store,
+            &throttle,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(step.fresh(4));
     }
 
@@ -183,13 +209,66 @@ mod tests {
         let step = StepUpStore::new(Duration::from_secs(300));
         let mut headers = HeaderMap::new();
         headers.insert(CONFIRM_HEADER, "correct horse".parse().unwrap());
-        let err = require_step_up(AuthMethod::ApiKey, &headers, &step, &store)
+        let throttle = LoginThrottle::default();
+        let err = require_step_up(AuthMethod::ApiKey, &headers, &step, &store, &throttle, None)
             .await
             .unwrap_err();
         assert_eq!(err.status(), http::StatusCode::FORBIDDEN);
         assert!(err.to_string().contains("API-key"));
-        require_step_up(AuthMethod::Basic, &headers, &step, &store)
+        require_step_up(AuthMethod::Basic, &headers, &step, &store, &throttle, None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_wrong_confirm_passwords_are_throttled() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(CredentialStore::new(temp.path().to_path_buf()));
+        store
+            .set_credentials(crate::auth::StoredCredentials {
+                username: "alice".into(),
+                password: "correct horse".into(),
+            })
+            .unwrap();
+        let step = StepUpStore::new(Duration::from_secs(300));
+        let mut throttle = LoginThrottle::default();
+        throttle.base_delay = Duration::from_millis(40);
+        let client = Some(std::net::IpAddr::from([203, 0, 113, 9]));
+        let mut headers = HeaderMap::new();
+        headers.insert(CONFIRM_HEADER, "wrong".parse().unwrap());
+        let started = Instant::now();
+        for _ in 0..2 {
+            let err = require_step_up(
+                AuthMethod::Bearer { session: 4 },
+                &headers,
+                &step,
+                &store,
+                &throttle,
+                client,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status(), http::StatusCode::FORBIDDEN);
+        }
+        // First failure holds 40ms, the second 80ms.
+        assert!(started.elapsed() >= Duration::from_millis(110));
+        assert_eq!(throttle.failures(client), Some(2));
+        assert!(!step.fresh(4));
+
+        headers.insert(CONFIRM_HEADER, "correct horse".parse().unwrap());
+        let started = Instant::now();
+        require_step_up(
+            AuthMethod::Bearer { session: 4 },
+            &headers,
+            &step,
+            &store,
+            &throttle,
+            client,
+        )
+        .await
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(40));
+        assert_eq!(throttle.failures(client), None);
+        assert!(step.fresh(4));
     }
 }

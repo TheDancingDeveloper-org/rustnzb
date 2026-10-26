@@ -10,7 +10,7 @@
 | `default` | Serde default. Secrets and unset options are JSON `null` or an empty string, never a live value. |
 | `apply` | `live` or `restart`. |
 | `restart_required` | `true` when `apply` is `restart`. |
-| `class` | `normal` or `sensitive`. Sensitive matches `nzb-web::auth_class::SENSITIVE_KEYS` (WI-2497). Extra keys that are not yet on that list (`general.local_import_dir`, `general.trusted_proxies`, `general.step_up_ttl_secs`, notification URLs and tokens) are still `sensitive` here so a later writer treats them the same way. |
+| `class` | `normal` or `sensitive`. `nzb-web::auth_class::class_of` reads this column, so a registry `sensitive` key (including `general.local_import_dir`, `general.trusted_proxies`, `general.step_up_ttl_secs`, notification URLs and tokens) requires step-up and is refused to an API key. |
 | `env` | Environment names, primary first. |
 | `cli` | CLI flag, when one exists. |
 | `group` | GUI section. |
@@ -52,4 +52,4 @@ here so the GUI and a later patch can use one table. Notable ones:
 `notifications.*`, `par2.*`.
 
 `config.backup.restore` and `config.backup.export_secrets` are actions, not
-fields, so they stay in `SENSITIVE_KEYS` and are not registry rows.
+fields, so they stay in `nzb-web::auth_class::ACTION_SENSITIVE_KEYS` and are not registry rows.
