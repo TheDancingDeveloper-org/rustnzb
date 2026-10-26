@@ -165,9 +165,10 @@ against the GitHub release.
 
 ## Standalone nzb-* crates
 
-The seven `nzb-*` crates under `crates/` are published to crates.io from
-standalone repositories (one per crate, named in `ci/nzb-crates.txt`, URL in
-each crate's `repository` field). This monorepo is the head:
+The crates named in `ci/nzb-crates.txt` (`mock-nntp-server` first, then
+the seven `nzb-*` crates) are published to crates.io from standalone
+repositories (one per crate, URL in each crate's `repository` field). This
+monorepo is the head:
 
 - **The monorepo owns version numbers.** Change a crate's `version` only in
   `crates/<name>/Cargo.toml`; the standalone repos never originate a bump.
@@ -195,9 +196,11 @@ each crate's `repository` field). This monorepo is the head:
   is an error, not a silently broken manifest.
 - **Publish only from a synced tag.** After a sync PR merges, publish that
   crate from a `vX.Y.Z` tag on the standalone repo — never from an out-of-sync
-  tree. Publish in dependency order (`nzb-nntp`, `nzb-decode`, `nzb-core`,
-  `nzb-news`, `nzb-postproc`, `nzb-dispatch`, `nzb-web`): the standalone
-  manifests take sibling crates from crates.io.
+  tree, and never from the monorepo. Publish in the order listed in
+  `ci/nzb-crates.txt`: `mock-nntp-server`, then `nzb-nntp`, `nzb-decode`,
+  `nzb-core`, `nzb-news`, `nzb-postproc`, `nzb-dispatch`, `nzb-web`. The
+  standalone manifests take sibling crates from crates.io, so each earlier
+  crate must already be on crates.io before the next `cargo publish`.
 - **Drift is gated.** The scheduled `crate-drift` job
   (`.github/workflows/quality-schedule.yml`, via `ci/tasks/crate-drift`) fails
   when any standalone repo's tree or package version differs from the export.

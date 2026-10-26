@@ -1,11 +1,15 @@
-# Standalone nzb-* crates kept in sync from this monorepo (the head).
-# One crate directory name per line; blank lines and #-comments are ignored.
-# The monorepo owns version numbers; standalone repos are sync targets.
-# Used by ci/tasks/sync-crate and ci/tasks/crate-drift.
-nzb-core
+# Standalone crates kept in sync from this monorepo (the head).
+# One crate directory name per line, in publish order; blank lines and
+# #-comments are ignored. The monorepo owns version numbers; standalone
+# repos are sync targets. Used by ci/tasks/sync-crate and ci/tasks/crate-drift.
+# Publish only from a synced standalone tag, in this order:
+# mock-nntp-server, nzb-nntp, nzb-decode, nzb-core, nzb-news,
+# nzb-postproc, nzb-dispatch, nzb-web.
+mock-nntp-server
 nzb-nntp
 nzb-decode
+nzb-core
 nzb-news
-nzb-dispatch
 nzb-postproc
+nzb-dispatch
 nzb-web

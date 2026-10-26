@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "mock-nntp-server"
-version = "1.7.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
