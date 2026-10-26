@@ -616,7 +616,7 @@ fn build_api_router(state: Arc<AppState>) -> Router {
     let auth_state = state.clone();
 
     let auth_middleware = axum::middleware::from_fn(
-        move |headers: HeaderMap, request: axum::extract::Request, next: Next| {
+        move |headers: HeaderMap, mut request: axum::extract::Request, next: Next| {
             let token_store = token_store.clone();
             let credential_store = credential_store.clone();
             let auth_state = auth_state.clone();
@@ -626,6 +626,9 @@ fn build_api_router(state: Arc<AppState>) -> Router {
                     && let Some(provided) = headers.get("X-Api-Key").and_then(|h| h.to_str().ok())
                 {
                     if auth::constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+                        request
+                            .extensions_mut()
+                            .insert(nzb_web::step_up::AuthMethod::ApiKey);
                         return Ok(next.run(request).await);
                     }
                     return Err(ApiError::unauthorized());
@@ -652,7 +655,10 @@ fn build_api_router(state: Arc<AppState>) -> Router {
                     .and_then(|h| h.to_str().ok())
                     .and_then(|h| h.strip_prefix("Bearer "))
                 {
-                    if token_store.validate_access_token(token) {
+                    if let Some(session) = token_store.session_of(token) {
+                        request
+                            .extensions_mut()
+                            .insert(nzb_web::step_up::AuthMethod::Bearer { session });
                         return Ok(next.run(request).await);
                     }
                     return Err(ApiError::unauthorized());
@@ -685,7 +691,12 @@ fn build_api_router(state: Arc<AppState>) -> Router {
                     .check_login(client, u.to_owned(), p.to_owned())
                     .await
                 {
-                    auth::LoginOutcome::Ok => Ok(next.run(request).await),
+                    auth::LoginOutcome::Ok => {
+                        request
+                            .extensions_mut()
+                            .insert(nzb_web::step_up::AuthMethod::Basic);
+                        Ok(next.run(request).await)
+                    }
                     auth::LoginOutcome::Invalid => Err(ApiError::unauthorized()),
                 }
             }

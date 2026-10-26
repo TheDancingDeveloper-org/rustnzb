@@ -83,12 +83,11 @@ async fn export(client: &reqwest::Client, base_url: &str, token: &str, secrets: 
     } else {
         format!("{base_url}/api/config/backup")
     };
-    let response = client
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .expect("export");
+    let mut request = client.get(&url).bearer_auth(token);
+    if secrets {
+        request = request.header("X-Confirm-Password", "backup-test-password");
+    }
+    let response = request.send().await.expect("export");
     assert_eq!(response.status(), StatusCode::OK);
     let headers = response.headers().clone();
     assert!(
@@ -129,14 +128,15 @@ async fn post_backup(
     path: &str,
     body: &str,
 ) -> reqwest::Response {
-    client
+    let mut request = client
         .post(format!("{base_url}/api/config/backup/{path}"))
         .bearer_auth(token)
         .header(reqwest::header::CONTENT_TYPE, "application/toml")
-        .body(body.to_string())
-        .send()
-        .await
-        .expect("post backup")
+        .body(body.to_string());
+    if path == "restore" {
+        request = request.header("X-Confirm-Password", "backup-test-password");
+    }
+    request.send().await.expect("post backup")
 }
 
 #[tokio::test]

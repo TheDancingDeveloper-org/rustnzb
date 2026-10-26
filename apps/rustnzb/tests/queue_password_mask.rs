@@ -100,6 +100,7 @@ async fn native_queue_masks_archive_password_but_sab_queue_keeps_it() {
     let sab_key = client
         .post(format!("{base_url}/api/config/sabnzbd-api-key/rotate"))
         .bearer_auth(&access)
+        .header("X-Confirm-Password", "mask-test-password")
         .json(&serde_json::json!({}))
         .send()
         .await

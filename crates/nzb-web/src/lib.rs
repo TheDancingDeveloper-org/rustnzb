@@ -5,6 +5,7 @@ pub use nzb_postproc;
 pub use nzb_postproc::nzb_core;
 
 pub mod auth;
+pub mod auth_class;
 mod damage_recorder;
 pub mod dir_watcher;
 pub mod direct_unpack;
@@ -20,6 +21,7 @@ pub mod sabnzbd_compat;
 pub mod schedule_monitor;
 pub mod startup;
 pub mod state;
+pub mod step_up;
 pub mod util;
 
 pub use log_buffer::{LogBuffer, LogBufferLayer};

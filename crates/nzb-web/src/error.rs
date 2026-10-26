@@ -63,6 +63,23 @@ impl ApiError {
         }
     }
 
+    /// 403 `error_kind: step_up_required`. Distinct from 401 so clients do
+    /// not treat a missing password confirmation as an expired session.
+    pub const fn step_up_required() -> Self {
+        Self {
+            status: Some(StatusCode::FORBIDDEN),
+            kind: ApiErrorKind::StepUpRequired,
+        }
+    }
+
+    /// 403 `error_kind: step_up_forbidden`. An API key cannot step up.
+    pub const fn step_up_forbidden() -> Self {
+        Self {
+            status: Some(StatusCode::FORBIDDEN),
+            kind: ApiErrorKind::StepUpForbidden,
+        }
+    }
+
     pub const fn bad_request(msg: &'static str) -> Self {
         Self {
             status: Some(StatusCode::BAD_REQUEST),
@@ -161,6 +178,14 @@ pub enum ApiErrorKind {
     ServerNotFound(String),
     #[error("unauthorized")]
     Unauthorized,
+    /// Sensitive write without a recent password confirmation. 403, not 401:
+    /// the session is still valid, so the GUI must not refresh it.
+    #[error("step-up re-authentication required")]
+    StepUpRequired,
+    /// Sensitive write attempted with an API key. The confirm header cannot
+    /// satisfy this; only an interactive session can.
+    #[error("step-up is not available to API-key clients")]
+    StepUpForbidden,
     #[error("idempotency key is already bound to another NZB payload")]
     AdmissionConflict,
     #[error("{0}")]
@@ -208,6 +233,8 @@ impl Serialize for ApiError {
                     "server_not_found"
                 }
                 ApiErrorKind::Unauthorized => "unauthorized",
+                ApiErrorKind::StepUpRequired => "step_up_required",
+                ApiErrorKind::StepUpForbidden => "step_up_forbidden",
                 ApiErrorKind::AdmissionConflict
                 | ApiErrorKind::Core(crate::nzb_core::NzbError::AdmissionConflict) => {
                     "admission_conflict"

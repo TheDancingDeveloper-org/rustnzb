@@ -2108,12 +2108,23 @@ async fn network_settings_are_saved_and_flagged_restart_required() {
             "listen_addr",
         ),
     ] {
-        let (status, body) = call(client.put(&url).bearer_auth(&access).json(&payload)).await;
+        let (status, body) = call(
+            client
+                .put(&url)
+                .bearer_auth(&access)
+                .header("X-Confirm-Password", "password")
+                .json(&payload),
+        )
+        .await;
         assert_eq!(status, 400, "{body}");
         assert!(body["human_readable"].as_str().unwrap().contains(field));
     }
 
-    let (status, body) = call(client.put(&url).bearer_auth(&access).json(
+    let (status, body) = call(client
+        .put(&url)
+        .bearer_auth(&access)
+        .header("X-Confirm-Password", "password")
+        .json(
         &serde_json::json!({"port": 9191, "listen_addr": "127.0.0.1", "par2_defer_volumes": false}),
     ))
     .await;
@@ -2138,6 +2149,7 @@ async fn network_settings_are_saved_and_flagged_restart_required() {
         client
             .put(&url)
             .bearer_auth(&access)
+            .header("X-Confirm-Password", "password")
             .json(&serde_json::json!({"port": default.port, "listen_addr": default.listen_addr})),
     )
     .await;

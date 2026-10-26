@@ -108,10 +108,15 @@ impl TokenStore {
     }
 
     pub fn validate_access_token(&self, token: &str) -> bool {
+        self.session_of(token).is_some()
+    }
+
+    /// Login session of a live access token, if it has not expired.
+    pub fn session_of(&self, token: &str) -> Option<u64> {
         let tokens = self.access_tokens.read();
         tokens
             .get(token)
-            .is_some_and(|entry| entry.expires_at > Instant::now())
+            .and_then(|entry| (entry.expires_at > Instant::now()).then_some(entry.session))
     }
 
     pub fn refresh(&self, refresh_token: &str) -> Option<TokenResponse> {
@@ -520,6 +525,24 @@ impl CredentialStore {
         };
         let password_ok = verify_password(password, &password_hash);
         username_ok & password_ok
+    }
+
+    /// Password-only check for step-up. The caller already holds a session,
+    /// so the username is not part of the proof. Argon2 still runs when no
+    /// account is configured, against a dummy hash, so the cost stays.
+    pub fn confirm_password(&self, password: &str) -> bool {
+        let hash = self
+            .account
+            .read()
+            .as_ref()
+            .map(|account| account.password_hash.clone());
+        match hash {
+            Some(hash) => verify_password(password, &hash),
+            None => {
+                let _ = verify_password(password, LOCKED_HASH);
+                false
+            }
+        }
     }
 
     /// Run Argon2 work (`f`) on the blocking thread pool, at most

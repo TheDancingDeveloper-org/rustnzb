@@ -49,6 +49,7 @@ impl Harness {
         let sab_key = client
             .post(format!("{base_url}/api/config/sabnzbd-api-key/rotate"))
             .bearer_auth(&access)
+            .header("X-Confirm-Password", "inline-pw-test-password")
             .json(&serde_json::json!({}))
             .send()
             .await
