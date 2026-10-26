@@ -10,7 +10,7 @@ publish = true
 
 [dependencies]
 anyhow = { workspace = true }
-nzb-nntp = { workspace = true, features = ["test-support"] }
+nzb-nntp = { version = "0.2.27", path = "../nzb-nntp", features = ["test-support"] }
 tokio = { workspace = true }
 yenc-simd = { workspace = true }
 clap = { version = "4", features = ["derive"] }
