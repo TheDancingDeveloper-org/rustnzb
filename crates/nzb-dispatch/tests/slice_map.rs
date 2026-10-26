@@ -45,6 +45,8 @@ struct Twist {
 struct Run {
     fixture: ScenarioFixture,
     map: SliceMapSummary,
+    success: bool,
+    articles_failed: usize,
     /// NZB file ids in the order their last article completed.
     completion_order: Vec<String>,
     job: nzb_core::models::NzbJob,
@@ -212,6 +214,8 @@ async fn run_with(scenario: DamageScenario, twist: Twist) -> Run {
                 release_index(data_pending);
             }
             ProgressUpdate::JobFinished {
+                success,
+                articles_failed,
                 slice_map,
                 repair_fold,
                 ..
@@ -220,6 +224,8 @@ async fn run_with(scenario: DamageScenario, twist: Twist) -> Run {
                 return Run {
                     fixture,
                     map,
+                    success,
+                    articles_failed,
                     completion_order,
                     job,
                     fold: repair_fold,
@@ -430,14 +436,23 @@ async fn restart_with_index_already_on_disk_installs_on_first_write() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_timeout_on_last_server_leaves_slices_unknown() {
     let scenario = DamageScenario::TransportTimeoutOnLastServer;
-    let Run { fixture, map, .. } = run_with(
+    let Run {
+        fixture,
+        map,
+        success,
+        articles_failed,
+        ..
+    } = run_with(
         scenario,
         Twist {
+            index_resumed: true,
             stall_timeout_secs: 1,
             ..Twist::default()
         },
     )
     .await;
+    assert!(!success);
+    assert_eq!(articles_failed, 1);
     assert!(!fixture.expect.unknown_slices.is_empty());
     assert_eq!(slices_with(&map, SliceVerdict::Damaged), BTreeSet::new());
     assert_eq!(
