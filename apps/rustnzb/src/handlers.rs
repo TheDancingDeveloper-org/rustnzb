@@ -1851,6 +1851,17 @@ pub async fn h_config_get(
         general.remove("cache_size");
         general.remove("log_file");
     }
+    let warnings = state.path_warnings();
+    if let Some(config) = value.as_object_mut() {
+        config.insert(
+            "paths_outside_allowed_roots".to_string(),
+            serde_json::Value::Bool(!warnings.is_empty()),
+        );
+        config.insert(
+            "path_warnings".to_string(),
+            serde_json::to_value(warnings).map_err(anyhow::Error::from)?,
+        );
+    }
     Ok(Json(value))
 }
 
@@ -2717,7 +2728,7 @@ pub async fn h_category_add(
 ) -> Result<impl IntoResponse, ApiError> {
     cat.validate().map_err(ApiError::bad_request)?;
     validate_category_output_dir(&state, &cat, None)?;
-    state.update_config_with(|config| {
+    let categories = state.update_config_with(|config| {
         if config.categories.iter().any(|c| c.name == cat.name) {
             return Err(ApiError::conflict(format!(
                 "Category '{}' already exists",
@@ -2725,11 +2736,9 @@ pub async fn h_category_add(
             )));
         }
         config.categories.push(cat);
-        state
-            .queue_manager
-            .set_categories(config.categories.clone());
-        Ok::<_, ApiError>(())
+        Ok::<_, ApiError>(config.categories.clone())
     })?;
+    state.queue_manager.set_categories(categories);
     Ok(Json(serde_json::json!({"status": true})))
 }
 
@@ -2761,18 +2770,16 @@ pub async fn h_category_update(
         .find(|c| c.name == name)
         .and_then(|c| c.output_dir.clone());
     validate_category_output_dir(&state, &cat, previous.as_deref())?;
-    state.update_config_with(|config| {
+    let categories = state.update_config_with(|config| {
         let idx = config
             .categories
             .iter()
             .position(|c| c.name == name)
             .ok_or_else(|| ApiError::from(NzbError::CategoryNotFound(name.clone())))?;
         config.categories[idx] = cat;
-        state
-            .queue_manager
-            .set_categories(config.categories.clone());
-        Ok::<_, ApiError>(())
+        Ok::<_, ApiError>(config.categories.clone())
     })?;
+    state.queue_manager.set_categories(categories);
     Ok(Json(serde_json::json!({"status": true})))
 }
 
@@ -4374,17 +4381,17 @@ pub async fn h_general_update(
         tracing::warn!("general.cache_size is unused; the submitted value was ignored");
     }
     state.update_config_with(|config| {
-        if let Some(dir) = body.incomplete_dir {
+        if let Some(dir) = body.incomplete_dir.as_deref() {
             config.general.incomplete_dir = dir.into();
         }
-        if let Some(dir) = body.complete_dir {
+        if let Some(dir) = body.complete_dir.as_deref() {
             config.general.complete_dir = dir.into();
         }
-        if let Some(dir) = body.data_dir {
+        if let Some(dir) = body.data_dir.as_deref() {
             config.general.data_dir = dir.into();
         }
         // watch_dir: empty string means unset
-        if let Some(dir) = body.watch_dir {
+        if let Some(dir) = body.watch_dir.as_deref() {
             config.general.watch_dir = if dir.is_empty() {
                 None
             } else {
@@ -4392,7 +4399,6 @@ pub async fn h_general_update(
             };
         }
         if let Some(mad) = body.max_active_downloads {
-            state.queue_manager.set_max_active_downloads(mad);
             config.general.max_active_downloads = mad;
         }
         // Resource pools cannot safely discard live permits. Persist updated
@@ -4408,18 +4414,12 @@ pub async fn h_general_update(
         }
         if let Some(ret) = body.history_retention {
             let ret = normalize_history_retention(ret);
-            state.queue_manager.set_history_retention(ret);
             config.general.history_retention = ret;
         }
         if let Some(rss_limit) = body.rss_history_limit {
             config.general.rss_history_limit = rss_limit;
-            // Prune RSS items if a limit is set
-            if let Some(limit) = rss_limit {
-                let _ = state.queue_manager.rss_items_prune(limit);
-            }
         }
         if let Some(enabled) = body.auto_sort_remaining_pct {
-            state.queue_manager.set_auto_sort_remaining_pct(enabled);
             config.general.auto_sort_remaining_pct = enabled;
         }
         // Validated by `validate_general_update`, so only a valid value gets here.
@@ -4428,27 +4428,26 @@ pub async fn h_general_update(
                 .parse::<nzb_web::nzb_core::config::DuplicatePolicy>()
                 .ok()
         }) {
-            state.queue_manager.set_duplicate_policy(policy);
             config.general.duplicate_policy = policy;
         }
         if let Some(days) = body.rss_downloaded_item_expiry_days {
             config.general.rss_downloaded_item_expiry_days = normalize_rss_expiry_days(days);
         }
-        if let Some(directory) = body.scripts_dir {
+        if let Some(directory) = body.scripts_dir.as_deref() {
             config.general.scripts_dir = if directory.is_empty() {
                 None
             } else {
                 Some(directory.into())
             };
         }
-        if let Some(script) = body.script_success {
+        if let Some(script) = body.script_success.as_deref() {
             config.general.script_success = if script.is_empty() {
                 None
             } else {
                 Some(script.into())
             };
         }
-        if let Some(script) = body.script_failure {
+        if let Some(script) = body.script_failure.as_deref() {
             config.general.script_failure = if script.is_empty() {
                 None
             } else {
@@ -4483,30 +4482,54 @@ pub async fn h_general_update(
             config.general.port = port;
         }
         if let Some(enabled) = body.par2_defer_volumes {
-            state.queue_manager.set_defer_par2_volumes(enabled);
             config.par2.defer_volumes = enabled;
         }
         if let Some(enabled) = body.par2_trust_inflight_verify {
-            state.queue_manager.set_trust_inflight_verify(enabled);
             config.par2.trust_inflight_verify = enabled;
         }
 
-        state.queue_manager.set_postproc_scripts(
-            config.general.scripts_dir.clone(),
-            config.general.script_success.clone(),
-            config.general.script_failure.clone(),
-            config.general.script_timeout_secs,
-            config.general.script_max_output_bytes,
-        );
-        state
-            .queue_manager
-            .set_queue_complete_persist(config.general.queue_complete_pers);
-
         Ok::<_, ApiError>(())
     })?;
+    let config = state.config();
+    if let Some(max) = body.max_active_downloads {
+        state.queue_manager.set_max_active_downloads(max);
+    }
+    if let Some(retention) = body.history_retention {
+        state
+            .queue_manager
+            .set_history_retention(normalize_history_retention(retention));
+    }
+    if let Some(Some(limit)) = body.rss_history_limit {
+        let _ = state.queue_manager.rss_items_prune(limit);
+    }
+    if let Some(enabled) = body.auto_sort_remaining_pct {
+        state.queue_manager.set_auto_sort_remaining_pct(enabled);
+    }
+    if let Some(policy) = body.duplicate_policy.as_deref().and_then(|policy| {
+        policy
+            .parse::<nzb_web::nzb_core::config::DuplicatePolicy>()
+            .ok()
+    }) {
+        state.queue_manager.set_duplicate_policy(policy);
+    }
+    if let Some(enabled) = body.par2_defer_volumes {
+        state.queue_manager.set_defer_par2_volumes(enabled);
+    }
+    if let Some(enabled) = body.par2_trust_inflight_verify {
+        state.queue_manager.set_trust_inflight_verify(enabled);
+    }
+    state.queue_manager.set_postproc_scripts(
+        config.general.scripts_dir.clone(),
+        config.general.script_success.clone(),
+        config.general.script_failure.clone(),
+        config.general.script_timeout_secs,
+        config.general.script_max_output_bytes,
+    );
+    state
+        .queue_manager
+        .set_queue_complete_persist(config.general.queue_complete_pers);
     if dirs_changed {
         // The effective value: an override keeps winning over the file.
-        let config = state.config();
         state
             .queue_manager
             .set_complete_dir(config.general.complete_dir.clone());
@@ -4768,13 +4791,15 @@ pub struct BrowseDirectoryResponse {
     ),
 )]
 pub async fn h_browse_directory(
+    State(state): State<Arc<AppState>>,
     Query(q): Query<BrowseDirectoryQuery>,
 ) -> Result<Json<BrowseDirectoryResponse>, ApiError> {
     let path = q
         .path
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| "/".to_string());
-    let dir = std::path::Path::new(&path);
+    let resolved = state.validate_browse_path(std::path::Path::new(&path))?;
+    let dir = resolved.as_path();
 
     if !dir.is_dir() {
         return Err(ApiError::from((
