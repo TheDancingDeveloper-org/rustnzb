@@ -53,6 +53,10 @@ pub struct SabApiRequest {
     pub last_history_update: Option<u64>,
     pub password: Option<String>,
     pub del_files: Option<String>,
+    /// `mode=set_config` section (`misc`, `categories`).
+    pub section: Option<String>,
+    /// `mode=set_config` keyword inside `section`.
+    pub keyword: Option<String>,
     /// Job name override for `addfile`/`addurl` (SABnzbd `nzbname`).
     pub nzbname: Option<String>,
     /// Post-processing override for `addfile`/`addurl` (SABnzbd `pp`, 0-3).
@@ -995,6 +999,8 @@ async fn dispatch_post(
                 sort: query_req.sort,
                 dir: query_req.dir,
                 client: query_req.client,
+                section: None,
+                keyword: None,
             };
             Ok(dispatch_mode(
                 state,
@@ -1175,6 +1181,8 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
         "history" => handle_history(state, req),
 
         "get_config" => handle_get_config(state),
+
+        "set_config" => handle_set_config(state, req),
 
         "config" => handle_config(state, req),
 
@@ -2336,6 +2344,214 @@ fn history_output_dir_is_deletable(
     })
 }
 
+/// SAB `mode=set_config` error, the shape *arr clients already parse:
+/// `{status: false, error: "..."}`.
+fn sab_error(message: impl Into<String>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": false, "error": message.into() }))
+}
+
+/// Settings an *arr may change through `mode=set_config`.
+///
+/// Documented allowlist (decision D8: Normal keys that map one to one, plus
+/// categories). Anything else, including Sensitive keys and paths, is refused.
+///
+/// | SAB section.keyword | Registry / store |
+/// | --- | --- |
+/// | `misc.bandwidth_max` | `general.speed_limit_bps` (K/M/G suffix, bytes/sec; `0` clears) |
+/// | `misc.history_retention` | `general.history_retention` (non-negative integer) |
+/// | `categories.<name>.name` | create or rename a category (Radarr/Sonarr) |
+/// | `categories.<name>.dir` | that category's `output_dir` (`*` is the Default category) |
+/// | `categories.<name>.pp` | that category's post-processing level `0`–`3` |
+const SAB_SET_CONFIG_ALLOWLIST: &str = "misc.bandwidth_max, misc.history_retention, \
+categories.<name>.{name,dir,pp}";
+
+/// `mode=set_config&section=&keyword=&value=`.
+///
+/// Only [`SAB_SET_CONFIG_ALLOWLIST`] is writable. Writes go through
+/// `AppState::update_config_with`, the same path as `PATCH /api/config`:
+/// registry type checks, override locks, and `RUSTNZB_ALLOWED_ROOTS`.
+/// Sensitive keys are refused even when a future mapping would name them,
+/// because the SAB API cannot step up.
+fn handle_set_config(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    let section = req.section.as_deref().unwrap_or("").trim();
+    let keyword = req.keyword.as_deref().unwrap_or("").trim();
+    let value = req.value.as_deref().unwrap_or("").trim();
+    if section.is_empty() || keyword.is_empty() {
+        return sab_error("set_config requires section and keyword");
+    }
+    match section {
+        "misc" => set_config_misc(state, keyword, value),
+        "categories" => set_config_category(state, keyword, value),
+        _ => sab_error(format!(
+            "{section}.{keyword} is not writable through set_config; allowlist: {SAB_SET_CONFIG_ALLOWLIST}"
+        )),
+    }
+}
+
+fn set_config_misc(state: &AppState, keyword: &str, value: &str) -> Json<serde_json::Value> {
+    let (key, json_value) = match keyword {
+        "bandwidth_max" => {
+            let Some(bytes) = parse_sab_units(value).filter(|amount| *amount <= u64::MAX as f64)
+            else {
+                return sab_error(format!("Invalid speed limit: {value}"));
+            };
+            ("general.speed_limit_bps", serde_json::json!(bytes as u64))
+        }
+        "history_retention" => {
+            let Ok(days) = value.parse::<u64>() else {
+                return sab_error(format!("Invalid history retention: {value}"));
+            };
+            let stored = if days == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(days)
+            };
+            ("general.history_retention", stored)
+        }
+        _ => {
+            return sab_error(format!(
+                "misc.{keyword} is not writable through set_config; allowlist: {SAB_SET_CONFIG_ALLOWLIST}"
+            ));
+        }
+    };
+    match apply_registry_setting(state, key, json_value) {
+        Ok(()) => Json(serde_json::json!({ "status": true })),
+        Err(message) => sab_error(message),
+    }
+}
+
+/// Write one registry leaf the way `PATCH /api/config` does: kind check,
+/// locked-key refusal, then `update_config_with` (path policy included).
+fn apply_registry_setting(
+    state: &AppState,
+    key: &str,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    use crate::nzb_core::config_registry::{self, AuthClass};
+    let setting = config_registry::get(key).ok_or_else(|| format!("unknown setting: {key}"))?;
+    if setting.class == AuthClass::Sensitive {
+        return Err(format!(
+            "{key} is sensitive and cannot be changed through the SABnzbd API"
+        ));
+    }
+    let checked = config_registry::validate_value(&setting.kind, &value)?;
+    if let Some(over) = state.overrides().get(key) {
+        return Err(format!("{key} is locked by {}", over.source));
+    }
+    state
+        .update_config_with(|config| -> Result<(), anyhow::Error> {
+            let mut document = serde_json::to_value(&*config)?;
+            config_registry::set_leaf(&mut document, key, checked.clone())
+                .map_err(anyhow::Error::msg)?;
+            let next: crate::nzb_core::config::AppConfig = serde_json::from_value(document)?;
+            let problems = next.validate();
+            if let Some(problem) = problems.into_iter().next() {
+                anyhow::bail!(problem);
+            }
+            *config = next;
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+    if key == "general.speed_limit_bps" {
+        state
+            .queue_manager
+            .set_speed_limit(state.config().general.speed_limit_bps);
+    }
+    if key == "general.history_retention" {
+        state
+            .queue_manager
+            .set_history_retention(state.config().general.history_retention);
+    }
+    Ok(())
+}
+
+/// `section=categories&keyword=<name>.<field>`.
+///
+/// `name` creates the category when it is missing (Radarr/Sonarr send the
+/// folder and the processing level as later keywords) and renames it when it
+/// already exists. `dir` and `pp` update the existing category; `dir` is
+/// confined by the same allowed-roots check as the native category API.
+fn set_config_category(state: &AppState, keyword: &str, value: &str) -> Json<serde_json::Value> {
+    let Some((raw_name, field)) = keyword.rsplit_once('.') else {
+        return sab_error("categories keyword must be <name>.name, <name>.dir or <name>.pp");
+    };
+    if raw_name.is_empty() || !matches!(field, "name" | "dir" | "pp") {
+        return sab_error(format!(
+            "categories.{keyword} is not writable through set_config; allowlist: {SAB_SET_CONFIG_ALLOWLIST}"
+        ));
+    }
+    let current_name = sab_resolve_category(raw_name).to_string();
+    let result = state.update_config_with(|config| -> Result<(), anyhow::Error> {
+        match field {
+            "name" => {
+                let new_name = if value == SAB_DEFAULT_CATEGORY_SENTINEL {
+                    "Default".to_string()
+                } else {
+                    value.to_string()
+                };
+                if let Some(existing) = config
+                    .categories
+                    .iter_mut()
+                    .find(|category| category.name.eq_ignore_ascii_case(&current_name))
+                {
+                    existing.name = new_name;
+                } else if !config
+                    .categories
+                    .iter()
+                    .any(|category| category.name.eq_ignore_ascii_case(&new_name))
+                {
+                    config
+                        .categories
+                        .push(crate::nzb_core::config::CategoryConfig {
+                            name: new_name,
+                            ..crate::nzb_core::config::CategoryConfig::default()
+                        });
+                }
+            }
+            "dir" => {
+                let category = config
+                    .categories
+                    .iter_mut()
+                    .find(|category| category.name.eq_ignore_ascii_case(&current_name))
+                    .ok_or_else(|| anyhow::anyhow!("category '{current_name}' not found"))?;
+                category.output_dir = if value.is_empty() {
+                    None
+                } else {
+                    Some(std::path::PathBuf::from(value))
+                };
+            }
+            "pp" => {
+                let level: u8 = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid post-processing level: {value}"))?;
+                if level > 3 {
+                    anyhow::bail!("Invalid post-processing level: {value}");
+                }
+                let category = config
+                    .categories
+                    .iter_mut()
+                    .find(|category| category.name.eq_ignore_ascii_case(&current_name))
+                    .ok_or_else(|| anyhow::anyhow!("category '{current_name}' not found"))?;
+                category.post_processing = level;
+            }
+            _ => unreachable!(),
+        }
+        for category in &config.categories {
+            category.validate().map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    });
+    match result {
+        Ok(()) => {
+            state
+                .queue_manager
+                .set_categories(state.config().categories.clone());
+            Json(serde_json::json!({ "status": true }))
+        }
+        Err(error) => sab_error(error.to_string()),
+    }
+}
+
 fn handle_get_config(state: &AppState) -> Json<serde_json::Value> {
     let config = state.config();
     let categories: Vec<serde_json::Value> = config
@@ -3371,6 +3587,10 @@ mod tests {
     struct TestState {
         state: AppState,
         _tempdir: tempfile::TempDir,
+    }
+
+    fn make_state() -> TestState {
+        test_state()
     }
 
     fn test_state() -> TestState {
@@ -5309,6 +5529,240 @@ mod tests {
         assert_eq!(response, serde_json::json!({ "status": true }));
         assert!(!qm.is_paused());
         assert_eq!(qm.pause_remaining_secs(), None);
+    }
+
+    fn set_config_request(section: &str, keyword: &str, value: &str) -> SabApiRequest {
+        SabApiRequest {
+            mode: Some("set_config".into()),
+            section: Some(section.into()),
+            keyword: Some(keyword.into()),
+            value: Some(value.into()),
+            ..SabApiRequest::default()
+        }
+    }
+
+    /// Recorded *arr `mode=set_config` shapes.
+    ///
+    /// Radarr `SabnzbdProxy.SetConfigAsync` posts
+    /// `mode=set_config&section=categories&keyword={name}.name&value={name}`
+    /// and then `{name}.dir` / `{name}.pp` (Servarr `NzbDrone.Core.Download.Clients.Sabnzbd`).
+    /// Sonarr uses the same proxy. `misc.bandwidth_max` is nzb360's speed
+    /// write. None of these call a live server; the strings are the request.
+    #[tokio::test]
+    async fn set_config_category_round_trips_and_misc_maps_to_the_registry() {
+        let test_state = test_state();
+        let created = dispatch_mode(
+            &test_state.state,
+            "set_config",
+            &set_config_request("categories", "tv.name", "tv"),
+        )
+        .0;
+        assert_eq!(created, serde_json::json!({ "status": true }));
+
+        let directory = dispatch_mode(
+            &test_state.state,
+            "set_config",
+            &set_config_request("categories", "tv.dir", "series"),
+        )
+        .0;
+        assert_eq!(directory, serde_json::json!({ "status": true }));
+
+        let processing = dispatch_mode(
+            &test_state.state,
+            "set_config",
+            &set_config_request("categories", "tv.pp", "1"),
+        )
+        .0;
+        assert_eq!(processing, serde_json::json!({ "status": true }));
+
+        let renamed = dispatch_mode(
+            &test_state.state,
+            "set_config",
+            &set_config_request("categories", "tv.name", "series-tv"),
+        )
+        .0;
+        assert_eq!(renamed, serde_json::json!({ "status": true }));
+
+        let category = test_state
+            .state
+            .config()
+            .categories
+            .iter()
+            .find(|category| category.name == "series-tv")
+            .expect("renamed category")
+            .clone();
+        assert_eq!(
+            category.output_dir.as_deref(),
+            Some(std::path::Path::new("series"))
+        );
+        assert_eq!(category.post_processing, 1);
+
+        let shown = dispatch_mode(&test_state.state, "get_config", &SabApiRequest::default()).0;
+        let listed = shown["config"]["categories"]
+            .as_array()
+            .expect("categories")
+            .iter()
+            .find(|entry| entry["name"] == "series-tv")
+            .expect("get_config lists the category");
+        assert_eq!(listed["dir"], "series");
+        assert_eq!(listed["pp"], "1");
+
+        let speed = dispatch_mode(
+            &test_state.state,
+            "set_config",
+            &set_config_request("misc", "bandwidth_max", "2M"),
+        )
+        .0;
+        assert_eq!(speed, serde_json::json!({ "status": true }));
+        assert_eq!(
+            test_state.state.config().general.speed_limit_bps,
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            test_state.state.queue_manager.get_speed_limit(),
+            2 * 1024 * 1024
+        );
+
+        let retention = dispatch_mode(
+            &test_state.state,
+            "set_config",
+            &set_config_request("misc", "history_retention", "14"),
+        )
+        .0;
+        assert_eq!(retention, serde_json::json!({ "status": true }));
+        assert_eq!(
+            test_state.state.config().general.history_retention,
+            Some(14)
+        );
+    }
+
+    /// Off-allowlist, sensitive, locked and unsafe category paths come back
+    /// as SAB `{status:false, error}` and leave the stored config alone.
+    #[tokio::test]
+    async fn set_config_refuses_locked_sensitive_and_paths_outside_roots() {
+        let test_state = test_state();
+        let before = test_state.state.config().general.api_key.clone();
+
+        let refused = dispatch_mode(
+            &test_state.state,
+            "set_config",
+            &set_config_request("misc", "api_key", "stolen"),
+        )
+        .0;
+        assert_eq!(refused["status"], serde_json::json!(false));
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("allowlist"),
+            "{refused}"
+        );
+        assert_eq!(test_state.state.config().general.api_key, before);
+
+        let sensitive_section = dispatch_mode(
+            &test_state.state,
+            "set_config",
+            &set_config_request("misc", "host", "0.0.0.0"),
+        )
+        .0;
+        assert_eq!(sensitive_section["status"], serde_json::json!(false));
+
+        // The allowlist cannot name a sensitive registry key. A sensitive
+        // mapping is still refused inside the shared writer.
+        let sensitive_direct = super::apply_registry_setting(
+            &test_state.state,
+            "general.api_key",
+            serde_json::json!("stolen"),
+        );
+        let sensitive_message = sensitive_direct.expect_err("sensitive key must be refused");
+        assert!(
+            sensitive_message.contains("sensitive"),
+            "{sensitive_message}"
+        );
+        assert_eq!(test_state.state.config().general.api_key, before);
+
+        // Allowlisted keys are AuthClass::Normal and have no override
+        // variant, so a running process cannot lock them. `dav.enabled` is
+        // Normal and is locked by RUSTNZB_DAV_ENABLED. It is not on the
+        // allowlist; the shared writer still refuses it before saving.
+        let mut extra = crate::nzb_core::overrides::OverrideSet::default();
+        extra.set(
+            crate::nzb_core::overrides::OverrideValue::DavEnabled(false),
+            crate::nzb_core::overrides::OverrideSource::Env("RUSTNZB_DAV_ENABLED"),
+        );
+        let locked_holder = make_state();
+        let locked_state = locked_holder.state.with_extra_overrides_for_test(extra);
+        let locked =
+            super::apply_registry_setting(&locked_state, "dav.enabled", serde_json::json!(true));
+        let locked_message = locked.expect_err("locked key must be refused");
+        assert!(locked_message.contains("locked"), "{locked_message}");
+        assert!(!locked_state.config().dav.enabled);
+
+        let created = dispatch_mode(
+            &test_state.state,
+            "set_config",
+            &set_config_request("categories", "tv.name", "tv"),
+        )
+        .0;
+        assert_eq!(created["status"], serde_json::json!(true));
+
+        // Absolute category dirs are a valid shape until RUSTNZB_ALLOWED_ROOTS
+        // is set. With roots, a path outside them is refused and not stored.
+        let rooted = make_state();
+        let rooted_state = rooted.state.with_path_policy_for_test(
+            crate::path_policy::ConfigPathPolicy::from_value(Some("/downloads")),
+        );
+        let made = dispatch_mode(
+            &rooted_state,
+            "set_config",
+            &set_config_request("categories", "tv.name", "tv"),
+        )
+        .0;
+        assert_eq!(made["status"], serde_json::json!(true), "{made}");
+        let escaped = dispatch_mode(
+            &rooted_state,
+            "set_config",
+            &set_config_request("categories", "tv.dir", "/etc/passwd"),
+        )
+        .0;
+        assert_eq!(escaped["status"], serde_json::json!(false), "{escaped}");
+        assert!(
+            escaped["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("output_dir"),
+            "{escaped}"
+        );
+        assert!(
+            rooted_state
+                .config()
+                .categories
+                .iter()
+                .find(|category| category.name == "tv")
+                .expect("category")
+                .output_dir
+                .is_none(),
+            "out-of-roots category dir must not be stored"
+        );
+        assert!(
+            test_state
+                .state
+                .config()
+                .categories
+                .iter()
+                .find(|category| category.name == "tv")
+                .expect("category")
+                .output_dir
+                .is_none(),
+            "unsafe category dir must not be stored"
+        );
+        let traversal = dispatch_mode(
+            &test_state.state,
+            "set_config",
+            &set_config_request("categories", "tv.dir", "../outside"),
+        )
+        .0;
+        assert_eq!(traversal["status"], serde_json::json!(false), "{traversal}");
     }
 
     /// `mode=config` without a setter keeps returning the configuration;
