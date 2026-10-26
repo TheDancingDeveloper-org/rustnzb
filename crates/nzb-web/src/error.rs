@@ -96,6 +96,22 @@ impl ApiError {
         }
     }
 
+    /// 412 `error_kind: precondition_failed`. The `If-Match` tag is stale.
+    pub fn precondition_failed(msg: impl Into<String>) -> Self {
+        Self {
+            status: Some(StatusCode::PRECONDITION_FAILED),
+            kind: ApiErrorKind::PreconditionFailed(msg.into()),
+        }
+    }
+
+    /// 428 `error_kind: precondition_required`. The request omitted `If-Match`.
+    pub const fn precondition_required() -> Self {
+        Self {
+            status: Some(StatusCode::PRECONDITION_REQUIRED),
+            kind: ApiErrorKind::PreconditionRequired,
+        }
+    }
+
     pub const fn admission_conflict() -> Self {
         Self {
             status: Some(StatusCode::CONFLICT),
@@ -188,6 +204,10 @@ pub enum ApiErrorKind {
     StepUpForbidden,
     #[error("idempotency key is already bound to another NZB payload")]
     AdmissionConflict,
+    #[error("If-Match precondition failed: {0}")]
+    PreconditionFailed(String),
+    #[error("If-Match header is required")]
+    PreconditionRequired,
     #[error("{0}")]
     Text(&'static str),
     #[error("{0}")]
@@ -239,6 +259,8 @@ impl Serialize for ApiError {
                 | ApiErrorKind::Core(crate::nzb_core::NzbError::AdmissionConflict) => {
                     "admission_conflict"
                 }
+                ApiErrorKind::PreconditionFailed(_) => "precondition_failed",
+                ApiErrorKind::PreconditionRequired => "precondition_required",
                 ApiErrorKind::UrlRejected(_) => "url_rejected",
                 ApiErrorKind::Core(crate::nzb_core::NzbError::DuplicateNzb(_)) => "duplicate_nzb",
                 // Otherwise classify by status so clients can tell a bad
@@ -372,6 +394,12 @@ mod tests {
         let json = serde_json::to_value(ApiError::conflict("taken")).unwrap();
         assert_eq!(json["error_kind"], "conflict");
         assert_eq!(json["status"], 409);
+        let json = serde_json::to_value(ApiError::precondition_failed("stale")).unwrap();
+        assert_eq!(json["error_kind"], "precondition_failed");
+        assert_eq!(json["status"], 412);
+        let json = serde_json::to_value(ApiError::precondition_required()).unwrap();
+        assert_eq!(json["error_kind"], "precondition_required");
+        assert_eq!(json["status"], 428);
     }
 
     #[test]
