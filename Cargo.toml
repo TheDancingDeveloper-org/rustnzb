@@ -100,7 +100,7 @@ nzb-decode = { version = "0.1.9", path = "crates/nzb-decode" }
 nzb-news = { version = "0.1.16", path = "crates/nzb-news" }
 nzb-dispatch = { version = "0.2.9", path = "crates/nzb-dispatch" }
 nzb-postproc = { version = "0.2.11", path = "crates/nzb-postproc" }
-mock-nntp-server = { path = "crates/mock-nntp-server" }
+mock-nntp-server = { version = "0.1.0", path = "crates/mock-nntp-server" }
 rust-par2 = { version = "0.2.0" }
 md-5 = "0.11"
 yenc-simd = { version = "0.1.1" }
