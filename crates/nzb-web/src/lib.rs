@@ -13,6 +13,7 @@ pub mod fetch_guard;
 pub mod log_buffer;
 pub mod notifications;
 pub mod nzb_archive;
+pub mod path_policy;
 pub mod queue_manager;
 pub mod rss_monitor;
 pub mod sabnzbd_compat;

@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 
 use crate::auth::{CredentialStore, TokenStore};
 use crate::log_buffer::LogBuffer;
+use crate::path_policy::{ConfigPathPolicy, PathPolicyError, PathWarning};
 use crate::queue_manager::QueueManager;
 
 /// Shared application state, accessible from all HTTP handlers.
@@ -48,6 +49,7 @@ pub struct AppState {
     /// only at startup are compared against it to tell the operator a
     /// restart is pending.
     startup_config: Arc<AppConfig>,
+    path_policy: ConfigPathPolicy,
 }
 
 impl AppState {
@@ -75,6 +77,7 @@ impl AppState {
             rss_monitor_wake: Arc::new(tokio::sync::Notify::new()),
             schedule_wake: Arc::new(tokio::sync::Notify::new()),
             startup_config,
+            path_policy: ConfigPathPolicy::from_env(),
         }
     }
 
@@ -83,10 +86,21 @@ impl AppState {
     pub fn with_overrides(mut self, file: AppConfig, overrides: OverrideSet) -> Self {
         let effective = Arc::new(overrides.overlay(&file));
         self.startup_config = effective.clone();
-        self.config.store(effective);
+        self.config.store(effective.clone());
         self.file = Mutex::new(file);
         self.overrides = overrides;
+        for warning in self.path_policy.warnings(&effective) {
+            tracing::warn!(field = %warning.field, path = %warning.path, error = %warning.message, "configured path is outside the allowed roots");
+        }
         self
+    }
+
+    pub fn path_warnings(&self) -> Vec<PathWarning> {
+        self.path_policy.warnings(&self.config())
+    }
+
+    pub fn validate_browse_path(&self, path: &std::path::Path) -> Result<PathBuf, PathPolicyError> {
+        self.path_policy.validate_browse_path(path)
     }
 
     /// Get current config snapshot.
@@ -104,8 +118,10 @@ impl AppState {
     /// This is a blind write: anything another writer changed since `config`
     /// was read is lost. Handlers that modify part of the config must use
     /// [`AppState::update_config_with`] instead.
-    pub fn update_config(&self, config: AppConfig) -> anyhow::Result<()> {
+    pub fn update_config(&self, mut config: AppConfig) -> anyhow::Result<()> {
         let mut file = self.file.lock();
+        self.overrides.keep_file_values(&mut config, &file);
+        self.path_policy.validate_update(&file, &config)?;
         self.commit_config(&mut file, config)
     }
 
@@ -120,11 +136,13 @@ impl AppState {
         f: impl FnOnce(&mut AppConfig) -> Result<R, E>,
     ) -> Result<R, E>
     where
-        E: From<anyhow::Error>,
+        E: From<anyhow::Error> + From<PathPolicyError>,
     {
         let mut file = self.file.lock();
         let mut next = file.clone();
         let result = f(&mut next)?;
+        self.overrides.keep_file_values(&mut next, &file);
+        self.path_policy.validate_update(&file, &next)?;
         self.commit_config(&mut file, next)?;
         Ok(result)
     }

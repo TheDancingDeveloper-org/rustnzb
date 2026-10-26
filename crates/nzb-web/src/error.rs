@@ -110,6 +110,15 @@ impl ApiError {
     }
 }
 
+impl From<crate::path_policy::PathPolicyError> for ApiError {
+    fn from(error: crate::path_policy::PathPolicyError) -> Self {
+        Self {
+            status: Some(StatusCode::BAD_REQUEST),
+            kind: ApiErrorKind::Message(error.to_string()),
+        }
+    }
+}
+
 impl utoipa::PartialSchema for ApiError {
     fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
         utoipa::openapi::ObjectBuilder::new()

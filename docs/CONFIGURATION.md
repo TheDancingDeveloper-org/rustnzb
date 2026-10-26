@@ -78,6 +78,19 @@ The container image (built on the linuxserver.io Alpine base) also reads:
 
 ## `[general]`
 
+### Allowed path roots
+
+Set `RUSTNZB_ALLOWED_ROOTS` to an OS-separated list of absolute directories
+(`:` on Linux and macOS, `;` on Windows) to confine every path written through
+the GUI or API. The default is unset, which preserves existing installations.
+When set, rustnzb canonicalises configurable paths and rejects paths outside
+the listed roots, including `..` traversal and symlink escapes. Existing paths
+outside the roots still load; `GET /api/config` reports them through
+`paths_outside_allowed_roots` and `path_warnings` until they are corrected.
+
+For example, a container that only exposes its standard writable mounts can
+use `RUSTNZB_ALLOWED_ROOTS=/downloads:/data:/config`.
+
 | Key | Default | Description |
 |-----|---------|-------------|
 | `listen_addr` | `"0.0.0.0"` | HTTP listen address. |
