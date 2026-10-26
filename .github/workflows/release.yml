@@ -78,11 +78,14 @@ jobs:
       - name: Stamp the build time for the OCI created label
         id: stamp
         run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-      - uses: docker/login-action@v4
-        with:
-          registry: repo.indexarr.net
-          username: x-access-token
-          password: ${{ secrets.FORGEJO_CARGO_TOKEN }}
+      - name: Authenticate to the rollback registry
+        if: vars.RUSTNZB_MIRROR_IMAGE != ''
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
+          MIRROR_IMAGE: ${{ vars.RUSTNZB_MIRROR_IMAGE }}
+        run: |
+          mirror_registry="${MIRROR_IMAGE%%/*}"
+          printf '%s' "$FORGEJO_TOKEN" | docker login "$mirror_registry" --username x-access-token --password-stdin >/dev/null
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -135,24 +138,27 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
       - name: Copy the same release manifest to the Forgejo rollback registry
+        if: vars.RUSTNZB_MIRROR_IMAGE != ''
         env:
           GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
+          MIRROR_IMAGE: ${{ vars.RUSTNZB_MIRROR_IMAGE }}
           MOVING_TAG: ${{ steps.channel.outputs.moving }}
           SKOPEO_IMAGE: quay.io/skopeo/stable:v1.19@sha256:77e6c8901f6976bdfa87b8b14c40b96de754794c492d8ed295f77fba1454a4ab
         run: |
           docker run --rm --entrypoint sh \
-            -e GH_TOKEN -e FORGEJO_TOKEN -e GITHUB_ACTOR -e GITHUB_REF_NAME -e MOVING_TAG \
+            -e GH_TOKEN -e FORGEJO_TOKEN -e GITHUB_ACTOR -e GITHUB_REF_NAME \
+            -e MIRROR_IMAGE -e MOVING_TAG \
             "$SKOPEO_IMAGE" -ec '
               src="docker://ghcr.io/thedancingdeveloper-org/rustnzbd:$GITHUB_REF_NAME"
-              dst="docker://repo.indexarr.net/indexarr/rustnzbd:$GITHUB_REF_NAME"
+              dst="docker://$MIRROR_IMAGE:$GITHUB_REF_NAME"
               skopeo copy --multi-arch all \
                 --src-creds "$GITHUB_ACTOR:$GH_TOKEN" \
                 --dest-creds "$FORGEJO_TOKEN:$FORGEJO_TOKEN" "$src" "$dst"
               skopeo copy --multi-arch all \
                 --src-creds "$GITHUB_ACTOR:$GH_TOKEN" \
                 --dest-creds "$FORGEJO_TOKEN:$FORGEJO_TOKEN" "$src" \
-                "docker://repo.indexarr.net/indexarr/rustnzbd:$MOVING_TAG"
+                "docker://$MIRROR_IMAGE:$MOVING_TAG"
               src_digest=$(skopeo inspect --creds "$GITHUB_ACTOR:$GH_TOKEN" --format "{{.Digest}}" "$src")
               dst_digest=$(skopeo inspect --creds "$FORGEJO_TOKEN:$FORGEJO_TOKEN" --format "{{.Digest}}" "$dst")
               test "$src_digest" = "$dst_digest"
@@ -185,6 +191,7 @@ jobs:
 
   release-assets:
     needs: verify-release-ref
+    if: vars.RUSTNZB_CROSS_IMAGE != ''
     permissions:
       contents: write
       # Keyless signing and build-provenance / SBOM attestations use this job's OIDC token.
@@ -194,14 +201,15 @@ jobs:
     env:
       # Keep in step with `.github/workflows/release-dry-run.yml`, which mirrors
       # this build without publishing.
-      CROSS_IMAGE: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:d747454fca94ebfd9dba1f566d9f549c4c9fbedf785c6aba36a0c383d9b9a955
+      CROSS_IMAGE: ${{ vars.RUSTNZB_CROSS_IMAGE }}
     steps:
       - uses: actions/checkout@v7
       - name: Build Linux, arm64, Windows, and package artifacts
         env:
           GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
         run: |
-          printf '%s' "$GIT_AUTH_TOKEN" | docker login repo.indexarr.net --username x-access-token --password-stdin >/dev/null
+          cross_registry="${CROSS_IMAGE%%/*}"
+          printf '%s' "$GIT_AUTH_TOKEN" | docker login "$cross_registry" --username x-access-token --password-stdin >/dev/null
           container="rustnzb-release-assets-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
