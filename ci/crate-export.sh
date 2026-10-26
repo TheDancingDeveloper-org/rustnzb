@@ -106,6 +106,7 @@ crate_export_manifest() {
             next
         }
         {
+            if ($0 ~ /^\[/) indev = ($0 ~ /^\[dev-dependencies\]/)
             line = $0
             self = "^" crate "[ \t]*=[ \t]*\\{[ \t]*workspace[ \t]*=[ \t]*true[ \t]*\\}"
             if (line ~ self) {
@@ -119,12 +120,17 @@ crate_export_manifest() {
             }
             if (line ~ /^[A-Za-z0-9_-]+[ \t]*=[ \t]*\{(.*,)?[ \t]*workspace[ \t]*=[ \t]*true[ \t]*(,.*)?\}[ \t]*$/) {
                 name = line; sub(/[ \t]*=.*/, "", name)
+                if (indev && (name in ws) && ws[name] ~ /path[ \t]*=/) next
                 inner = line; sub(/^[^{]*\{[ \t]*/, "", inner); sub(/[ \t]*\}[ \t]*$/, "", inner)
                 print inline_inherit(name, inner)
                 next
             }
             if (line ~ /workspace[ \t]*=[ \t]*true/) fail("unsupported workspace inheritance: " line)
             if (line ~ /path[ \t]*=[ \t]*"\.\.\//) {
+                # A dev-only sibling with no version (the mock server) is not
+                # part of the published crate. Drop it rather than invent a
+                # crates.io requirement.
+                if (indev && line !~ /version[ \t]*=/) next
                 if (line !~ /version[ \t]*=/) fail("sibling path dependency without a version: " line)
                 # Here the path wins, so a stale requirement still builds; in
                 # the standalone repo it resolves from crates.io and may pick
