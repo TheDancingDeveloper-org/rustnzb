@@ -32,6 +32,7 @@ const NATIVE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/ready"),
     ("GET", "/api/logs"),
     ("GET", "/api/setup/status"),
+    ("POST", "/api/setup/first-run"),
     ("POST", "/api/setup/import-sabnzbd"),
     ("POST", "/api/setup/import-sabnzbd-api"),
     ("POST", "/api/setup/apply"),

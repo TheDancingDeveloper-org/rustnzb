@@ -56,6 +56,7 @@ pub const AUTH_BODY_LIMIT: usize = 16 * 1024;
         handlers::h_global_statistics,
         // setup
         handlers::h_setup_status,
+        handlers::h_setup_first_run,
         handlers::h_import_sabnzbd_ini,
         handlers::h_import_sabnzbd_api,
         handlers::h_setup_apply,
@@ -409,6 +410,7 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/status", get(handlers::h_status))
         // Setup / Import
         .route("/setup/status", get(handlers::h_setup_status))
+        .route("/setup/first-run", post(handlers::h_setup_first_run))
         .route(
             "/setup/import-sabnzbd",
             post(handlers::h_import_sabnzbd_ini),

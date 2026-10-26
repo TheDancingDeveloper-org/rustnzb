@@ -15,7 +15,7 @@ import { httpErrorDetail } from '../../core/http/http-error';
         <div class="login-header">
           <img src="/logo.png" alt="rustnzb" class="login-logo" />
           @if (isSetup()) {
-            <p class="login-subtitle">Create your account to get started</p>
+            <p class="login-subtitle">Set up this install: an admin account, folders and one server</p>
           } @else {
             <p class="login-subtitle">Sign in to continue</p>
           }
@@ -58,6 +58,18 @@ import { httpErrorDetail } from '../../core/http/http-error';
             </div>
 
             @if (isSetup()) {
+              <div class="form-group">
+                <label class="form-label" for="incompleteDir">Incomplete folder</label>
+                <input id="incompleteDir" type="text" class="form-input" [(ngModel)]="incompleteDir" name="incompleteDir" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="completeDir">Complete folder</label>
+                <input id="completeDir" type="text" class="form-input" [(ngModel)]="completeDir" name="completeDir" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="serverHost">Usenet server</label>
+                <input id="serverHost" type="text" class="form-input" [(ngModel)]="serverHost" name="serverHost" placeholder="news.example.com" required />
+              </div>
               <div class="form-group">
                 <label class="form-label" for="confirmPassword">Confirm Password</label>
                 <input
@@ -142,8 +154,12 @@ export class LoginComponent implements OnInit {
   username = '';
   password = '';
   confirmPassword = '';
+  incompleteDir = '';
+  completeDir = '';
+  serverHost = '';
 
   isSetup = signal(false);
+  firstRun = signal(false);
   loading = signal(true);
   submitting = signal(false);
   errorMessage = signal('');
@@ -175,6 +191,18 @@ export class LoginComponent implements OnInit {
           return;
         }
         this.isSetup.set(status.setup_required);
+        if (status.setup_required) {
+          this.authService.setupStatus().subscribe({
+            next: (setup) => {
+              // A container, or an install that already has a server, keeps
+              // the account-only setup. First-run is the non-Docker path.
+              this.firstRun.set(!!setup.first_run);
+              this.loading.set(false);
+            },
+            error: () => this.loading.set(false),
+          });
+          return;
+        }
         this.loading.set(false);
       },
       error: () => {
@@ -197,16 +225,29 @@ export class LoginComponent implements OnInit {
       return;
     }
 
+    if (this.firstRun() && (!this.incompleteDir.trim() || !this.completeDir.trim() || !this.serverHost.trim())) {
+      this.errorMessage.set('Folders and a server host are required.');
+      return;
+    }
+
     this.submitting.set(true);
 
-    const request$ = this.isSetup()
-      ? this.authService.setup(this.username, this.password)
-      : this.authService.login(this.username, this.password);
+    const request$ = this.firstRun()
+      ? this.authService.firstRun({
+          username: this.username,
+          password: this.password,
+          incomplete_dir: this.incompleteDir.trim(),
+          complete_dir: this.completeDir.trim(),
+          server_host: this.serverHost.trim(),
+        })
+      : this.isSetup()
+        ? this.authService.setup(this.username, this.password)
+        : this.authService.login(this.username, this.password);
 
     const isSetup = this.isSetup();
     request$.subscribe({
       next: () => {
-        this.router.navigate(isSetup ? ['/welcome'] : ['/downloads']);
+        this.router.navigate(isSetup && !this.firstRun() ? ['/welcome'] : ['/downloads']);
       },
       error: (err) => {
         this.submitting.set(false);
