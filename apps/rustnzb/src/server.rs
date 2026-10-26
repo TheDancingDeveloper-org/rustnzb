@@ -87,6 +87,7 @@ pub const AUTH_BODY_LIMIT: usize = 16 * 1024;
         // config
         handlers::h_config_get,
         handlers::h_config_schema,
+        handlers::h_config_effective,
         handlers::h_general_update,
         handlers::h_restart_pending,
         handlers::h_config_backup_export,
@@ -455,6 +456,7 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         // Config
         .route("/config", get(handlers::h_config_get))
         .route("/config/schema", get(handlers::h_config_schema))
+        .route("/config/effective", get(handlers::h_config_effective))
         .route("/config/general", put(handlers::h_general_update))
         .route("/config/restart-pending", get(handlers::h_restart_pending))
         .route("/config/backup", get(handlers::h_config_backup_export))

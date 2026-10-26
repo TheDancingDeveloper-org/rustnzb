@@ -115,6 +115,16 @@ impl AppState {
         self.config.load_full()
     }
 
+    /// The file layer, without CLI or environment overrides.
+    pub fn file_config(&self) -> AppConfig {
+        self.file.lock().clone()
+    }
+
+    /// Overrides from CLI, environment and desktop.
+    pub fn overrides(&self) -> &OverrideSet {
+        &self.overrides
+    }
+
     /// The effective configuration the process started with.
     pub fn startup_config(&self) -> Arc<AppConfig> {
         self.startup_config.clone()

@@ -1915,6 +1915,90 @@ pub async fn h_config_schema() -> Json<Vec<ConfigSchemaEntry>> {
     Json(entries)
 }
 
+/// One setting in `GET /api/config/effective`.
+#[derive(Serialize, ToSchema)]
+pub struct EffectiveSetting {
+    pub key: String,
+    pub value: serde_json::Value,
+    /// `default`, `file`, `env` or `cli`. Desktop overrides report as `cli`.
+    pub source: String,
+    /// True when env or CLI forced the value, so the GUI must not edit it.
+    pub locked: bool,
+}
+
+/// GET /api/config/effective -- Each registry setting's live value and source.
+///
+/// Secrets are replaced with the password mask. The `ETag` is a hash of the
+/// body, so an unchanged configuration keeps the same tag and a change
+/// produces a different one. Later writes use it with `If-Match`.
+#[utoipa::path(
+    get,
+    path = "/api/config/effective",
+    tag = "config",
+    summary = "Effective settings with source and lock state",
+    description = "Returns every leaf in the settings registry with its effective value and where that value came from (`default`, `file`, `env` or `cli`). Settings forced by the environment or the command line are `locked`. Secrets are masked. The response carries an `ETag` that changes only when the body does.",
+    responses(
+        (status = 200, description = "Effective settings", body = Vec<EffectiveSetting>),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
+pub async fn h_config_effective(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let effective = state.config();
+    let file = state.file_config();
+    let masked = masked_config(&effective);
+    let effective_value = serde_json::to_value(&masked).map_err(anyhow::Error::from)?;
+    let file_value = serde_json::to_value(&file).map_err(anyhow::Error::from)?;
+    let defaults = nzb_web::nzb_core::config::AppConfig::default();
+    let default_value = serde_json::to_value(&defaults).map_err(anyhow::Error::from)?;
+
+    let mut entries = Vec::new();
+    for setting in nzb_web::nzb_core::config_registry::settings() {
+        let value = json_at(&effective_value, setting.key);
+        let source = if let Some(over) = state.overrides().get(setting.key) {
+            match over.source {
+                nzb_web::nzb_core::overrides::OverrideSource::Env(_) => "env",
+                nzb_web::nzb_core::overrides::OverrideSource::Cli
+                | nzb_web::nzb_core::overrides::OverrideSource::Desktop => "cli",
+            }
+        } else if json_at(&file_value, setting.key) != json_at(&default_value, setting.key) {
+            "file"
+        } else {
+            "default"
+        };
+        let locked = matches!(source, "env" | "cli");
+        entries.push(EffectiveSetting {
+            key: setting.key.to_string(),
+            value,
+            source: source.to_string(),
+            locked,
+        });
+    }
+    let body = serde_json::to_vec(&entries).map_err(anyhow::Error::from)?;
+    let etag = format!("\"{}\"", etag_of(&body));
+    Ok(([(axum::http::header::ETAG, etag)], Json(entries)))
+}
+
+fn json_at(root: &serde_json::Value, dotted: &str) -> serde_json::Value {
+    let mut current = root;
+    for part in dotted.split('.') {
+        match current.get(part) {
+            Some(next) => current = next,
+            None => return serde_json::Value::Null,
+        }
+    }
+    current.clone()
+}
+
+fn etag_of(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(body))
+}
+
+/// GET /api/config -- The persisted configuration, with secrets masked.
+///
+/// Server passwords and API keys are replaced with the password mask. A mask
 /// returned; an update that sends the mask back keeps it. The dead settings
 /// `general.cache_size` and `general.log_file` are left out of the response.
 #[utoipa::path(

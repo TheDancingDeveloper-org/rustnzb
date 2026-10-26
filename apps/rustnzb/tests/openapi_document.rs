@@ -60,6 +60,8 @@ const NATIVE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/history/restore"),
     ("GET", "/api/statistics"),
     ("GET", "/api/config"),
+    ("GET", "/api/config/schema"),
+    ("GET", "/api/config/effective"),
     ("PUT", "/api/config/general"),
     ("GET", "/api/config/restart-pending"),
     ("GET", "/api/config/backup"),
