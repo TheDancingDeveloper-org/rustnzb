@@ -72,6 +72,11 @@ script_max_output_bytes = 1048576
 # each real client on its own. Empty ignores X-Forwarded-For.
 # trusted_proxies = ["172.18.0.0/16"]
 
+# Seconds a confirmed web password authorises further sensitive writes
+# (API key, scripts, listen address, backup restore, secret export).
+# 0 means every sensitive write must present the password again.
+# step_up_ttl_secs = 300
+
 # Most headers kept per group when fetching (oldest pruned first). 0 keeps all.
 # group_max_headers = 100000
 

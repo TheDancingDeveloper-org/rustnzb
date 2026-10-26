@@ -5,8 +5,10 @@ import { TestBed } from '@angular/core/testing';
 import { Router } from '@angular/router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { firstValueFrom, of, throwError } from 'rxjs';
+import { MatDialog } from '@angular/material/dialog';
 
 import { AuthService } from '../services/auth.service';
+import { StepUpDialogComponent } from '../../shared/step-up-dialog.component';
 import { authInterceptor } from './auth.interceptor';
 
 function setup(token = 'access-1') {
@@ -18,17 +20,63 @@ function setup(token = 'access-1') {
     markSessionVerified: vi.fn(),
   };
   const router = { navigate: vi.fn() };
+  const dialog = {
+    open: vi.fn(() => ({ afterClosed: () => of('web-password') })),
+  };
   TestBed.configureTestingModule({
     providers: [
       { provide: AuthService, useValue: auth },
       { provide: Router, useValue: router },
+      { provide: MatDialog, useValue: dialog },
     ],
   });
   const run = (req: HttpRequest<unknown>, next: (r: HttpRequest<unknown>) => unknown) =>
     firstValueFrom(
       TestBed.runInInjectionContext(() => authInterceptor(req, next as never)),
     );
-  return { auth, router, run };
+  return { auth, router, dialog, run };
+
+  it('prompts and retries once when a write needs step-up', async () => {
+    const { auth, dialog, run } = setup();
+    const stepUp = new HttpErrorResponse({
+      status: 403,
+      url: '/api/config/general',
+      error: { error_kind: 'step_up_required' },
+    });
+    const next = vi
+      .fn()
+      .mockReturnValueOnce(throwError(() => stepUp))
+      .mockReturnValueOnce(of(new HttpResponse({ status: 200 })));
+
+    await run(new HttpRequest('PUT', '/api/config/general', { port: 9091 }), next);
+
+    expect(auth.refresh).not.toHaveBeenCalled();
+    expect(dialog.open).toHaveBeenCalledWith(
+      StepUpDialogComponent,
+      expect.objectContaining({ width: '380px' }),
+    );
+    expect(next).toHaveBeenCalledTimes(2);
+    expect(next.mock.calls[1][0].headers.get('X-Confirm-Password')).toBe('web-password');
+  });
+
+  it('does not prompt when an API key is told step-up is forbidden', async () => {
+    const { auth, dialog, run } = setup();
+    const next = vi.fn().mockReturnValue(
+      throwError(
+        () =>
+          new HttpErrorResponse({
+            status: 403,
+            error: { error_kind: 'step_up_forbidden' },
+          }),
+      ),
+    );
+
+    await expect(run(new HttpRequest('PUT', '/api/config/general', {}), next)).rejects.toMatchObject({
+      status: 403,
+    });
+    expect(dialog.open).not.toHaveBeenCalled();
+    expect(auth.refresh).not.toHaveBeenCalled();
+  });
 }
 
 const unauthorized = (url: string) =>

@@ -10,6 +10,7 @@ use crate::auth::{CredentialStore, TokenStore};
 use crate::log_buffer::LogBuffer;
 use crate::path_policy::{ConfigPathPolicy, PathPolicyError, PathWarning};
 use crate::queue_manager::QueueManager;
+use crate::step_up::StepUpStore;
 
 /// Shared application state, accessible from all HTTP handlers.
 ///
@@ -25,6 +26,8 @@ pub struct AppState {
     pub log_buffer: LogBuffer,
     pub token_store: Arc<TokenStore>,
     pub credential_store: Arc<CredentialStore>,
+    /// Recent password confirmations for sensitive settings.
+    pub step_up: Arc<StepUpStore>,
     /// Set once shutdown begins, so `/api/ready` stops reporting ready while
     /// the process drains and a load balancer can stop routing to it.
     pub shutting_down: std::sync::atomic::AtomicBool,
@@ -63,6 +66,7 @@ impl AppState {
     ) -> Self {
         let file = (*config.load_full()).clone();
         let startup_config = config.load_full();
+        let step_up_ttl = startup_config.general.step_up_ttl_secs;
         Self {
             config,
             config_path,
@@ -70,6 +74,9 @@ impl AppState {
             log_buffer,
             token_store,
             credential_store,
+            step_up: Arc::new(StepUpStore::new(std::time::Duration::from_secs(
+                step_up_ttl,
+            ))),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             started_at: std::time::Instant::now(),
             file: Mutex::new(file),

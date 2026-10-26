@@ -5,8 +5,10 @@ import {
   HttpResponse,
 } from '@angular/common/http';
 import { inject } from '@angular/core';
+import { MatDialog } from '@angular/material/dialog';
 import { Router } from '@angular/router';
 import { catchError, of, switchMap, tap, throwError } from 'rxjs';
+import { StepUpDialogComponent } from '../../shared/step-up-dialog.component';
 import { AuthService, TokenResponse } from '../services/auth.service';
 
 function withToken<T>(req: HttpRequest<T>, token: string): HttpRequest<T> {
@@ -36,6 +38,7 @@ export const authInterceptor: HttpInterceptorFn = (req, next) => {
 
   const authService = inject(AuthService);
   const router = inject(Router);
+  const dialog = inject(MatDialog);
 
   const token = authService.getAccessToken();
   if (token && !req.headers.has('Authorization')) {
@@ -44,6 +47,25 @@ export const authInterceptor: HttpInterceptorFn = (req, next) => {
 
   return next(req).pipe(
     catchError((error: HttpErrorResponse) => {
+      // 403, not 401: the session is still valid. Do not refresh it.
+      // An API key cannot step up, so step_up_forbidden is left alone.
+      const kind = (error.error as { error_kind?: string } | null)?.error_kind;
+      if (
+        error.status === 403 &&
+        kind === 'step_up_required' &&
+        !req.headers.has('X-Confirm-Password')
+      ) {
+        return dialog
+          .open(StepUpDialogComponent, { width: '380px', autoFocus: 'dialog' })
+          .afterClosed()
+          .pipe(
+            switchMap((password: string | null | undefined) => {
+              if (!password) return throwError(() => error);
+              return next(req.clone({ setHeaders: { 'X-Confirm-Password': password } }));
+            }),
+          );
+      }
+
       if (error.status !== 401 || isWebDavRequest(req.url)) {
         return throwError(() => error);
       }

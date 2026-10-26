@@ -270,6 +270,11 @@ pub struct GeneralConfig {
     /// ignores `X-Forwarded-For`.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// How long a confirmed password authorises further sensitive writes,
+    /// in seconds. Default 300 (five minutes). `0` means every sensitive
+    /// write must present the password again.
+    #[serde(default = "default_step_up_ttl_secs")]
+    pub step_up_ttl_secs: u64,
 }
 
 /// Parse `addr` or `addr/prefix` (IPv4 or IPv6, optionally in brackets) into
@@ -291,6 +296,10 @@ pub fn parse_ip_network(entry: &str) -> Option<(std::net::IpAddr, u8)> {
 
 fn default_shutdown_timeout_secs() -> u64 {
     30
+}
+
+fn default_step_up_ttl_secs() -> u64 {
+    300
 }
 
 fn default_group_max_headers() -> usize {
@@ -365,6 +374,7 @@ impl Default for GeneralConfig {
         Self {
             listen_addr: "0.0.0.0".into(),
             port: 9090,
+            step_up_ttl_secs: default_step_up_ttl_secs(),
             api_key: None,
             incomplete_dir: PathBuf::from("/downloads/incomplete"),
             complete_dir: PathBuf::from("/downloads/complete"),

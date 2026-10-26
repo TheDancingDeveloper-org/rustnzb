@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{Extension, Multipart, Path, Query, Request, State};
 use axum::http::HeaderMap;
 use axum::http::header;
 use axum::response::IntoResponse;
@@ -47,6 +47,7 @@ use nzb_web::fetch_guard::{
 use nzb_web::log_buffer::LogEntry;
 use nzb_web::nzb_archive::extract_nzbs;
 use nzb_web::state::AppState;
+use nzb_web::step_up::{self, AuthMethod};
 
 use crate::admissions::{IdempotencyKey, payload_digest};
 
@@ -1821,6 +1822,27 @@ pub async fn h_logs(
     }))
 }
 
+/// Sensitive writes: session or Basic plus a recent password, never an API key.
+async fn ensure_step_up(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    method: Option<AuthMethod>,
+) -> Result<(), ApiError> {
+    let Some(method) = method else {
+        // No credential extension means the route was reached without the
+        // auth middleware (tests that call the handler directly). Treat that
+        // as a session that still has to present the password.
+        return step_up::require_step_up(
+            AuthMethod::Bearer { session: 0 },
+            headers,
+            &state.step_up,
+            &state.credential_store,
+        )
+        .await;
+    };
+    step_up::require_step_up(method, headers, &state.step_up, &state.credential_store).await
+}
+
 // ---------------------------------------------------------------------------
 // Config handlers
 // ---------------------------------------------------------------------------
@@ -1902,7 +1924,12 @@ pub struct BackupExportQuery {
 pub async fn h_config_backup_export(
     State(state): State<Arc<AppState>>,
     Query(query): Query<BackupExportQuery>,
+    method: Option<Extension<AuthMethod>>,
+    request: Request,
 ) -> Result<impl IntoResponse, ApiError> {
+    if query.secrets {
+        ensure_step_up(&state, request.headers(), method.map(|Extension(m)| m)).await?;
+    }
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let body = config_backup::export(
         &state.config(),
@@ -2141,8 +2168,19 @@ pub async fn h_config_backup_preview(
 )]
 pub async fn h_config_backup_restore(
     State(state): State<Arc<AppState>>,
-    body: axum::body::Bytes,
+    method: Option<Extension<AuthMethod>>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let (parts, body) = request.into_parts();
+    ensure_step_up(&state, &parts.headers, method.map(|Extension(m)| m)).await?;
+    let body = axum::body::to_bytes(body, MAX_BACKUP_BYTES)
+        .await
+        .map_err(|_| {
+            ApiError::from((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("backup file is larger than {MAX_BACKUP_BYTES} bytes"),
+            ))
+        })?;
     let stored = state.config();
     let parsed = parse_and_prepare(&body, &stored)?;
     let mut restart_keys = Vec::new();
@@ -2251,7 +2289,10 @@ pub async fn h_sab_api_key_get(
 )]
 pub async fn h_sab_api_key_rotate(
     State(state): State<Arc<AppState>>,
+    method: Option<Extension<AuthMethod>>,
+    request: Request,
 ) -> Result<Json<SabApiKeyResponse>, ApiError> {
+    ensure_step_up(&state, request.headers(), method.map(|Extension(m)| m)).await?;
     // UUID v4 is backed by the operating system's cryptographically secure
     // random source. A simple-form UUID supplies a 32-character token without
     // separators, matching the common SABnzbd API-key format.
@@ -4134,6 +4175,12 @@ pub(crate) const SETTINGS_AUDIT: &[(&str, Result<&str, &str>)] = &[
         ),
     ),
     (
+        "general.step_up_ttl_secs",
+        Err(
+            "read at startup; how long a confirmed password authorises sensitive writes (default 300s)",
+        ),
+    ),
+    (
         "general.group_max_headers",
         Err("follow-up: newsgroup browsing settings get their own panel"),
     ),
@@ -4347,13 +4394,32 @@ fn validate_general_update(body: &UpdateGeneralBody) -> Result<(), ApiError> {
 )]
 pub async fn h_general_update(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<UpdateGeneralBody>, JsonRejection>,
+    method: Option<Extension<AuthMethod>>,
+    request: Request,
 ) -> Result<Json<GeneralUpdateResponse>, ApiError> {
+    let (parts, body_stream) = request.into_parts();
+    let headers = parts.headers;
+    let bytes = axum::body::to_bytes(body_stream, 1024 * 1024)
+        .await
+        .map_err(|_| ApiError::bad_request("request body could not be read"))?;
     // Map extractor failures (unknown field, wrong type) to a 400 that names
     // the offending field, instead of axum's plain-text 422.
-    let Json(body) =
-        body.map_err(|rejection| ApiError::from((StatusCode::BAD_REQUEST, rejection.body_text())))?;
+    let Json(body) = Json::<UpdateGeneralBody>::from_bytes(&bytes)
+        .map_err(|rejection| ApiError::from((StatusCode::BAD_REQUEST, rejection.body_text())))?;
     validate_general_update(&body)?;
+    if nzb_web::auth_class::general_update_sensitive_fields(|field| match field {
+        "data_dir" => body.data_dir.is_some(),
+        "scripts_dir" => body.scripts_dir.is_some(),
+        "script_success" => body.script_success.is_some(),
+        "script_failure" => body.script_failure.is_some(),
+        "script_timeout_secs" => body.script_timeout_secs.is_some(),
+        "script_max_output_bytes" => body.script_max_output_bytes.is_some(),
+        "listen_addr" => body.listen_addr.is_some(),
+        "port" => body.port.is_some(),
+        _ => false,
+    }) {
+        ensure_step_up(&state, &headers, method.map(|Extension(m)| m)).await?;
+    }
     // A changed download directory must exist in the container and be
     // writable before it is saved. It applies to new jobs only: queued and
     // history entries keep the paths they were created with.
@@ -5432,8 +5498,16 @@ pub async fn h_dav_config_get(
 )]
 pub async fn h_dav_config_set(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
+    method: Option<Extension<AuthMethod>>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let (parts, body_stream) = request.into_parts();
+    let headers = parts.headers;
+    let bytes = axum::body::to_bytes(body_stream, 1024 * 1024)
+        .await
+        .map_err(|_| ApiError::bad_request("request body could not be read"))?;
+    let Json(body) = Json::<serde_json::Value>::from_bytes(&bytes)
+        .map_err(|rejection| ApiError::from((StatusCode::BAD_REQUEST, rejection.body_text())))?;
     let serde_json::Value::Object(fields) = &body else {
         return Err(ApiError::bad_request("DAV config must be a JSON object"));
     };
@@ -5447,6 +5521,16 @@ pub async fn h_dav_config_set(
         return Err(ApiError::bad_request(
             "playback_reserve_pct must be between 0 and 100",
         ));
+    }
+    let method = method.map(|Extension(m)| m);
+    let secrets_change = {
+        let config = state.config();
+        let password = resolve_secret(fields, "password", config.dav.password.clone());
+        let api_key = resolve_secret(fields, "api_key", config.dav.api_key.clone());
+        password != config.dav.password || api_key != config.dav.api_key
+    };
+    if secrets_change {
+        ensure_step_up(&state, &headers, method).await?;
     }
     state.update_config_with(|config| {
         // Clients that predate the setting leave it as it was.

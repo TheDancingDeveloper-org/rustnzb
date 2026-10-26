@@ -98,6 +98,7 @@ async fn data_dir_override_is_not_saved_by_the_general_settings_put() {
     let put = client
         .put(format!("{}/api/config/general", app.base_url))
         .bearer_auth(&token)
+        .header("X-Confirm-Password", "overrides-test-password")
         .json(&serde_json::json!({
             "data_dir": "/override/data",
             "max_active_downloads": 3
