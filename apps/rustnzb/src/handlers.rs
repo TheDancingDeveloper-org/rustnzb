@@ -1851,6 +1851,70 @@ async fn ensure_step_up(
 ///
 /// Secrets are replaced with `********`: server passwords, `general.api_key`,
 /// and the `user:pass@` part of server proxy URLs. The stored value is never
+/// One entry of `GET /api/config/schema`.
+#[derive(Serialize, ToSchema)]
+pub struct ConfigSchemaEntry {
+    pub key: String,
+    pub kind: serde_json::Value,
+    pub default: serde_json::Value,
+    pub apply: String,
+    pub class: String,
+    pub env: Vec<String>,
+    pub cli: Option<String>,
+    pub group: String,
+    pub label: String,
+    /// `true` when a granular endpoint from the beta.5 settings work already
+    /// writes this key. See `docs/config-schema.md`.
+    pub granular: bool,
+    pub restart_required: bool,
+}
+
+/// GET /api/config/schema -- The settings registry as JSON.
+///
+/// The body is the static registry: key, type, default, constraints, env and
+/// CLI source, restart-required flag and auth class. It does not include the
+/// live configuration. Auth is the same middleware as the other `/api/config`
+/// reads.
+#[utoipa::path(
+    get,
+    path = "/api/config/schema",
+    tag = "config",
+    summary = "Settings registry",
+    description = "Returns every leaf setting the GUI can render: key, type and constraints, default, env and CLI source, whether a restart is required, and the auth class. Keys that a granular endpoint already writes are marked `granular`. Servers, categories, RSS feeds and schedule rules are not in this list.",
+    responses(
+        (status = 200, description = "The settings registry", body = Vec<ConfigSchemaEntry>),
+        (status = 401, description = "Not authenticated", body = ApiError),
+    ),
+)]
+pub async fn h_config_schema() -> Json<Vec<ConfigSchemaEntry>> {
+    let entries = nzb_web::nzb_core::config_registry::settings()
+        .into_iter()
+        .map(|setting| ConfigSchemaEntry {
+            key: setting.key.to_string(),
+            kind: serde_json::to_value(&setting.kind).unwrap_or(serde_json::Value::Null),
+            default: setting.default,
+            apply: serde_json::to_value(setting.apply)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default(),
+            class: serde_json::to_value(setting.class)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default(),
+            env: setting.env.iter().map(|name| (*name).to_string()).collect(),
+            cli: setting.cli.map(str::to_string),
+            group: setting.group.to_string(),
+            label: setting.label.to_string(),
+            granular: setting.granular,
+            restart_required: matches!(
+                setting.apply,
+                nzb_web::nzb_core::config_registry::Apply::Restart
+            ),
+        })
+        .collect();
+    Json(entries)
+}
+
 /// returned; an update that sends the mask back keeps it. The dead settings
 /// `general.cache_size` and `general.log_file` are left out of the response.
 #[utoipa::path(
