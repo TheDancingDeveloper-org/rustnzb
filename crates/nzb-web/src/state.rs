@@ -40,6 +40,7 @@ pub struct AppState {
     file: Mutex<AppConfig>,
     /// Overrides from CLI, environment and desktop, applied over `file`.
     overrides: OverrideSet,
+    config_managed: bool,
     /// Signalled after every committed config change so the RSS monitor
     /// re-reads its feeds at once instead of finishing its current sleep.
     /// Single consumer: `notify_one` stores a permit if the monitor is busy.
@@ -81,6 +82,7 @@ impl AppState {
             started_at: std::time::Instant::now(),
             file: Mutex::new(file),
             overrides: OverrideSet::default(),
+            config_managed: false,
             rss_monitor_wake: Arc::new(tokio::sync::Notify::new()),
             schedule_wake: Arc::new(tokio::sync::Notify::new()),
             startup_config,
@@ -123,6 +125,17 @@ impl AppState {
     /// Overrides from CLI, environment and desktop.
     pub fn overrides(&self) -> &OverrideSet {
         &self.overrides
+    }
+
+    pub fn config_managed(&self) -> bool {
+        self.config_managed
+    }
+
+    /// Mark the process as configuration-managed. Every registry write is
+    /// then refused. Pause and resume stay available.
+    pub fn set_config_managed(mut self, managed: bool) -> Self {
+        self.config_managed = managed;
+        self
     }
 
     /// Replace the allowed-roots policy. Tests use this; production reads

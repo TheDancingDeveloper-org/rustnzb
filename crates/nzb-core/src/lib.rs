@@ -23,5 +23,7 @@ pub use db::{Database, HistoryFilter, HistorySummary, HistoryWindowStats};
 pub use error::{NzbError, Result};
 pub use models::*;
 pub use nzb_nntp;
-pub use overrides::{OverrideSet, OverrideSource, OverrideValue};
+pub use overrides::{
+    OverrideSet, OverrideSource, OverrideValue, config_managed, generic_env_override,
+};
 pub use par2_match::{CandidateFile, PAR2_HASH_16K_LEN, Par2FileRef, match_files_by_hash16k};

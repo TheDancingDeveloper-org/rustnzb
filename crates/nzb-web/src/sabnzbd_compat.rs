@@ -2427,6 +2427,9 @@ fn apply_registry_setting(
     key: &str,
     value: serde_json::Value,
 ) -> Result<(), String> {
+    if state.config_managed() {
+        return Err("managed".to_string());
+    }
     use crate::nzb_core::config_registry::{self, AuthClass};
     let setting = config_registry::get(key).ok_or_else(|| format!("unknown setting: {key}"))?;
     if setting.class == AuthClass::Sensitive {
