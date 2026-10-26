@@ -33,7 +33,7 @@ parking_lot = "0.12"
 # `tests/support/par2_fixture.rs`), which requires writing spec-correct
 # packet MD5s. Version tracks what `rust-par2` itself parses with.
 md-5 = { workspace = true }
-mock-nntp-server = { path = "../mock-nntp-server" }
+mock-nntp-server = { version = "0.1.0", path = "../mock-nntp-server" }
 crc32fast = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
