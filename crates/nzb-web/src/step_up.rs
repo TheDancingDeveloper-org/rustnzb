@@ -290,5 +290,4 @@ mod tests {
         .await
         .expect("throttle must be observable on the paused clock");
     }
-
 }
