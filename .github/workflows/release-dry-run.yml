@@ -53,6 +53,9 @@ jobs:
           test -n "$version"
           printf 'tag=v%s\n' "$version" >>"$GITHUB_OUTPUT"
           printf 'dry run for v%s\n' "$version"
+      # The dry run links with thin LTO: fat LTO at codegen-units=1 for the
+      # aarch64 binary is killed by the OOM killer inside the runner's memory cap.
+      # Tag and promote releases keep fat LTO.
       - name: Build Linux, arm64, Windows, and package artifacts
         env:
           GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
@@ -66,6 +69,7 @@ jobs:
           docker create --name "$container" -w /workspace \
             -e GIT_AUTH_TOKEN -e CI_COMMIT_SHA="$GITHUB_SHA" \
             -e CI_COMMIT_TAG="$TAG" -e CI_PIPELINE_NUMBER="$GITHUB_RUN_ID" \
+            -e RUSTNZB_RELEASE_LTO=thin \
             "$CROSS_IMAGE" sh -ec '
               ci/tasks/frontend-build
               ci/tasks/build-linux
