@@ -2,13 +2,13 @@
 # The first custom-image bootstrap deliberately starts with pending entries;
 # ci/verify-image-pins rejects this file until real digests replace them.
 CORE_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:eca077eed627bcfe5dd311e648a43af041fceacb33aae1434912f8bbfd218af9
-CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:d747454fca94ebfd9dba1f566d9f549c4c9fbedf785c6aba36a0c383d9b9a955
+CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:41e994741ddc7620ac6301761b3eb26571242a0d2ac4dbf908efed6797c33d9e
 E2E_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-e2e@sha256:d166a5f7af1495d06cd5d948fb0fddc422437470b4993a4b74ee0b2d1ddbd841
 DESKTOP_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-desktop@sha256:b69857f8429821ed04cb1830dfaab77a9ed933629085a5ddfebbea15c4755094
 
 # Rust 1.88 images replaced by the Rust 1.95 rebuild; retained for immediate
 # rollback.
 PREVIOUS_CORE_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:63a6ecb9f4897f223419c69bdc1bbae3d930f028955fdaa480fac156daedfb47
-PREVIOUS_CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:89f1f570acb0f8e6514ffcca39bd9f26305263d95274e4c170eedf867d113ad9
+PREVIOUS_CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:d747454fca94ebfd9dba1f566d9f549c4c9fbedf785c6aba36a0c383d9b9a955
 PREVIOUS_E2E_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-e2e@sha256:76cdc92ce89bd37dc9d5b533fc63562b5a76f2c25885f7fb73a40ddbd75e1623
 PREVIOUS_DESKTOP_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-desktop@sha256:8c5b1fdee2c79a48b555a246e0804547488ba46e9b69d2094d6b033862bde2ae

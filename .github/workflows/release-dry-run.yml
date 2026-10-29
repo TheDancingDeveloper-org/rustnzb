@@ -83,7 +83,7 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -eu
-          packaging/appimage/build-appimage.sh "$TAG" --assets-dir .ci-output/packages
+          packaging/appimage/build-in-container.sh "$CROSS_IMAGE" "$TAG" .ci-output/packages
           (cd .ci-output/packages && sha256sum rustnzb-* >"SHA256SUMS-${TAG}.txt" \
             && sha256sum -c "SHA256SUMS-${TAG}.txt")
       - name: Verify the audit section reached the shipped binaries
