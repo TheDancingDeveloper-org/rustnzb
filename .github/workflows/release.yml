@@ -234,9 +234,8 @@ jobs:
       - name: Build Linux AppImages from the release tarballs
         run: |
           set -eu
-          # The cross image does not ship squashfs-tools; install it here.
-          command -v mksquashfs >/dev/null || { apt-get update -qq && apt-get install -y -qq --no-install-recommends squashfs-tools; }
-          packaging/appimage/build-appimage.sh "${GITHUB_REF_NAME}" --assets-dir .ci-output/packages
+          # Runs in the cross image, which gets squashfs-tools installed there.
+          packaging/appimage/build-in-container.sh "$CROSS_IMAGE" "${GITHUB_REF_NAME}" .ci-output/packages
           (cd .ci-output/packages && sha256sum rustnzb-* >"SHA256SUMS-${GITHUB_REF_NAME}.txt" \
             && sha256sum -c "SHA256SUMS-${GITHUB_REF_NAME}.txt")
       # The shipped binaries must carry cargo-auditable's `.dep-v0` section, or

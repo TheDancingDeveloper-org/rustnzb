@@ -113,7 +113,7 @@ jobs:
     env:
       STABLE: ${{ needs.resolve.outputs.stable_tag }}
       SHA: ${{ needs.resolve.outputs.sha }}
-      CROSS_IMAGE: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:d747454fca94ebfd9dba1f566d9f549c4c9fbedf785c6aba36a0c383d9b9a955
+      CROSS_IMAGE: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:41e994741ddc7620ac6301761b3eb26571242a0d2ac4dbf908efed6797c33d9e
     steps:
       - uses: actions/checkout@v7
         with:
@@ -147,7 +147,7 @@ jobs:
       - name: Build Linux AppImages from the release tarballs
         run: |
           set -eu
-          packaging/appimage/build-appimage.sh "${STABLE}" --assets-dir .ci-output/packages
+          packaging/appimage/build-in-container.sh "$CROSS_IMAGE" "${STABLE}" .ci-output/packages
           (cd .ci-output/packages && sha256sum rustnzb-* >"SHA256SUMS-${STABLE}.txt" \
             && sha256sum -c "SHA256SUMS-${STABLE}.txt")
       # Stable binaries are rebuilt by the same tasks as a tag release, so they

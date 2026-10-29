@@ -112,8 +112,9 @@ Both workflows wrap the Linux tarballs' binaries in
 `rustnzb-<tag>-{x86_64,aarch64}.AppImage` with
 `packaging/appimage/build-appimage.sh`, after the tarballs are verified and
 before `SHA256SUMS-<tag>.txt` is signed, so the checksum file, SBOMs and
-attestations cover them. The script needs `mksquashfs` (squashfs-tools) on the
-publish runner and pins the AppImage type2 runtime by SHA-256. The AppImages
+attestations cover them. The workflows run it via `build-in-container.sh` in the cross image, which
+gets squashfs-tools installed there, so the runner needs only docker. The
+script pins the AppImage type2 runtime by SHA-256. The AppImages
 are not GPG-signed.
 
 The macOS dmg is a dry run and off by default. The `macos-dmg` job in
