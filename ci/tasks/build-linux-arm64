@@ -9,7 +9,7 @@ ensure_frontend
 install_cargo_auditable
 auditable_env
 if [ -n "${CI_COMMIT_TAG:-}" ]; then
-    export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols
+    export CARGO_PROFILE_RELEASE_LTO="${RUSTNZB_RELEASE_LTO:-fat}" CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols
 fi
 cargo zigbuild --release -p rustnzb \
     --target aarch64-unknown-linux-gnu.2.17 \
