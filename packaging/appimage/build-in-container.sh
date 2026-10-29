@@ -1,17 +1,34 @@
 #!/usr/bin/env bash
 # Run build-appimage.sh inside the CI cross image, installing squashfs-tools
-# there, so the runner host needs nothing beyond docker.
+# and curl there, so the runner host needs nothing beyond docker.
 #
 #   packaging/appimage/build-in-container.sh IMAGE TAG ASSETS_DIR
 #
-# ASSETS_DIR is relative to the repository root. Files written into it are
-# handed back to the invoking user.
+# ASSETS_DIR is relative to the repository root. The runner may itself be a
+# container talking to the host's docker daemon, so a bind mount of $PWD would
+# name a host path that does not exist; the workspace is copied in and the
+# assets copied back with docker cp, as the release build step does.
 set -euo pipefail
 image=${1:?image}; tag=${2:?tag}; assets=${3:?assets dir}
-docker run --rm -v "$PWD:/workspace" -w /workspace \
-  -e TAG="$tag" -e ASSETS="$assets" -e OWNER="$(id -u):$(id -g)" \
-  "$image" sh -ec '
-    trap "chown -R \"$OWNER\" \"$ASSETS\"" EXIT
-    command -v mksquashfs >/dev/null || { apt-get update -qq && apt-get install -y -qq --no-install-recommends squashfs-tools; }
+container="rustnzb-appimage-${GITHUB_RUN_ID:-$$}-${GITHUB_RUN_ATTEMPT:-0}"
+cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+docker create --name "$container" -w /workspace -e TAG="$tag" -e ASSETS="$assets" \
+  --entrypoint sh "$image" -ec '
+    install_deps() { apt-get update -qq && apt-get install -y -qq --no-install-recommends squashfs-tools curl ca-certificates; }
+    if ! command -v mksquashfs >/dev/null || ! command -v curl >/dev/null; then
+      # Stale or truncated lists give "InRelease is not signed"; start clean and
+      # fall back to https if the plain-http mirror path is mangled.
+      rm -rf /var/lib/apt/lists/*
+      install_deps || {
+        rm -rf /var/lib/apt/lists/*
+        sed -i "s|http://deb.debian.org|https://deb.debian.org|g" /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+        install_deps
+      }
+    fi
     packaging/appimage/build-appimage.sh "$TAG" --assets-dir "$ASSETS"
-  '
+  ' >/dev/null
+docker cp . "$container:/workspace"
+docker start -a "$container"
+mkdir -p "$assets"
+docker cp "$container:/workspace/$assets/." "$assets/"
