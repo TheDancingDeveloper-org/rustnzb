@@ -8,7 +8,7 @@ task_target_dir build-linux
 ensure_frontend
 install_cargo_auditable
 if [ -n "${CI_COMMIT_TAG:-}" ]; then
-    export CARGO_PROFILE_RELEASE_LTO="${RUSTNZB_RELEASE_LTO:-fat}" CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols
+    export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols
 fi
 auditable_cargo build --release -p rustnzb --features webdav --locked
 test -x "$CARGO_TARGET_DIR/release/rustnzb"
