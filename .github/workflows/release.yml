@@ -74,6 +74,17 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/setup-qemu-action@v4
+      # The Dockerfile's builder stage is FROM the pinned CROSS_IMAGE on
+      # repo.indexarr.net, a private registry. Log in before setup-buildx so
+      # buildx forwards these credentials from the runner's Docker config to
+      # the BuildKit builder when it resolves and pulls that base. Without it
+      # the HEAD on the manifest returns 401 (v1.7.0-beta.9).
+      - name: Authenticate to the build-base registry (repo.indexarr.net)
+        uses: docker/login-action@v4
+        with:
+          registry: repo.indexarr.net
+          username: x-access-token
+          password: ${{ secrets.FORGEJO_CARGO_TOKEN }}
       - uses: docker/setup-buildx-action@v4
       - name: Stamp the build time for the OCI created label
         id: stamp

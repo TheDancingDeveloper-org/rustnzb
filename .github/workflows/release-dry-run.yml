@@ -6,6 +6,10 @@ name: Release dry run
 # the release tooling (WI-2069). `ci.yml` treats a `packaging/` change the same
 # way: it is exercised here rather than by a Rust build.
 #
+# The `image-dry-run` job builds the multi-architecture runtime image exactly as
+# the `release-image` job in `release.yml` does, with the same Dockerfile, base
+# (the Dockerfile's pinned CROSS_IMAGE) and registry logins, but pushes nothing.
+#
 # The build steps and the artefact names must stay in step with the
 # `release-assets` job in `.github/workflows/release.yml`. `CROSS_IMAGE` is
 # `vars.RUSTNZB_CROSS_IMAGE`, the same variable that job uses. The job is
@@ -32,6 +36,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  image-dry-run:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, docker, publish]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Authenticate to Docker Hub (higher pull rate limit for base images)
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/setup-qemu-action@v4
+      - name: Authenticate to the build-base registry (repo.indexarr.net)
+        uses: docker/login-action@v4
+        with:
+          registry: repo.indexarr.net
+          username: x-access-token
+          password: ${{ secrets.FORGEJO_CARGO_TOKEN }}
+      - uses: docker/setup-buildx-action@v4
+      - name: Stamp the build time for the OCI created label
+        id: stamp
+        run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - name: Build the multi-architecture release image without pushing
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: |
+            RUSTNZB_BUILD_REF=dry-run
+            RUSTNZB_BUILD_CREATED=${{ steps.stamp.outputs.created }}
+            RELEASE_OPTIMIZED=true
+          cache-from: ''
+          cache-to: ''
+
   dry-run:
     # The build authenticates to repo.indexarr.net with FORGEJO_CARGO_TOKEN.
     # A fork's PR run does not receive secrets, so it cannot run this job.
