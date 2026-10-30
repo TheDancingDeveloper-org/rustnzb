@@ -61,6 +61,16 @@ useful where a local Docker environment is available:
 ./ci/run smoke-image rustnzb:local
 ```
 
+The pinned toolchain images live in a private registry, so these tasks and a
+plain `docker build .` need registry access. Without it, build the same
+`Dockerfile` with the cross toolchain built locally from `Dockerfile.ci`:
+
+```bash
+docker buildx bake --file docker-bake.hcl --load image
+```
+
+The first run compiles the toolchain, so it takes several minutes.
+
 Generated output belongs in `target/`, `.ci-output/`, `.ci-artifacts/`, or
 frontend build directories and must not be committed.
 
