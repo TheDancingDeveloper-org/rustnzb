@@ -1043,36 +1043,9 @@ impl JobContext {
     /// and rename on disk if needed. Called exactly once at job completion.
     fn deobfuscate_files(&self) {
         let renames = self.yenc_names.lock();
-        for (file_id, yenc_name) in renames.iter() {
-            let Some(nzb_name) = self.nzb_filenames.get(file_id) else {
-                continue;
-            };
-            if nzb_name == yenc_name {
-                continue;
-            }
-            let clean_yenc = std::path::Path::new(yenc_name.as_str())
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(yenc_name);
-            if clean_yenc.is_empty() || nzb_name == clean_yenc {
-                continue;
-            }
-
-            let nzb_has_ext = has_known_extension(nzb_name);
-            let yenc_has_ext = has_known_extension(clean_yenc);
-
-            let (old_name, new_name) = if yenc_has_ext && !nzb_has_ext {
-                (nzb_name.as_str(), clean_yenc)
-            } else if nzb_has_ext && !yenc_has_ext {
-                continue;
-            } else if yenc_has_ext && nzb_has_ext {
-                (nzb_name.as_str(), clean_yenc)
-            } else {
-                continue;
-            };
-
-            let old_path = self.work_dir.join(old_name);
-            let new_path = self.work_dir.join(new_name);
+        for (old_name, new_name) in plan_deobfuscation(&self.nzb_filenames, &renames) {
+            let old_path = self.work_dir.join(&old_name);
+            let new_path = self.work_dir.join(&new_name);
             if old_path.exists() && !new_path.exists() {
                 if let Err(e) = std::fs::rename(&old_path, &new_path) {
                     warn!(
@@ -1092,6 +1065,68 @@ impl JobContext {
             }
         }
     }
+}
+
+/// Decide which files to rename from their NZB name to the yEnc header name.
+///
+/// RAR volumes are planned as a set: the set is renamed together or not at
+/// all, and a `.partNN.rar` first volume sitting next to old-style `.rNN`
+/// volumes is renamed to `<set>.rar` so the set is named consistently.
+fn plan_deobfuscation(
+    nzb_filenames: &HashMap<String, String>,
+    yenc_names: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut plain: Vec<(String, String)> = Vec::new();
+    let mut sets: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut ids: Vec<&String> = yenc_names.keys().collect();
+    ids.sort();
+    for file_id in ids {
+        let yenc_name = &yenc_names[file_id];
+        let Some(nzb_name) = nzb_filenames.get(file_id) else {
+            continue;
+        };
+        if nzb_name == yenc_name {
+            continue;
+        }
+        let clean_yenc = std::path::Path::new(yenc_name.as_str())
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(yenc_name);
+        if clean_yenc.is_empty() || nzb_name == clean_yenc {
+            continue;
+        }
+        if !has_known_extension(clean_yenc) {
+            continue;
+        }
+        let pair = (nzb_name.clone(), clean_yenc.to_string());
+        match rar_volume(clean_yenc) {
+            Some((set, _)) => sets.entry(set).or_default().push(pair),
+            None => plain.push(pair),
+        }
+    }
+
+    for (set_name, mut volumes) in sets {
+        // `movie.part01.rar` next to `movie.rNN` volumes becomes `movie.rar`.
+        let has_old_style = volumes
+            .iter()
+            .any(|(_, new)| !new.to_ascii_lowercase().ends_with(".rar"));
+        if has_old_style {
+            for (_, new) in volumes.iter_mut() {
+                let lower = new.to_ascii_lowercase();
+                if lower.ends_with(".rar") && rar_volume(new).is_some_and(|(_, first)| first) {
+                    *new = format!("{set_name}.rar");
+                }
+            }
+        }
+        // All targets must be distinct, otherwise leave the set untouched.
+        let mut targets: Vec<&str> = volumes.iter().map(|(_, n)| n.as_str()).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.len() == volumes.len() {
+            plain.extend(volumes);
+        }
+    }
+    plain
 }
 
 // ---------------------------------------------------------------------------
@@ -3570,58 +3605,86 @@ pub fn has_known_extension(name: &str) -> bool {
     let lower = name.to_lowercase();
     if let Some(dot_pos) = lower.rfind('.') {
         let ext = &lower[dot_pos + 1..];
-        matches!(
-            ext,
-            "rar"
-                | "r00"
-                | "r01"
-                | "r02"
-                | "r03"
-                | "r04"
-                | "r05"
-                | "zip"
-                | "7z"
-                | "gz"
-                | "bz2"
-                | "xz"
-                | "tar"
-                | "mkv"
-                | "mp4"
-                | "avi"
-                | "wmv"
-                | "ts"
-                | "m4v"
-                | "mov"
-                | "mpg"
-                | "mpeg"
-                | "mp3"
-                | "flac"
-                | "ogg"
-                | "m4a"
-                | "aac"
-                | "wav"
-                | "srt"
-                | "sub"
-                | "idx"
-                | "ass"
-                | "ssa"
-                | "sup"
-                | "nfo"
-                | "jpg"
-                | "jpeg"
-                | "png"
-                | "gif"
-                | "bmp"
-                | "par2"
-                | "001"
-                | "002"
-                | "003"
-                | "004"
-                | "005"
-        )
+        is_archive_volume_ext(ext)
+            || matches!(
+                ext,
+                "rar"
+                    | "zip"
+                    | "7z"
+                    | "gz"
+                    | "bz2"
+                    | "xz"
+                    | "tar"
+                    | "mkv"
+                    | "mp4"
+                    | "avi"
+                    | "wmv"
+                    | "ts"
+                    | "m4v"
+                    | "mov"
+                    | "mpg"
+                    | "mpeg"
+                    | "mp3"
+                    | "flac"
+                    | "ogg"
+                    | "m4a"
+                    | "aac"
+                    | "wav"
+                    | "srt"
+                    | "sub"
+                    | "idx"
+                    | "ass"
+                    | "ssa"
+                    | "sup"
+                    | "nfo"
+                    | "jpg"
+                    | "jpeg"
+                    | "png"
+                    | "gif"
+                    | "bmp"
+                    | "par2"
+            )
     } else {
         false
     }
+}
+
+/// Split a RAR volume name into its set name and whether it is the first
+/// volume: `set.rar`, `set.partNN.rar` (`NN` of 0 or 1 is first) or `set.rNN`.
+/// Mirrors `nzb_postproc::parse_rar_volume`, which this crate does not depend on.
+fn rar_volume(name: &str) -> Option<(String, bool)> {
+    let lower = name.to_ascii_lowercase();
+    if let Some(stem) = lower.strip_suffix(".rar") {
+        if let Some(pos) = stem.rfind(".part") {
+            let n = &stem[pos + 5..];
+            if !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) {
+                return Some((
+                    name[..pos].to_string(),
+                    n.parse::<u32>().is_ok_and(|n| n <= 1),
+                ));
+            }
+        }
+        return Some((name[..stem.len()].to_string(), true));
+    }
+    let ext = lower.rsplit('.').next()?;
+    let dot = lower.len().checked_sub(4)?;
+    if lower.as_bytes()[dot] == b'.'
+        && ext.len() == 3
+        && (b'r'..=b'z').contains(&ext.as_bytes()[0])
+        && is_archive_volume_ext(ext)
+    {
+        return Some((name[..dot].to_string(), false));
+    }
+    None
+}
+
+/// Old-style RAR continuation (`r00`..`z99`) or split-archive (`001`..) extension.
+fn is_archive_volume_ext(ext: &str) -> bool {
+    let b = ext.as_bytes();
+    b.len() == 3
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && (b[0].is_ascii_digit() || (b'r'..=b'z').contains(&b[0]))
 }
 
 // ---------------------------------------------------------------------------
@@ -4215,6 +4278,82 @@ mod tests {
         let (progress_tx, _progress_rx) = mpsc::channel(1);
         let ctx = Arc::new(JobContext::new(job, assembler, progress_tx, 1));
         pool.job_contexts.lock().insert(job.id.clone(), ctx);
+    }
+
+    fn rar_set_ctx(root: &std::path::Path, first_yenc: &str) -> JobContext {
+        let job = test_job("rar-set", root);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = JobContext::new(&job, Arc::new(FileAssembler::new()), tx, 1);
+        let mut nzb = HashMap::new();
+        let mut yenc = HashMap::new();
+        for i in 0..14 {
+            let obf = format!("abc{i:02}x9f");
+            let real = if i == 0 {
+                first_yenc.to_string()
+            } else {
+                format!("movie.r{:02}", i - 1)
+            };
+            std::fs::write(root.join(&obf), b"x").unwrap();
+            nzb.insert(format!("f{i}"), obf);
+            yenc.insert(format!("f{i}"), real);
+        }
+        ctx.nzb_filenames = nzb;
+        *ctx.yenc_names.lock() = yenc;
+        ctx
+    }
+
+    #[test]
+    fn deobfuscate_renames_whole_old_style_rar_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = rar_set_ctx(temp.path(), "movie.rar");
+        ctx.deobfuscate_files();
+        assert!(temp.path().join("movie.rar").exists());
+        for i in 0..13 {
+            assert!(
+                temp.path().join(format!("movie.r{i:02}")).exists(),
+                "r{i:02}"
+            );
+        }
+        assert!(!temp.path().join("abc13x9f").exists());
+    }
+
+    #[test]
+    fn deobfuscate_normalises_part01_first_volume_next_to_rnn() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = rar_set_ctx(temp.path(), "movie.part01.rar");
+        ctx.deobfuscate_files();
+        assert!(temp.path().join("movie.rar").exists());
+        assert!(!temp.path().join("movie.part01.rar").exists());
+        for i in 0..13 {
+            assert!(
+                temp.path().join(format!("movie.r{i:02}")).exists(),
+                "r{i:02}"
+            );
+        }
+    }
+
+    #[test]
+    fn deobfuscate_leaves_rar_set_alone_when_a_target_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = rar_set_ctx(temp.path(), "movie.rar");
+        std::fs::write(temp.path().join("movie.r03"), b"x").unwrap();
+        // Same-target collision: two files claim one name.
+        ctx.yenc_names
+            .lock()
+            .insert("f2".into(), "movie.r00".into());
+        ctx.deobfuscate_files();
+        assert!(!temp.path().join("movie.rar").exists());
+        assert!(temp.path().join("abc00x9f").exists());
+    }
+
+    #[test]
+    fn has_known_extension_recognizes_long_rar_and_split_sets() {
+        for n in ["a.r06", "a.r57", "a.s00", "a.z99", "a.006", "a.123"] {
+            assert!(has_known_extension(n), "{n}");
+        }
+        for n in ["a.n64", "a.q01", "a.r1", "a.1234"] {
+            assert!(!has_known_extension(n), "{n}");
+        }
     }
 
     #[test]
