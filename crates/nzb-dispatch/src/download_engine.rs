@@ -30,7 +30,7 @@
 //! 6. A job only fails if failed articles exceed the threshold and no par2
 //!    recovery is possible.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1043,41 +1043,66 @@ impl JobContext {
     /// and rename on disk if needed. Called exactly once at job completion.
     fn deobfuscate_files(&self) {
         let renames = self.yenc_names.lock();
-        for (old_name, new_name) in plan_deobfuscation(&self.nzb_filenames, &renames) {
-            let old_path = self.work_dir.join(&old_name);
-            let new_path = self.work_dir.join(&new_name);
-            if old_path.exists() && !new_path.exists() {
-                if let Err(e) = std::fs::rename(&old_path, &new_path) {
-                    warn!(
-                        job_id = %self.job_id,
-                        from = %old_name,
-                        to = %new_name,
-                        "Failed to deobfuscate file: {e}"
-                    );
-                } else {
-                    info!(
-                        job_id = %self.job_id,
-                        from = %old_name,
-                        to = %new_name,
-                        "Deobfuscated file"
-                    );
+        for group in plan_deobfuscation(&self.nzb_filenames, &renames) {
+            let ready = group.iter().all(|(old, new)| {
+                self.work_dir.join(old).exists() && !self.work_dir.join(new).exists()
+            });
+            if !ready {
+                debug!(
+                    job_id = %self.job_id,
+                    files = group.len(),
+                    "Skipping deobfuscation: a source is missing or a target exists"
+                );
+                continue;
+            }
+            match rename_all_or_none(&self.work_dir, &group) {
+                Ok(()) => {
+                    for (old_name, new_name) in &group {
+                        info!(
+                            job_id = %self.job_id,
+                            from = %old_name,
+                            to = %new_name,
+                            "Deobfuscated file"
+                        );
+                    }
                 }
+                Err(e) => warn!(
+                    job_id = %self.job_id,
+                    files = group.len(),
+                    "Failed to deobfuscate files, rolled back: {e}"
+                ),
             }
         }
     }
 }
 
+/// Rename every `(old, new)` pair in `dir`. If one rename fails, the pairs
+/// already renamed are renamed back so the group is never left half done.
+fn rename_all_or_none(dir: &std::path::Path, group: &[(String, String)]) -> std::io::Result<()> {
+    for (done, (old, new)) in group.iter().enumerate() {
+        if let Err(e) = std::fs::rename(dir.join(old), dir.join(new)) {
+            for (old, new) in group[..done].iter().rev() {
+                let _ = std::fs::rename(dir.join(new), dir.join(old));
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// Decide which files to rename from their NZB name to the yEnc header name.
 ///
-/// RAR volumes are planned as a set: the set is renamed together or not at
-/// all, and a `.partNN.rar` first volume sitting next to old-style `.rNN`
-/// volumes is renamed to `<set>.rar` so the set is named consistently.
+/// Returns rename groups, each applied all-or-nothing. RAR volumes form one
+/// group per set (grouped case-insensitively), and a `.partNN.rar` first
+/// volume sitting next to old-style `.rNN` volumes is renamed to `<set>.rar`
+/// so the set is named consistently. A group whose target is claimed by any
+/// other rename is dropped. A split-archive `.NNN` name only counts when a
+/// `.001` sibling is present, so `x.264` or `x.720` is not taken for one.
 fn plan_deobfuscation(
     nzb_filenames: &HashMap<String, String>,
     yenc_names: &HashMap<String, String>,
-) -> Vec<(String, String)> {
-    let mut plain: Vec<(String, String)> = Vec::new();
-    let mut sets: HashMap<String, Vec<(String, String)>> = HashMap::new();
+) -> Vec<Vec<(String, String)>> {
+    let mut candidates: Vec<(String, String)> = Vec::new();
     let mut ids: Vec<&String> = yenc_names.keys().collect();
     ids.sort();
     for file_id in ids {
@@ -1098,14 +1123,36 @@ fn plan_deobfuscation(
         if !has_known_extension(clean_yenc) {
             continue;
         }
-        let pair = (nzb_name.clone(), clean_yenc.to_string());
-        match rar_volume(clean_yenc) {
-            Some((set, _)) => sets.entry(set).or_default().push(pair),
-            None => plain.push(pair),
+        candidates.push((nzb_name.clone(), clean_yenc.to_string()));
+    }
+
+    let lower_targets: HashSet<String> = candidates
+        .iter()
+        .map(|(_, n)| n.to_ascii_lowercase())
+        .collect();
+    let mut groups: Vec<Vec<(String, String)>> = Vec::new();
+    // Keyed by lower-cased set name; the first spelling seen names the set.
+    let mut sets: BTreeMap<String, (String, Vec<(String, String)>)> = BTreeMap::new();
+    for pair in candidates {
+        let lower = pair.1.to_ascii_lowercase();
+        if let Some((stem, ext)) = lower.rsplit_once('.')
+            && ext.len() == 3
+            && ext.bytes().all(|c| c.is_ascii_digit())
+            && !lower_targets.contains(&format!("{stem}.001"))
+        {
+            continue;
+        }
+        match rar_volume(&pair.1) {
+            Some((set, _)) => sets
+                .entry(set.to_ascii_lowercase())
+                .or_insert_with(|| (set, Vec::new()))
+                .1
+                .push(pair),
+            None => groups.push(vec![pair]),
         }
     }
 
-    for (set_name, mut volumes) in sets {
+    for (_, (set_name, mut volumes)) in sets {
         // `movie.part01.rar` next to `movie.rNN` volumes becomes `movie.rar`.
         let has_old_style = volumes
             .iter()
@@ -1118,15 +1165,17 @@ fn plan_deobfuscation(
                 }
             }
         }
-        // All targets must be distinct, otherwise leave the set untouched.
-        let mut targets: Vec<&str> = volumes.iter().map(|(_, n)| n.as_str()).collect();
-        targets.sort_unstable();
-        targets.dedup();
-        if targets.len() == volumes.len() {
-            plain.extend(volumes);
-        }
+        groups.push(volumes);
     }
-    plain
+
+    // Every target must be claimed once across all groups, otherwise the
+    // groups sharing it are left untouched.
+    let mut claims: HashMap<String, usize> = HashMap::new();
+    for (_, new) in groups.iter().flatten() {
+        *claims.entry(new.to_ascii_lowercase()).or_default() += 1;
+    }
+    groups.retain(|g| g.iter().all(|(_, n)| claims[&n.to_ascii_lowercase()] == 1));
+    groups
 }
 
 // ---------------------------------------------------------------------------
@@ -4333,10 +4382,9 @@ mod tests {
     }
 
     #[test]
-    fn deobfuscate_leaves_rar_set_alone_when_a_target_exists() {
+    fn deobfuscate_leaves_rar_set_alone_when_targets_duplicate() {
         let temp = tempfile::tempdir().unwrap();
         let ctx = rar_set_ctx(temp.path(), "movie.rar");
-        std::fs::write(temp.path().join("movie.r03"), b"x").unwrap();
         // Same-target collision: two files claim one name.
         ctx.yenc_names
             .lock()
@@ -4344,6 +4392,73 @@ mod tests {
         ctx.deobfuscate_files();
         assert!(!temp.path().join("movie.rar").exists());
         assert!(temp.path().join("abc00x9f").exists());
+    }
+
+    #[test]
+    fn deobfuscate_leaves_rar_set_alone_when_a_target_is_on_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = rar_set_ctx(temp.path(), "movie.rar");
+        // Stale file already on disk; the plan itself has no duplicates.
+        std::fs::write(temp.path().join("movie.r03"), b"stale").unwrap();
+        ctx.deobfuscate_files();
+        for i in 0..14 {
+            assert!(temp.path().join(format!("abc{i:02}x9f")).exists(), "{i}");
+        }
+        assert!(!temp.path().join("movie.rar").exists());
+        assert!(!temp.path().join("movie.r00").exists());
+        assert_eq!(
+            std::fs::read(temp.path().join("movie.r03")).unwrap(),
+            b"stale"
+        );
+    }
+
+    #[test]
+    fn rename_all_or_none_rolls_back_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a"), b"x").unwrap();
+        let group = vec![
+            ("a".to_string(), "a.r00".to_string()),
+            ("missing".to_string(), "a.r01".to_string()),
+        ];
+        assert!(rename_all_or_none(temp.path(), &group).is_err());
+        assert!(temp.path().join("a").exists());
+        assert!(!temp.path().join("a.r00").exists());
+    }
+
+    #[test]
+    fn plan_groups_sets_case_insensitively_and_drops_shared_targets() {
+        let map = |v: &[(&str, &str)]| -> HashMap<String, String> {
+            v.iter()
+                .map(|(k, n)| (k.to_string(), n.to_string()))
+                .collect()
+        };
+        let nzb = map(&[("1", "o1"), ("2", "o2"), ("3", "o3")]);
+        let plan = plan_deobfuscation(
+            &nzb,
+            &map(&[("1", "Movie.rar"), ("2", "movie.r00"), ("3", "x.mkv")]),
+        );
+        assert_eq!(plan.len(), 2);
+        assert!(plan.iter().any(|g| g.len() == 2));
+        // A second file claiming a volume name (any case) drops the set.
+        let plan = plan_deobfuscation(
+            &nzb,
+            &map(&[("1", "movie.rar"), ("2", "movie.r00"), ("3", "movie.R00")]),
+        );
+        assert!(plan.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn plan_needs_a_001_sibling_for_numeric_extensions() {
+        let map = |v: &[(&str, &str)]| -> HashMap<String, String> {
+            v.iter()
+                .map(|(k, n)| (k.to_string(), n.to_string()))
+                .collect()
+        };
+        let nzb = map(&[("1", "o1"), ("2", "o2"), ("3", "o3")]);
+        let plan = plan_deobfuscation(&nzb, &map(&[("1", "x.264"), ("2", "y.720")]));
+        assert!(plan.is_empty(), "{plan:?}");
+        let plan = plan_deobfuscation(&nzb, &map(&[("1", "a.001"), ("2", "a.002")]));
+        assert_eq!(plan.len(), 2);
     }
 
     #[test]
