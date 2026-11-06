@@ -144,7 +144,7 @@ use `RUSTNZB_ALLOWED_ROOTS=/downloads:/data:/config`.
 | `max_nested_archive_depth` | `5` | Archive layers extracted after the outer one. `0` extracts only the outer archive. The API accepts 0 to 10. |
 | `abort_hopeless` | `true` | Abort jobs that cannot complete because too many articles are missing. Applied at start. |
 | `early_failure_check` | `true` | Abort an NZB early if most of its first articles are missing. Needs `abort_hopeless`. Applied at start. |
-| `required_completion_pct` | `100.2` | Minimum completion, counting PAR2 recovery, to keep downloading. Values above 100 keep a repair margin. Range 100.0 to 200.0. Applied at start. |
+| `required_completion_pct` | `100.0` | Minimum completion, counting PAR2 recovery, to keep downloading. Used only for jobs with no PAR2 set or with recovery volumes of unknown block count; other jobs are judged by damaged slices. Values above 100 keep a repair margin. Range 100.0 to 200.0. Applied at start. |
 | `article_timeout_secs` | `30` | Wait for one article response before reconnecting. `0` disables the timeout. The API accepts at most 3600. Applied at start. |
 | `auto_sort_remaining_pct` | `false` | Keep queued jobs ordered by remaining work. |
 | `duplicate_policy` | `"warn"` | When an NZB matches a queued or history job by name or content: `allow`, `warn` (log it) or `skip` (refuse it). |
