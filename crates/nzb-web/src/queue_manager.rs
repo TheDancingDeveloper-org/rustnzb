@@ -3762,6 +3762,7 @@ impl QueueManager {
                     download_time_secs,
                     slice_map,
                     repair_fold,
+                    incomplete_nzb,
                     ..
                 } => {
                     // The slice map gives the exact damage: refuse to hand a
@@ -3838,6 +3839,10 @@ impl QueueManager {
                             state.job.slice_map = slice_map;
                             state.repair_fold = repair_fold;
                             state.par2_volumes = par2_volume_counts(&state.job, &held);
+                            if let Some(note) = &incomplete_nzb {
+                                // The NZB itself leaves segments out (WI-3467).
+                                state.job.error_message = Some(note.clone());
+                            }
                         }
                     }
                     self.history_changed();
