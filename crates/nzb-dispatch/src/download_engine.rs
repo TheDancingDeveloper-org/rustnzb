@@ -1090,14 +1090,6 @@ fn rename_all_or_none(dir: &std::path::Path, group: &[(String, String)]) -> std:
     Ok(())
 }
 
-/// Decide which files to rename from their NZB name to the yEnc header name.
-///
-/// Returns rename groups, each applied all-or-nothing. RAR volumes form one
-/// group per set (grouped case-insensitively), and a `.partNN.rar` first
-/// volume sitting next to old-style `.rNN` volumes is renamed to `<set>.rar`
-/// so the set is named consistently. A group whose target is claimed by any
-/// other rename is dropped. A split-archive `.NNN` name only counts when a
-/// `.001` sibling is present, so `x.264` or `x.720` is not taken for one.
 fn is_par2_name(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".par2")
 }
@@ -1113,8 +1105,22 @@ fn looks_obfuscated(stem: &str) -> bool {
     stem.len() >= 16
         && stem.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
         && stem.bytes().any(|c| c.is_ascii_digit())
+        && !stem.split('-').any(|word| {
+            word.len() >= 3
+                && word
+                    .bytes()
+                    .all(|character| character.is_ascii_alphabetic())
+        })
 }
 
+/// Decide which files to rename from their NZB name to the yEnc header name.
+///
+/// Returns rename groups, each applied all-or-nothing. RAR volumes form one
+/// group per set (grouped case-insensitively), and a `.partNN.rar` first
+/// volume sitting next to old-style `.rNN` volumes is renamed to `<set>.rar`
+/// so the set is named consistently. A group whose target is claimed by any
+/// other rename is dropped. A split-archive `.NNN` name only counts when a
+/// `.001` sibling is present, so `x.264` or `x.720` is not taken for one.
 fn plan_deobfuscation(
     nzb_filenames: &HashMap<String, String>,
     yenc_names: &HashMap<String, String>,
@@ -1140,8 +1146,7 @@ fn plan_deobfuscation(
         if !has_known_extension(clean_yenc) {
             continue;
         }
-        // PAR2 files are renamed by post-processing from their own packets.
-        if is_par2_name(nzb_name) || is_par2_name(clean_yenc) {
+        if is_par2_name(nzb_name) {
             continue;
         }
         // A clean NZB name beats an obfuscated yEnc name (rustnzb#299).
@@ -4487,6 +4492,37 @@ mod tests {
         let nzb = map(&[("1", "Show.S01E01.1080p.WEB.NSW-HR.vol07+08.par2")]);
         let plan = plan_deobfuscation(&nzb, &map(&[("1", "75xIQRHP2P-03FKV64rnvb.par2")]));
         assert!(plan.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn plan_restores_par2_extension_from_yenc_name() {
+        let nzb = HashMap::from([(
+            "1".to_string(),
+            "9b6a324d7560b87091685020371ba869".to_string(),
+        )]);
+        let yenc = HashMap::from([("1".to_string(), "Show.vol01+02.par2".to_string())]);
+        assert_eq!(
+            plan_deobfuscation(&nzb, &yenc),
+            vec![vec![(
+                "9b6a324d7560b87091685020371ba869".to_string(),
+                "Show.vol01+02.par2".to_string()
+            )]]
+        );
+    }
+
+    #[test]
+    fn plan_keeps_clean_nzb_media_name_over_obfuscated_yenc_name() {
+        let nzb = HashMap::from([(
+            "1".to_string(),
+            "Show.S01E01.1080p.WEB.NSW-HR.mkv".to_string(),
+        )]);
+        let yenc = HashMap::from([("1".to_string(), "75xIQRHP2P-03FKV64rnvb.mkv".to_string())]);
+        assert!(plan_deobfuscation(&nzb, &yenc).is_empty());
+    }
+
+    #[test]
+    fn looks_obfuscated_preserves_dash_separated_titles() {
+        assert!(!looks_obfuscated("Some-Movie-2024-1080p-WEB"));
     }
 
     #[test]
