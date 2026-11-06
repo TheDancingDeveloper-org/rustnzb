@@ -1098,6 +1098,23 @@ fn rename_all_or_none(dir: &std::path::Path, group: &[(String, String)]) -> std:
 /// so the set is named consistently. A group whose target is claimed by any
 /// other rename is dropped. A split-archive `.NNN` name only counts when a
 /// `.001` sibling is present, so `x.264` or `x.720` is not taken for one.
+fn is_par2_name(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".par2")
+}
+
+/// The name up to its first dot.
+fn file_stem(name: &str) -> &str {
+    name.split('.').next().unwrap_or(name)
+}
+
+/// True for a stem that reads as a hash or random token rather than a title:
+/// long, a single word of letters, digits and dashes, mixing digits in.
+fn looks_obfuscated(stem: &str) -> bool {
+    stem.len() >= 16
+        && stem.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        && stem.bytes().any(|c| c.is_ascii_digit())
+}
+
 fn plan_deobfuscation(
     nzb_filenames: &HashMap<String, String>,
     yenc_names: &HashMap<String, String>,
@@ -1121,6 +1138,17 @@ fn plan_deobfuscation(
             continue;
         }
         if !has_known_extension(clean_yenc) {
+            continue;
+        }
+        // PAR2 files are renamed by post-processing from their own packets.
+        if is_par2_name(nzb_name) || is_par2_name(clean_yenc) {
+            continue;
+        }
+        // A clean NZB name beats an obfuscated yEnc name (rustnzb#299).
+        if has_known_extension(nzb_name)
+            && !looks_obfuscated(file_stem(nzb_name))
+            && looks_obfuscated(file_stem(clean_yenc))
+        {
             continue;
         }
         candidates.push((nzb_name.clone(), clean_yenc.to_string()));
@@ -4445,6 +4473,46 @@ mod tests {
             &map(&[("1", "movie.rar"), ("2", "movie.r00"), ("3", "movie.R00")]),
         );
         assert!(plan.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn plan_keeps_clean_nzb_par2_name_over_obfuscated_yenc_name() {
+        // rustnzb#299: a well-named recovery volume must not be renamed to
+        // the obfuscated yEnc name.
+        let map = |v: &[(&str, &str)]| -> HashMap<String, String> {
+            v.iter()
+                .map(|(k, n)| (k.to_string(), n.to_string()))
+                .collect()
+        };
+        let nzb = map(&[("1", "Show.S01E01.1080p.WEB.NSW-HR.vol07+08.par2")]);
+        let plan = plan_deobfuscation(&nzb, &map(&[("1", "75xIQRHP2P-03FKV64rnvb.par2")]));
+        assert!(plan.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn looks_obfuscated_flags_tokens_not_titles() {
+        assert!(looks_obfuscated("75xIQRHP2P-03FKV64rnvb"));
+        assert!(looks_obfuscated("9b6a324d7560b87091685020371ba869"));
+        assert!(!looks_obfuscated("Show"));
+        assert!(!looks_obfuscated("Some_Movie_2024_1080p"));
+    }
+
+    #[test]
+    fn plan_renames_obfuscated_nzb_name_to_clean_yenc_name() {
+        let map = |v: &[(&str, &str)]| -> HashMap<String, String> {
+            v.iter()
+                .map(|(k, n)| (k.to_string(), n.to_string()))
+                .collect()
+        };
+        let nzb = map(&[("1", "9b6a324d7560b87091685020371ba869")]);
+        let plan = plan_deobfuscation(&nzb, &map(&[("1", "movie.mkv")]));
+        assert_eq!(
+            plan,
+            vec![vec![(
+                "9b6a324d7560b87091685020371ba869".to_string(),
+                "movie.mkv".to_string()
+            )]]
+        );
     }
 
     #[test]
