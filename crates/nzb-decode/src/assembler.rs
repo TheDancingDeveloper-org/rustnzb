@@ -421,6 +421,20 @@ impl FileAssembler {
             .and_then(|state| state.declared_bytes)
     }
 
+    /// `(listed, highest)` for a file whose NZB segment numbers are not
+    /// exactly `1..=N`: how many distinct numbers the NZB listed and the
+    /// highest of them. `None` for a contiguous or unregistered file.
+    pub fn segment_gap(&self, job_id: &str, file_id: &str) -> Option<(u32, u32)> {
+        let key = FileKey {
+            job_id: job_id.to_string(),
+            file_id: file_id.to_string(),
+        };
+        let files = self.files.read();
+        let state = files.get(&key)?;
+        let numbers = state.segment_numbers.as_ref()?;
+        Some((state.total_segments, numbers.last().copied().unwrap_or(0)))
+    }
+
     /// Write a decoded article directly to the output file at the given offset.
     ///
     /// Uses `pwrite` (write_at) for lock-free concurrent writes — multiple

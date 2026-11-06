@@ -2763,6 +2763,10 @@ async fn run_worker_serial(
                 // article resolves without being written or reported.
                 ctx.resolve_one();
             }
+            Err(ArticleError::IncompleteNzb(msg)) => {
+                fail_incomplete_nzb_article(&ctx, &item, primary_server, worker_id, &msg);
+                last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+            }
             Err(ArticleError::AssemblyError(msg)) => {
                 // The server served a decodable body; only the local write failed.
                 send_outcome(&ctx, &item, nzb_core::Outcome::Present);
@@ -3115,6 +3119,16 @@ async fn run_worker_pipelined(
                                     last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
                                 }
                             }
+                            Err(ArticleError::IncompleteNzb(msg)) => {
+                                fail_incomplete_nzb_article(
+                                    &ctx,
+                                    &item,
+                                    primary_server,
+                                    worker_id,
+                                    &msg,
+                                );
+                                last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                            }
                             Err(ArticleError::AssemblyError(msg)) => {
                                 send_outcome(&ctx, &item, nzb_core::Outcome::Present);
                                 ctx.slices.record_failure(&item.file_id, false);
@@ -3414,6 +3428,36 @@ async fn connect_with_retry(
 // ---------------------------------------------------------------------------
 // Helpers: re-queue, not-available routing, par2 sort key
 // ---------------------------------------------------------------------------
+
+/// Fail an article that could not be placed because the NZB leaves segments
+/// out of its file (WI-3467). The server served the body, and every server
+/// would serve the same one, so the failure is final: no failover.
+fn fail_incomplete_nzb_article(
+    ctx: &Arc<JobContext>,
+    item: &WorkItem,
+    server: &ServerConfig,
+    worker_id: &str,
+    msg: &str,
+) {
+    send_outcome(ctx, item, nzb_core::Outcome::Present);
+    ctx.slices.record_failure(&item.file_id, false);
+    warn!(job_id = %item.job_id, file_id = %item.file_id, segment_number = item.segment_number, message_id = %item.message_id, server_id = %server.id, worker_id = %worker_id, terminal_failure_kind = "decode_error", "Incomplete NZB: {msg}");
+    try_send_progress(
+        &ctx.progress_tx,
+        &item.job_id,
+        ProgressUpdate::ArticleFailed {
+            job_id: item.job_id.clone(),
+            file_id: item.file_id.clone(),
+            segment_number: item.segment_number,
+            failure: crate::article_failure::ArticleFailure::decode_error(
+                &server.id,
+                format!("Incomplete NZB: {msg}"),
+            ),
+        },
+    );
+    ctx.articles_failed.fetch_add(1, Ordering::Relaxed);
+    ctx.resolve_one();
+}
 
 /// Handle an article that's not available on this server (not found, decode
 /// error, etc.): mark the server as tried and either requeue or mark failed.
@@ -3801,11 +3845,24 @@ pub(crate) fn build_job_submission(
         // whose segments omit it sums to 0 (or to an understatement) and
         // every article would then be rejected as past the declared size.
         // With no bound, the write check falls back to the article's size=.
-        let declared_bytes = file
-            .articles
-            .iter()
-            .all(|article| article.bytes > 0)
-            .then_some(file.bytes);
+        let all_sized = file.articles.iter().all(|article| article.bytes > 0);
+        // An NZB whose segment numbers are not 1..=N leaves articles out, so
+        // the sum of the listed bytes understates the file and would reject
+        // every later segment as corrupt (WI-3467). Register a sanity cap
+        // instead; the decode bound is then the article's `=ybegin size=`,
+        // clamped to the cap so a forged size still cannot grow the file.
+        let declared_bytes = match nzb_segment_gap(&segment_numbers) {
+            Some((listed, highest)) => {
+                warn!(
+                    job_id = %job.id,
+                    file = %file.filename,
+                    "Incomplete NZB: lists {listed} of {highest} segments; bounding writes by the yEnc size"
+                );
+                let largest = file.articles.iter().map(|a| a.bytes).max().unwrap_or(0);
+                all_sized.then(|| incomplete_nzb_size_cap(highest, largest))
+            }
+            None => all_sized.then_some(file.bytes),
+        };
         if let Err(e) = assembler.register_file_with_segment_numbers(
             &job.id,
             &file.id,
@@ -4043,10 +4100,37 @@ enum ArticleError {
     DecodeError(String),
     #[error("Assembly error: {0}")]
     AssemblyError(String),
+    /// The NZB leaves segments out of this file and the article could not be
+    /// placed. Every server returns the same body, so this is final for the
+    /// article and is not retried elsewhere (WI-3467).
+    #[error("Incomplete NZB: {0}")]
+    IncompleteNzb(String),
     /// The job was cancelled while the fetch was in flight; the article was
     /// not written.
     #[error("Job cancelled")]
     Cancelled,
+}
+
+/// `(listed, highest)` when an NZB file's segment numbers are not exactly
+/// `1..=N`, that is when the NZB leaves segments out.
+fn nzb_segment_gap(segment_numbers: &[u32]) -> Option<(u32, u32)> {
+    let mut numbers: Vec<u32> = segment_numbers
+        .iter()
+        .copied()
+        .filter(|&n| n != 0)
+        .collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    let listed = numbers.len() as u32;
+    let highest = *numbers.last()?;
+    (highest != listed).then_some((listed, highest))
+}
+
+/// Largest size an incomplete NZB file may be written up to: the highest
+/// listed segment number times the largest listed segment, plus 10%.
+fn incomplete_nzb_size_cap(highest_segment: u32, largest_segment_bytes: u64) -> u64 {
+    let raw = u64::from(highest_segment).saturating_mul(largest_segment_bytes);
+    raw.saturating_add(raw / 10)
 }
 
 /// `(first, min, max, logged)`: the first `=ybegin size=` recorded for one
@@ -4236,6 +4320,13 @@ fn decode_and_assemble(
     };
     // With an NZB size the record above is only a log. Without one, the first
     // `size=` seen is the only bound the write has.
+    // For an NZB that leaves segments out, the registered size is only a
+    // sanity cap: the bound is the first `size=` seen, clamped to that cap.
+    let gap = assembler.segment_gap(&item.job_id, &item.file_id);
+    let declared = match (gap, declared) {
+        (Some(_), Some(cap)) => Some(pinned_size.map_or(cap, |size| size.min(cap))),
+        _ => declared,
+    };
     let pinned_bound = if declared.is_some() {
         None
     } else {
@@ -4250,11 +4341,15 @@ fn decode_and_assemble(
         declared,
         pinned_bound,
     )
-    .map_err(|reason| {
-        ArticleError::DecodeError(format!(
+    .map_err(|reason| match gap {
+        Some((listed, highest)) => ArticleError::IncompleteNzb(format!(
+            "NZB lists {listed} of {highest} segments for {}; seg {} not placed: {reason}",
+            item.filename, item.segment_number
+        )),
+        None => ArticleError::DecodeError(format!(
             "Corrupt yEnc article for {} seg {}: {reason}",
             item.filename, item.segment_number
-        ))
+        )),
     })?;
     let yenc_filename = decoded.filename;
 
@@ -4976,6 +5071,106 @@ mod tests {
         );
         assert!(std::fs::metadata(&path).unwrap().len() <= 8);
         assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 2));
+    }
+
+    /// A job with one 16-byte file of four 4-byte segments whose NZB lists
+    /// only segments 1, 2 and 4 (WI-3467).
+    fn gap_nzb_job(dir: &std::path::Path) -> NzbJob {
+        let mut job = test_job("gap", dir);
+        let article = |segment_number: u32| nzb_nntp::Article {
+            message_id: format!("seg{segment_number}"),
+            segment_number,
+            bytes: 4,
+            downloaded: false,
+            data_begin: None,
+            data_size: None,
+            crc32: None,
+            tried_servers: Vec::new(),
+            tries: 0,
+        };
+        job.files.push(nzb_core::models::NzbFile {
+            id: "file-1".into(),
+            filename: "out.bin".into(),
+            bytes: 12,
+            bytes_downloaded: 0,
+            is_par2: false,
+            par2_setname: None,
+            par2_vol: None,
+            par2_blocks: None,
+            assembled: false,
+            groups: Vec::new(),
+            articles: vec![article(1), article(2), article(4)],
+        });
+        job
+    }
+
+    fn gap_item(job: &NzbJob, segment_number: u32) -> WorkItem {
+        let mut item = decode_test_item(&job.id, segment_number);
+        item.file_id = "file-1".into();
+        item
+    }
+
+    #[test]
+    fn decode_accepts_listed_segment_past_the_sum_of_an_incomplete_nzb() {
+        let temp = tempfile::tempdir().unwrap();
+        let job = gap_nzb_job(temp.path());
+        let (tx, _rx) = mpsc::channel(4);
+        let (ctx, _items) = build_job_submission(&job, tx, &["srv1".into()]);
+
+        // Segment 4 starts at byte 12, which is the sum of the listed bytes.
+        let (raw, _) = yenc_simd::encode_article(b"DDDD", "out.bin", 4, 4, 12, 16);
+        let result = decode_and_assemble(&gap_item(&job, 4), &raw, &ctx.assembler, None);
+
+        assert!(
+            result.is_ok(),
+            "segment 4 at its real offset, got {result:?}"
+        );
+        let written = std::fs::read(job.work_dir.join("out.bin")).unwrap();
+        assert_eq!(&written[12..16], b"DDDD");
+    }
+
+    #[test]
+    fn decode_rejects_forged_size_past_the_cap_of_an_incomplete_nzb() {
+        let temp = tempfile::tempdir().unwrap();
+        let job = gap_nzb_job(temp.path());
+        let (tx, _rx) = mpsc::channel(4);
+        let (ctx, _items) = build_job_submission(&job, tx, &["srv1".into()]);
+
+        let (raw, _) = yenc_simd::encode_article(
+            b"DDDD",
+            "out.bin",
+            4,
+            4,
+            1_000_000_000_000,
+            2_000_000_000_000,
+        );
+        let result = decode_and_assemble(&gap_item(&job, 4), &raw, &ctx.assembler, None);
+
+        assert!(
+            result.is_err(),
+            "forged size= must stay rejected, got {result:?}"
+        );
+        // Cap: highest number 4 x largest segment 4 bytes, plus 10%.
+        let len = std::fs::metadata(job.work_dir.join("out.bin"))
+            .unwrap()
+            .len();
+        assert!(len <= 17, "file grew to {len}");
+    }
+
+    #[test]
+    fn decode_reports_a_gap_file_as_an_incomplete_nzb() {
+        let temp = tempfile::tempdir().unwrap();
+        let job = gap_nzb_job(temp.path());
+        let (tx, _rx) = mpsc::channel(4);
+        let (ctx, _items) = build_job_submission(&job, tx, &["srv1".into()]);
+
+        let (raw, _) = yenc_simd::encode_article(b"DDDD", "out.bin", 4, 4, 100, 104);
+        let err = decode_and_assemble(&gap_item(&job, 4), &raw, &ctx.assembler, None)
+            .expect_err("an article past the cap is not placed");
+
+        let text = err.to_string();
+        assert!(text.contains("NZB lists 3 of 4 segments"), "got {text}");
+        assert!(!text.contains("Corrupt yEnc"), "got {text}");
     }
 
     #[test]
