@@ -991,7 +991,10 @@ impl SpeedTracker {
 /// 2. **Early failure check** — if most articles fail, abort fast (Phase 6:
 ///    no longer capped to the first 25% of articles; the check runs
 ///    continuously while the job is downloading)
-/// 3. **Ongoing availability** — compare missing content with usable PAR2 capacity
+/// 3. **Ongoing availability** — compare missing content with usable PAR2
+///    capacity. Only for jobs without a PAR2 set or with a recovery volume
+///    of unknown block count; with known recovery blocks only the proven
+///    parity tier may abort mid-download (rustnzb#302).
 /// 4. **No-progress timeout** — abort when the job stops emitting article
 ///    progress for longer than `no_progress_timeout`, even after partial
 ///    success. This catches both startup zombies and late-stage stalls.
@@ -1016,6 +1019,18 @@ struct HopelessTracker {
     /// masking damage in another set.
     recovery_capacity_by_set: HashMap<String, u64>,
     recovery_unavailable_by_set: HashMap<String, u64>,
+    /// Declared recovery blocks per PAR2 set.
+    recovery_blocks_by_set: HashMap<String, u64>,
+    /// Upper bound on each set's slice size: the smallest declared bytes
+    /// per recovery block among the set's volumes. A volume carries every
+    /// recovery slice in full plus headers and critical packets, so this
+    /// never understates the slice size.
+    slice_size_bound_by_set: HashMap<String, u64>,
+    /// Upper bound on the slice size of every set in the job, for damage
+    /// that cannot be attributed to one set.
+    slice_size_bound: u64,
+    /// Content bytes per PAR2 set, for the set's own safety reserve.
+    content_bytes_by_set: HashMap<String, u64>,
     missing_content_by_set: HashMap<String, u64>,
     unassociated_missing_bytes: u64,
     content_file_sets: HashMap<String, Option<String>>,
@@ -1035,9 +1050,10 @@ struct HopelessTracker {
     /// one is not, the declared total undercounts and the parity tier stays
     /// out of the way.
     recovery_blocks_known: bool,
-    /// Content files with at least one article refused by every server.
-    /// PAR2 slices never span files, so each is at least one damaged slice.
-    confirmed_missing_files: std::collections::HashSet<String>,
+    /// Content files with at least one article refused by every server,
+    /// with the declared bytes so refused. PAR2 slices never span files, so
+    /// each is at least one damaged slice.
+    confirmed_missing_files: HashMap<String, u64>,
     /// Confirmed-missing content articles not attributed to a file.
     confirmed_missing_unattributed: usize,
 }
@@ -1046,6 +1062,9 @@ struct HopelessTracker {
 /// Jobs with a PAR2 set are first judged by the parity tier, which needs no
 /// grace; this remains the only guard for jobs with no PAR2 set at all.
 const HOPELESS_GRACE_ARTICLES: usize = 5;
+/// Largest yEnc encoding overhead assumed, in percent of decoded size, when
+/// turning declared (encoded) article bytes into decoded slice bytes.
+const YENC_OVERHEAD_PCT: u64 = 103;
 /// Minimum content articles checked before the early failure check fires.
 const EARLY_CHECK_MIN_ARTICLES: usize = 10;
 /// Failure rate threshold for the early check (0.0–1.0).
@@ -1065,6 +1084,10 @@ impl HopelessTracker {
             .map(str::to_ascii_lowercase)
             .collect::<std::collections::HashSet<_>>();
         let mut recovery_capacity_by_set = HashMap::new();
+        let mut recovery_blocks_by_set = HashMap::new();
+        let mut slice_size_bound_by_set: HashMap<String, u64> = HashMap::new();
+        let mut unnamed_slice_size_bound = 0u64;
+        let mut content_bytes_by_set: HashMap<String, u64> = HashMap::new();
         let mut content_file_sets = HashMap::new();
         let mut pending_file_classifications = std::collections::HashSet::new();
         let mut has_par2_set = false;
@@ -1082,11 +1105,21 @@ impl HopelessTracker {
                     recovery_capacity_bytes = recovery_capacity_bytes.saturating_add(file.bytes);
                     recovery_blocks_total = recovery_blocks_total
                         .saturating_add(u64::from(file.par2_blocks.unwrap_or_default()));
+                    let blocks = u64::from(file.par2_blocks.unwrap_or_default());
+                    let per_block = file.bytes.div_ceil(blocks);
                     if let Some(set_name) = file.par2_setname.as_deref() {
+                        let set_name = set_name.to_ascii_lowercase();
                         let capacity = recovery_capacity_by_set
-                            .entry(set_name.to_ascii_lowercase())
+                            .entry(set_name.clone())
                             .or_insert(0u64);
                         *capacity = capacity.saturating_add(file.bytes);
+                        *recovery_blocks_by_set
+                            .entry(set_name.clone())
+                            .or_insert(0u64) += blocks;
+                        let bound = slice_size_bound_by_set.entry(set_name).or_insert(u64::MAX);
+                        *bound = (*bound).min(per_block);
+                    } else {
+                        unnamed_slice_size_bound = unnamed_slice_size_bound.max(per_block);
                     }
                 }
                 content_file_sets.insert(
@@ -1106,6 +1139,9 @@ impl HopelessTracker {
                         .max_by_key(|set_name| set_name.len())
                         .cloned()
                 };
+                if let Some(set_name) = &associated_set {
+                    *content_bytes_by_set.entry(set_name.clone()).or_insert(0) += file.bytes;
+                }
                 content_file_sets.insert(file.id.clone(), associated_set);
                 if !nzb_dispatch::has_known_extension(&file.filename) {
                     pending_file_classifications.insert(file.id.clone());
@@ -1113,6 +1149,10 @@ impl HopelessTracker {
             }
         }
 
+        let slice_size_bound = slice_size_bound_by_set
+            .values()
+            .copied()
+            .fold(unnamed_slice_size_bound, u64::max);
         Self {
             created_at: Instant::now(),
             last_progress_at: Instant::now(),
@@ -1123,6 +1163,10 @@ impl HopelessTracker {
             recovery_blocks_unavailable: 0,
             recovery_capacity_by_set,
             recovery_unavailable_by_set: HashMap::new(),
+            recovery_blocks_by_set,
+            slice_size_bound_by_set,
+            slice_size_bound,
+            content_bytes_by_set,
             missing_content_by_set: HashMap::new(),
             unassociated_missing_bytes: 0,
             content_file_sets,
@@ -1133,7 +1177,7 @@ impl HopelessTracker {
             content_articles_total,
             has_par2_set,
             recovery_blocks_known,
-            confirmed_missing_files: std::collections::HashSet::new(),
+            confirmed_missing_files: HashMap::new(),
             confirmed_missing_unattributed: 0,
         }
     }
@@ -1165,16 +1209,34 @@ impl HopelessTracker {
             self.recovery_blocks_known = false;
         }
         self.confirmed_missing_files.remove(file_id);
+        if let Some(Some(old_set)) = self.content_file_sets.get(file_id)
+            && let Some(bytes) = self.content_bytes_by_set.get_mut(old_set)
+        {
+            *bytes = bytes.saturating_sub(file_bytes);
+        }
         if volume.is_some() && blocks.is_some_and(|count| count > 0) {
             self.recovery_capacity_bytes = self.recovery_capacity_bytes.saturating_add(file_bytes);
             self.recovery_blocks_total = self
                 .recovery_blocks_total
                 .saturating_add(u64::from(blocks.unwrap_or_default()));
+            let block_count = u64::from(blocks.unwrap_or_default());
+            let per_block = file_bytes.div_ceil(block_count);
+            self.slice_size_bound = self.slice_size_bound.max(per_block);
             if let Some(set_name) = set_name {
+                let set_name = set_name.to_ascii_lowercase();
                 *self
                     .recovery_capacity_by_set
-                    .entry(set_name.to_ascii_lowercase())
+                    .entry(set_name.clone())
                     .or_insert(0) += file_bytes;
+                *self
+                    .recovery_blocks_by_set
+                    .entry(set_name.clone())
+                    .or_insert(0) += block_count;
+                let bound = self
+                    .slice_size_bound_by_set
+                    .entry(set_name)
+                    .or_insert(u64::MAX);
+                *bound = (*bound).min(per_block);
             }
         }
         self.content_file_sets
@@ -1237,7 +1299,10 @@ impl HopelessTracker {
         if kind == nzb_dispatch::ArticleFailureKind::NotFound {
             match file_id {
                 Some(id) => {
-                    self.confirmed_missing_files.insert(id.to_string());
+                    *self
+                        .confirmed_missing_files
+                        .entry(id.to_string())
+                        .or_insert(0) += estimated_bytes;
                 }
                 None => self.confirmed_missing_unattributed += 1,
             }
@@ -1286,6 +1351,15 @@ impl HopelessTracker {
             && let Some(abort) = self.parity_check()
         {
             return Some(abort);
+        }
+
+        // With known recovery blocks, the byte tiers below are only an
+        // estimate: whether a job is repairable is decided by damaged slices
+        // against recovery slices. Only the proven parity bound may abort
+        // mid-download; the slice map at job end makes the exact decision
+        // (rustnzb#302).
+        if self.has_par2_set && self.recovery_blocks_known {
+            return None;
         }
 
         // Tier 1: grace period — allow minor gaps that par2 can fix
@@ -1342,17 +1416,30 @@ impl HopelessTracker {
             }
         }
 
-        let safety_reserve = required_bytes.saturating_sub(self.content_bytes);
-        let set_repairable = (!self.recovery_capacity_by_set.is_empty()).then(|| {
+        // Prefer per-set proof when set associations are available: recovery
+        // blocks from one set cannot repair another, and each set must keep
+        // its own safety reserve.
+        if !self.recovery_capacity_by_set.is_empty() {
             if self.unassociated_missing_bytes > 0 {
                 // Multiple PAR2 sets with an ambiguous content filename need
                 // the assembled index for authoritative association. Defer
                 // to post-processing instead of borrowing blocks from the
                 // wrong set or aborting prematurely.
-                return true;
+                return None;
             }
-            let mut remaining_reserve = 0u64;
-            for (set_name, capacity) in &self.recovery_capacity_by_set {
+            let mut set_names = self
+                .recovery_capacity_by_set
+                .keys()
+                .chain(self.missing_content_by_set.keys())
+                .collect::<Vec<_>>();
+            set_names.sort();
+            set_names.dedup();
+            for set_name in set_names {
+                let capacity = self
+                    .recovery_capacity_by_set
+                    .get(set_name)
+                    .copied()
+                    .unwrap_or(0);
                 let usable = capacity.saturating_sub(
                     self.recovery_unavailable_by_set
                         .get(set_name)
@@ -1364,45 +1451,52 @@ impl HopelessTracker {
                     .get(set_name)
                     .copied()
                     .unwrap_or(0);
-                if missing > usable {
-                    return false;
+                if missing == 0 {
+                    // An undamaged set needs no repair and no reserve.
+                    continue;
                 }
-                remaining_reserve =
-                    remaining_reserve.saturating_add(usable.saturating_sub(missing));
+                let set_content = self
+                    .content_bytes_by_set
+                    .get(set_name)
+                    .copied()
+                    .unwrap_or(0);
+                let set_reserve =
+                    ((set_content as f64) * required_completion_pct / 100.0).ceil() as u64;
+                let set_reserve = set_reserve.saturating_sub(set_content);
+                if missing.saturating_add(set_reserve) > usable {
+                    return Some(HopelessAbort {
+                        tier: "set_availability",
+                        reason: format!(
+                            "Aborted: PAR2 set \"{set_name}\" cannot repair its damage: {missing} \
+                             missing content bytes, {usable} usable recovery bytes, {set_reserve} \
+                             bytes safety reserve at {required_completion_pct:.3}%"
+                        ),
+                    });
+                }
             }
-            self.missing_content_by_set
-                .keys()
-                .all(|set_name| self.recovery_capacity_by_set.contains_key(set_name))
-                && remaining_reserve >= safety_reserve
-        });
-
-        // Recovery capacity and the configured safety reserve are the
-        // primary ongoing completion model. Prefer per-set proof when set
-        // associations are available; otherwise retain the conservative
-        // aggregate estimate for older/ambiguous NZBs.
-        if set_repairable.unwrap_or(effective_bytes >= required_bytes) {
             return None;
         }
 
         // Tier 3: effective completion, including usable PAR2 recovery.
+        if effective_bytes >= required_bytes {
+            return None;
+        }
         if self.content_bytes > 0 {
             let availability_pct = 100.0 * effective_bytes as f64 / self.content_bytes as f64;
-            if availability_pct < required_completion_pct || set_repairable == Some(false) {
-                return Some(HopelessAbort {
-                    tier: "ongoing_availability",
-                    reason: format!(
-                        "Aborted: effective completion {availability_pct:.3}% is below \
-                         {required_completion_pct:.3}%: {} missing content bytes in {} of {} \
-                         articles, {} usable recovery bytes ({} of {} recovery blocks unavailable)",
-                        self.content_bytes_missing,
-                        self.content_articles_failed,
-                        self.content_articles_total,
-                        usable_recovery_bytes,
-                        self.recovery_blocks_unavailable,
-                        self.recovery_blocks_total,
-                    ),
-                });
-            }
+            return Some(HopelessAbort {
+                tier: "ongoing_availability",
+                reason: format!(
+                    "Aborted: effective completion {availability_pct:.3}% is below \
+                     {required_completion_pct:.3}%: {} missing content bytes in {} of {} \
+                     articles, {} usable recovery bytes ({} of {} recovery blocks unavailable)",
+                    self.content_bytes_missing,
+                    self.content_articles_failed,
+                    self.content_articles_total,
+                    usable_recovery_bytes,
+                    self.recovery_blocks_unavailable,
+                    self.recovery_blocks_total,
+                ),
+            });
         }
 
         None
@@ -1417,35 +1511,105 @@ impl HopelessTracker {
             .saturating_sub(self.recovery_blocks_unavailable)
     }
 
+    /// Slices certainly damaged by `missing_bytes` refused in one file,
+    /// given an upper bound on the slice size. A file's refused bytes cannot
+    /// fit in fewer than ceil(bytes / slice_size) slices, wherever they sit.
+    /// The declared bytes are yEnc-encoded, so they are first discounted by
+    /// a generous encoding overhead to stay a lower bound.
+    fn file_damaged_slices(missing_bytes: u64, slice_size_bound: u64) -> u64 {
+        if slice_size_bound == 0 || slice_size_bound == u64::MAX {
+            return 1;
+        }
+        let decoded = missing_bytes.saturating_mul(100) / YENC_OVERHEAD_PCT;
+        decoded.div_ceil(slice_size_bound).max(1)
+    }
+
     /// A lower bound on damaged slices from confirmed-missing articles. Only
     /// articles every server refused count; provisional, transport-failed
     /// and unasked articles are unestablished. Slices never span files, so
-    /// each file with a confirmed hole holds at least one damaged slice.
+    /// each file with a confirmed hole holds at least one damaged slice, and
+    /// more once its refused bytes exceed the slice size.
     fn damaged_slices_lower_bound(&self) -> u64 {
-        let files = self.confirmed_missing_files.len() as u64;
-        if files == 0 && self.confirmed_missing_unattributed > 0 {
+        let damaged = self
+            .confirmed_missing_files
+            .values()
+            .map(|&bytes| Self::file_damaged_slices(bytes, self.slice_size_bound))
+            .sum::<u64>();
+        if damaged == 0 && self.confirmed_missing_unattributed > 0 {
             1
         } else {
-            files
+            damaged
         }
     }
 
+    /// Recovery slices still obtainable in one set: declared blocks less the
+    /// share lost to failed volume articles of that set.
+    fn set_recovery_blocks_available(&self, set_name: &str) -> u64 {
+        let blocks = self
+            .recovery_blocks_by_set
+            .get(set_name)
+            .copied()
+            .unwrap_or(0);
+        let capacity = self
+            .recovery_capacity_by_set
+            .get(set_name)
+            .copied()
+            .unwrap_or(0);
+        let lost_bytes = self
+            .recovery_unavailable_by_set
+            .get(set_name)
+            .copied()
+            .unwrap_or(0)
+            .min(capacity);
+        let lost = if capacity == 0 {
+            0
+        } else {
+            ((u128::from(lost_bytes) * u128::from(blocks)).div_ceil(u128::from(capacity))) as u64
+        };
+        blocks.saturating_sub(lost)
+    }
+
     /// Hopeless when the slices certainly damaged exceed the recovery
-    /// slices available. Mid-download the damaged count is a lower bound;
-    /// the exact count comes from the slice map at job end
-    /// ([`parity_diagnosis`]).
+    /// slices available, for the whole job or for one recovery set.
+    /// Mid-download the damaged count is a lower bound; the exact count
+    /// comes from the slice map at job end ([`parity_diagnosis`]).
     fn parity_check(&self) -> Option<HopelessAbort> {
         if !self.recovery_blocks_known {
             return None;
         }
         let damaged = self.damaged_slices_lower_bound();
         let available = self.recovery_blocks_available();
-        (damaged > available).then(|| HopelessAbort {
-            tier: "parity",
-            reason: format!(
-                "Aborted: at least {damaged} slice(s) missing but the release only \
-                 carries {available} recovery slice(s)"
-            ),
+        if damaged > available {
+            return Some(HopelessAbort {
+                tier: "parity",
+                reason: format!(
+                    "Aborted: at least {damaged} slice(s) missing but the release only \
+                     carries {available} recovery slice(s)"
+                ),
+            });
+        }
+        // Per set: blocks of one set cannot repair another. Only files
+        // attributed to a set that declares recovery blocks are counted.
+        let mut damaged_by_set: HashMap<&str, u64> = HashMap::new();
+        for (file_id, &bytes) in &self.confirmed_missing_files {
+            if let Some(Some(set_name)) = self.content_file_sets.get(file_id)
+                && let Some(&bound) = self.slice_size_bound_by_set.get(set_name)
+            {
+                *damaged_by_set.entry(set_name.as_str()).or_insert(0) +=
+                    Self::file_damaged_slices(bytes, bound);
+            }
+        }
+        let mut sets = damaged_by_set.into_iter().collect::<Vec<_>>();
+        sets.sort();
+        sets.into_iter().find_map(|(set_name, damaged)| {
+            let available = self.set_recovery_blocks_available(set_name);
+            (damaged > available).then(|| HopelessAbort {
+                tier: "parity",
+                reason: format!(
+                    "Aborted: at least {damaged} slice(s) missing in PAR2 set \"{set_name}\" \
+                     but it only carries {available} recovery slice(s)"
+                ),
+            })
         })
     }
 }
@@ -10028,6 +10192,10 @@ mod hopeless_tests {
             recovery_blocks_unavailable: 0,
             recovery_capacity_by_set: HashMap::new(),
             recovery_unavailable_by_set: HashMap::new(),
+            recovery_blocks_by_set: HashMap::new(),
+            slice_size_bound_by_set: HashMap::new(),
+            slice_size_bound: 0,
+            content_bytes_by_set: HashMap::new(),
             missing_content_by_set: HashMap::new(),
             unassociated_missing_bytes: 0,
             content_file_sets: HashMap::new(),
@@ -10037,8 +10205,10 @@ mod hopeless_tests {
             content_articles_failed: 0,
             content_articles_total: content_articles,
             has_par2_set: par2_articles > 0,
-            recovery_blocks_known: true,
-            confirmed_missing_files: std::collections::HashSet::new(),
+            // The byte tiers judge only jobs whose recovery block counts
+            // are unknown; trackers for the parity tier set this to true.
+            recovery_blocks_known: false,
+            confirmed_missing_files: HashMap::new(),
             confirmed_missing_unattributed: 0,
         }
     }
@@ -10047,6 +10217,7 @@ mod hopeless_tests {
     fn par2_tracker(recovery_blocks: u64) -> HopelessTracker {
         let mut t = make_tracker(1000, 0);
         t.has_par2_set = true;
+        t.recovery_blocks_known = true;
         t.recovery_blocks_total = recovery_blocks;
         t.recovery_capacity_bytes = recovery_blocks * 750_000;
         t
@@ -10054,6 +10225,90 @@ mod hopeless_tests {
 
     fn fail(t: &mut HopelessTracker, file: &str, kind: nzb_dispatch::ArticleFailureKind) {
         t.record_file_failure(Some(file), false, 750_000, kind);
+    }
+
+    /// rustnzb#302 case 1: 142 content articles of 722,391 bytes, 11
+    /// recovery blocks totalling 7,956,295 bytes.
+    fn issue_302_case_1() -> HopelessTracker {
+        let mut t = make_tracker(142, 0);
+        t.content_bytes = 142 * 722_391;
+        t.has_par2_set = true;
+        t.recovery_blocks_known = true;
+        t.recovery_blocks_total = 11;
+        t.recovery_capacity_bytes = 7_956_295;
+        t.slice_size_bound = 7_956_295_u64.div_ceil(11);
+        t
+    }
+
+    #[test]
+    fn issue_302_damage_covered_by_recovery_blocks_does_not_abort() {
+        let mut t = issue_302_case_1();
+        for _ in 0..131 {
+            t.record_success(false);
+        }
+        for _ in 0..11 {
+            t.record_file_failure(
+                Some("mkv"),
+                false,
+                722_391,
+                nzb_dispatch::ArticleFailureKind::NotFound,
+            );
+        }
+        let result = t.check(true, true, 100.2);
+        assert!(result.is_none(), "{:?}", result.map(|a| a.reason));
+    }
+
+    #[test]
+    fn issue_302_one_slice_beyond_recovery_aborts_as_parity() {
+        let mut t = issue_302_case_1();
+        for _ in 0..130 {
+            t.record_success(false);
+        }
+        for _ in 0..12 {
+            t.record_file_failure(
+                Some("mkv"),
+                false,
+                722_391,
+                nzb_dispatch::ArticleFailureKind::NotFound,
+            );
+        }
+        let abort = t.check(true, true, 100.0).expect("12 slices, 11 recovery");
+        assert_eq!(abort.tier, "parity");
+        assert!(
+            abort.reason.contains("at least 12 slice(s)"),
+            "{}",
+            abort.reason
+        );
+    }
+
+    #[test]
+    fn parity_counts_damage_per_recovery_set() {
+        // 20 recovery blocks overall, but set B carries only 2 and has 3
+        // slices' worth of refused bytes.
+        let mut t = par2_tracker(20);
+        t.recovery_capacity_by_set = HashMap::from([
+            ("set-a".to_string(), 18 * 750_000),
+            ("set-b".to_string(), 2 * 750_000),
+        ]);
+        t.recovery_blocks_by_set =
+            HashMap::from([("set-a".to_string(), 18), ("set-b".to_string(), 2)]);
+        t.slice_size_bound_by_set = HashMap::from([
+            ("set-a".to_string(), 750_000),
+            ("set-b".to_string(), 750_000),
+        ]);
+        t.slice_size_bound = 750_000;
+        t.content_file_sets
+            .insert("file-b".to_string(), Some("set-b".to_string()));
+        for _ in 0..3 {
+            fail(&mut t, "file-b", nzb_dispatch::ArticleFailureKind::NotFound);
+        }
+        let abort = t.check(true, true, 100.0).expect("set B cannot repair");
+        assert_eq!(abort.tier, "parity");
+        assert!(
+            abort.reason.contains("PAR2 set \"set-b\""),
+            "{}",
+            abort.reason
+        );
     }
 
     #[test]
@@ -10280,13 +10535,27 @@ mod hopeless_tests {
 
     #[test]
     fn damage_exactly_at_capacity_still_requires_safety_reserve() {
+        // With known recovery blocks, damage exactly at capacity is
+        // repairable and no byte reserve applies (rustnzb#302): only one
+        // slice more than the recovery available aborts, as parity.
+        let mut t = par2_tracker(10);
+        t.slice_size_bound = 750_000;
+        for _ in 0..10 {
+            fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::NotFound);
+        }
+        assert!(t.check(true, false, 100.2).is_none());
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::NotFound);
+        assert_eq!(t.check(true, false, 100.2).unwrap().tier, "parity");
+
+        // Without known block counts the byte estimate still keeps the
+        // configured reserve, which now defaults to none.
         let mut t = make_tracker(100, 10);
         for _ in 0..10 {
             t.record_failure(false, 750_000, nzb_dispatch::ArticleFailureKind::NotFound);
         }
         let abort = t
             .check(true, false, 100.2)
-            .expect("reserve must be available");
+            .expect("configured reserve must be available");
         assert_eq!(abort.tier, "ongoing_availability");
         assert!(t.check(true, false, 100.0).is_none());
     }
@@ -10312,7 +10581,54 @@ mod hopeless_tests {
         let abort = t
             .check(true, false, 100.0)
             .expect("set A blocks cannot repair set B content");
-        assert_eq!(abort.tier, "ongoing_availability");
+        assert_eq!(abort.tier, "set_availability");
+        assert!(
+            abort.reason.contains("PAR2 set \"set-b\""),
+            "{}",
+            abort.reason
+        );
+    }
+
+    #[test]
+    fn set_reserve_is_measured_against_the_sets_own_surplus() {
+        // Set B is 2% of the job. Its surplus of 10 kB covers its own 0.2%
+        // reserve (3 kB) but not the whole job's (150 kB).
+        let mut t = make_tracker(100, 0);
+        t.recovery_capacity_by_set = HashMap::from([
+            ("set-a".to_string(), 0),
+            ("set-b".to_string(), 1_500_000 + 10_000),
+        ]);
+        t.content_bytes_by_set = HashMap::from([
+            ("set-a".to_string(), 98 * 750_000),
+            ("set-b".to_string(), 2 * 750_000),
+        ]);
+        t.content_file_sets
+            .insert("file-b".to_string(), Some("set-b".to_string()));
+        for _ in 0..6 {
+            t.record_file_failure(
+                Some("file-b"),
+                false,
+                250_000,
+                nzb_dispatch::ArticleFailureKind::NotFound,
+            );
+        }
+        let result = t.check(true, false, 100.2);
+        assert!(result.is_none(), "{:?}", result.map(|a| a.reason));
+        // A surplus below set B's own reserve aborts, naming the set.
+        t.recovery_capacity_by_set
+            .insert("set-b".to_string(), 1_500_000 + 2_000);
+        let abort = t.check(true, false, 100.2).expect("set B reserve short");
+        assert_eq!(abort.tier, "set_availability");
+        assert!(
+            abort.reason.contains("PAR2 set \"set-b\""),
+            "{}",
+            abort.reason
+        );
+        assert!(
+            abort.reason.contains("3000 bytes safety reserve"),
+            "{}",
+            abort.reason
+        );
     }
 
     #[test]

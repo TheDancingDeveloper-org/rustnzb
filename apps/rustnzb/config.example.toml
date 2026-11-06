@@ -39,7 +39,7 @@ max_nested_archive_depth = 5  # 0=outer archive only; protects against unbounded
 # The download-health settings below are applied at process start.
 # abort_hopeless = true          # edited via /api/config/disk-guards
 # early_failure_check = true     # abort dead NZBs after the first articles
-# required_completion_pct = 100.2  # 100.0-200.0; >100 reserves a PAR2 repair margin
+# required_completion_pct = 100.0  # 100.0-200.0; >100 reserves a PAR2 repair margin
 # article_timeout_secs = 30      # 0 = no timeout; the API accepts at most 3600
 # Post-processing hooks run without a shell, with a bounded timeout and output capture.
 # They get SABnzbd's positional arguments (final dir, NZB name, job name, report,

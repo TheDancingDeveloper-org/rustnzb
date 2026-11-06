@@ -194,7 +194,9 @@ pub struct GeneralConfig {
     /// Minimum effective completion percentage required to keep downloading.
     /// Effective completion includes available content plus usable PAR2
     /// recovery capacity; values above 100 reserve a repair safety margin.
-    /// Range: 100.0–200.0. Default: 100.2.
+    /// Applies only to jobs without a PAR2 set or with recovery volumes of
+    /// unknown block count; jobs with known recovery blocks are judged by
+    /// damaged slices instead. Range: 100.0–200.0. Default: 100.0.
     #[serde(default = "default_required_completion_pct")]
     pub required_completion_pct: f64,
     /// Maximum time in seconds to wait for a single NNTP article response
@@ -327,7 +329,7 @@ fn default_max_extract_workers() -> usize {
 }
 
 fn default_required_completion_pct() -> f64 {
-    100.2
+    100.0
 }
 
 fn default_max_nested_archive_depth() -> u8 {
