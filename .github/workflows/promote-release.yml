@@ -109,6 +109,8 @@ jobs:
     needs: resolve
     permissions:
       contents: write
+      # Keyless cosign signing uses this job's GitHub OIDC token.
+      id-token: write
     runs-on: [self-hosted, docker, publish]
     env:
       STABLE: ${{ needs.resolve.outputs.stable_tag }}
@@ -163,6 +165,30 @@ jobs:
               -C "$work" "rustnzb-${STABLE}/rustnzb"
             objdump -h "$work/rustnzb-${STABLE}/rustnzb" | grep -q '\.dep-v0'
             printf 'audit: linux-%s carries .dep-v0\n' "$arch"
+          done
+      # Same signing and SBOM steps as a tag release (release.yml), so the
+      # stable release carries SHA256SUMS-<tag>.sig/.pem and the per-artefact
+      # SPDX SBOMs. They are signed over the rebuilt stable checksum file;
+      # the beta signature does not cover these files.
+      - uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: v2.4.1
+      - name: Sign SHA256SUMS (keyless) so the checksum file has a verifiable origin
+        working-directory: .ci-output/packages
+        run: |
+          cosign sign-blob --yes \
+            --output-signature "SHA256SUMS-${STABLE}.sig" \
+            --output-certificate "SHA256SUMS-${STABLE}.pem" \
+            "SHA256SUMS-${STABLE}.txt"
+      - uses: anchore/sbom-action/download-syft@v0.17.9
+        with:
+          syft-version: v1.18.1
+      - name: Generate per-artefact SBOMs (SPDX JSON)
+        working-directory: .ci-output/packages
+        run: |
+          for file in rustnzb-*; do
+            case "$file" in *.spdx.json) continue ;; esac
+            syft "$file" -o "spdx-json=${file}.spdx.json"
           done
       - uses: actions/upload-artifact@v4
         with:

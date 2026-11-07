@@ -1,0 +1,72 @@
+name: Re-sign a stable release
+
+# Adds the keyless cosign signature over SHA256SUMS-<tag>.txt and the
+# per-artefact SPDX SBOMs to an already-published release, without rebuilding
+# or replacing any binary. Keyless signing needs this workflow's GitHub OIDC
+# identity, so it cannot be done from a workstation. Used to backfill releases
+# promoted before promote-release.yml signed its assets (v1.7.0).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published release tag to sign (e.g. v1.7.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustnzb-release-resign
+  cancel-in-progress: false
+
+jobs:
+  resign:
+    runs-on: [self-hosted]
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Validate the tag
+        run: |
+          case "$TAG" in
+            v[0-9]*-*) echo "pre-releases are signed by release.yml: $TAG" >&2; exit 1 ;;
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "bad tag: $TAG" >&2; exit 1 ;;
+          esac
+      - name: Download the published assets and verify them against the published checksums
+        run: |
+          set -eu
+          mkdir -p pkg
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D pkg \
+            --pattern "rustnzb-*" --pattern "SHA256SUMS-${TAG}.txt"
+          (cd pkg && rm -f ./*.spdx.json && sha256sum -c "SHA256SUMS-${TAG}.txt")
+      - uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: v2.4.1
+      - name: Sign SHA256SUMS (keyless)
+        working-directory: pkg
+        run: |
+          cosign sign-blob --yes \
+            --output-signature "SHA256SUMS-${TAG}.sig" \
+            --output-certificate "SHA256SUMS-${TAG}.pem" \
+            "SHA256SUMS-${TAG}.txt"
+      - uses: anchore/sbom-action/download-syft@v0.17.9
+        with:
+          syft-version: v1.18.1
+      - name: Generate per-artefact SBOMs (SPDX JSON)
+        working-directory: pkg
+        run: |
+          for file in rustnzb-*; do
+            case "$file" in *.spdx.json) continue ;; esac
+            syft "$file" -o "spdx-json=${file}.spdx.json"
+          done
+      - name: Upload the signature, certificate and SBOMs to the release
+        working-directory: pkg
+        run: |
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber \
+            "SHA256SUMS-${TAG}.sig" "SHA256SUMS-${TAG}.pem" ./*.spdx.json
