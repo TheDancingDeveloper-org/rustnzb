@@ -92,7 +92,9 @@ describe('LiveStateService', () => {
     s.refresh();
     expect(requests).toHaveLength(4);
     requests[0].emit({ value: status, bytes: 0, parseTime: 0 });
+    requests[0].finish();
     requests[1].emit({ value: queue, bytes: 0, parseTime: 0 });
+    requests[1].finish();
     expect(s.snapshot()).toBeNull();
     requests[2].emit({ value: status, bytes: 0, parseTime: 0 });
     requests[2].finish();
