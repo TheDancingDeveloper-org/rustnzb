@@ -1,8 +1,29 @@
-import { Observable, of, Subject } from 'rxjs';
+import { Observable, Subject, of } from 'rxjs';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { LiveStateService } from './live-state.service';
 const status = { speed_bps: 1, queue_size: 1 } as never;
 const queue = { jobs: [], total: 0 } as never;
+
+type LateSource = {
+  source: unknown;
+  emit(value: unknown): void;
+  finish(): void;
+};
+
+function lateSource(): LateSource {
+  let observer: any = null;
+  let destination: any = null;
+  const source = new Observable<unknown>((subscriber: any) => {
+    observer = subscriber;
+    destination = subscriber.destination;
+    return undefined;
+  });
+  return Object.assign(source, {
+    emit: (value: unknown) => destination?.next(value),
+    finish: () => observer?.complete(),
+    source,
+  }) as never;
+}
 describe('LiveStateService', () => {
   beforeEach(() => {
     localStorage.clear();
@@ -41,44 +62,42 @@ describe('LiveStateService', () => {
     expect(s.snapshot()?.revision).toBe(1);
   });
   it('discards a response that arrives after stop', () => {
-    const status$ = new Subject<never>();
-    const queue$ = new Subject<never>();
+    const sources: LateSource[] = [];
     const s = new LiveStateService({
-      get: vi.fn((p: string) => (p === '/status' ? status$ : queue$)),
+      get: vi.fn(() => {
+        const source = lateSource();
+        sources.push(source);
+        return source.source;
+      }),
     } as never);
     s.refresh();
     s.stop();
-    status$.next(status);
-    status$.complete();
-    queue$.next(queue);
-    queue$.complete();
+    sources[0].emit(status);
+    sources[0].finish();
+    sources[1].emit(queue);
+    sources[1].finish();
     expect(s.snapshot()).toBeNull();
   });
   it('discards a superseded response after a manual refresh', () => {
-    const requests: Subject<never>[] = [];
+    const requests: LateSource[] = [];
     const api = {
-      get: vi.fn(
-        (_path: string) =>
-          new Observable<never>((subscriber) => {
-            const subject = new Subject<never>();
-            requests.push(subject);
-            const subscription = subject.subscribe(subscriber);
-            return () => subscription.unsubscribe();
-          }),
-      ),
+      get: vi.fn((_path: string) => {
+        const source = lateSource();
+        requests.push(source);
+        return source.source;
+      }),
     };
     const s = new LiveStateService(api as never);
     s.refresh();
     s.refresh();
-    requests[0].next(status);
-    requests[0].complete();
-    requests[1].next(queue);
-    requests[1].complete();
+    expect(requests).toHaveLength(4);
+    requests[0].emit({ value: status, bytes: 0, parseTime: 0 });
+    requests[1].emit({ value: queue, bytes: 0, parseTime: 0 });
     expect(s.snapshot()).toBeNull();
-    requests[2].next(status);
-    requests[2].complete();
-    requests[3].next(queue);
-    requests[3].complete();
+    requests[2].emit({ value: status, bytes: 0, parseTime: 0 });
+    requests[2].finish();
+    requests[3].emit({ value: queue, bytes: 0, parseTime: 0 });
+    requests[3].finish();
     expect(s.snapshot()?.revision).toBe(1);
   });
   it('defaults to 500ms and persists supported timer intervals', () => {
