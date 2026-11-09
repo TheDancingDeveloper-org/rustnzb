@@ -5,7 +5,7 @@
 //! - ZIP: Uses std::fs + zip crate
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -609,9 +609,8 @@ pub async fn extract_zip(zip_file: &Path, output_dir: &Path) -> anyhow::Result<U
     let out_path = output_dir.to_path_buf();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<UnpackResult> {
-        let bytes = std::fs::read(&zip_path)?;
-        validate_zip_headers(&bytes)?;
-        let file = std::fs::File::open(&zip_path)?;
+        let mut file = std::fs::File::open(&zip_path)?;
+        validate_zip_headers(&mut file)?;
         let mut archive = zip::ZipArchive::new(file)?;
         let mut extracted = Vec::new();
         let mut output_paths = HashSet::new();
@@ -657,55 +656,113 @@ pub async fn extract_zip(zip_file: &Path, output_dir: &Path) -> anyhow::Result<U
 }
 
 /// Ensure each local-file header agrees with its central-directory header.
-/// `zip` uses the central directory for entry metadata, so accepting a
-/// mismatched pair would make the bytes selected for extraction ambiguous.
-fn validate_zip_headers(bytes: &[u8]) -> anyhow::Result<()> {
-    let locals = zip_header_fields(bytes, 0x0403_4b50, 14, 26, 30);
-    let centrals = zip_header_fields(bytes, 0x0201_4b50, 16, 28, 46);
-    if locals.len() != centrals.len()
-        || locals
-            .iter()
-            .zip(&centrals)
-            .any(|(local, central)| local != central)
+///
+/// The central directory is authoritative for entry ordering and offsets. Read
+/// only the fixed-size headers and names rather than scanning compressed data:
+/// signatures in an entry's payload are not archive headers.
+fn validate_zip_headers(file: &mut std::fs::File) -> anyhow::Result<()> {
+    let file_len = file.metadata()?.len();
+    let tail_len = file_len.min(65_557) as usize;
+    file.seek(SeekFrom::End(-(tail_len as i64)))?;
+    let mut tail = vec![0; tail_len];
+    file.read_exact(&mut tail)?;
+    let eocd = tail
+        .windows(4)
+        .rposition(|window| window == 0x0605_4b50u32.to_le_bytes())
+        .ok_or_else(|| anyhow::anyhow!("ZIP end-of-central-directory record missing"))?;
+    if eocd + 22 > tail.len() {
+        anyhow::bail!("ZIP end-of-central-directory record truncated");
+    }
+    let read_u16 =
+        |offset: usize| u16::from_le_bytes([tail[eocd + offset], tail[eocd + offset + 1]]);
+    let read_u32 = |offset: usize| {
+        u32::from_le_bytes([
+            tail[eocd + offset],
+            tail[eocd + offset + 1],
+            tail[eocd + offset + 2],
+            tail[eocd + offset + 3],
+        ])
+    };
+    let entries = read_u16(10) as u64;
+    let central_size = read_u32(12) as u64;
+    let central_offset = read_u32(16) as u64;
+    if entries == u16::MAX as u64
+        || central_size == u32::MAX as u64
+        || central_offset == u32::MAX as u64
     {
-        anyhow::bail!("ZIP local and central headers disagree");
+        anyhow::bail!("ZIP64 headers are not supported by header validation");
+    }
+    if central_offset
+        .checked_add(central_size)
+        .is_none_or(|end| end > file_len)
+    {
+        anyhow::bail!("ZIP central directory is outside the archive");
+    }
+
+    let central_pos = central_offset;
+    for _ in 0..entries {
+        file.seek(SeekFrom::Start(central_pos))?;
+        let mut central = [0; 46];
+        file.read_exact(&mut central)?;
+        if central[..4] != 0x0201_4b50u32.to_le_bytes() {
+            anyhow::bail!("ZIP central header is malformed");
+        }
+        let u16_at = |offset: usize| u16::from_le_bytes([central[offset], central[offset + 1]]);
+        let u32_at = |offset: usize| {
+            u32::from_le_bytes([
+                central[offset],
+                central[offset + 1],
+                central[offset + 2],
+                central[offset + 3],
+            ])
+        };
+        let flags = u16_at(8);
+        let method = u16_at(10);
+        let crc = u32_at(16);
+        let compressed_size = u32_at(20);
+        let uncompressed_size = u32_at(24);
+        let name_len = u16_at(28) as usize;
+        let extra_len = u16_at(30) as usize;
+        let comment_len = u16_at(32) as usize;
+        let local_offset = u32_at(42) as u64;
+        let mut name = vec![0; name_len];
+        file.read_exact(&mut name)?;
+        file.seek(SeekFrom::Current((extra_len + comment_len) as i64))?;
+
+        file.seek(SeekFrom::Start(local_offset))?;
+        let mut local = [0; 30];
+        file.read_exact(&mut local)?;
+        if local[..4] != 0x0403_4b50u32.to_le_bytes() {
+            anyhow::bail!("ZIP local and central headers disagree");
+        }
+        let local_flags = u16::from_le_bytes([local[6], local[7]]);
+        let local_method = u16::from_le_bytes([local[8], local[9]]);
+        let local_crc = u32::from_le_bytes([local[14], local[15], local[16], local[17]]);
+        let local_compressed_size =
+            u32::from_le_bytes([local[18], local[19], local[20], local[21]]);
+        let local_uncompressed_size =
+            u32::from_le_bytes([local[22], local[23], local[24], local[25]]);
+        let local_name_len = u16::from_le_bytes([local[26], local[27]]) as usize;
+        let local_extra_len = u16::from_le_bytes([local[28], local[29]]) as usize;
+        let mut local_name = vec![0; local_name_len];
+        file.read_exact(&mut local_name)?;
+        let descriptor = flags & 0x0008 != 0;
+        if local_name != name
+            || local_method != method
+            || local_flags != flags
+            || (!descriptor
+                && (local_crc != crc
+                    || local_compressed_size != compressed_size
+                    || local_uncompressed_size != uncompressed_size))
+        {
+            anyhow::bail!("ZIP local and central headers disagree");
+        }
+        let _ = local_extra_len;
+        file.seek(SeekFrom::Start(
+            central_offset + 46 + name_len as u64 + extra_len as u64 + comment_len as u64,
+        ))?;
     }
     Ok(())
-}
-
-fn zip_header_fields(
-    bytes: &[u8],
-    signature: u32,
-    crc_offset: usize,
-    name_length_offset: usize,
-    name_offset: usize,
-) -> Vec<(u32, Vec<u8>)> {
-    let signature = signature.to_le_bytes();
-    let mut names = Vec::new();
-    for offset in bytes
-        .windows(4)
-        .enumerate()
-        .filter_map(|(offset, window)| (window == signature).then_some(offset))
-    {
-        if offset + name_length_offset + 2 > bytes.len() {
-            continue;
-        }
-        let name_len = u16::from_le_bytes([
-            bytes[offset + name_length_offset],
-            bytes[offset + name_length_offset + 1],
-        ]) as usize;
-        let name_start = offset + name_offset;
-        if name_start + name_len <= bytes.len() {
-            let crc = u32::from_le_bytes([
-                bytes[offset + crc_offset],
-                bytes[offset + crc_offset + 1],
-                bytes[offset + crc_offset + 2],
-                bytes[offset + crc_offset + 3],
-            ]);
-            names.push((crc, bytes[name_start..name_start + name_len].to_vec()));
-        }
-    }
-    names
 }
 
 /// Extract a TAR archive without materializing links or paths outside the job.
@@ -846,6 +903,78 @@ mod tests {
         assert_eq!(result.files_extracted.len(), 1);
         let content = std::fs::read_to_string(out_dir.join("hello.txt")).unwrap();
         assert_eq!(content, "Hello, world!");
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_accepts_data_descriptor_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("descriptor.zip");
+        let out_dir = dir.path().join("out");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file("payload.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"payload").unwrap();
+            writer.finish().unwrap();
+        }
+        let mut bytes = std::fs::read(&zip_path).unwrap();
+        let local_header = bytes
+            .windows(4)
+            .position(|window| window == [0x50, 0x4b, 0x03, 0x04])
+            .unwrap();
+        bytes[local_header + 6..local_header + 8].copy_from_slice(&0x0008u16.to_le_bytes());
+        bytes[local_header + 14..local_header + 26].fill(0);
+        let central_header = bytes
+            .windows(4)
+            .position(|window| window == [0x50, 0x4b, 0x01, 0x02])
+            .unwrap();
+        bytes[central_header + 8..central_header + 10].copy_from_slice(&0x0008u16.to_le_bytes());
+        std::fs::write(&zip_path, bytes).unwrap();
+
+        let result = extract_zip(&zip_path, &out_dir).await.unwrap();
+        assert!(result.success);
+        assert_eq!(
+            std::fs::read(out_dir.join("payload.txt")).unwrap(),
+            b"payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_ignores_signatures_in_stored_nested_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("nested.zip");
+        let out_dir = dir.path().join("out");
+        let mut nested = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut nested);
+            writer
+                .start_file("inner.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"inner").unwrap();
+            writer.finish().unwrap();
+        }
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file(
+                    "nested.zip",
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored),
+                )
+                .unwrap();
+            writer.write_all(nested.get_ref()).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let result = extract_zip(&zip_path, &out_dir).await.unwrap();
+        assert!(result.success);
+        assert_eq!(
+            std::fs::read(out_dir.join("nested.zip")).unwrap(),
+            nested.into_inner()
+        );
     }
 
     #[tokio::test]
