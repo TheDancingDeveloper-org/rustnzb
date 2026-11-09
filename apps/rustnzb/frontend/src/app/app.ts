@@ -17,7 +17,11 @@ import { filter, timeout } from 'rxjs';
 import { ApiService, POLL_TIMEOUT_MS, pageHidden } from './core/services/api.service';
 import { AuthService } from './core/services/auth.service';
 import { StatusResponse } from './core/models/queue.model';
-import { LiveStateService } from './core/services/live-state.service';
+import {
+  LIVE_STATE_INTERVALS,
+  LiveStateService,
+  LiveStateInterval,
+} from './core/services/live-state.service';
 import { formatBytes, formatSpeed } from './core/format';
 import {
   AddNzbPrefill,
@@ -135,6 +139,13 @@ export function documentTitle(
             @if (demoMode) {
               <a class="action demo-exit" href="/">{{ 'nav.exitDemo' | t }}</a>
             }
+            <label class="live-interval">
+              <select [value]="liveState.interval()" (change)="setLiveInterval($event)">
+                @for (interval of liveIntervalOptions; track interval) {
+                  <option [value]="interval">{{ interval }}ms</option>
+                }
+              </select>
+            </label>
             <div
               class="status"
               [class.stale]="offline()"
@@ -730,7 +741,8 @@ export class App implements OnInit, OnDestroy {
   readonly noServers = computed(() => this.serverCount() === 0);
   private liveStateSub: { unsubscribe(): void } | null = null;
   private liveStateErrorSub: { unsubscribe(): void } | null = null;
-  private readonly liveState: LiveStateService;
+  readonly liveState: LiveStateService;
+  readonly liveIntervalOptions = LIVE_STATE_INTERVALS;
   /** Permission can be revoked while the page is open; re-read it on return. */
   private onVisibilityChange = () => {
     if (!pageHidden()) {
@@ -798,6 +810,12 @@ export class App implements OnInit, OnDestroy {
     if (this.chordTimer) clearTimeout(this.chordTimer);
     document.removeEventListener('click', this.docClickHandler);
     document.removeEventListener('visibilitychange', this.onVisibilityChange);
+  }
+
+  setLiveInterval(event: Event): void {
+    this.liveState.setIntervalMs(
+      Number((event.target as HTMLSelectElement).value) as LiveStateInterval,
+    );
   }
 
   pollStatus(): void {

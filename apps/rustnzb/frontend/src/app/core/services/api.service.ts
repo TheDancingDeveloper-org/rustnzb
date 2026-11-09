@@ -25,6 +25,15 @@ export class ApiService {
     return this.http.get<T>(`${this.baseUrl}${path}`, { headers: this.headers(), params });
   }
 
+  /** A JSON response as text, for callers that need to time JSON.parse. */
+  getRaw(path: string, params?: Record<string, string>): Observable<string> {
+    return this.http.get(`${this.baseUrl}${path}`, {
+      headers: this.headers(),
+      params,
+      responseType: 'text',
+    });
+  }
+
   /**
    * A GET whose body is text, not JSON (the config backup download). The whole
    * response is returned so the caller can keep the server's `Content-Disposition`
@@ -42,9 +51,7 @@ export class ApiService {
   /** A POST whose body is `application/toml` and whose answer is JSON. */
   postText<T>(path: string, body: string): Observable<T> {
     const token = localStorage.getItem('access_token');
-    let headers = token
-      ? new HttpHeaders({ Authorization: `Bearer ${token}` })
-      : new HttpHeaders();
+    let headers = token ? new HttpHeaders({ Authorization: `Bearer ${token}` }) : new HttpHeaders();
     headers = headers.set('Content-Type', 'application/toml');
     return this.http.post<T>(`${this.baseUrl}${path}`, body, { headers });
   }
@@ -66,7 +73,9 @@ export class ApiService {
 
   postForm<T>(path: string, body: FormData): Observable<T> {
     const token = localStorage.getItem('access_token');
-    const headers = token ? new HttpHeaders({ Authorization: `Bearer ${token}` }) : new HttpHeaders();
+    const headers = token
+      ? new HttpHeaders({ Authorization: `Bearer ${token}` })
+      : new HttpHeaders();
     return this.http.post<T>(`${this.baseUrl}${path}`, body, { headers });
   }
 }
