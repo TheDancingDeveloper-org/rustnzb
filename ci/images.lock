@@ -6,7 +6,7 @@ CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:41e994741ddc7620a
 E2E_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-e2e@sha256:d166a5f7af1495d06cd5d948fb0fddc422437470b4993a4b74ee0b2d1ddbd841
 DESKTOP_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-desktop@sha256:b69857f8429821ed04cb1830dfaab77a9ed933629085a5ddfebbea15c4755094
 
-# Rust 1.88 images replaced by the Rust 1.95 rebuild; retained for immediate
+# Rust 1.99 images replaced by the Rust 1.99 rebuild; retained for immediate
 # rollback.
 PREVIOUS_CORE_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:63a6ecb9f4897f223419c69bdc1bbae3d930f028955fdaa480fac156daedfb47
 PREVIOUS_CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:d747454fca94ebfd9dba1f566d9f549c4c9fbedf785c6aba36a0c383d9b9a955
