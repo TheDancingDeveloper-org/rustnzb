@@ -35,7 +35,7 @@ axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.7", features = ["compression-full", "cors", "trace"] }
 utoipa = { version = "5", features = ["axum_extras", "chrono"] }
-utoipa-swagger-ui = { version = "9", features = ["axum"] }
+utoipa-swagger-ui = { version = "10", features = ["axum"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 # Content digests (duplicate NZB detection)
@@ -85,7 +85,7 @@ regex = "1"
 walkdir = "2"
 tar = "0.4"
 flate2 = "1"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 bzip2 = "0.6"
 tokio-socks = "0.5"
 notify = "7"
