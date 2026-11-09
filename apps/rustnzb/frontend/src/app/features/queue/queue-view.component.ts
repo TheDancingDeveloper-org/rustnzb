@@ -5,7 +5,8 @@ import { ActivatedRoute, Router, RouterModule } from '@angular/router';
 import { HttpClient } from '@angular/common/http';
 import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { Observable, Subscription, catchError, finalize, forkJoin, map, of, timeout } from 'rxjs';
-import { ApiService, POLL_TIMEOUT_MS, pageHidden } from '../../core/services/api.service';
+import { ApiService, POLL_TIMEOUT_MS } from '../../core/services/api.service';
+import { LiveStateService } from '../../core/services/live-state.service';
 import { AnnouncerService } from '../../core/services/announcer.service';
 import { AddNzbService } from '../../core/services/add-nzb.service';
 import { PauseStateService } from '../../core/services/pause-state.service';
@@ -99,7 +100,9 @@ interface PipelineStep {
         </div>
         @if (diskTotalKnown()) {
           <div class="bar green"><div [style.width.%]="diskUsedPct()"></div></div>
-          <div class="sub">{{ diskUsedPct() }}% used of {{ formatBytes(status()?.disk_space_total ?? 0) }}</div>
+          <div class="sub">
+            {{ diskUsedPct() }}% used of {{ formatBytes(status()?.disk_space_total ?? 0) }}
+          </div>
         } @else {
           <div class="sub">Downloads volume</div>
         }
@@ -147,9 +150,8 @@ interface PipelineStep {
               </div>
               <span class="srv-count">
                 @if (s.enabled) {
-                  {{ s.connected }} connected · {{ s.active }} active · {{
-                    s.connections - s.connected
-                  }} free
+                  {{ s.connected }} connected · {{ s.active }} active ·
+                  {{ s.connections - s.connected }} free
                 } @else {
                   disabled
                 }
@@ -193,7 +195,12 @@ interface PipelineStep {
         <h3>
           Add NZB
           <span class="hint">upload .nzb files or paste a URL</span>
-          <button class="row-action" (click)="showAddPanel = false" title="close" aria-label="Close">
+          <button
+            class="row-action"
+            (click)="showAddPanel = false"
+            title="close"
+            aria-label="Close"
+          >
             <app-icon name="close" [size]="12" />
           </button>
         </h3>
@@ -236,7 +243,9 @@ interface PipelineStep {
                 @for (f of selectedFiles; track f.name) {
                   <div class="file-chip">
                     <span>{{ f.name }}</span>
-                    <span class="chip-x" (click)="removeFile(f)"><app-icon name="close" [size]="11" /></span>
+                    <span class="chip-x" (click)="removeFile(f)"
+                      ><app-icon name="close" [size]="11"
+                    /></span>
                   </div>
                 }
               </div>
@@ -327,8 +336,12 @@ interface PipelineStep {
 
       @if (selectedIds().size > 0) {
         <span class="bulk-count">{{ selectedIds().size }} selected</span>
-        <button class="btn sm" (click)="bulkResume()"><app-icon name="play" [size]="11" /> Start</button>
-        <button class="btn sm" (click)="bulkPause()"><app-icon name="pause" [size]="11" /> Pause</button>
+        <button class="btn sm" (click)="bulkResume()">
+          <app-icon name="play" [size]="11" /> Start
+        </button>
+        <button class="btn sm" (click)="bulkPause()">
+          <app-icon name="pause" [size]="11" /> Pause
+        </button>
         <button class="btn sm danger" (click)="bulkDelete()">Delete</button>
         <button class="btn sm ghost" (click)="clearSelection()" aria-label="Clear selection">
           <app-icon name="close" [size]="11" />
@@ -338,9 +351,7 @@ interface PipelineStep {
 
     <!-- ============ Active downloads table ============ -->
     <div class="panel queue-table-panel">
-      <h3>
-        Active downloads
-      </h3>
+      <h3>Active downloads</h3>
       <div class="body flush">
         <table class="data">
           <thead>
@@ -512,7 +523,7 @@ interface PipelineStep {
               <tr>
                 <td colspan="11" class="empty-cell error-cell" role="alert">
                   {{ loadError() }}
-                  <button class="row-action" (click)="fetchQueue(true)">Retry</button>
+                  <button class="row-action" (click)="loadQueue()">Retry</button>
                 </td>
               </tr>
             } @else if (filteredJobs().length === 0) {
@@ -1122,8 +1133,12 @@ interface PipelineStep {
         color: var(--mute);
         font-size: 13px;
       }
-      .error-cell { color: var(--danger); }
-      .error-cell .row-action { margin-left: 10px; }
+      .error-cell {
+        color: var(--danger);
+      }
+      .error-cell .row-action {
+        margin-left: 10px;
+      }
     `,
   ],
 })
@@ -1140,6 +1155,8 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   // False until the first successful load, so the upload warning never flashes on a guess.
   serversLoaded = signal(false);
   status = signal<StatusResponse | null>(null);
+  private readonly liveState: LiveStateService;
+  private liveStateSub: { unsubscribe(): void } | null = null;
   selectedIds = signal<Set<string>>(new Set());
   paused: WritableSignal<boolean>;
   /** Why the queue is globally paused, from the last queue refresh. */
@@ -1169,10 +1186,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     localStorage.setItem(this.HISTORY_KEY, String(next));
   }
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
   private queueRequestSeq = 0;
-  private queuePollInFlight = false;
-  private statusPollInFlight = false;
   // Polls started before this sequence finished must not apply their response:
   // a snapshot taken mid-reorder/delete would resurrect rows (BUG-126).
   private queueStaleThrough = 0;
@@ -1204,7 +1218,12 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     private confirmSvc: ConfirmService,
     pauseState: PauseStateService,
     private announcer: AnnouncerService,
+    liveState?: LiveStateService,
   ) {
+    this.liveState = liveState ?? new LiveStateService(api);
+    this.liveStateSub = this.liveState.onSnapshot((snapshot) => {
+      this.applyLiveSnapshot(snapshot);
+    });
     this.paused = pauseState.paused;
   }
 
@@ -1231,11 +1250,6 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       setTimeout(() => document.getElementById('history')?.scrollIntoView({ block: 'start' }));
     });
     this.loadAll();
-    this.pollTimer = setInterval(() => {
-      if (pageHidden()) return;
-      if (!this.queuePollInFlight) this.fetchQueue(false);
-      this.fetchStatus();
-    }, 2000);
     this.toggleSub = this.addNzbService.panelToggle$.subscribe(() => {
       this.showAddPanel = !this.showAddPanel;
     });
@@ -1253,7 +1267,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   }
 
   ngOnDestroy(): void {
-    if (this.pollTimer) clearInterval(this.pollTimer);
+    this.liveStateSub?.unsubscribe();
     this.routeSub?.unsubscribe();
     this.fragmentSub?.unsubscribe();
     this.toggleSub?.unsubscribe();
@@ -1267,69 +1281,33 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   }
 
   loadQueue(): void {
-    this.fetchQueue(true);
-    this.fetchStatus();
+    this.liveState.refresh();
   }
 
-  /**
-   * Refreshes /status (connection pool, speed limit). Called on load and on
-   * each poll tick. The pool panel is derived from `status` alone, so every
-   * answer repaints it with exactly what the backend reported (WI-2086).
-   */
-  fetchStatus(): void {
-    if (this.statusPollInFlight) return;
-    this.statusPollInFlight = true;
-    this.api
-      .get<StatusResponse>('/status')
-      .pipe(
-        timeout(POLL_TIMEOUT_MS),
-        finalize(() => {
-          this.statusPollInFlight = false;
-        }),
-      )
-      .subscribe({
-        next: (s) => {
-          this.status.set(s);
-          this.statusError.set(null);
-        },
-        error: (err) => {
-          if (isAuthHandledError(err)) return;
-          this.statusError.set(httpErrorMessage(err, "Couldn't load download status"));
-        },
-      });
+  /** Compatibility entry point for action tests and the Retry button. */
+  fetchQueue(_supersedeInFlight = false): void {
+    this.loadQueue();
   }
 
-  fetchQueue(supersedeInFlight: boolean): void {
-    const seq = ++this.queueRequestSeq;
-    if (supersedeInFlight) this.queueStaleThrough = seq - 1;
-    this.queuePollInFlight = true;
-    this.api.get<QueueResponse>('/queue').pipe(timeout(POLL_TIMEOUT_MS)).subscribe({
-      next: (r) => {
-        if (seq === this.queueRequestSeq) this.queuePollInFlight = false;
-        if (seq <= this.queueStaleThrough || this.reorderPending()) return;
-        this.queueStaleThrough = seq;
-        this.jobs.set(r.jobs);
-        this.paused.set(r.paused);
-        this.pauseReason.set(r.pause_reason ?? null);
-        this.remainingBytes.set(
-          r.jobs.reduce((sum, j) => sum + (j.total_bytes - j.downloaded_bytes), 0),
-        );
-        // Prune selectedIds of jobs that no longer exist.
-        const liveIds = new Set(r.jobs.map((j) => j.id));
-        const cur = this.selectedIds();
-        const next = new Set<string>();
-        for (const id of cur) if (liveIds.has(id)) next.add(id);
-        if (next.size !== cur.size) this.selectedIds.set(next);
-        this.loadError.set(null);
-        this.loading.set(false);
-      },
-      error: (err) => {
-        if (seq !== this.queueRequestSeq) return;
-        this.queuePollInFlight = false;
-        this.loadError.set(httpErrorMessage(err, "Couldn't load the download queue"));
-        this.loading.set(false);
-      },
-    });
+  private applyLiveSnapshot(
+    snapshot: import('../../core/services/live-state.service').LiveSnapshot,
+  ): void {
+    this.status.set(snapshot.status);
+    this.statusError.set(null);
+    const r = snapshot.queue;
+    this.jobs.set(r.jobs);
+    this.paused.set(r.paused);
+    this.pauseReason.set(r.pause_reason ?? null);
+    this.remainingBytes.set(
+      r.jobs.reduce((sum, j) => sum + (j.total_bytes - j.downloaded_bytes), 0),
+    );
+    const liveIds = new Set(r.jobs.map((j) => j.id));
+    const cur = this.selectedIds();
+    const next = new Set<string>();
+    for (const id of cur) if (liveIds.has(id)) next.add(id);
+    if (next.size !== cur.size) this.selectedIds.set(next);
+    this.loadError.set(null);
+    this.loading.set(false);
   }
 
   loadCategories(): void {
@@ -1714,7 +1692,12 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     if (!draggedId) return;
     event.preventDefault();
 
-    if (!draggedId || draggedId === targetJobId || !this.canReorderRows() || this.reorderPending()) {
+    if (
+      !draggedId ||
+      draggedId === targetJobId ||
+      !this.canReorderRows() ||
+      this.reorderPending()
+    ) {
       return;
     }
 
@@ -1804,11 +1787,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
    * Run one request per selected job and report failures once, with the
    * first server message, instead of silently dropping them.
    */
-  private runBulk(
-    ids: string[],
-    request: (id: string) => Observable<unknown>,
-    verb: string,
-  ): void {
+  private runBulk(ids: string[], request: (id: string) => Observable<unknown>, verb: string): void {
     this.clearSelection();
     if (ids.length === 0) return;
     forkJoin(
