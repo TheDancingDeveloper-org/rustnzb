@@ -2,7 +2,7 @@
 name = "mock-nntp-server"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.99"
 description = "Scriptable mock NNTP server with yEnc and PAR2 fixtures, for testing Usenet download clients"
 license = "MIT"
 repository = "https://github.com/TheDancingDeveloper-org/mock-nntp-server"
