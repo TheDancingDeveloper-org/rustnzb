@@ -26,7 +26,7 @@ async fn history_json_is_gzip_encoded_when_offered_and_plain_otherwise() {
     let app = start_test_server(Vec::new()).await;
     let http = client();
     let setup = http
-        .post(format!("{}/api/auth/setup", &app.base_url))
+        .post(format!("{}/api/auth/setup", app.base_url))
         .json(&serde_json::json!({
             "username": "compression-test",
             "password": "compression-test-password"
