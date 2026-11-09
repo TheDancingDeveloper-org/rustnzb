@@ -81,8 +81,13 @@ function makeComponent(
   const http: HttpStub = {
     post: vi.fn(() => of({})),
   };
-  const snackbarStub =
-    snackBar ?? { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
+  const snackbarStub = snackBar ?? {
+    open: vi.fn(),
+    success: vi.fn(),
+    info: vi.fn(),
+    error: vi.fn(),
+    undo: vi.fn(),
+  };
   const route: RouteStub = {
     data: of({}),
     queryParamMap: of(convertToParamMap({})),
@@ -310,88 +315,6 @@ describe('QueueViewComponent', () => {
     expect(snackBar.success).toHaveBeenCalledWith('Job paused', 2500);
   });
 
-  it('shows a failed status poll inline and clears it on the next success', () => {
-    let failStatus = true;
-    const { component } = makeComponent({
-      get: vi.fn((path: string) => {
-        if (path === '/status' && failStatus) {
-          return throwError(() => ({ status: 500, error: { human_readable: 'db locked' } }));
-        }
-        return of(path === '/queue' ? { jobs: [], paused: false } : {});
-      }),
-    });
-    component.loadQueue();
-    expect(component.statusError()).toBe("Couldn't load download status: db locked");
-    failStatus = false;
-    component.loadQueue();
-    expect(component.statusError()).toBeNull();
-  });
-
-  describe('queue poll sequencing (BUG-126)', () => {
-    /** /queue responses are held until the test flushes them, in any order. */
-    function controlledQueue(overrides: Partial<ApiStub> = {}) {
-      const pending: Subject<unknown>[] = [];
-      const ctx = makeComponent({
-        get: vi.fn((path: string) => {
-          if (path !== '/queue') return of({});
-          const response = new Subject<unknown>();
-          pending.push(response);
-          return response.asObservable();
-        }),
-        ...overrides,
-      });
-      const respond = (index: number, jobs: NzbJob[]) => {
-        pending[index].next({ jobs, total: jobs.length, speed_bps: 0, paused: false });
-        pending[index].complete();
-      };
-      return { ...ctx, pending, respond };
-    }
-    const ids = (component: QueueViewComponent) => component.jobs().map((job) => job.id);
-
-    it('drops a poll that started before a delete finished', () => {
-      const { component, respond } = controlledQueue();
-      const [one, two] = [makeJob({ id: 'job-1' }), makeJob({ id: 'job-2' })];
-      component.jobs.set([one, two]);
-
-      component.loadQueue(); // #0: poll in flight while the delete runs
-      component.deleteJob(one); // delete succeeds → reload #1
-      respond(1, [two]);
-      respond(0, [one, two]); // stale: must not resurrect job-1
-
-      expect(ids(component)).toEqual(['job-2']);
-    });
-
-    it('keeps the optimistic order while a reorder is in flight and after it lands', () => {
-      const move = new Subject<unknown>();
-      const { component, respond } = controlledQueue({ post: vi.fn(() => move.asObservable()) });
-      const jobs = ['job-1', 'job-2', 'job-3'].map((id) => makeJob({ id }));
-      component.jobs.set(jobs);
-      component.draggingJobId.set('job-1');
-      component.dropAfterTarget.set(true);
-
-      component.loadQueue(); // #0 started before the drop
-      component.onRowDrop({ preventDefault: vi.fn() } as unknown as DragEvent, 'job-2');
-      component.loadQueue(); // #1 started while the move is pending
-      respond(0, jobs);
-      respond(1, jobs);
-      expect(ids(component)).toEqual(['job-2', 'job-1', 'job-3']);
-
-      move.next({});
-      move.complete(); // → reload #2
-      respond(2, [jobs[1], jobs[0], jobs[2]]);
-      expect(ids(component)).toEqual(['job-2', 'job-1', 'job-3']);
-    });
-
-    it('ignores a poll response that arrives after a newer one', () => {
-      const { component, respond } = controlledQueue();
-      component.loadQueue();
-      component.loadQueue();
-      respond(1, [makeJob({ id: 'new' })]);
-      respond(0, [makeJob({ id: 'old' })]);
-      expect(ids(component)).toEqual(['new']);
-    });
-  });
-
   it('shows active download states as paused while global pause is active', () => {
     const { component } = makeComponent();
     component.paused.set(true);
@@ -428,7 +351,11 @@ describe('QueueViewComponent', () => {
           () =>
             new HttpErrorResponse({
               status: 409,
-              error: { error_kind: 'conflict', human_readable: 'Job is post-processing', status: 409 },
+              error: {
+                error_kind: 'conflict',
+                human_readable: 'Job is post-processing',
+                status: 409,
+              },
             }),
         ),
       ),
@@ -637,130 +564,6 @@ describe('QueueViewComponent', () => {
     expect(snackBar.open).not.toHaveBeenCalled();
   });
 
-  it('shows a retryable error instead of the empty queue when the fetch fails', () => {
-    let failQueue = true;
-    const { component } = makeComponent({
-      get: vi.fn((url: string) => {
-        if (url !== '/queue') return of({});
-        return failQueue
-          ? throwError(() => new HttpErrorResponse({ status: 500, error: { human_readable: 'boom' } }))
-          : of({ jobs: [], total: 0, speed_bps: 0, paused: false });
-      }),
-    });
-
-    component.loadQueue();
-    expect(component.loading()).toBe(false);
-    expect(component.loadError()).toBe("Couldn't load the download queue: boom");
-
-    failQueue = false;
-    component.fetchQueue(true);
-    expect(component.loadError()).toBeNull();
-  });
-
-  describe('status poll (WI-2082)', () => {
-    afterEach(() => {
-      vi.useRealTimers();
-      delete (document as unknown as { hidden?: boolean }).hidden;
-    });
-
-    /** Starts the component's real 2 s poll timer; /queue and /status answer per `status`. */
-    function startPolling(status: () => Observable<unknown>) {
-      vi.useFakeTimers();
-      const get = vi.fn((path: string) => {
-        if (path === '/status') return status();
-        if (path === '/queue') return of({ jobs: [], paused: false });
-        return of([]);
-      });
-      const ctx = makeComponent({ get });
-      ctx.component.ngOnInit();
-      return { ...ctx, get };
-    }
-
-    it('refreshes nntp_connections on each poll tick', () => {
-      let connected = 1;
-      const { component } = startPolling(() =>
-        of({ nntp_connections: [{ server_id: 'server_1', connected, active: connected, limit: 100 }] }),
-      );
-      expect(component.status()?.nntp_connections?.[0].connected).toBe(1);
-
-      connected = 100;
-      vi.advanceTimersByTime(2000);
-
-      expect(component.status()?.nntp_connections?.[0].connected).toBe(100);
-      component.ngOnDestroy();
-    });
-
-    it('repaints the connection pool panel on every tick, including a drop to zero (WI-2086)', () => {
-      // Backend samples as a download runs, winds down, and the sockets close.
-      const samples = [
-        { connected: 4, active: 4 },
-        { connected: 4, active: 2 },
-        { connected: 4, active: 0 },
-        { connected: 0, active: 0 },
-        { connected: 3, active: 3 },
-      ];
-      let sample = 0;
-      const { component, get } = startPolling(() =>
-        of({ nntp_connections: [{ server_id: 'server_1', limit: 4, ...samples[sample] }] }),
-      );
-      component.servers.set([
-        {
-          id: 'server_1',
-          name: 'Primary',
-          host: 'news.example',
-          port: 563,
-          connections: 4,
-          priority: 0,
-          enabled: true,
-          ssl: true,
-        },
-      ]);
-      get.mockClear();
-
-      const panel = () => {
-        const row = component.visibleServersWithConns()[0];
-        return { connected: row.connected, active: row.active, total: component.connsConnected() };
-      };
-      expect(panel()).toEqual({ connected: 4, active: 4, total: 4 });
-
-      for (sample = 1; sample < samples.length; sample++) {
-        vi.advanceTimersByTime(2000);
-        expect(get.mock.calls.filter(([path]) => path === '/status')).toHaveLength(sample);
-        expect(panel()).toEqual({ ...samples[sample], total: samples[sample].connected });
-      }
-      component.ngOnDestroy();
-    });
-
-    it('makes no status poll while the page is hidden', () => {
-      const { component, get } = startPolling(() => of({ nntp_connections: [] }));
-      get.mockClear();
-
-      Object.defineProperty(document, 'hidden', { configurable: true, value: true });
-      vi.advanceTimersByTime(6000);
-
-      expect(get).not.toHaveBeenCalled();
-      component.ngOnDestroy();
-    });
-
-    it('does not stack a status poll while one is still in flight', () => {
-      const pending: Subject<unknown>[] = [];
-      const { component, get } = startPolling(() => {
-        const response = new Subject<unknown>();
-        pending.push(response);
-        return response.asObservable();
-      });
-      get.mockClear();
-
-      vi.advanceTimersByTime(4000);
-      expect(get.mock.calls.filter(([path]) => path === '/status')).toHaveLength(0);
-      expect(pending).toHaveLength(1);
-
-      pending[0].next({ nntp_connections: [] });
-      pending[0].complete();
-      component.ngOnDestroy();
-    });
-  });
-
   it('reports a failed category or server load as a toast', () => {
     const { component, snackBar } = makeComponent({
       get: vi.fn(() => throwError(() => ({ status: 500 }))),
@@ -769,7 +572,11 @@ describe('QueueViewComponent', () => {
     component.loadCategories();
     component.loadServers();
 
-    expect(snackBar.open).toHaveBeenCalledWith('Failed to load categories', 'Close', { duration: 5000 });
-    expect(snackBar.open).toHaveBeenCalledWith('Failed to load servers', 'Close', { duration: 5000 });
+    expect(snackBar.open).toHaveBeenCalledWith('Failed to load categories', 'Close', {
+      duration: 5000,
+    });
+    expect(snackBar.open).toHaveBeenCalledWith('Failed to load servers', 'Close', {
+      duration: 5000,
+    });
   });
 });

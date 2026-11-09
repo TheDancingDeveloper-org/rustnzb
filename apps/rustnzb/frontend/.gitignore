@@ -45,3 +45,7 @@ Thumbs.db
 frontend/node_modules/
 frontend/.angular/
 frontend/dist/
+
+# Test runner caches
+/node_modules/.vite/
+/node_modules/.vitest-cache/
