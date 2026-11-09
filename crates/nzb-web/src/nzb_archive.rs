@@ -62,7 +62,7 @@ fn extract_nzbs_bounded(
             let mut entry = archive
                 .by_index(i)
                 .map_err(|e| anyhow::anyhow!("Zip entry error: {e}"))?;
-            let entry_name = entry.name().to_string();
+            let entry_name = entry.name()?.into_owned();
             if entry_name.to_lowercase().ends_with(".nzb") {
                 if nzbs.len() >= MAX_ZIP_NZB_ENTRIES {
                     anyhow::bail!("Zip archive '{file_name}' contains too many NZB files");
@@ -74,11 +74,17 @@ fn extract_nzbs_bounded(
                     .saturating_sub(total_uncompressed)
                     .saturating_add(1);
                 let mut buf = Vec::new();
-                entry
-                    .by_ref()
-                    .take(room)
-                    .read_to_end(&mut buf)
-                    .map_err(|e| anyhow::anyhow!("Failed to read zip entry '{entry_name}': {e}"))?;
+                if let Err(error) = entry.by_ref().take(room).read_to_end(&mut buf) {
+                    if error.to_string().contains("declared uncompressed size") {
+                        anyhow::bail!(
+                            "Decompressed NZB exceeds the {} MB limit",
+                            MAX_NZB_DECOMPRESSED_BYTES / 1024 / 1024
+                        );
+                    }
+                    return Err(anyhow::anyhow!(
+                        "Failed to read zip entry '{entry_name}': {error}"
+                    ));
+                }
                 total_uncompressed = total_uncompressed
                     .checked_add(buf.len() as u64)
                     .ok_or_else(|| anyhow::anyhow!("Zip archive size overflow"))?;
