@@ -2,7 +2,7 @@
 name = "rustnzb-desktop"
 version = "1.7.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.99"
 description = "rustnzb desktop application"
 
 [build-dependencies]

@@ -120,7 +120,7 @@ pre-upgrade backup or set a new password immediately after downgrading. See
 - **webdav:** Drop the PAR2 volume fields from DAV history entries
 - **schedule:** Keep overlapping holds, windows and manual resumes independent,
   and make a speed cap of 0 mean unlimited
-- **toolchain:** Rust 1.95
+- **toolchain:** Rust 1.99
 - **docs:** Move internal docs and `promtail.yml` under `docs/internal`
 
 ### Fixed
