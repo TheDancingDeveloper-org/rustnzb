@@ -2168,7 +2168,13 @@ pub async fn h_config_patch(
                 source = over.source
             )));
         }
-        if nzb_web::auth_class::class_of(setting.key) == nzb_web::auth_class::AuthClass::Sensitive {
+        // The registry is the authority for settings.  Do not consult the
+        // web layer's compatibility helper here: doing so can silently leave
+        // a newly-added registry-sensitive key writable without step-up.
+        if matches!(
+            setting.class,
+            nzb_web::nzb_core::config_registry::AuthClass::Sensitive
+        ) {
             changed_sensitive = true;
         }
         changed_keys.push((*setting, value.clone()));
@@ -4875,10 +4881,20 @@ fn validate_general_update(body: &UpdateGeneralBody) -> Result<(), ApiError> {
 }
 
 fn bind_is_loopback(addr: &str) -> bool {
-    matches!(
-        addr.trim().parse::<std::net::IpAddr>(),
-        Ok(ip) if ip.is_loopback()
-    )
+    let value = addr.trim();
+    let ip = value.parse::<std::net::IpAddr>().ok().or_else(|| {
+        value
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|peer| peer.ip())
+    });
+    match ip {
+        Some(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
+        Some(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback() || ip.to_ipv4().is_some_and(|ip| ip.is_loopback())
+        }
+        None => false,
+    }
 }
 
 /// PUT /api/config/general -- Update general settings.
@@ -6337,5 +6353,17 @@ mod tests {
         // The same config twice needs no restart at all.
         previous = next.clone();
         assert!(restart_required(&previous, &next).is_empty());
+    }
+
+    #[test]
+    fn bind_is_loopback_parses_ip_socket_and_mapped_addresses() {
+        assert!(super::bind_is_loopback("127.0.0.1"));
+        assert!(super::bind_is_loopback("127.0.0.1:8080"));
+        assert!(super::bind_is_loopback("[::1]:8080"));
+        assert!(super::bind_is_loopback("::ffff:127.0.0.1"));
+        assert!(super::bind_is_loopback("[::ffff:127.0.0.1]:8080"));
+        assert!(!super::bind_is_loopback("0.0.0.0:8080"));
+        assert!(!super::bind_is_loopback("[2001:db8::1]:8080"));
+        assert!(!super::bind_is_loopback("not-an-address"));
     }
 }
