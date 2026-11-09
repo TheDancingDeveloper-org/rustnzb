@@ -30,3 +30,8 @@ e2e/mock-auth-state.json
 
 # Operator-specific compose (host paths, logging sidecar). Not tracked.
 docker-compose.local.yml
+
+# Dependencies and test caches anywhere in the repository
+/node_modules/
+**/node_modules/.vite/
+**/node_modules/.vitest-cache/
