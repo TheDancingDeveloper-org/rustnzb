@@ -139,7 +139,7 @@ cargo build -p rustnzb --release
 ./target/release/rustnzb
 ```
 
-Requirements: Rust 1.95+ (2024 edition), plus `7z` (7-Zip) and `unrar` on
+Requirements: Rust 1.99+ (2024 edition), plus `7z` (7-Zip) and `unrar` on
 `PATH` for archive extraction. `unrar` also enables direct unpack while
 downloading. Run `rustnzb --smoke-test` to check that both work.
 
