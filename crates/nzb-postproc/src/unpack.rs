@@ -609,6 +609,8 @@ pub async fn extract_zip(zip_file: &Path, output_dir: &Path) -> anyhow::Result<U
     let out_path = output_dir.to_path_buf();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<UnpackResult> {
+        let bytes = std::fs::read(&zip_path)?;
+        validate_zip_headers(&bytes)?;
         let file = std::fs::File::open(&zip_path)?;
         let mut archive = zip::ZipArchive::new(file)?;
         let mut extracted = Vec::new();
@@ -619,18 +621,13 @@ pub async fn extract_zip(zip_file: &Path, output_dir: &Path) -> anyhow::Result<U
             // Never materialize links from an untrusted archive. Treating a
             // link payload as a regular file also makes the policy explicit
             // on platforms where link metadata is partially supported.
+            let entry_name = entry.name()?.into_owned();
             if entry.is_symlink() {
-                anyhow::bail!(
-                    "ZIP archive contains unsupported symbolic link `{}`",
-                    entry.name()
-                );
+                anyhow::bail!("ZIP archive contains unsupported symbolic link `{entry_name}`");
             }
-            let outpath = safe_archive_output_path(&out_path, entry.name(), "ZIP")?;
+            let outpath = safe_archive_output_path(&out_path, &entry_name, "ZIP")?;
             if !output_paths.insert(outpath.clone()) {
-                anyhow::bail!(
-                    "ZIP archive contains duplicate output path `{}`",
-                    entry.name()
-                );
+                anyhow::bail!("ZIP archive contains duplicate output path `{entry_name}`");
             }
 
             if entry.is_dir() {
@@ -657,6 +654,58 @@ pub async fn extract_zip(zip_file: &Path, output_dir: &Path) -> anyhow::Result<U
     .await??;
 
     Ok(result)
+}
+
+/// Ensure each local-file header agrees with its central-directory header.
+/// `zip` uses the central directory for entry metadata, so accepting a
+/// mismatched pair would make the bytes selected for extraction ambiguous.
+fn validate_zip_headers(bytes: &[u8]) -> anyhow::Result<()> {
+    let locals = zip_header_fields(bytes, 0x0403_4b50, 14, 26, 30);
+    let centrals = zip_header_fields(bytes, 0x0201_4b50, 16, 28, 46);
+    if locals.len() != centrals.len()
+        || locals
+            .iter()
+            .zip(&centrals)
+            .any(|(local, central)| local != central)
+    {
+        anyhow::bail!("ZIP local and central headers disagree");
+    }
+    Ok(())
+}
+
+fn zip_header_fields(
+    bytes: &[u8],
+    signature: u32,
+    crc_offset: usize,
+    name_length_offset: usize,
+    name_offset: usize,
+) -> Vec<(u32, Vec<u8>)> {
+    let signature = signature.to_le_bytes();
+    let mut names = Vec::new();
+    for offset in bytes
+        .windows(4)
+        .enumerate()
+        .filter_map(|(offset, window)| (window == signature).then_some(offset))
+    {
+        if offset + name_length_offset + 2 > bytes.len() {
+            continue;
+        }
+        let name_len = u16::from_le_bytes([
+            bytes[offset + name_length_offset],
+            bytes[offset + name_length_offset + 1],
+        ]) as usize;
+        let name_start = offset + name_offset;
+        if name_start + name_len <= bytes.len() {
+            let crc = u32::from_le_bytes([
+                bytes[offset + crc_offset],
+                bytes[offset + crc_offset + 1],
+                bytes[offset + crc_offset + 2],
+                bytes[offset + crc_offset + 3],
+            ]);
+            names.push((crc, bytes[name_start..name_start + name_len].to_vec()));
+        }
+    }
+    names
 }
 
 /// Extract a TAR archive without materializing links or paths outside the job.
@@ -797,6 +846,43 @@ mod tests {
         assert_eq!(result.files_extracted.len(), 1);
         let content = std::fs::read_to_string(out_dir.join("hello.txt")).unwrap();
         assert_eq!(content, "Hello, world!");
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_rejects_mismatched_local_and_central_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("mismatched-headers.zip");
+        let out_dir = dir.path().join("out");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file("payload.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"payload").unwrap();
+            writer.finish().unwrap();
+        }
+
+        // Keep the central-directory header truthful but make the local file
+        // header's CRC disagree. This crafted dual-header archive must not be
+        // extracted ambiguously.
+        let mut bytes = std::fs::read(&zip_path).unwrap();
+        let local_header = bytes
+            .windows(4)
+            .position(|window| window == [0x50, 0x4b, 0x03, 0x04])
+            .unwrap();
+        bytes[local_header + 14..local_header + 18].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&zip_path, bytes).unwrap();
+
+        let error = extract_zip(&zip_path, &out_dir)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("header") || error.contains("size"),
+            "{error}"
+        );
+        assert!(!out_dir.join("payload.txt").exists());
     }
 
     #[tokio::test]
