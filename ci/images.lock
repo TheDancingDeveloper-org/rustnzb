@@ -2,7 +2,7 @@
 # The first custom-image bootstrap deliberately starts with pending entries;
 # ci/verify-image-pins rejects this file until real digests replace them.
 CORE_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:d03aebdc33355152013c1bd1ffe42231194ada26b5c40a06668abae85259d1d7
-CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:e528700067aadc79156ed338cb350563c155962796a7f247204b19b9ef48118c
+CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:27641a62856a52a21378536ae607196a71bdedaaa428cc624260828998f550be
 E2E_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-e2e@sha256:6ec458ed0a30297844e05f70cb568974440f92343f3218dead146ad9a2451037
 DESKTOP_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-desktop@sha256:3e0365d875a2ae0165f3a05ff55e95fac9c144b0ea8bef3ffa454b99d39eb459
 
