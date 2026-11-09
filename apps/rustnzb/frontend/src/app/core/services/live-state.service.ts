@@ -34,7 +34,6 @@ export class LiveStateService implements OnDestroy {
   readonly interval = signal<LiveStateInterval>(this.readInterval());
   private timer: ReturnType<typeof setInterval> | null = null;
   private request: Subscription | null = null;
-  private requestToken = 0;
   private revision = 0;
   private concurrentRequests = 0;
   private skippedTicks = 0;
@@ -54,7 +53,7 @@ export class LiveStateService implements OnDestroy {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    this.requestToken++;
+    // Unsubscribing the active RxJS subscription drops responses made stale by stop or refresh.
     this.request?.unsubscribe();
     this.request = null;
     this.listeners.clear();
@@ -109,18 +108,15 @@ export class LiveStateService implements OnDestroy {
 
     const requestStart = clock();
     if (this.request) {
-      this.requestToken++;
       this.request.unsubscribe();
       this.request = null;
     }
-    const requestToken = ++this.requestToken;
     this.concurrentRequests += 2;
     const request = forkJoin({
       status: this.fetch<StatusResponse>('/status'),
       queue: this.fetch<QueueResponse>('/queue'),
     }).subscribe({
       next: ({ status, queue }) => {
-        if (requestToken !== this.requestToken) return;
         const responseBytes = status.bytes + queue.bytes;
         const parseTime = status.parseTime + queue.parseTime;
         const updateStart = clock();
@@ -138,12 +134,11 @@ export class LiveStateService implements OnDestroy {
         this.finish(tickStart, requestStart, responseBytes, parseTime, updateTime, renderTime);
       },
       error: () => {
-        if (requestToken !== this.requestToken) return;
         for (const listener of this.errorListeners) listener();
         this.finish(tickStart, requestStart, 0, 0, 0, 0);
       },
     });
-    this.request = request.closed || requestToken !== this.requestToken ? null : request;
+    this.request = request.closed ? null : request;
   }
 
   private fetch<T>(path: string): Observable<{ value: T; bytes: number; parseTime: number }> {
