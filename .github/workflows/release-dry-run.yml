@@ -19,6 +19,8 @@ on:
   pull_request:
     paths:
       - '.github/workflows/release*.yml'
+      - 'Dockerfile*'
+      - 'ci/images.lock'
       - 'ci/tasks/**'
       - 'packaging/**'
       - 'installer/**'
