@@ -3,8 +3,8 @@
 #
 # The workspace version in the root Cargo.toml ([workspace.package]) is the
 # only place a version number is typed. Every other version field must equal
-# it, and an optional release tag must be that version with an optional
-# pre-release suffix (v1.6.0 or v1.6.0-beta.1 both match 1.6.0).
+# it, and an optional release tag must be exactly that version with a leading
+# "v" (workspace 1.6.0-beta.1 is tagged v1.6.0-beta.1; v1.6.0 does not match).
 #
 # usage: ci/check-version.sh [TAG]
 set -eu
@@ -51,9 +51,7 @@ expect desktop/src-tauri/Cargo.lock "desktop/src-tauri/Cargo.lock rustnzb-deskto
 
 if [ "$#" -ge 1 ] && [ -n "$1" ]; then
     tag=$1
-    base=${tag%%-*}
-    workspace_base=${workspace%%-*}
-    if [ "$base" != "v$workspace_base" ]; then
+    if [ "$tag" != "v$workspace" ]; then
         printf 'check-version: tag %s does not match workspace version %s\n' "$tag" "$workspace" >&2
         failed=1
     fi
