@@ -1815,7 +1815,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "unicode-normalization",
- "utoipa 5.5.0",
+ "utoipa",
  "uuid",
 ]
 
@@ -1909,7 +1909,7 @@ dependencies = [
  "tokio-socks",
  "toml",
  "tracing",
- "utoipa 5.5.0",
+ "utoipa",
  "uuid",
  "webpki-roots",
 ]
@@ -1977,7 +1977,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
- "utoipa 5.5.0",
+ "utoipa",
  "utoipa-swagger-ui",
  "uuid",
  "yenc-simd",
@@ -2915,7 +2915,7 @@ dependencies = [
  "tracing-appender",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "utoipa 5.5.0",
+ "utoipa",
  "utoipa-swagger-ui",
  "uuid",
 ]
@@ -3855,18 +3855,6 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "utoipa"
-version = "5.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bde15df68e80b16c7d16b9616e80770ad158988daa56a27dccd1e55558b0160"
-dependencies = [
- "indexmap",
- "serde",
- "serde_json",
- "utoipa-gen 5.5.0",
-]
-
-[[package]]
-name = "utoipa"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8765fe27aeff71012a3f90fa474cf1df863a7d0dd81ed25de4e63fff2544994f"
@@ -3874,19 +3862,7 @@ dependencies = [
  "indexmap",
  "serde",
  "serde_json",
- "utoipa-gen 6.0.1",
-]
-
-[[package]]
-name = "utoipa-gen"
-version = "5.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba0b99ee52df3028635d93840c797102da61f8a7bb3cf751032455895b52ef8"
-dependencies = [
- "proc-macro2",
- "quote",
- "regex",
- "syn 2.0.118",
+ "utoipa-gen",
 ]
 
 [[package]]
@@ -3897,6 +3873,7 @@ checksum = "d935f1c83fdf8b88f09bbe050d0cea78ea4afee6d7b0317403228c1200b2c8ab"
 dependencies = [
  "proc-macro2",
  "quote",
+ "regex",
  "syn 3.0.4",
 ]
 
@@ -3913,7 +3890,7 @@ dependencies = [
  "serde",
  "serde_json",
  "url",
- "utoipa 6.0.0",
+ "utoipa",
  "zip",
 ]
 

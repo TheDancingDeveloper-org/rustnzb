@@ -34,7 +34,7 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.7", features = ["compression-full", "cors", "trace"] }
-utoipa = { version = "5", features = ["axum_extras", "chrono"] }
+utoipa = { version = "6", features = ["axum_extras", "chrono"] }
 utoipa-swagger-ui = { version = "10", features = ["axum"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
