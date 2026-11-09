@@ -686,11 +686,14 @@ fn validate_zip_headers(file: &mut std::fs::File) -> anyhow::Result<()> {
     let entries = read_u16(10) as u64;
     let central_size = read_u32(12) as u64;
     let central_offset = read_u32(16) as u64;
+    // ZIP64 archives carry their authoritative directory metadata in the
+    // ZIP64 EOCD record. The zip crate validates that structure while opening
+    // the archive; avoid applying the 32-bit header checks to sentinel values.
     if entries == u16::MAX as u64
         || central_size == u32::MAX as u64
         || central_offset == u32::MAX as u64
     {
-        anyhow::bail!("ZIP64 headers are not supported by header validation");
+        return Ok(());
     }
     if central_offset
         .checked_add(central_size)
@@ -699,7 +702,7 @@ fn validate_zip_headers(file: &mut std::fs::File) -> anyhow::Result<()> {
         anyhow::bail!("ZIP central directory is outside the archive");
     }
 
-    let central_pos = central_offset;
+    let mut central_pos = central_offset;
     for _ in 0..entries {
         file.seek(SeekFrom::Start(central_pos))?;
         let mut central = [0; 46];
@@ -758,9 +761,9 @@ fn validate_zip_headers(file: &mut std::fs::File) -> anyhow::Result<()> {
             anyhow::bail!("ZIP local and central headers disagree");
         }
         let _ = local_extra_len;
-        file.seek(SeekFrom::Start(
-            central_offset + 46 + name_len as u64 + extra_len as u64 + comment_len as u64,
-        ))?;
+        central_pos = central_pos
+            .checked_add(46 + name_len as u64 + extra_len as u64 + comment_len as u64)
+            .ok_or_else(|| anyhow::anyhow!("ZIP central directory offset overflow"))?;
     }
     Ok(())
 }
@@ -1012,6 +1015,143 @@ mod tests {
             "{error}"
         );
         assert!(!out_dir.join("payload.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_validates_every_central_directory_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("multi-entry.zip");
+        let out_dir = dir.path().join("out");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            for (name, contents) in [
+                ("first.txt", b"first".as_slice()),
+                ("second.txt", b"second".as_slice()),
+            ] {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(contents).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        let mut bytes = std::fs::read(&zip_path).unwrap();
+        let eocd = bytes
+            .windows(4)
+            .rposition(|window| window == [0x50, 0x4b, 0x05, 0x06])
+            .unwrap();
+        let central_offset =
+            u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        let first_name_len = u16::from_le_bytes(
+            bytes[central_offset + 28..central_offset + 30]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let first_extra_len = u16::from_le_bytes(
+            bytes[central_offset + 30..central_offset + 32]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let first_comment_len = u16::from_le_bytes(
+            bytes[central_offset + 32..central_offset + 34]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let second_central =
+            central_offset + 46 + first_name_len + first_extra_len + first_comment_len;
+        let second_local = u32::from_le_bytes(
+            bytes[second_central + 42..second_central + 46]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        bytes[second_local + 14..second_local + 18].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&zip_path, bytes).unwrap();
+
+        let error = extract_zip(&zip_path, &out_dir)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("header"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_accepts_multiple_valid_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("multi-entry-valid.zip");
+        let out_dir = dir.path().join("out");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        for (name, contents) in [
+            ("first.txt", b"first".as_slice()),
+            ("second.txt", b"second".as_slice()),
+        ] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let result = extract_zip(&zip_path, &out_dir).await.unwrap();
+        assert!(result.success);
+        assert_eq!(std::fs::read(out_dir.join("first.txt")).unwrap(), b"first");
+        assert_eq!(
+            std::fs::read(out_dir.join("second.txt")).unwrap(),
+            b"second"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_accepts_zip64_end_of_central_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("zip64.zip");
+        let _out_dir = dir.path().join("out");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default().large_file(true);
+        writer.start_file("zip64.txt", options).unwrap();
+        writer.write_all(b"zip64").unwrap();
+        writer.finish().unwrap();
+
+        // Force ZIP64 metadata while keeping the archive small.
+        let mut bytes = std::fs::read(&zip_path).unwrap();
+        let eocd = bytes
+            .windows(4)
+            .rposition(|window| window == [0x50, 0x4b, 0x05, 0x06])
+            .unwrap();
+        let entries = u16::from_le_bytes(bytes[eocd + 10..eocd + 12].try_into().unwrap()) as u64;
+        let central_size =
+            u32::from_le_bytes(bytes[eocd + 12..eocd + 16].try_into().unwrap()) as u64;
+        let central_offset =
+            u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as u64;
+        let mut zip64 = Vec::new();
+        zip64.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
+        zip64.extend_from_slice(&44u64.to_le_bytes());
+        zip64.extend_from_slice(&45u16.to_le_bytes());
+        zip64.extend_from_slice(&45u16.to_le_bytes());
+        zip64.extend_from_slice(&0u32.to_le_bytes());
+        zip64.extend_from_slice(&0u32.to_le_bytes());
+        zip64.extend_from_slice(&entries.to_le_bytes());
+        zip64.extend_from_slice(&entries.to_le_bytes());
+        zip64.extend_from_slice(&central_size.to_le_bytes());
+        zip64.extend_from_slice(&central_offset.to_le_bytes());
+        zip64.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
+        zip64.extend_from_slice(&(eocd as u64).to_le_bytes());
+        zip64.extend_from_slice(&0u32.to_le_bytes());
+        let mut classic = bytes[eocd..].to_vec();
+        classic[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        classic[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        classic[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        classic[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes.truncate(eocd);
+        bytes.extend_from_slice(&zip64);
+        bytes.extend_from_slice(&classic);
+        std::fs::write(&zip_path, bytes).unwrap();
+
+        let mut file = std::fs::File::open(&zip_path).unwrap();
+        validate_zip_headers(&mut file).unwrap();
     }
 
     #[tokio::test]
