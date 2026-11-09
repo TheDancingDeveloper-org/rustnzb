@@ -52,7 +52,8 @@ expect desktop/src-tauri/Cargo.lock "desktop/src-tauri/Cargo.lock rustnzb-deskto
 if [ "$#" -ge 1 ] && [ -n "$1" ]; then
     tag=$1
     base=${tag%%-*}
-    if [ "$base" != "v$workspace" ]; then
+    workspace_base=${workspace%%-*}
+    if [ "$base" != "v$workspace_base" ]; then
         printf 'check-version: tag %s does not match workspace version %s\n' "$tag" "$workspace" >&2
         failed=1
     fi

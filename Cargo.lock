@@ -2873,7 +2873,7 @@ dependencies = [
 
 [[package]]
 name = "rustnzb"
-version = "1.7.0"
+version = "1.7.1-beta.1"
 dependencies = [
  "anyhow",
  "arc-swap",
