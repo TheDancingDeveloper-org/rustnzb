@@ -17,6 +17,7 @@ import { filter, timeout } from 'rxjs';
 import { ApiService, POLL_TIMEOUT_MS, pageHidden } from './core/services/api.service';
 import { AuthService } from './core/services/auth.service';
 import { StatusResponse } from './core/models/queue.model';
+import { LiveStateService } from './core/services/live-state.service';
 import { formatBytes, formatSpeed } from './core/format';
 import {
   AddNzbPrefill,
@@ -134,7 +135,11 @@ export function documentTitle(
             @if (demoMode) {
               <a class="action demo-exit" href="/">{{ 'nav.exitDemo' | t }}</a>
             }
-            <div class="status" [class.stale]="offline()" [attr.title]="offline() ? ('status.stale' | t) : null">
+            <div
+              class="status"
+              [class.stale]="offline()"
+              [attr.title]="offline() ? ('status.stale' | t) : null"
+            >
               @if (offline()) {
                 <span class="pill err" role="status">● {{ 'status.offline' | t }}</span>
               } @else if (!loaded()) {
@@ -165,7 +170,16 @@ export function documentTitle(
                     (click)="$event.stopPropagation()"
                   >
                     <div class="pm-title">{{ 'speed.title' | t }}</div>
-                    <div class="pm-current">{{ 'speed.current' | t: { value: speedLimit() > 0 ? formatSpeed(speedLimit()) : ('speed.off' | t) } }}</div>
+                    <div class="pm-current">
+                      {{
+                        'speed.current'
+                          | t
+                            : {
+                                value:
+                                  speedLimit() > 0 ? formatSpeed(speedLimit()) : ('speed.off' | t),
+                              }
+                      }}
+                    </div>
                     @for (opt of speedPresets; track opt.bps) {
                       <button
                         class="pm-item"
@@ -186,13 +200,19 @@ export function documentTitle(
                         [(ngModel)]="customSpeedMb"
                         (keydown.enter)="setCustomSpeedLimit()"
                       />
-                      <button class="pm-go" (click)="setCustomSpeedLimit()">{{ 'speed.set' | t }}</button>
+                      <button class="pm-go" (click)="setCustomSpeedLimit()">
+                        {{ 'speed.set' | t }}
+                      </button>
                     </div>
                   </div>
                 }
               </div>
-              <span class="pill">{{ 'status.queued' | t: { count: loaded() ? queueCount() : '—' } }}</span>
-              <span class="pill">{{ 'status.free' | t: { size: loaded() ? formatBytes(diskFree()) : '—' } }}</span>
+              <span class="pill">{{
+                'status.queued' | t: { count: loaded() ? queueCount() : '—' }
+              }}</span>
+              <span class="pill">{{
+                'status.free' | t: { size: loaded() ? formatBytes(diskFree()) : '—' }
+              }}</span>
             </div>
             <div class="mode-toggle" role="group" [attr.aria-label]="'layout.width' | t">
               <button
@@ -232,7 +252,9 @@ export function documentTitle(
                 </svg>
               </button>
             </div>
-            <button class="action primary" (click)="onAddNzb()">{{ 'actions.uploadNzb' | t }}</button>
+            <button class="action primary" (click)="onAddNzb()">
+              {{ 'actions.uploadNzb' | t }}
+            </button>
             <div class="pause-group" (keydown.escape)="closePauseMenu()">
               <button class="action" (click)="togglePause()">
                 @if (paused()) {
@@ -276,7 +298,9 @@ export function documentTitle(
                         [(ngModel)]="customPauseMin"
                         (keydown.enter)="pauseForCustom()"
                       />
-                      <button class="pm-go" (click)="pauseForCustom()">{{ 'actions.go' | t }}</button>
+                      <button class="pm-go" (click)="pauseForCustom()">
+                        {{ 'actions.go' | t }}
+                      </button>
                     </div>
                   </div>
                 }
@@ -405,7 +429,9 @@ export function documentTitle(
         gap: 6px;
         align-items: center;
       }
-      .status.stale .pill:not(.err) { opacity: 0.6; }
+      .status.stale .pill:not(.err) {
+        opacity: 0.6;
+      }
 
       nav.topbar {
         background: var(--panel);
@@ -702,15 +728,15 @@ export class App implements OnInit, OnDestroy {
   // Null until the server list has loaded, so the banner never shows on a guess.
   readonly serverCount = signal<number | null>(null);
   readonly noServers = computed(() => this.serverCount() === 0);
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
-  private statusInFlight = false;
+  private liveStateSub: { unsubscribe(): void } | null = null;
+  private readonly liveState: LiveStateService;
   /** Permission can be revoked while the page is open; re-read it on return. */
   private onVisibilityChange = () => {
     if (!pageHidden()) {
       this.notifications.refreshPermission();
       // Poll at once rather than waiting out the interval, so a job that
       // finished while the tab was hidden shows the moment it is opened.
-      if (!this.statusInFlight) this.pollStatus();
+      this.liveState.refresh();
     }
   };
   private docClickHandler = (e: MouseEvent) => {
@@ -733,10 +759,15 @@ export class App implements OnInit, OnDestroy {
     private shortcuts: KeyboardShortcutsService,
     private dialog: MatDialog,
     private i18n: I18nService = new I18nService(),
+    liveState?: LiveStateService,
   ) {
+    this.liveState = liveState ?? new LiveStateService(api);
     this.paused = pauseState.paused;
     this.authenticated = authService.authenticated;
     this.currentUrl.set(router.url);
+    this.liveStateSub = this.liveState.onSnapshot((snapshot) => {
+      this.applyLiveStatus(snapshot.status);
+    });
     router.events
       .pipe(filter((e): e is NavigationEnd => e instanceof NavigationEnd))
       .subscribe((e) => {
@@ -748,52 +779,37 @@ export class App implements OnInit, OnDestroy {
   }
 
   ngOnInit(): void {
-    this.pollStatus();
+    this.liveState.start(() => this.authenticated());
+    this.liveState.refresh();
     this.loadServerCount();
     document.addEventListener('visibilitychange', this.onVisibilityChange);
-    this.pollTimer = setInterval(() => {
-      // A background tab polls only to feed browser notifications. Alerts
-      // are for a user looking at another tab, so skipping the poll while
-      // hidden would mean they never fire; with alerts off the old skip
-      // still applies and a hidden tab makes no requests.
-      if (this.statusInFlight) return;
-      if (pageHidden() && !this.notifications.enabled()) return;
-      this.pollStatus();
-    }, 2000);
     document.addEventListener('click', this.docClickHandler);
   }
 
   ngOnDestroy(): void {
-    if (this.pollTimer) clearInterval(this.pollTimer);
+    this.liveStateSub?.unsubscribe();
+    this.liveState.stop();
     if (this.chordTimer) clearTimeout(this.chordTimer);
     document.removeEventListener('click', this.docClickHandler);
     document.removeEventListener('visibilitychange', this.onVisibilityChange);
   }
 
   pollStatus(): void {
-    if (!this.authenticated()) return;
-    this.statusInFlight = true;
-    this.api.get<StatusResponse>('/status').pipe(timeout(POLL_TIMEOUT_MS)).subscribe({
-      next: (s) => {
-        this.statusInFlight = false;
-        this.speed.set(s.speed_bps);
-        this.speedLimit.set(s.speed_limit_bps ?? 0);
-        this.paused.set(s.paused);
-        this.queueCount.set(s.queue_size);
-        this.diskFree.set(s.disk_space_free);
-        this.webdavEnabled.set(!!s.webdav_enabled);
-        if (s.version) this.version.set(s.version);
-        this.loaded.set(true);
-        this.offline.set(false);
-        this.notifications.observeStatus(s);
-        this.updateTitle();
-      },
-      error: () => {
-        this.statusInFlight = false;
-        this.offline.set(true);
-        this.updateTitle();
-      },
-    });
+    this.liveState.refresh();
+  }
+
+  private applyLiveStatus(s: StatusResponse): void {
+    this.speed.set(s.speed_bps);
+    this.speedLimit.set(s.speed_limit_bps ?? 0);
+    this.paused.set(s.paused);
+    this.queueCount.set(s.queue_size);
+    this.diskFree.set(s.disk_space_free);
+    this.webdavEnabled.set(!!s.webdav_enabled);
+    if (s.version) this.version.set(s.version);
+    this.loaded.set(true);
+    this.offline.set(false);
+    this.notifications.observeStatus(s);
+    this.updateTitle();
   }
 
   loadServerCount(): void {
@@ -855,9 +871,7 @@ export class App implements OnInit, OnDestroy {
       next: () => {
         this.speedLimit.set(bps);
         this.speedMenuOpen = false;
-        this.toast.success(
-          bps > 0 ? `Speed limit set to ${formatSpeed(bps)}` : 'Speed limit off',
-        );
+        this.toast.success(bps > 0 ? `Speed limit set to ${formatSpeed(bps)}` : 'Speed limit off');
         this.pollStatus();
       },
       error: (err) => showHttpError(this.toast, err, 'Failed to set speed limit'),
