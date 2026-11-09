@@ -5,6 +5,7 @@ trap cleanup_frontend EXIT
 task_start check cargo
 task_target_dir check
 prepare_placeholder_frontend
+sh "$REPO_ROOT/ci/tests/check-version.sh"
 cargo check --workspace --locked
 
 # Keep the dispatch boundary enforceable: QueueManager may depend on the
