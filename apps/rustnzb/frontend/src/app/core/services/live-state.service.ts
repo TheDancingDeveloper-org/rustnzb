@@ -1,5 +1,5 @@
 import { Injectable, OnDestroy, signal } from '@angular/core';
-import { Subscription, forkJoin, timeout } from 'rxjs';
+import { Observable, Subscription, forkJoin, map, timeout } from 'rxjs';
 import { ApiService, POLL_TIMEOUT_MS, pageHidden } from './api.service';
 import { QueueResponse, StatusResponse } from '../models/queue.model';
 
@@ -35,7 +35,6 @@ export class LiveStateService implements OnDestroy {
   private timer: ReturnType<typeof setInterval> | null = null;
   private request: Subscription | null = null;
   private revision = 0;
-  private tickNumber = 0;
   private concurrentRequests = 0;
   private skippedTicks = 0;
   private isAuthenticated = () => true;
@@ -92,44 +91,62 @@ export class LiveStateService implements OnDestroy {
   }
 
   private tick(manual = false): void {
-    const tickStart = performance.now();
+    const clock = () => (this.debug ? performance.now() : 0);
+    const tickStart = clock();
     if (this.request || !this.isAuthenticated() || (!manual && pageHidden() && !this.debug)) {
-      this.skippedTicks++;
-      this.debugMetrics({ tickStart, tickEnd: performance.now(), skippedTicks: this.skippedTicks });
+      if (this.debug) {
+        this.skippedTicks++;
+        this.debugMetrics({ tickStart, tickEnd: clock(), skippedTicks: this.skippedTicks });
+      }
       return;
     }
 
-    const tick = ++this.tickNumber;
-    const requestStart = performance.now();
+    const requestStart = clock();
     this.concurrentRequests += 2;
     const request = forkJoin({
-      status: this.api.get<StatusResponse>('/status').pipe(timeout(POLL_TIMEOUT_MS)),
-      queue: this.api.get<QueueResponse>('/queue').pipe(timeout(POLL_TIMEOUT_MS)),
+      status: this.fetch<StatusResponse>('/status'),
+      queue: this.fetch<QueueResponse>('/queue'),
     }).subscribe({
       next: ({ status, queue }) => {
-        const parseStart = performance.now();
-        const responseBytes = JSON.stringify(status).length + JSON.stringify(queue).length;
-        const parseTime = performance.now() - parseStart;
-        const updateStart = performance.now();
-        if (tick === this.tickNumber) {
-          const snapshot: LiveSnapshot = Object.freeze({
-            revision: ++this.revision,
-            capturedAt: Date.now(),
-            status: Object.freeze(status),
-            queue: Object.freeze(queue),
-          });
-          this.snapshot.set(snapshot);
-          for (const listener of this.listeners) listener(snapshot);
-        }
-        const updateTime = performance.now() - updateStart;
-        this.finish(tickStart, requestStart, responseBytes, parseTime, updateTime);
+        const responseBytes = status.bytes + queue.bytes;
+        const parseTime = status.parseTime + queue.parseTime;
+        const updateStart = clock();
+        const snapshot: LiveSnapshot = Object.freeze({
+          revision: ++this.revision,
+          capturedAt: Date.now(),
+          status: Object.freeze(status.value),
+          queue: Object.freeze(queue.value),
+        });
+        this.snapshot.set(snapshot);
+        const renderStart = clock();
+        for (const listener of this.listeners) listener(snapshot);
+        const renderTime = this.debug ? clock() - renderStart : 0;
+        const updateTime = this.debug ? clock() - updateStart : 0;
+        this.finish(tickStart, requestStart, responseBytes, parseTime, updateTime, renderTime);
       },
       error: () => {
         for (const listener of this.errorListeners) listener();
-        this.finish(tickStart, requestStart, 0, 0, 0);
+        this.finish(tickStart, requestStart, 0, 0, 0, 0);
       },
     });
     this.request = request.closed ? null : request;
+  }
+
+  private fetch<T>(path: string): Observable<{ value: T; bytes: number; parseTime: number }> {
+    if (!this.debug) {
+      return this.api.get<T>(path).pipe(
+        timeout(POLL_TIMEOUT_MS),
+        map((value) => ({ value, bytes: 0, parseTime: 0 })),
+      );
+    }
+    return this.api.getRaw(path).pipe(
+      timeout(POLL_TIMEOUT_MS),
+      map((raw) => {
+        const parseStart = performance.now();
+        const value = JSON.parse(raw) as T;
+        return { value, bytes: raw.length, parseTime: performance.now() - parseStart };
+      }),
+    );
   }
 
   private finish(
@@ -138,19 +155,20 @@ export class LiveStateService implements OnDestroy {
     responseBytes: number,
     parseTime: number,
     updateTime: number,
+    renderTime: number,
   ): void {
     this.concurrentRequests = Math.max(0, this.concurrentRequests - 2);
     this.request = null;
     this.debugMetrics({
       tickStart,
-      tickEnd: performance.now(),
+      tickEnd: this.debug ? performance.now() : 0,
       requestStart,
-      requestEnd: performance.now(),
+      requestEnd: this.debug ? performance.now() : 0,
       concurrentRequests: this.concurrentRequests,
       responseBytes,
       parseTime,
       updateTime,
-      renderTime: 0,
+      renderTime,
       skippedTicks: this.skippedTicks,
     });
   }
