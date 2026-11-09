@@ -41,6 +41,7 @@ export class LiveStateService implements OnDestroy {
   private isAuthenticated = () => true;
   private readonly debug = this.isDebugEnabled();
   private readonly listeners = new Set<(snapshot: LiveSnapshot) => void>();
+  private readonly errorListeners = new Set<() => void>();
 
   constructor(private readonly api: ApiService) {}
 
@@ -56,6 +57,7 @@ export class LiveStateService implements OnDestroy {
     this.request?.unsubscribe();
     this.request = null;
     this.listeners.clear();
+    this.errorListeners.clear();
   }
 
   setIntervalMs(value: number): void {
@@ -71,6 +73,11 @@ export class LiveStateService implements OnDestroy {
 
   refresh(): void {
     this.tick(true);
+  }
+
+  onError(listener: () => void): { unsubscribe(): void } {
+    this.errorListeners.add(listener);
+    return { unsubscribe: () => this.errorListeners.delete(listener) };
   }
 
   onSnapshot(listener: (snapshot: LiveSnapshot) => void): { unsubscribe(): void } {
@@ -117,7 +124,10 @@ export class LiveStateService implements OnDestroy {
         const updateTime = performance.now() - updateStart;
         this.finish(tickStart, requestStart, responseBytes, parseTime, updateTime);
       },
-      error: () => this.finish(tickStart, requestStart, 0, 0, 0),
+      error: () => {
+        for (const listener of this.errorListeners) listener();
+        this.finish(tickStart, requestStart, 0, 0, 0);
+      },
     });
     this.request = request.closed ? null : request;
   }

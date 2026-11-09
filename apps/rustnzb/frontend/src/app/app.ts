@@ -729,6 +729,7 @@ export class App implements OnInit, OnDestroy {
   readonly serverCount = signal<number | null>(null);
   readonly noServers = computed(() => this.serverCount() === 0);
   private liveStateSub: { unsubscribe(): void } | null = null;
+  private liveStateErrorSub: { unsubscribe(): void } | null = null;
   private readonly liveState: LiveStateService;
   /** Permission can be revoked while the page is open; re-read it on return. */
   private onVisibilityChange = () => {
@@ -768,6 +769,10 @@ export class App implements OnInit, OnDestroy {
     this.liveStateSub = this.liveState.onSnapshot((snapshot) => {
       this.applyLiveStatus(snapshot.status);
     });
+    this.liveStateErrorSub = this.liveState.onError(() => {
+      this.offline.set(true);
+      this.updateTitle();
+    });
     router.events
       .pipe(filter((e): e is NavigationEnd => e instanceof NavigationEnd))
       .subscribe((e) => {
@@ -788,6 +793,7 @@ export class App implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.liveStateSub?.unsubscribe();
+    this.liveStateErrorSub?.unsubscribe();
     this.liveState.stop();
     if (this.chordTimer) clearTimeout(this.chordTimer);
     document.removeEventListener('click', this.docClickHandler);
@@ -872,7 +878,6 @@ export class App implements OnInit, OnDestroy {
         this.speedLimit.set(bps);
         this.speedMenuOpen = false;
         this.toast.success(bps > 0 ? `Speed limit set to ${formatSpeed(bps)}` : 'Speed limit off');
-        this.pollStatus();
       },
       error: (err) => showHttpError(this.toast, err, 'Failed to set speed limit'),
     });
