@@ -185,11 +185,6 @@ export class LoginComponent implements OnInit {
   private loadAuthStatus(): void {
     this.authService.checkAuth().subscribe({
       next: (status) => {
-        if (!status.auth_enabled && !status.setup_required) {
-          // Auth is disabled, go straight to downloads
-          this.router.navigate(['/downloads']);
-          return;
-        }
         this.isSetup.set(status.setup_required);
         if (status.setup_required) {
           this.authService.setupStatus().subscribe({

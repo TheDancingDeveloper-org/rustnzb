@@ -19,6 +19,7 @@ function makeApp(postResult = new Subject<unknown>(), openDialogs: unknown[] = [
   };
   const auth = {
     authenticated: signal(false),
+    open: signal(false),
     logout: vi.fn(() => of({})),
   };
   const router = {

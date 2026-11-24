@@ -82,6 +82,11 @@ mod tests {
             .collect();
         for key in [
             "general.trusted_proxies",
+            "general.auth_method",
+            "general.inet_exposure",
+            "general.local_ranges",
+            "general.host_whitelist",
+            "general.verify_xff_header",
             "general.local_import_dir",
             "general.password_file",
             "general.step_up_ttl_secs",

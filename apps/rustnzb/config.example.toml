@@ -75,6 +75,20 @@ script_max_output_bytes = 1048576
 # each real client on its own. Empty ignores X-Forwarded-For.
 # trusted_proxies = ["172.18.0.0/16"]
 
+# "login" always requires the web login. "optional" follows SABnzbd: no login
+# while no password is set, for local clients. The settings below apply only
+# to "optional". See docs/CONFIGURATION.md.
+# auth_method = "login"
+# External access level, 0 to 5: 4 opens the web UI to non-local clients, 5
+# does too but asks them for the login.
+# inet_exposure = 0
+# Networks that count as local. Empty: private and link-local addresses.
+# local_ranges = []
+# Host names the UI may be visited under while no password is set.
+# host_whitelist = ["nzb.example.com"]
+# Also require every X-Forwarded-For address to be local.
+# verify_xff_header = true
+
 # Seconds a confirmed web password authorises further sensitive writes
 # (API key, scripts, listen address, backup restore, secret export).
 # 0 means every sensitive write must present the password again.

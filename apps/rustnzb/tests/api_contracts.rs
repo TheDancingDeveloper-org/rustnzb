@@ -2262,3 +2262,134 @@ async fn bind_change_refuses_exposure_without_auth_or_confirmation() {
     assert_eq!(app.state.config().general.listen_addr, "::1");
     assert_eq!(app.state.config().general.port, 9090);
 }
+
+fn optional_login(config: &mut AppConfig) {
+    config.general.auth_method = nzb_web::nzb_core::config::WebAuthMethod::Optional;
+}
+
+async fn status_of(request: reqwest::RequestBuilder) -> u16 {
+    request.send().await.unwrap().status().as_u16()
+}
+
+#[tokio::test]
+async fn optional_login_opens_the_api_only_while_no_password_is_set() {
+    let client = reqwest::Client::new();
+    let queue = |app: &ContractApp| client.get(format!("{}/api/queue", app.base_url));
+
+    // Default: missing credentials still close everything but setup.
+    let app = start_app(false).await;
+    assert_eq!(status_of(queue(&app)).await, 401);
+
+    let app = start_app_with(false, optional_login).await;
+    assert_eq!(status_of(queue(&app)).await, 200);
+    let auth: serde_json::Value = client
+        .get(format!("{}/api/auth/status", app.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(auth["login_required"], false);
+    assert_eq!(auth["setup_required"], false);
+    // A leftover token or a proxy's own Basic credentials do not matter.
+    assert_eq!(status_of(queue(&app).bearer_auth("stale")).await, 200);
+    assert_eq!(
+        status_of(queue(&app).basic_auth("proxy", Some("x"))).await,
+        200
+    );
+    // Not local, or under an unknown host name.
+    let forwarded = queue(&app).header("X-Forwarded-For", "203.0.113.1");
+    assert_eq!(status_of(forwarded).await, 403);
+    assert_eq!(
+        status_of(queue(&app).header("Host", "evil.example")).await,
+        403
+    );
+    for path in ["auth/status", "setup/status"] {
+        let request = client
+            .get(format!("{}/api/{path}", app.base_url))
+            .header("X-Forwarded-For", "203.0.113.1");
+        assert_eq!(status_of(request).await, 403, "{path}");
+    }
+    // Writes: a foreign page is refused; sensitive ones need no password.
+    let write = |origin: bool, ours: bool| {
+        let mut request = client
+            .put(format!("{}/api/config/general", app.base_url))
+            .json(&serde_json::json!({"port": 9191}));
+        if origin {
+            request = request.header("Origin", "http://evil.example");
+        }
+        if ours {
+            request = request.header("X-Requested-With", "rustnzb");
+        }
+        status_of(request)
+    };
+    assert_eq!(write(true, false).await, 403);
+    assert_eq!(write(true, true).await, 200);
+    assert_eq!(write(false, false).await, 200);
+
+    // Setting a password closes it again.
+    let setup = client
+        .post(format!("{}/api/auth/setup", app.base_url))
+        .json(&serde_json::json!({"username": "admin", "password": "password"}));
+    assert_eq!(status_of(setup).await, 200);
+    assert_eq!(status_of(queue(&app)).await, 401);
+}
+
+#[tokio::test]
+async fn optional_login_with_a_password_follows_the_exposure_level() {
+    let client = reqwest::Client::new();
+    let app = start_app_with(true, |config| {
+        optional_login(config);
+        config.general.inet_exposure = 5;
+    })
+    .await;
+    let queue = client.get(format!("{}/api/queue", app.base_url));
+    let external = |request: &reqwest::RequestBuilder| {
+        request
+            .try_clone()
+            .unwrap()
+            .header("X-Forwarded-For", "203.0.113.1")
+    };
+    assert_eq!(status_of(external(&queue)).await, 401);
+    assert_eq!(
+        status_of(external(&queue).basic_auth("admin", Some("password"))).await,
+        200
+    );
+    assert_eq!(status_of(queue).await, 200);
+
+    // A non-local client gets no closer to the UI by naming an API key.
+    let app = start_app_with(false, |config| {
+        optional_login(config);
+        config.general.inet_exposure = 3;
+    })
+    .await;
+    let queue = client.get(format!("{}/api/queue", app.base_url));
+    assert_eq!(
+        status_of(external(&queue).header("X-Api-Key", "any")).await,
+        403
+    );
+}
+
+#[tokio::test]
+async fn optional_login_leaves_the_sabnzbd_api_key_and_corrupt_credentials_closed() {
+    let client = reqwest::Client::new();
+    let app = start_app_with(false, |config| {
+        optional_login(config);
+        config.general.api_key = Some("sab-key".into());
+    })
+    .await;
+    let refused: serde_json::Value = client
+        .get(format!("{}/api?mode=queue&output=json", app.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(refused["status"], false, "{refused}");
+
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("credentials.json"), "{broken").unwrap();
+    assert!(CredentialStore::new(temp.path().to_path_buf()).has_credentials());
+}

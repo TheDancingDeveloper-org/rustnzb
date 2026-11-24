@@ -31,6 +31,9 @@ pub enum AuthMethod {
     /// HTTP Basic with the web credentials. The password was just presented,
     /// so this request counts as step-up without a stored window.
     Basic,
+    /// No login: `general.auth_method = "optional"` (see `web_access`).
+    /// There is no password to confirm, so step-up does not apply.
+    Open,
 }
 
 /// Recent successful step-ups, keyed by login session.
@@ -81,6 +84,7 @@ impl Default for StepUpStore {
 ///
 /// * API key → 403 `step_up_forbidden` (the confirm header is ignored).
 /// * HTTP Basic → allowed (the password authenticated this request).
+/// * Open → allowed (the login is optional and none was needed).
 /// * `X-Confirm-Password` verifies against the stored Argon2 hash. Success
 ///   records the session and allows the write. A wrong password is counted
 ///   on `throttle` the same way a failed login is: the answer is held, and
@@ -98,7 +102,7 @@ pub async fn require_step_up(
 ) -> Result<(), ApiError> {
     match method {
         AuthMethod::ApiKey => Err(ApiError::step_up_forbidden()),
-        AuthMethod::Basic => Ok(()),
+        AuthMethod::Basic | AuthMethod::Open => Ok(()),
         AuthMethod::Bearer { session } => {
             if let Some(password) = headers
                 .get(CONFIRM_HEADER)

@@ -397,7 +397,15 @@ pub async fn initialize(
     let credential_store = Arc::new(CredentialStore::new(config.general.data_dir.clone()));
     let token_store = Arc::new(TokenStore::new());
 
-    if credential_store.has_credentials() {
+    if config.general.auth_method == crate::nzb_core::config::WebAuthMethod::Optional
+        && !credential_store.has_credentials()
+    {
+        warn!(
+            inet_exposure = config.general.inet_exposure,
+            "The web login is optional and no password is set: admitted clients get full \
+             access to the web UI and native API without logging in"
+        );
+    } else if credential_store.has_credentials() {
         info!("Authentication enabled (credentials configured)");
     } else {
         info!("Authentication not yet configured; first-boot setup required");

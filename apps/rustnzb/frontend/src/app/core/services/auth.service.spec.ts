@@ -122,14 +122,25 @@ describe('AuthService', () => {
 
     await expect(firstValueFrom(service.ensureSession())).resolves.toBe(true);
 
-    expect(http.get).not.toHaveBeenCalled();
+    expect(http.get).not.toHaveBeenCalledWith('/api/status');
     expect(http.post).toHaveBeenCalledWith('/api/auth/refresh', { refresh_token: 'old-refresh' });
     expect(service.getAccessToken()).toBe('access-1');
   });
 
-  it('reports no session without contacting the server when no token is stored', async () => {
+  it('reports no session when no token is stored and a login is required', async () => {
     await expect(firstValueFrom(service.ensureSession())).resolves.toBe(false);
-    expect(http.get).not.toHaveBeenCalled();
+    expect(http.get).not.toHaveBeenCalledWith('/api/status');
+  });
+
+  it('needs no session when the server makes the login optional', async () => {
+    http.get.mockReturnValue(
+      of({ auth_enabled: false, setup_required: false, login_required: false }),
+    );
+    await expect(firstValueFrom(service.ensureSession())).resolves.toBe(true);
+    expect(service.authenticated()).toBe(true);
+    expect(service.open()).toBe(true);
+    service.clearTokens();
+    expect(service.authenticated()).toBe(false);
   });
 
   it('marks the session authenticated immediately after login', () => {

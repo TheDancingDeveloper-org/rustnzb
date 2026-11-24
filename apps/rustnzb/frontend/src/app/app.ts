@@ -325,9 +325,11 @@ export function documentTitle(
             >
               ?
             </button>
-            <button class="action muted" (click)="onLogout()" [title]="'actions.signOut' | t">
-              {{ 'actions.signOut' | t }}
-            </button>
+            @if (!loginOptional()) {
+              <button class="action muted" (click)="onLogout()" [title]="'actions.signOut' | t">
+                {{ 'actions.signOut' | t }}
+              </button>
+            }
           </div>
         </nav>
 
@@ -706,6 +708,8 @@ export class App implements OnInit, OnDestroy {
   offline = signal(false);
   webdavEnabled = signal(false);
   readonly authenticated: Signal<boolean>;
+  /** No login was needed, so there is nothing to sign out of. */
+  readonly loginOptional: Signal<boolean>;
   private readonly currentUrl = signal('');
   // Keyed on the route as well as the session: swapping branches rebuilds the
   // router outlet, and doing that under /login mid-submit would re-run the
@@ -777,6 +781,7 @@ export class App implements OnInit, OnDestroy {
     this.liveState = liveState ?? new LiveStateService(api);
     this.paused = pauseState.paused;
     this.authenticated = authService.authenticated;
+    this.loginOptional = authService.open;
     this.currentUrl.set(router.url);
     this.liveStateSub = this.liveState.onSnapshot((snapshot) => {
       this.applyLiveStatus(snapshot.status);

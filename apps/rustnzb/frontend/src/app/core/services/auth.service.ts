@@ -1,10 +1,12 @@
 import { Injectable, computed, signal } from '@angular/core';
 import { HttpClient, HttpErrorResponse } from '@angular/common/http';
-import { Observable, catchError, filter, finalize, fromEvent, map, of, shareReplay, take, tap, throwError, timeout } from 'rxjs';
+import { Observable, catchError, filter, finalize, fromEvent, map, of, shareReplay, switchMap, take, tap, throwError, timeout } from 'rxjs';
 
 export interface AuthStatus {
   auth_enabled: boolean;
   setup_required: boolean;
+  /** False when this client may use the UI without logging in. */
+  login_required?: boolean;
 }
 
 export interface SetupStatus {
@@ -38,7 +40,11 @@ export class AuthService {
   // restart (or expiry) invalidates it. Chrome and guarded routes wait until
   // the token has been confirmed against the server once per page load.
   private readonly verified = signal(false);
-  readonly authenticated = computed(() => !!this.accessToken() && this.verified());
+  /** The server lets this client in without a login. */
+  readonly open = signal(false);
+  readonly authenticated = computed(
+    () => this.open() || (!!this.accessToken() && this.verified()),
+  );
 
   private refresh$: Observable<TokenResponse> | null = null;
   private lastSpentRefresh: string | null = null;
@@ -138,33 +144,44 @@ export class AuthService {
 
   /**
    * Resolve whether the stored session is usable, confirming it with the
-   * server on first use. Emits false (and clears tokens) when the server
+   * server on first use. The login may be optional for
+   * this client, so the server is asked that first. Emits false (and clears tokens) when the server
    * rejects it; a network failure leaves the session in place.
    */
   ensureSession(): Observable<boolean> {
-    if (!this.getAccessToken()) return of(false);
-    if (this.verified()) return of(true);
+    if (this.authenticated()) return of(true);
     if (!this.verify$) {
-      const probe$: Observable<unknown> = this.accessTokenExpired()
-        ? this.refresh()
-        : this.http.get('/api/status');
-      this.verify$ = probe$.pipe(
-        map(() => true),
-        catchError((err) => {
-          const probed = this.getAccessToken();
-          const rejected =
-            err instanceof HttpErrorResponse && (err.status === 401 || err.status === 403);
-          const replaced = this.getAccessToken() !== probed;
-          if (rejected && !replaced) this.clearTokens();
-          return of(!rejected || replaced);
-        }),
-        map((ok) => ok && this.isLoggedIn()),
-        tap((ok) => this.verified.set(ok)),
+      this.verify$ = this.checkAuth().pipe(
+        map((status) => status.login_required === false),
+        // Unreachable or refused: let the stored session decide.
+        catchError(() => of(false)),
+        tap((open) => this.open.set(open)),
+        switchMap((open) => (open ? of(true) : this.verifyStoredSession())),
         finalize(() => (this.verify$ = null)),
         shareReplay({ bufferSize: 1, refCount: false }),
       );
     }
     return this.verify$;
+  }
+
+  private verifyStoredSession(): Observable<boolean> {
+    if (!this.getAccessToken()) return of(false);
+    const probe$: Observable<unknown> = this.accessTokenExpired()
+      ? this.refresh()
+      : this.http.get('/api/status');
+    return probe$.pipe(
+      map(() => true),
+      catchError((err) => {
+        const probed = this.getAccessToken();
+        const rejected =
+          err instanceof HttpErrorResponse && (err.status === 401 || err.status === 403);
+        const replaced = this.getAccessToken() !== probed;
+        if (rejected && !replaced) this.clearTokens();
+        return of(!rejected || replaced);
+      }),
+      map((ok) => ok && this.isLoggedIn()),
+      tap((ok) => this.verified.set(ok)),
+    );
   }
 
   isLoggedIn(): boolean {
@@ -224,5 +241,7 @@ export class AuthService {
     localStorage.removeItem(EXPIRES_KEY);
     this.accessToken.set(null);
     this.verified.set(false);
+    // A 401 ends here too: re-check whether a login is needed.
+    this.open.set(false);
   }
 }

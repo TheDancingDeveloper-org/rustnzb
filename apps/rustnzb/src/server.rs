@@ -24,6 +24,7 @@ use nzb_web::auth;
 use nzb_web::error::ApiError;
 use nzb_web::sabnzbd_compat;
 use nzb_web::state::AppState;
+use nzb_web::web_access;
 
 /// Largest request body the `/api/auth/*` endpoints accept.
 pub const AUTH_BODY_LIMIT: usize = 16 * 1024;
@@ -380,6 +381,20 @@ async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
     response
 }
 
+fn access_denied() -> ApiError {
+    ApiError::from((
+        StatusCode::FORBIDDEN,
+        "access denied by inet_exposure, local_ranges or host_whitelist",
+    ))
+}
+
+fn cross_site_refused() -> ApiError {
+    ApiError::from((
+        StatusCode::FORBIDDEN,
+        "refusing a cross-site request; browser clients must send X-Requested-With",
+    ))
+}
+
 fn build_api_router(state: Arc<AppState>) -> Router {
     // No CorsLayer. The previous layer allowed any origin and any header,
     // which let a foreign page drive the API from a browser. Same-origin is
@@ -401,6 +416,28 @@ fn build_api_router(state: Arc<AppState>) -> Router {
         // login paths should not hold the 200 MB upload limit's worth of
         // memory per request while a guess waits for a hashing slot.
         .layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT));
+    let access_state = state.clone();
+    let auth_routes = auth_routes.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: Next| {
+            let state = access_state.clone();
+            async move {
+                if !web_access::admitted(
+                    &state,
+                    request.extensions(),
+                    request.headers(),
+                    web_access::ACCESS_WEB_UI,
+                ) {
+                    return Err(access_denied());
+                }
+                if web_access::login_optional(&state, request.extensions(), request.headers())
+                    && web_access::cross_site_write(request.method(), request.headers())
+                {
+                    return Err(cross_site_refused());
+                }
+                Ok(next.run(request).await)
+            }
+        },
+    ));
 
     // Native REST API (protected by auth middleware)
     let api_routes = Router::new()
@@ -631,6 +668,17 @@ fn build_api_router(state: Arc<AppState>) -> Router {
             let credential_store = credential_store.clone();
             let auth_state = auth_state.clone();
             async move {
+                // SABnzbd's access rules; they admit everyone unless the web
+                // login is optional.
+                let access = if headers.contains_key("X-Api-Key") {
+                    web_access::ACCESS_API
+                } else {
+                    web_access::ACCESS_WEB_UI
+                };
+                if !web_access::admitted(&auth_state, request.extensions(), &headers, access) {
+                    return Err(access_denied());
+                }
+
                 // API key (X-Api-Key header) — config-based, bypasses session/credential auth
                 if let Some(ref expected) = auth_state.config().general.api_key
                     && let Some(provided) = headers.get("X-Api-Key").and_then(|h| h.to_str().ok())
@@ -642,6 +690,28 @@ fn build_api_router(state: Arc<AppState>) -> Router {
                         return Ok(next.run(request).await);
                     }
                     return Err(ApiError::unauthorized());
+                }
+
+                // Optional login: an admitted client needs none. A leftover
+                // token or the proxy's own Authorization header is ignored.
+                // ACCESS_API is not enough here: without a configured key,
+                // sending X-Api-Key must not lower the bar.
+                if web_access::login_optional(&auth_state, request.extensions(), &headers) {
+                    if !web_access::admitted(
+                        &auth_state,
+                        request.extensions(),
+                        &headers,
+                        web_access::ACCESS_WEB_UI,
+                    ) {
+                        return Err(access_denied());
+                    }
+                    if web_access::cross_site_write(request.method(), &headers) {
+                        return Err(cross_site_refused());
+                    }
+                    request
+                        .extensions_mut()
+                        .insert(nzb_web::step_up::AuthMethod::Open);
+                    return Ok(next.run(request).await);
                 }
 
                 // Before first-boot setup, only the setup endpoints may be
