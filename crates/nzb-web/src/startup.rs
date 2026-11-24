@@ -201,91 +201,68 @@ pub struct StartupResult {
 
 /// Exclusive lock on `<data_dir>/rustnzb.lock` ensuring only one rustnzb
 /// instance uses a given data directory at a time. Released on drop.
+///
+/// Uses the std file lock (`flock` on Unix, `LockFileEx` on Windows): it
+/// excludes other rustnzb instances, but other programs can still open the file.
 pub struct InstanceLock {
-    #[cfg(unix)]
-    _file: std::fs::File,
-    #[cfg(windows)]
-    _file: std::fs::File,
+    file: std::fs::File,
 }
 
-#[cfg(unix)]
 impl InstanceLock {
     fn acquire(data_dir: &Path) -> anyhow::Result<Self> {
-        use std::os::unix::io::AsRawFd;
-
-        let file = open_lock_options()
-            .open(lock_path(data_dir))
-            .with_context(|| format!("failed to open {}", lock_path(data_dir).display()))?;
-        let fd = file.as_raw_fd();
-        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                anyhow::bail!(
-                    "another rustnzb instance is using {}; stop it or choose a different data_dir",
-                    data_dir.display()
-                );
-            }
-            return Err(err).context(format!("failed to lock {}", lock_path(data_dir).display()));
-        }
-        Ok(Self { _file: file })
-    }
-}
-
-#[cfg(windows)]
-impl InstanceLock {
-    fn acquire(data_dir: &Path) -> anyhow::Result<Self> {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        // share_mode(0) denies all sharing: a second open fails outright.
+        let path = lock_path(data_dir);
+        // Deliberately no truncate: the lock file's contents are irrelevant and
+        // truncating would churn the file on every start.
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .share_mode(0)
-            .open(lock_path(data_dir))
+            .truncate(false)
+            .open(&path)
             .map_err(|err| {
-                if err.raw_os_error() == Some(32) {
-                    anyhow::anyhow!(
-                        "another rustnzb instance is using {}; stop it or choose a different data_dir",
-                        data_dir.display()
-                    )
+                if is_sharing_violation(&err) {
+                    already_running(data_dir)
                 } else {
-                    anyhow::Error::new(err).context(format!(
-                        "failed to lock {}",
-                        lock_path(data_dir).display()
-                    ))
+                    anyhow::Error::new(err).context(format!("failed to open {}", path.display()))
                 }
             })?;
-        Ok(Self { _file: file })
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(already_running(data_dir)),
+            Err(std::fs::TryLockError::Error(err)) => {
+                Err(err).context(format!("failed to lock {}", path.display()))
+            }
+        }
     }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // Unlock explicitly rather than relying on close: a duplicated handle
+        // (e.g. in a child between fork and exec) would keep the lock alive,
+        // and Windows does not promise a prompt release on close.
+        if let Err(err) = self.file.unlock() {
+            warn!(error = %err, "failed to release the instance lock");
+        }
+    }
+}
+
+fn already_running(data_dir: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "another rustnzb instance is using {}; stop it or choose a different data_dir",
+        data_dir.display()
+    )
+}
+
+/// Releases that predate the std file lock open the lock file on Windows with
+/// no sharing, so one that is still running fails our open, not our lock.
+fn is_sharing_violation(err: &std::io::Error) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    cfg!(windows) && err.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
 }
 
 fn lock_path(data_dir: &Path) -> PathBuf {
     data_dir.join("rustnzb.lock")
-}
-
-fn open_lock_options() -> std::fs::OpenOptions {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
-    // Deliberately no truncate: the lock file's contents are irrelevant and
-    // truncating would churn the file on every start.
-    options
-}
-
-#[cfg(unix)]
-impl Drop for InstanceLock {
-    fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
-
-#[cfg(windows)]
-impl Drop for InstanceLock {
-    fn drop(&mut self) {
-        // Closing the file handle releases the exclusive share.
-    }
 }
 
 /// Acquire the single-instance lock for `data_dir`.
@@ -549,6 +526,131 @@ mod tests {
         // Releasing the first lock lets a later instance acquire it again.
         drop(first);
         acquire_instance_lock(&data_dir).unwrap();
+    }
+
+    const LOCK_CHILD_DIR: &str = "RUSTNZB_TEST_LOCK_CHILD_DIR";
+
+    /// Not a test on its own: the process that `spawn_lock_child` re-executes.
+    /// Reports the outcome on stderr and, if it got the lock, holds it until
+    /// stdin closes.
+    #[test]
+    fn instance_lock_child_process() {
+        use std::io::Read;
+
+        let Some(dir) = std::env::var_os(LOCK_CHILD_DIR) else {
+            return;
+        };
+        match acquire_instance_lock(std::path::Path::new(&dir)) {
+            Ok(_lock) => {
+                eprintln!("LOCK-CHILD acquired");
+                let _ = std::io::stdin().read_to_end(&mut Vec::new());
+            }
+            Err(err) => eprintln!("LOCK-CHILD {err:?}"),
+        }
+    }
+
+    /// Run `acquire_instance_lock` in another process; returns the child and
+    /// the outcome it reported.
+    fn spawn_lock_child(data_dir: &std::path::Path) -> (std::process::Child, String) {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "startup::tests::instance_lock_child_process",
+                "--nocapture",
+            ])
+            .env(LOCK_CHILD_DIR, data_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let outcome = std::io::BufReader::new(child.stderr.take().unwrap())
+            .lines()
+            .map(|line| line.unwrap())
+            .find_map(|line| line.strip_prefix("LOCK-CHILD ").map(str::to_owned))
+            .expect("child should report a lock outcome");
+        (child, outcome)
+    }
+
+    #[test]
+    fn instance_lock_excludes_other_processes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let expected = format!(
+            "another rustnzb instance is using {}; stop it or choose a different data_dir",
+            data_dir.display()
+        );
+
+        // Held here: another process is refused with the operator message.
+        let lock = acquire_instance_lock(data_dir).unwrap();
+        let (mut child, outcome) = spawn_lock_child(data_dir);
+        assert!(child.wait().unwrap().success());
+        assert_eq!(outcome, expected);
+
+        // Dropped here: another process gets it, and this one is refused.
+        drop(lock);
+        let (mut child, outcome) = spawn_lock_child(data_dir);
+        assert_eq!(outcome, "acquired");
+        let err = acquire_instance_lock(data_dir).err().expect("child holds");
+        assert_eq!(err.to_string(), expected);
+
+        // Dropped there: the lock is free again.
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        acquire_instance_lock(data_dir).unwrap();
+    }
+
+    /// A crashed instance must not leave the data directory locked. Unix only:
+    /// Windows releases a killed process's locks at an unspecified later time.
+    #[cfg(unix)]
+    #[test]
+    fn killed_instance_releases_its_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut child, outcome) = spawn_lock_child(tmp.path());
+        assert_eq!(outcome, "acquired");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        acquire_instance_lock(tmp.path()).unwrap();
+    }
+
+    /// Releases before the std lock took `flock` (Unix) or denied sharing
+    /// (Windows). Old and new must still exclude each other during an upgrade.
+    #[test]
+    fn excludes_a_release_that_predates_the_std_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 0);
+        let old_acquire = || -> std::io::Result<std::fs::File> {
+            let file = options.open(super::lock_path(tmp.path()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                // SAFETY: the descriptor is open for the duration of the call.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(file)
+        };
+
+        let old = old_acquire().unwrap();
+        let err = acquire_instance_lock(tmp.path()).err().expect("old holds");
+        assert!(err.to_string().contains("another rustnzb instance"));
+        // Those releases also unlocked explicitly on Unix, which matters here:
+        // a child another test is spawning may briefly hold a duplicate.
+        #[cfg(unix)]
+        old.unlock().unwrap();
+        drop(old);
+
+        let new = acquire_instance_lock(tmp.path()).unwrap();
+        assert!(old_acquire().is_err());
+        drop(new);
+        old_acquire().unwrap();
     }
 
     /// Desktop `start_engine` moves `StartupResult.instance_lock` into process
