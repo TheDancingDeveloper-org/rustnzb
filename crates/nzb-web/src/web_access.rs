@@ -48,7 +48,7 @@ pub fn admitted(
     let general = &state.config().general;
     let allowed = check_access(general, peer(extensions), headers, access)
         && (state.credential_store.has_credentials() || check_hostname(general, headers));
-    if !allowed {
+    if !allowed && warn_due() {
         tracing::warn!(
             "Refused connection from {}",
             peer(extensions).map_or_else(|| "an unknown address".to_owned(), |ip| ip.to_string())
@@ -72,6 +72,18 @@ pub fn login_optional(
     !state.credential_store.has_credentials()
         || (general.inet_exposure == 5
             && check_access(general, peer(extensions), headers, ACCESS_LOCAL_ONLY))
+}
+
+/// Refusals are logged at most once a minute, so an exposed port cannot flood
+/// the log.
+fn warn_due() -> bool {
+    static LAST: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
+    let mut last = LAST.lock();
+    let due = last.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60));
+    if due {
+        *last = Some(std::time::Instant::now());
+    }
+    due
 }
 
 fn check_access(

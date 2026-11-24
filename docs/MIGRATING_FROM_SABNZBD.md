@@ -57,7 +57,8 @@ Open `http://localhost:9090`.
 ## 2. Import your SABnzbd settings
 
 On first start rustnzb asks you to create a login, then opens the **Welcome**
-screen. Later, the "Add a server" banner or `/welcome` opens it again.
+screen. To run without one, as SABnzbd can, see
+[Optional web login](CONFIGURATION.md#optional-web-login). Later, the "Add a server" banner or `/welcome` opens it again.
 Choose **Import from SABnzbd**, then either:
 
 - **Live instance:** enter SABnzbd's URL and its API key (SABnzbd → Config →

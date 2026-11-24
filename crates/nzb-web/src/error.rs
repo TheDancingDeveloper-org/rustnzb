@@ -63,6 +63,15 @@ impl ApiError {
         }
     }
 
+    /// 403 `error_kind: access_denied`. Refused before any login: the client
+    /// is not admitted by the optional-login access rules.
+    pub const fn access_denied(msg: &'static str) -> Self {
+        Self {
+            status: Some(StatusCode::FORBIDDEN),
+            kind: ApiErrorKind::AccessDenied(msg),
+        }
+    }
+
     /// 403 `error_kind: step_up_required`. Distinct from 401 so clients do
     /// not treat a missing password confirmation as an expired session.
     pub const fn step_up_required() -> Self {
@@ -194,6 +203,9 @@ pub enum ApiErrorKind {
     ServerNotFound(String),
     #[error("unauthorized")]
     Unauthorized,
+    /// Refused by `web_access`; no login would help.
+    #[error("{0}")]
+    AccessDenied(&'static str),
     /// Sensitive write without a recent password confirmation. 403, not 401:
     /// the session is still valid, so the GUI must not refresh it.
     #[error("step-up re-authentication required")]
@@ -253,6 +265,7 @@ impl Serialize for ApiError {
                     "server_not_found"
                 }
                 ApiErrorKind::Unauthorized => "unauthorized",
+                ApiErrorKind::AccessDenied(_) => "access_denied",
                 ApiErrorKind::StepUpRequired => "step_up_required",
                 ApiErrorKind::StepUpForbidden => "step_up_forbidden",
                 ApiErrorKind::AdmissionConflict

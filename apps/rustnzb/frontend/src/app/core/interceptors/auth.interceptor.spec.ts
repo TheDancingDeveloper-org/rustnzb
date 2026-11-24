@@ -85,6 +85,19 @@ const unauthorized = (url: string) =>
 describe('authInterceptor', () => {
   afterEach(() => TestBed.resetTestingModule());
 
+  it.each([
+    ['POST', '/api/queue/pause', 'rustnzb'],
+    ['GET', '/api/queue', null],
+    ['DELETE', '/dav/file', null],
+  ] as const)('marks writes to the API as its own: %s %s', async (method, url, expected) => {
+    const { run } = setup('');
+    const next = vi.fn((_: HttpRequest<unknown>) => of(new HttpResponse({ status: 200 })));
+    const req = method === 'POST' ? new HttpRequest(method, url, {}) : new HttpRequest(method, url);
+    await run(req as HttpRequest<unknown>, next);
+    expect(next.mock.calls[0][0].headers.get('X-Requested-With')).toBe(expected);
+    expect(next.mock.calls[0][0].headers.has('Authorization')).toBe(false);
+  });
+
   it('refreshes and retries API requests that get a 401', async () => {
     const { auth, run } = setup();
     const next = vi

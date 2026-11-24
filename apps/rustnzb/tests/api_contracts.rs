@@ -34,7 +34,19 @@ async fn start_app_with(
     with_credentials: bool,
     configure: impl FnOnce(&mut AppConfig),
 ) -> ContractApp {
+    start_app_seeded(with_credentials, configure, None).await
+}
+
+/// Like [`start_app_with`], with `credentials.json` already on disk.
+async fn start_app_seeded(
+    with_credentials: bool,
+    configure: impl FnOnce(&mut AppConfig),
+    credentials_file: Option<&str>,
+) -> ContractApp {
     let temp = tempfile::tempdir().unwrap();
+    if let Some(contents) = credentials_file {
+        std::fs::write(temp.path().join("credentials.json"), contents).unwrap();
+    }
     let config_path = temp.path().join("config.toml");
     let mut config = AppConfig::default();
     configure(&mut config);
@@ -2300,7 +2312,10 @@ async fn optional_login_opens_the_api_only_while_no_password_is_set() {
     );
     // Not local, or under an unknown host name.
     let forwarded = queue(&app).header("X-Forwarded-For", "203.0.113.1");
-    assert_eq!(status_of(forwarded).await, 403);
+    let denied = forwarded.send().await.unwrap();
+    assert_eq!(denied.status(), 403);
+    let denied: serde_json::Value = denied.json().await.unwrap();
+    assert_eq!(denied["error_kind"], "access_denied");
     assert_eq!(
         status_of(queue(&app).header("Host", "evil.example")).await,
         403
@@ -2389,7 +2404,25 @@ async fn optional_login_leaves_the_sabnzbd_api_key_and_corrupt_credentials_close
         .unwrap();
     assert_eq!(refused["status"], false, "{refused}");
 
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("credentials.json"), "{broken").unwrap();
-    assert!(CredentialStore::new(temp.path().to_path_buf()).has_credentials());
+    // An API key still cannot make a sensitive write.
+    let response = client
+        .put(format!("{}/api/config/general", app.base_url))
+        .header("X-Api-Key", "sab-key")
+        .json(&serde_json::json!({"port": 9191}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error_kind"], "step_up_forbidden");
+    // Neither does a wrong key fall through to open access.
+    let wrong = client
+        .get(format!("{}/api/queue", app.base_url))
+        .header("X-Api-Key", "wrong");
+    assert_eq!(status_of(wrong).await, 401);
+
+    // A damaged credentials.json is not "no password".
+    let app = start_app_seeded(false, optional_login, Some("{broken")).await;
+    let queue = client.get(format!("{}/api/queue", app.base_url));
+    assert_eq!(status_of(queue).await, 401);
 }
