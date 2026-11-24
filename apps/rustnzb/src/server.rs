@@ -382,17 +382,13 @@ async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
 }
 
 fn access_denied() -> ApiError {
-    ApiError::from((
-        StatusCode::FORBIDDEN,
-        "access denied by inet_exposure, local_ranges or host_whitelist",
-    ))
+    ApiError::access_denied("access denied by inet_exposure, local_ranges or host_whitelist")
 }
 
 fn cross_site_refused() -> ApiError {
-    ApiError::from((
-        StatusCode::FORBIDDEN,
+    ApiError::access_denied(
         "refusing a cross-site request; browser clients must send X-Requested-With",
-    ))
+    )
 }
 
 fn build_api_router(state: Arc<AppState>) -> Router {

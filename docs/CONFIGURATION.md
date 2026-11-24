@@ -191,7 +191,9 @@ password set, so damage never opens the UI; a missing one does open it.
   is `false`. Others get 403, with or without a password.
 - `inet_exposure` admits non-local clients: `3` to the native API with its
   key, `4` to the web UI too, `5` as `4` but local clients skip a set login
-  and only non-local ones are asked. `0` to `2` admit none.
+  and only non-local ones are asked. `0` to `2` admit none. **With no password,
+  `4` and `5` give anyone who can reach the port full control**; use them only
+  behind a proxy that authenticates or filters clients, or with a password.
 - Without a password, the host name must be `localhost`, an IP address,
   `*.local`, this machine's name or in `host_whitelist`. Behind a proxy, list
   the public name.
