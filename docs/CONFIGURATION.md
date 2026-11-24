@@ -160,12 +160,48 @@ use `RUSTNZB_ALLOWED_ROOTS=/downloads:/data:/config`.
 | `fetch_allow_private` | `false` | Let URL fetches (add-url, SABnzbd `addurl`, RSS, SABnzbd import) reach private LAN addresses. Loopback and link-local addresses stay blocked. |
 | `fetch_allowed_hosts` | `[]` | Hosts that URL fetches may always reach: IP addresses, CIDR blocks or exact hostnames, such as `["prowlarr", "192.168.1.0/24"]`. |
 | `trusted_proxies` | `[]` | Reverse proxies whose `X-Forwarded-For` header is believed: IP addresses or CIDR blocks. Wrong web-login passwords are delayed per client address (see [Login brute-force protection](#login-brute-force-protection)). Behind a reverse proxy every request arrives from the proxy, so all clients share one failure count until the proxy is listed here. For a reverse-proxied install (for example rustnzb behind Caddy), set it to the proxy's address or its Docker network, such as `["172.18.0.0/16"]`. The client is the rightmost `X-Forwarded-For` address that is not itself a trusted proxy. Leave it empty when rustnzb is reached directly; a listed address can then claim any client address. Read on every login, so a change needs no restart. |
+| `auth_method` | `"login"` | `"optional"` makes the web login optional, as in SABnzbd (see [Optional web login](#optional-web-login)). Applied at start. |
+| `inet_exposure` | `0` | With `optional`: what non-local clients may reach, 0 to 5. |
+| `local_ranges` | `[]` | With `optional`: networks that count as local. Empty means private and link-local addresses. |
+| `host_whitelist` | `[]` | With `optional` and no password: host names the UI may be visited under. |
+| `verify_xff_header` | `true` | With `optional`: every `X-Forwarded-For` address must be local too. |
 | `group_max_headers` | `100000` | Headers kept per newsgroup, oldest pruned first. `0` keeps all. |
 | `shutdown_timeout_secs` | `30` | Wait for connections and downloads on SIGINT/SIGTERM before exiting. `0` waits forever. |
 
 Scripts run without a shell, with SABnzbd's positional arguments (final
 directory, NZB name, job name, report number, category, group, status 0-3,
 URL) and `SAB_*` / `NZBPP_*` environment variables, described below.
+
+### Optional web login
+
+```toml
+[general]
+auth_method = "optional"
+host_whitelist = ["nzb.example.com"]
+```
+
+This follows SABnzbd. While no password is set, the web UI and native API are
+open to every admitted client, and startup logs a warning. With a password
+set, the login is required. An unusable `credentials.json` counts as a
+password set, so damage never opens the UI; a missing one does open it.
+
+- Only local clients are admitted: loopback, and `local_ranges` or else
+  private and link-local addresses. Behind a reverse proxy every
+  `X-Forwarded-For` address must be local as well, unless `verify_xff_header`
+  is `false`. Others get 403, with or without a password.
+- `inet_exposure` admits non-local clients: `3` to the native API with its
+  key, `4` to the web UI too, `5` as `4` but local clients skip a set login
+  and only non-local ones are asked. `0` to `2` admit none.
+- Without a password, the host name must be `localhost`, an IP address,
+  `*.local`, this machine's name or in `host_whitelist`. Behind a proxy, list
+  the public name.
+- Sensitive settings ask for no password confirmation.
+- Browser writes from another site are refused where no login was needed. The
+  web UI sends `X-Requested-With`; scripts outside a browser need nothing.
+- First-boot setup is not mandatory. `POST /api/auth/setup` sets a password.
+
+The SABnzbd-compatible API, whose key is checked as before, and `/dav` do not
+change. `inet_exposure` does not apply to them.
 
 ### Login brute-force protection
 

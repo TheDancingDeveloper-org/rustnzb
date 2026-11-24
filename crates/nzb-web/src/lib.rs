@@ -23,6 +23,7 @@ pub mod startup;
 pub mod state;
 pub mod step_up;
 pub mod util;
+pub mod web_access;
 
 pub use log_buffer::{LogBuffer, LogBufferLayer};
 pub use nzb_dispatch::{ArticleFailure, ArticleFailureKind};

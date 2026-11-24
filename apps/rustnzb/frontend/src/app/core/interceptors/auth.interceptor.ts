@@ -40,6 +40,12 @@ export const authInterceptor: HttpInterceptorFn = (req, next) => {
   const router = inject(Router);
   const dialog = inject(MatDialog);
 
+  // With an optional login there may be no token, so this header is what
+  // tells the server a write is not a foreign page's doing.
+  if (req.method !== 'GET' && !isWebDavRequest(req.url)) {
+    req = req.clone({ setHeaders: { 'X-Requested-With': 'rustnzb' } });
+  }
+
   const token = authService.getAccessToken();
   if (token && !req.headers.has('Authorization')) {
     req = withToken(req, token);

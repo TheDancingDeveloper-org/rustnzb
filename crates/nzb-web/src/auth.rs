@@ -889,6 +889,9 @@ type ApiState = Arc<AppState>;
 pub struct AuthStatus {
     pub auth_enabled: bool,
     pub setup_required: bool,
+    /// False when this client may use the web UI without logging in
+    /// (`general.auth_method = "optional"`).
+    pub login_required: bool,
 }
 
 #[utoipa::path(
@@ -896,16 +899,21 @@ pub struct AuthStatus {
     path = "/api/auth/status",
     tag = "auth",
     summary = "Authentication status",
-    description = "Reports whether credentials are configured and whether the first-boot setup wizard is required.",
+    description = "Reports whether credentials are configured, whether the first-boot setup wizard is required, and whether this client has to log in.",
     responses(
         (status = 200, description = "Authentication state", body = AuthStatus),
     ),
 )]
-pub async fn h_auth_status(State(state): State<ApiState>) -> impl IntoResponse {
+pub async fn h_auth_status(
+    State(state): State<ApiState>,
+    extensions: http::Extensions,
+    headers: http::HeaderMap,
+) -> impl IntoResponse {
     let has_stored_creds = state.credential_store.has_credentials();
     Json(AuthStatus {
         auth_enabled: has_stored_creds,
-        setup_required: !has_stored_creds,
+        setup_required: !has_stored_creds && !crate::web_access::optional(&state),
+        login_required: !crate::web_access::login_optional(&state, &extensions, &headers),
     })
 }
 

@@ -1852,6 +1852,11 @@ async fn ensure_step_up(
     extensions: Option<&http::Extensions>,
     method: Option<AuthMethod>,
 ) -> Result<(), ApiError> {
+    // SABnzbd has no password confirmation, so its rules leave none. An API
+    // key still cannot make sensitive writes.
+    if nzb_web::web_access::optional(state) && method.is_some_and(|m| m != AuthMethod::ApiKey) {
+        return Ok(());
+    }
     let client =
         extensions.and_then(|extensions| nzb_web::auth::client_ip(state, extensions, headers));
     let Some(method) = method else {
@@ -2309,7 +2314,7 @@ fn enforce_bind_policy(
     if bind_is_loopback(next.general.listen_addr.trim()) {
         return Ok(());
     }
-    if !state.credential_store.has_credentials() {
+    if !state.credential_store.has_credentials() && !nzb_web::web_access::optional(state) {
         return Err(ApiError::from((
             StatusCode::BAD_REQUEST,
             "refusing a non-loopback listen address while web login is disabled; enable authentication first, or bind 127.0.0.1".to_string(),
@@ -4719,6 +4724,17 @@ pub(crate) const SETTINGS_AUDIT: &[(&str, Result<&str, &str>)] = &[
         ),
     ),
     (
+        "general.auth_method",
+        Err("read at startup; decides whether the web login is mandatory"),
+    ),
+    (
+        "general.inet_exposure",
+        Err("who may reach an optional-login install; TOML only, as auth_method"),
+    ),
+    ("general.local_ranges", Err("as inet_exposure")),
+    ("general.host_whitelist", Err("as inet_exposure")),
+    ("general.verify_xff_header", Err("as inet_exposure")),
+    (
         "general.step_up_ttl_secs",
         Err(
             "read at startup; how long a confirmed password authorises sensitive writes (default 300s)",
@@ -5021,7 +5037,7 @@ pub async fn h_general_update(
         let next = addr.trim();
         let changed = next != current.general.listen_addr.trim();
         if changed && !bind_is_loopback(next) {
-            if !state.credential_store.has_credentials() {
+            if !state.credential_store.has_credentials() && !nzb_web::web_access::optional(&state) {
                 return Err(ApiError::bad_request(
                     "refusing a non-loopback listen address while web login is disabled; enable authentication first, or bind 127.0.0.1",
                 ));

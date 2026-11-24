@@ -111,6 +111,18 @@ impl std::str::FromStr for DuplicatePolicy {
     }
 }
 
+/// Whether the web login is mandatory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WebAuthMethod {
+    /// rustnzb's own login (default).
+    #[default]
+    Login,
+    /// SABnzbd's rules: no login while no password is set, for clients that
+    /// `inet_exposure`, `local_ranges` and `host_whitelist` admit.
+    Optional,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct GeneralConfig {
@@ -281,6 +293,27 @@ pub struct GeneralConfig {
     /// ignores `X-Forwarded-For`.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// `login` (the default) always requires the web login. `optional`
+    /// follows SABnzbd: no login while no password is set. Read at startup.
+    /// The four settings below apply only to `optional`.
+    #[serde(default)]
+    pub auth_method: WebAuthMethod,
+    /// SABnzbd's external access level: what non-local clients may reach.
+    /// 0 to 2 nothing, 3 the native API with its key, 4 also the web UI,
+    /// 5 the web UI with the login asked of non-local clients only.
+    #[serde(default)]
+    pub inet_exposure: u8,
+    /// Networks that count as local (IP addresses or CIDR blocks). Empty
+    /// means private and link-local addresses. Loopback is always local.
+    #[serde(default)]
+    pub local_ranges: Vec<String>,
+    /// Host names the web UI may be visited under while no password is set,
+    /// besides localhost, IP addresses, `*.local` and this machine's name.
+    #[serde(default)]
+    pub host_whitelist: Vec<String>,
+    /// Also require every `X-Forwarded-For` address to be local.
+    #[serde(default = "default_true")]
+    pub verify_xff_header: bool,
     /// How long a confirmed password authorises further sensitive writes,
     /// in seconds. Default 300 (five minutes). `0` means every sensitive
     /// write must present the password again.
@@ -427,6 +460,11 @@ impl Default for GeneralConfig {
             group_max_headers: default_group_max_headers(),
             shutdown_timeout_secs: default_shutdown_timeout_secs(),
             trusted_proxies: Vec::new(),
+            auth_method: WebAuthMethod::Login,
+            inet_exposure: 0,
+            local_ranges: Vec::new(),
+            host_whitelist: Vec::new(),
+            verify_xff_header: true,
         }
     }
 }
@@ -755,6 +793,16 @@ impl AppConfig {
                     "general.trusted_proxies[{i}] ({entry}) must be an IP address or CIDR block"
                 ));
             }
+        }
+        for (i, entry) in self.general.local_ranges.iter().enumerate() {
+            if parse_ip_network(entry.trim()).is_none() {
+                problems.push(format!(
+                    "general.local_ranges[{i}] ({entry}) must be an IP address or CIDR block"
+                ));
+            }
+        }
+        if self.general.inet_exposure > 5 {
+            problems.push("general.inet_exposure must be between 0 and 5".to_string());
         }
         let mut seen_ids = std::collections::HashSet::new();
         for (i, server) in self.servers.iter().enumerate() {
@@ -1277,6 +1325,25 @@ ssl = false
         let example = include_str!("../../../apps/rustnzb/config.example.toml");
         let config: AppConfig = toml::from_str(example).unwrap();
         assert!(config.validate().is_empty(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn optional_web_login_is_opt_in_and_validated() {
+        let parse = |toml: &str| toml::from_str::<GeneralConfig>(toml);
+        let general = parse("").unwrap();
+        assert_eq!(general.auth_method, WebAuthMethod::Login);
+        assert!(general.verify_xff_header);
+        assert!(parse("auth_method = \"none\"").is_err());
+
+        let cfg = AppConfig {
+            general: parse(
+                "auth_method = \"optional\"\ninet_exposure = 6\nlocal_ranges = [\"lan\"]",
+            )
+            .unwrap(),
+            ..AppConfig::default()
+        };
+        assert_eq!(cfg.general.auth_method, WebAuthMethod::Optional);
+        assert_eq!(cfg.validate().len(), 2, "{:?}", cfg.validate());
     }
 
     #[test]

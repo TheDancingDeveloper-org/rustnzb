@@ -10,7 +10,7 @@
 | `default` | Serde default. Secrets and unset options are JSON `null` or an empty string, never a live value. |
 | `apply` | `live` or `restart`. |
 | `restart_required` | `true` when `apply` is `restart`. |
-| `class` | `normal` or `sensitive`. `nzb-web::auth_class::class_of` reads this column, so a registry `sensitive` key (including `general.local_import_dir`, `general.trusted_proxies`, `general.step_up_ttl_secs`, notification URLs and tokens) requires step-up and is refused to an API key. |
+| `class` | `normal` or `sensitive`. `nzb-web::auth_class::class_of` reads this column, so a registry `sensitive` key (including `general.local_import_dir`, `general.trusted_proxies`, `general.auth_method` and its access rules, `general.step_up_ttl_secs`, notification URLs and tokens) requires step-up and is refused to an API key. |
 | `env` | Environment names, primary first. |
 | `cli` | CLI flag, when one exists. |
 | `group` | GUI section. |

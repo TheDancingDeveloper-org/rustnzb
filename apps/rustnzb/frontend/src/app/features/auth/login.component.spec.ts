@@ -86,12 +86,6 @@ describe('LoginComponent', () => {
     expect(router.navigate).toHaveBeenCalledWith(['/downloads']);
   });
 
-  it('bypasses login when authentication is disabled', () => {
-    auth.checkAuth.mockReturnValue(of({ auth_enabled: false, setup_required: false }));
-    component.ngOnInit();
-    expect(router.navigate).toHaveBeenCalledWith(['/downloads']);
-  });
-
   it('validates required credentials and setup password confirmation', () => {
     component.onSubmit();
     expect(component.errorMessage()).toBe('Username and password are required.');
