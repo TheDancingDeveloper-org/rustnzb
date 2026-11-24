@@ -92,8 +92,7 @@ describe('authInterceptor', () => {
   ] as const)('marks writes to the API as its own: %s %s', async (method, url, expected) => {
     const { run } = setup('');
     const next = vi.fn((_: HttpRequest<unknown>) => of(new HttpResponse({ status: 200 })));
-    const req = method === 'POST' ? new HttpRequest(method, url, {}) : new HttpRequest(method, url);
-    await run(req as HttpRequest<unknown>, next);
+    await run(new HttpRequest<unknown>(method as string, url, null), next);
     expect(next.mock.calls[0][0].headers.get('X-Requested-With')).toBe(expected);
     expect(next.mock.calls[0][0].headers.has('Authorization')).toBe(false);
   });
