@@ -74,6 +74,7 @@ pub const AUTH_BODY_LIMIT: usize = 16 * 1024;
         handlers::h_queue_pause_for,
         handlers::h_queue_set_priority,
         handlers::h_queue_change_category,
+        handlers::h_queue_set_password,
         handlers::h_queue_bulk_action,
         admissions::h_queue_admission_get,
         // history
@@ -442,6 +443,7 @@ fn build_api_router(state: Arc<AppState>) -> Router {
             "/queue/{id}/category",
             put(handlers::h_queue_change_category),
         )
+        .route("/queue/{id}/password", put(handlers::h_queue_set_password))
         .route("/queue/bulk", post(handlers::h_queue_bulk_action))
         .route("/queue/{id}", delete(handlers::h_queue_delete))
         // History

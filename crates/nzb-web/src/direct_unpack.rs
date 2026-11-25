@@ -306,6 +306,7 @@ fn unpack_set(
     // Spawn unrar with -vp (pause between volumes).
     // -o+ = overwrite, -y = assume yes, -vp = pause between volumes
     let mut child = match Command::new(unrar_bin)
+        .envs(nzb_postproc::unpack::extractor_locale())
         .args(["x", "-o+", "-y", "-vp"])
         .arg(&pw_flag)
         .arg(first_volume)

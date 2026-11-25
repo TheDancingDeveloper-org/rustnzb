@@ -49,6 +49,7 @@ const NATIVE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/queue/sort"),
     ("PUT", "/api/queue/{id}/priority"),
     ("PUT", "/api/queue/{id}/category"),
+    ("PUT", "/api/queue/{id}/password"),
     ("POST", "/api/queue/bulk"),
     ("DELETE", "/api/queue/{id}"),
     ("GET", "/api/history"),

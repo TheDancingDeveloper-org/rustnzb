@@ -156,6 +156,7 @@ fn configurable_paths(config: &AppConfig) -> Vec<(String, PathBuf)> {
             general.local_import_dir.as_ref(),
         ),
         ("general.scripts_dir", general.scripts_dir.as_ref()),
+        ("general.password_file", general.password_file.as_ref()),
     ] {
         if let Some(path) = path {
             paths.push((field.to_string(), path.clone()));

@@ -24,7 +24,9 @@ use mock_nntp_server::SAMPLE_GROUP;
 use mock_nntp_server::damage::{DamageRelease, seeded_bytes};
 use mock_nntp_server::fake_unrar::{self, FakeUnrar};
 use nzb_nntp::testutil::MockConfig;
+use nzb_web::nzb_core::config::EncryptedAction;
 use nzb_web::nzb_core::models::{JobFailureCode, JobStatus};
+use nzb_web::queue_manager::HistoryRetryOutcome;
 
 const TERMINAL: &[JobStatus] = &[JobStatus::Completed, JobStatus::Failed];
 const RAR5_MAGIC: &[u8] = b"Rar!\x1a\x07\x01\x00";
@@ -203,6 +205,25 @@ async fn nzb_password_unpacks_a_protected_archive() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn password_file_unpacks_a_protected_archive() {
+    let fake = fake_unrar::install();
+    let (release, volumes) = rar_release("e2epwfile", 0x1757_1005, &[1, 2]);
+    fake.register("e2epwfile", &refs(&volumes), Some("letmein"));
+    let engine = engine(&release, &BTreeSet::new()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let passwords = dir.path().join("passwords.txt");
+    std::fs::write(&passwords, "wrong\n\nletmein\nunused\n").unwrap();
+    engine.queue_manager.set_password_file(Some(passwords));
+
+    let xml = with_password(release.nzb_xml(&[]), "alsowrong");
+    let (status, code) = run(&engine, "e2epwfile", xml).await;
+
+    assert_eq!(status, JobStatus::Completed, "failure code: {code:?}");
+    let files = files_under(&engine.complete_dir);
+    assert_eq!(named(&files, "e2epwfile.mkv").len(), 1, "{files:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn protected_archive_without_a_password_fails_typed() {
     let fake = fake_unrar::install();
     let (release, volumes) = rar_release("e2enopw", 0x1757_1004, &[1, 2]);
@@ -218,4 +239,219 @@ async fn protected_archive_without_a_password_fails_typed() {
         named(&files, ".mkv").is_empty(),
         "nothing extracted: {files:?}"
     );
+}
+
+/// Like [`rar_release`], with each volume starting as an encrypted RAR5 does.
+fn encrypted_release(stem: &str, seed: u64) -> (DamageRelease, Vec<(String, Vec<u8>)>) {
+    let volumes: Vec<(String, Vec<u8>)> = (1..=3)
+        .map(|n| {
+            let mut bytes = RAR5_MAGIC.to_vec();
+            // Archive encryption header: CRC, size, type 4, then its fields.
+            bytes.extend([0, 0, 0, 0, 5, 4, 0, 0, 0, 15]);
+            bytes.extend(seeded_bytes(seed + n, 24_000));
+            (format!("{stem}.part{n:02}.rar"), bytes)
+        })
+        .collect();
+    (
+        DamageRelease::from_files(stem, volumes.clone(), &[1]),
+        volumes,
+    )
+}
+
+/// An engine that downloads slowly enough for the encryption check to act
+/// before the last article.
+async fn slow_engine(release: &DamageRelease) -> TestEngine {
+    let engine = engine(release, &BTreeSet::new()).await;
+    engine.queue_manager.set_speed_limit(20_000);
+    engine
+}
+
+async fn history_status(engine: &TestEngine, id: &str) -> (JobStatus, Option<JobFailureCode>) {
+    for _ in 0..1200 {
+        if let Some(entry) = engine.queue_manager.history_get(id).unwrap() {
+            return (entry.status, entry.failure_code);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{id}: no history entry");
+}
+
+/// A password failure keeps the download; a retry with the password extracts
+/// it without fetching anything, and deleting the entry reclaims the files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_with_password_reuses_the_kept_files() {
+    let fake = fake_unrar::install();
+    let (release, volumes) = rar_release("e2ekept", 0x1757_1006, &[1]);
+    fake.register("e2ekept", &refs(&volumes), Some("letmein"));
+    let engine = engine(&release, &BTreeSet::new()).await;
+    let qm = &engine.queue_manager;
+
+    let id = engine
+        .submit_nzb_xml("e2ekept", release.nzb_xml(&[]))
+        .unwrap();
+    assert_eq!(
+        history_status(&engine, &id).await.1,
+        Some(JobFailureCode::ArchivePasswordRequired)
+    );
+    let kept = engine.incomplete_dir.join(&id);
+    let volume = kept.join("e2ekept.part01.rar");
+    assert!(volume.is_file(), "volumes are kept");
+    assert!(files_under(&engine.complete_dir).is_empty());
+
+    let entry = qm.history_get(&id).unwrap().unwrap();
+    let retry = |password: &str| match qm
+        .retry_history_entry_with_password(&entry, Some(password.to_string()))
+        .unwrap()
+    {
+        HistoryRetryOutcome::Started(id) => id,
+        _ => panic!("retry did not start"),
+    };
+    // A wrong password keeps the files for another try.
+    let wrong = retry("wrong");
+    let (status, code) = history_status(&engine, &wrong).await;
+    assert_eq!(status, JobStatus::Failed);
+    assert_eq!(code, Some(JobFailureCode::ArchivePasswordRequired));
+    assert!(volume.is_file());
+    // Both entries name the directory; deleting one leaves it to the other.
+    qm.history_remove(&wrong).unwrap();
+    assert!(volume.is_file());
+
+    // The finished retry stays in the queue view for some seconds, during
+    // which the entry counts as being retried.
+    for _ in 0..400 {
+        if !qm.get_jobs().iter().any(|job| job.id == wrong) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let right = retry("letmein");
+    let (status, code) = history_status(&engine, &right).await;
+    assert_eq!(status, JobStatus::Completed, "failure code: {code:?}");
+    let files = files_under(&engine.complete_dir);
+    assert_eq!(
+        files,
+        [engine.complete_dir.join("Default/e2ekept/e2ekept.mkv")],
+        "output goes to the plain folder name"
+    );
+    let done = qm.history_get(&right).unwrap().unwrap();
+    assert_eq!(
+        done.server_stats
+            .iter()
+            .map(|server| server.articles_downloaded)
+            .sum::<usize>(),
+        0,
+        "nothing is downloaded again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_a_password_failure_removes_the_kept_files() {
+    let fake = fake_unrar::install();
+    let (release, volumes) = rar_release("e2edrop", 0x1757_1007, &[1]);
+    fake.register("e2edrop", &refs(&volumes), Some("letmein"));
+    let engine = engine(&release, &BTreeSet::new()).await;
+    let id = engine
+        .submit_nzb_xml("e2edrop", release.nzb_xml(&[]))
+        .unwrap();
+    history_status(&engine, &id).await;
+    let kept = engine.incomplete_dir.join(&id);
+    assert!(kept.is_dir());
+    engine.queue_manager.history_remove(&id).unwrap();
+    assert!(!kept.exists());
+}
+
+/// Every password the NZB lists is tried, and the job ends up with the one
+/// that worked, which is what scripts see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_nzb_password_is_tried() {
+    let fake = fake_unrar::install();
+    let (release, volumes) = rar_release("e2emulti", 0x1757_1008, &[1]);
+    fake.register("e2emulti", &refs(&volumes), Some("first"));
+    let engine = engine(&release, &BTreeSet::new()).await;
+    let xml = with_password(with_password(release.nzb_xml(&[]), "last"), "first");
+    let id = engine.submit_nzb_xml("e2emulti", xml).unwrap();
+    let (status, code) = history_status(&engine, &id).await;
+    assert_eq!(status, JobStatus::Completed, "failure code: {code:?}");
+    let job = engine
+        .queue_manager
+        .get_jobs()
+        .into_iter()
+        .find(|job| job.id == id)
+        .expect("a finished job stays in the queue view briefly");
+    assert_eq!(job.password.as_deref(), Some("first"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_encrypted_job_is_aborted_and_its_retry_completes() {
+    let fake = fake_unrar::install();
+    let (release, volumes) = encrypted_release("e2eabort", 0x1757_1009);
+    fake.register("e2eabort", &refs(&volumes), Some("letmein"));
+    let engine = engine(&release, &BTreeSet::new()).await;
+    let qm = &engine.queue_manager;
+    qm.set_encrypted_action(EncryptedAction::Abort);
+    let id = engine
+        .submit_nzb_xml("e2eabort", release.nzb_xml(&[]))
+        .unwrap();
+    // Aborted early or, if the download won the race, failed at extraction.
+    assert_eq!(
+        history_status(&engine, &id).await,
+        (
+            JobStatus::Failed,
+            Some(JobFailureCode::ArchivePasswordRequired)
+        )
+    );
+    let entry = qm.history_get(&id).unwrap().unwrap();
+    let HistoryRetryOutcome::Started(retry) = qm
+        .retry_history_entry_with_password(&entry, Some("letmein".into()))
+        .unwrap()
+    else {
+        panic!("retry did not start");
+    };
+    let (status, code) = history_status(&engine, &retry).await;
+    assert_eq!(status, JobStatus::Completed, "failure code: {code:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_encrypted_job_pauses_until_its_password_is_set() {
+    let fake = fake_unrar::install();
+    let (release, volumes) = encrypted_release("e2epause", 0x1757_100a);
+    fake.register("e2epause", &refs(&volumes), Some("letmein"));
+    let engine = slow_engine(&release).await;
+    let qm = &engine.queue_manager;
+    qm.set_encrypted_action(EncryptedAction::Pause);
+    let id = engine
+        .submit_nzb_xml("e2epause", release.nzb_xml(&[]))
+        .unwrap();
+    assert!(
+        engine
+            .wait_for_status(&id, Duration::from_secs(60), &[JobStatus::Paused])
+            .await,
+        "encrypted job was not paused"
+    );
+    for _ in 0..100 {
+        let job = qm.get_jobs().into_iter().find(|job| job.id == id).unwrap();
+        if job.error_message.is_some_and(|m| m.contains("Encrypted")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    qm.set_job_password(&id, Some("letmein".into())).unwrap();
+    qm.resume_job(&id).unwrap();
+    let (status, code) = history_status(&engine, &id).await;
+    assert_eq!(status, JobStatus::Completed, "failure code: {code:?}");
+}
+
+/// A job whose known password opens the archive is not stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_known_password_keeps_an_encrypted_job_downloading() {
+    let fake = fake_unrar::install();
+    let (release, volumes) = encrypted_release("e2eknown", 0x1757_100b);
+    fake.register("e2eknown", &refs(&volumes), Some("letmein"));
+    let engine = slow_engine(&release).await;
+    engine
+        .queue_manager
+        .set_encrypted_action(EncryptedAction::Abort);
+    let xml = with_password(with_password(release.nzb_xml(&[]), "wrong"), "letmein");
+    let (status, code) = run(&engine, "e2eknown", xml).await;
+    assert_eq!(status, JobStatus::Completed, "failure code: {code:?}");
 }

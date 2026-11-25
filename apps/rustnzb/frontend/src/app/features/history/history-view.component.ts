@@ -2,9 +2,11 @@ import { Component, OnInit, OnDestroy, signal, computed } from '@angular/core';
 import { EMPTY, Observable, expand, map, reduce, timeout } from 'rxjs';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { MatDialog } from '@angular/material/dialog';
 import { MatSnackBarModule } from '@angular/material/snack-bar';
 import { ApiService, POLL_TIMEOUT_MS, pageHidden } from '../../core/services/api.service';
 import { HistoryClientRemoval, HistoryEntry, StatusResponse } from '../../core/models/queue.model';
+import { ArchivePasswordDialogComponent, ArchivePasswordDialogData } from '../../shared/archive-password-dialog.component';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
 import { httpErrorMessage, showHttpError } from '../../core/http/http-error';
@@ -246,6 +248,9 @@ const DEFAULT_STATS_DAYS = 7;
                       <button class="row-action warn" (click)="$event.stopPropagation(); retry(e.id)">
                         <app-icon name="retry" [size]="11" /> retry
                       </button>
+                      <button class="row-action warn" (click)="$event.stopPropagation(); retryWithPassword(e)">
+                        <app-icon name="retry" [size]="11" /> retry with password
+                      </button>
                     }
                     @if (e.status === 'completed' && webdavEnabled()) {
                       <button class="row-action media" (click)="$event.stopPropagation(); addToMedia(e.id)" title="Add to Media Library">
@@ -472,6 +477,7 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
     private toast: ToastService,
     private confirmSvc: ConfirmService,
     private announcer: AnnouncerService,
+    private dialog: MatDialog,
   ) {}
 
   ngOnInit(): void {
@@ -849,14 +855,35 @@ export class HistoryViewComponent implements OnInit, OnDestroy {
       });
   }
 
-  retry(id: string): void {
-    this.api.post(`/history/${id}/retry`).subscribe({
+  retry(id: string, password?: string): void {
+    const path = `/history/${id}/retry`;
+    const request = password ? this.api.post(path, { password }) : this.api.post(path);
+    request.subscribe({
       next: () => {
         this.load();
         this.toast.success('Retrying…');
       },
       error: (err) => showHttpError(this.toast, err, 'Failed to retry job'),
     });
+  }
+
+  retryWithPassword(entry: HistoryEntry): void {
+    this.dialog
+      .open<ArchivePasswordDialogComponent, ArchivePasswordDialogData, string | null>(
+        ArchivePasswordDialogComponent,
+        {
+          data: {
+            title: 'Retry with password',
+            message: `Enter the archive password for ${entry.name}. Files that were kept are not downloaded again.`,
+            confirmLabel: 'Retry',
+          },
+          width: '380px',
+        },
+      )
+      .afterClosed()
+      .subscribe((password) => {
+        if (password) this.retry(entry.id, password);
+      });
   }
 
   addToMedia(id: string): void {

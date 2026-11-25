@@ -142,6 +142,27 @@ fn banner_reads_password_from_stdin(banner: &str) -> bool {
     false
 }
 
+/// The environment an extractor needs to read passwords as UTF-8.
+///
+/// On Linux, unrar decodes them by its locale. Without one, as in a bare
+/// service, it aborts on a non-ASCII password from stdin and refuses a correct
+/// one from argv.
+pub fn extractor_locale() -> Option<(&'static str, &'static str)> {
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .find(|value| !value.is_empty());
+    (cfg!(target_os = "linux") && !is_utf8_locale(locale.as_deref()))
+        .then_some(("LC_ALL", "C.UTF-8"))
+}
+
+fn is_utf8_locale(locale: Option<&std::ffi::OsStr>) -> bool {
+    locale.is_some_and(|locale| {
+        let locale = locale.to_string_lossy().to_ascii_lowercase();
+        locale.contains("utf-8") || locale.contains("utf8")
+    })
+}
+
 /// Run an extractor, writing `stdin_password` (if any) as a single line to
 /// its stdin and then closing it. Closing matters: a wrong password makes the
 /// extractor fail or hit EOF on a re-prompt instead of waiting for input.
@@ -153,6 +174,7 @@ async fn run_extractor(
     let mut command = Command::new(bin);
     command
         .args(args)
+        .envs(extractor_locale())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let Some(password) = stdin_password else {
@@ -253,6 +275,10 @@ fn unrar_password_failure(exit_code: Option<i32>, output: &str, password: &Passw
         || output.contains("Incorrect password")
         || output.contains("password is incorrect")
         || output.contains("Encrypted file")
+        // RAR4 has no password check value, so a wrong password shows up as a
+        // checksum error: "Checksum error in the encrypted file <f>. Corrupt
+        // file or wrong password."
+        || output.contains("in the encrypted file")
         || unanswered_password_prompt(output, password)
 }
 
@@ -521,6 +547,73 @@ async fn extract_rar_with(
     })
 }
 
+/// Longest a [`rar_password_rejected`] check may run.
+const PASSWORD_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Link `file` into an empty temporary directory.
+fn link_alone(file: &Path) -> std::io::Result<(tempfile::TempDir, PathBuf)> {
+    let file = std::path::absolute(file)?;
+    let name = file
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("not a file"))?;
+    #[cfg(unix)]
+    let dir = tempfile::tempdir()?;
+    // A hard link has to stay on the file's own volume.
+    #[cfg(not(unix))]
+    let dir = tempfile::tempdir_in(file.parent().unwrap_or(&file))?;
+    let link = dir.path().join(name);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&file, &link)?;
+    #[cfg(not(unix))]
+    std::fs::hard_link(&file, &link)?;
+    Ok((dir, link))
+}
+
+/// Whether unrar refuses `password` for the volume `rar_file`, which may be
+/// one volume of an unfinished set. `Some(false)` whenever no volume could
+/// tell: no unrar that takes a password on stdin, a check that runs too long,
+/// or an archive (RAR4) whose password shows only in the complete data. `None`
+/// if only this volume cannot tell, because its file starts in an earlier one.
+pub async fn rar_password_rejected(rar_file: &Path, password: &str) -> Option<bool> {
+    let Some(unrar) = find_unrar() else {
+        return Some(false);
+    };
+    let password_arg = password_arg_for(&unrar, Some(password)).await;
+    let Some(stdin_password) = password_arg.stdin_password(Some(password)) else {
+        return Some(false);
+    };
+    // Alone in a directory: unrar would go on to the set's other volumes, which
+    // may be half written, and report on those instead.
+    let Ok((_alone, volume)) = link_alone(rar_file) else {
+        return Some(false);
+    };
+    let args = vec![
+        "t".to_string(),
+        "-y".to_string(),
+        "-p".to_string(),
+        "-idp".to_string(),
+        volume.display().to_string(),
+    ];
+    let check = run_extractor(&unrar, args, Some(stdin_password));
+    let Ok(Ok(output)) = tokio::time::timeout(PASSWORD_CHECK_TIMEOUT, check).await else {
+        return Some(false);
+    };
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Not `unrar_password_failure`: a missing next volume also looks like a
+    // checksum error in the encrypted file.
+    if output.status.code() == Some(11) || text.contains("Incorrect password") {
+        Some(true)
+    } else if text.contains("from a previous volume") {
+        None
+    } else {
+        Some(false)
+    }
+}
+
 /// Strings in 7z stderr/stdout that indicate a missing or wrong password.
 /// The `Enter password` prompt is handled separately: in stdin mode 7z
 /// prints it once for every encrypted archive, whatever the outcome.
@@ -602,6 +695,72 @@ async fn extract_7z_with(
 
 /// Extract ZIP archives.
 pub async fn extract_zip(zip_file: &Path, output_dir: &Path) -> anyhow::Result<UnpackResult> {
+    extract_zip_with_password(zip_file, output_dir, None).await
+}
+
+/// Extract a ZIP archive, through 7-Zip when its entries are encrypted.
+pub async fn extract_zip_with_password(
+    zip_file: &Path,
+    output_dir: &Path,
+    password: Option<&str>,
+) -> anyhow::Result<UnpackResult> {
+    let checked = zip_file.to_path_buf();
+    let root = output_dir.to_path_buf();
+    let encrypted =
+        tokio::task::spawn_blocking(move || check_encrypted_zip(&checked, &root)).await??;
+    if !encrypted {
+        return extract_plain_zip(zip_file, output_dir).await;
+    }
+    if password.is_none_or(str::is_empty) {
+        return Err(ArchivePasswordRequired.into());
+    }
+    let sevenz = find_7z().ok_or_else(|| {
+        anyhow::anyhow!("an encrypted ZIP needs 7-Zip, and 7z/7zz/7za is not on PATH")
+    })?;
+    extract_7z_with(&sevenz, zip_file, output_dir, password).await
+}
+
+/// Whether a ZIP has encrypted entries. If so, its entries are held to the
+/// rules of [`extract_plain_zip`] first, as 7-Zip will write them.
+fn check_encrypted_zip(zip_file: &Path, output_dir: &Path) -> anyhow::Result<bool> {
+    let mut file = std::fs::File::open(zip_file)?;
+    validate_zip_headers(&mut file)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut encrypted = false;
+    let mut output_paths = HashSet::new();
+    let mut problem = None;
+    for i in 0..archive.len() {
+        let entry = archive.by_index_raw(i)?;
+        encrypted |= entry.encrypted();
+        let name = entry.name()?.into_owned();
+        if entry.is_symlink() {
+            problem = Some(anyhow::anyhow!(
+                "ZIP archive contains unsupported symbolic link `{name}`"
+            ));
+            continue;
+        }
+        match safe_archive_output_path(output_dir, &name, "ZIP") {
+            Ok(path) if !output_paths.insert(path.clone()) => {
+                problem = Some(anyhow::anyhow!(
+                    "ZIP archive contains duplicate output path `{name}`"
+                ));
+            }
+            Ok(path) => {
+                if let Err(error) = reject_symlinked_path(output_dir, &path) {
+                    problem = Some(error);
+                }
+            }
+            Err(error) => problem = Some(error),
+        }
+    }
+    match problem {
+        // Plain archives report their own errors as they are extracted.
+        Some(error) if encrypted => Err(error),
+        _ => Ok(encrypted),
+    }
+}
+
+async fn extract_plain_zip(zip_file: &Path, output_dir: &Path) -> anyhow::Result<UnpackResult> {
     info!(file = %zip_file.display(), dest = %output_dir.display(), "Extracting ZIP");
 
     // Use tokio spawn_blocking since zip extraction is CPU-bound
@@ -1639,6 +1798,50 @@ mod tests {
         );
     }
 
+    /// RAR4 stores no password check value: unrar reports a wrong password as
+    /// a checksum error in the encrypted file, with exit code 3.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rar4_wrong_password_is_typed() {
+        let tools = tempfile::tempdir().unwrap();
+        let body = "IFS= read -r pw\n\
+                    echo 'Checksum error in the encrypted file movie.mkv. Corrupt file or wrong password.' >&2; exit 3";
+        let unrar = fake_extractor(tools.path(), "unrar", "UNRAR 7.20 freeware", body);
+        let error = run_rar(&unrar, false, Some("wrong")).await.unwrap_err();
+        assert!(
+            error.downcast_ref::<ArchivePasswordRequired>().is_some(),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn only_utf8_locales_are_left_alone() {
+        for (locale, utf8) in [
+            (Some("en_US.UTF-8"), true),
+            (Some("C.utf8"), true),
+            (Some("C"), false),
+            (Some("de_DE.ISO-8859-1"), false),
+            (None, false),
+        ] {
+            assert_eq!(is_utf8_locale(locale.map(std::ffi::OsStr::new)), utf8);
+        }
+    }
+
+    /// unrar must not find the set's other, perhaps half-written, volumes.
+    #[test]
+    fn a_checked_volume_has_no_neighbours() {
+        let work = tempfile::tempdir().unwrap();
+        for name in ["a.part1.rar", "a.part2.rar"] {
+            fs::write(work.path().join(name), name).unwrap();
+        }
+        let (dir, link) = link_alone(&work.path().join("a.part1.rar")).unwrap();
+        assert_eq!(link.file_name().unwrap(), "a.part1.rar");
+        assert_eq!(fs::read(&link).unwrap(), b"a.part1.rar");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        drop(dir);
+        assert!(work.path().join("a.part1.rar").exists());
+    }
+
     /// The prompt we answer ourselves is not evidence of a password problem:
     /// any other failure stays an ordinary failed extraction.
     #[cfg(unix)]
@@ -1731,6 +1934,87 @@ mod tests {
             !sevenz_extract_args(rar, out, &stdin)
                 .iter()
                 .any(|a| a.starts_with("-p"))
+        );
+    }
+
+    /// An encrypted ZIP asks for a password before anything is written.
+    #[tokio::test]
+    async fn encrypted_zip_without_a_password_is_typed() {
+        let work = tempfile::tempdir().unwrap();
+        // One stored entry with the encryption flag set.
+        let name = b"a.txt";
+        let payload = [0u8; 12];
+        let mut zip = Vec::new();
+        let common = |out: &mut Vec<u8>| {
+            for value in [20u16, 1, 0, 0, 0x21] {
+                out.extend(value.to_le_bytes());
+            }
+            for value in [0u32, 12, 0] {
+                out.extend(value.to_le_bytes());
+            }
+            out.extend((name.len() as u16).to_le_bytes());
+            out.extend(0u16.to_le_bytes());
+        };
+        zip.extend(0x0403_4b50u32.to_le_bytes());
+        common(&mut zip);
+        zip.extend(name);
+        zip.extend(payload);
+        let central = zip.len() as u32;
+        zip.extend(0x0201_4b50u32.to_le_bytes());
+        zip.extend(20u16.to_le_bytes());
+        common(&mut zip);
+        zip.extend([0; 14]);
+        zip.extend(name);
+        let size = zip.len() as u32 - central;
+        zip.extend(0x0605_4b50u32.to_le_bytes());
+        for value in [0u16, 0, 1, 1] {
+            zip.extend(value.to_le_bytes());
+        }
+        zip.extend(size.to_le_bytes());
+        zip.extend(central.to_le_bytes());
+        zip.extend(0u16.to_le_bytes());
+        let path = work.path().join("locked.zip");
+        fs::write(&path, zip).unwrap();
+
+        let out = work.path().join("out");
+        let error = extract_zip(&path, &out).await.unwrap_err();
+        assert!(
+            error.downcast_ref::<ArchivePasswordRequired>().is_some(),
+            "{error:#}"
+        );
+        assert!(!out.exists());
+    }
+
+    /// End to end against a real 7z, when one is installed: an encrypted
+    /// ZIP extracts with the right password and is typed for a wrong one.
+    #[tokio::test]
+    async fn real_7z_encrypted_zip_round_trip() {
+        let Some(sevenz) = find_7z() else {
+            eprintln!("skipping: no 7z/7zz/7za on PATH");
+            return;
+        };
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("movie.mkv"), b"payload").unwrap();
+        let archive = work.path().join("release.zip");
+        let created = std::process::Command::new(&sevenz)
+            .current_dir(work.path())
+            .args(["a", "-tzip", "-pp4ss word", "release.zip", "movie.mkv"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{created:?}");
+        let ok = work.path().join("ok");
+        let result = extract_zip_with_password(&archive, &ok, Some("p4ss word"))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.error_output);
+        assert_eq!(fs::read(ok.join("movie.mkv")).unwrap(), b"payload");
+        let error = extract_zip_with_password(&archive, &work.path().join("bad"), Some("nope"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<ArchivePasswordRequired>().is_some(),
+            "{error:#}"
         );
     }
 

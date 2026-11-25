@@ -21,7 +21,10 @@ use crate::fold_repair::repair_from_fold;
 use crate::inflight::{VerifySource, map_fits, verify_set};
 use crate::par2::par2_repair;
 use crate::resources::PostProcResourcePool;
-use crate::unpack::{ArchivePasswordRequired, extract_7z, extract_rar, extract_tar, extract_zip};
+use crate::unpack::{
+    ArchivePasswordRequired, UnpackResult, extract_7z, extract_rar, extract_tar,
+    extract_zip_with_password,
+};
 use nzb_decode::SharedFold;
 
 fn increment_counter(name: &'static str) {
@@ -307,6 +310,9 @@ pub struct PostProcResult {
     pub error: Option<String>,
     /// Typed terminal failure code when the pipeline failed.
     pub failure_code: Option<JobFailureCode>,
+    /// The password that opened the job's archives, when one was needed
+    /// other than [`PostProcConfig::password`].
+    pub password: Option<String>,
 }
 
 /// Configuration for the post-processing pipeline.
@@ -335,6 +341,9 @@ pub struct PostProcConfig {
     pub skip_extract: bool,
     /// Optional archive password (from NZB metadata or indexer API).
     pub password: Option<String>,
+    /// Passwords to try, in order, when an archive needs one that
+    /// [`password`](Self::password) does not supply.
+    pub password_candidates: Vec<String>,
     /// Maximum archive nesting depth processed automatically. Zero permits
     /// the outer archive only; the default handles five nested layers.
     pub max_nested_archive_depth: u8,
@@ -359,6 +368,7 @@ impl Default for PostProcConfig {
             content_articles_failed: 0,
             skip_extract: false,
             password: None,
+            password_candidates: Vec::new(),
             max_nested_archive_depth: 5,
             slice_map: None,
             trust_inflight_verify: true,
@@ -710,6 +720,8 @@ async fn run_stages(
         }
     }
 
+    let mut passwords =
+        PasswordAttempts::new(config.password.as_deref(), &config.password_candidates);
     // ------------------------------------------------------------------
     // Stage 3: Extract
     // ------------------------------------------------------------------
@@ -750,7 +762,7 @@ async fn run_stages(
                 source_dir,
                 job_dir_archives,
                 output_dir,
-                config.password.as_deref(),
+                &mut passwords,
                 config.max_nested_archive_depth,
             ),
             tracing::info_span!("extract"),
@@ -814,6 +826,7 @@ async fn run_stages(
         } else {
             failure_code.or(Some(JobFailureCode::DownloadFailed))
         },
+        password: passwords.listed_password.map(str::to_string),
     }
 }
 
@@ -953,6 +966,72 @@ async fn run_repair_stage(job_dir: &Path) -> StageResult {
     }
 }
 
+/// The passwords to try on a job's archives, in order: the job's own (or none),
+/// then the configured candidates. One that works is tried first on the
+/// archives after it, since a release normally uses a single password.
+struct PasswordAttempts<'a> {
+    order: Vec<Option<&'a str>>,
+    /// The candidate that opened an archive, if one had to.
+    listed_password: Option<&'a str>,
+}
+
+impl<'a> PasswordAttempts<'a> {
+    fn new(password: Option<&'a str>, candidates: &'a [String]) -> Self {
+        let mut order = vec![password.filter(|password| !password.is_empty())];
+        for candidate in candidates {
+            let candidate = Some(candidate.as_str()).filter(|candidate| !candidate.is_empty());
+            if candidate.is_some() && !order.contains(&candidate) {
+                order.push(candidate);
+            }
+        }
+        Self {
+            order,
+            listed_password: None,
+        }
+    }
+
+    /// Whether to try the next password after attempt `index` gave `result`.
+    /// Only a password failure is worth another try. A listed password that
+    /// worked moves to the front.
+    fn try_next(&mut self, index: usize, result: &anyhow::Result<UnpackResult>) -> bool {
+        match result {
+            Err(error) if error.downcast_ref::<ArchivePasswordRequired>().is_some() => {
+                index + 1 < self.order.len()
+            }
+            Ok(result) if result.success && index > 0 => {
+                info!("A password from the password list opened the archive");
+                let working = self.order.remove(index);
+                self.order.insert(0, working);
+                self.listed_password = working;
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Extract a RAR, 7z or ZIP archive, trying `passwords` in order.
+async fn extract_with_passwords(
+    archive_type: ArchiveType,
+    path: &Path,
+    output_dir: &Path,
+    passwords: &mut PasswordAttempts<'_>,
+) -> anyhow::Result<UnpackResult> {
+    let mut index = 0;
+    loop {
+        let password = passwords.order[index];
+        let result = match archive_type {
+            ArchiveType::Rar => extract_rar(path, output_dir, password).await,
+            ArchiveType::Zip => extract_zip_with_password(path, output_dir, password).await,
+            _ => extract_7z(path, output_dir, password).await,
+        };
+        if !passwords.try_next(index, &result) {
+            return result;
+        }
+        index += 1;
+    }
+}
+
 /// `extra_archives` are extracted alongside the first-level archives found in
 /// `source_dir` (used for non-RAR archives left in the job directory after
 /// direct unpack).
@@ -960,7 +1039,7 @@ async fn run_extract_stage(
     source_dir: &Path,
     extra_archives: Vec<(ArchiveType, PathBuf)>,
     output_dir: &Path,
-    password: Option<&str>,
+    passwords: &mut PasswordAttempts<'_>,
     max_nested_archive_depth: u8,
 ) -> (StageResult, Vec<PathBuf>, Option<JobFailureCode>) {
     let start = Instant::now();
@@ -999,10 +1078,10 @@ async fn run_extract_stage(
         for (archive_type, path) in &archives {
             info!(depth, kind = %archive_type, file = %path.display(), "Extracting archive");
             let result = match archive_type {
-                ArchiveType::Rar => extract_rar(path, output_dir, password).await,
-                ArchiveType::SevenZip => extract_7z(path, output_dir, password).await,
+                ArchiveType::Rar | ArchiveType::SevenZip | ArchiveType::Zip => {
+                    extract_with_passwords(*archive_type, path, output_dir, passwords).await
+                }
                 ArchiveType::Tar => extract_tar(path, output_dir).await,
-                ArchiveType::Zip => extract_zip(path, output_dir).await,
             };
 
             match result {
@@ -1277,6 +1356,7 @@ mod tests {
             stages: vec![],
             error: None,
             failure_code: None,
+            password: None,
         };
         assert!(result.success);
         assert!(result.stages.is_empty());
@@ -1363,6 +1443,73 @@ mod tests {
         writer.finish().unwrap();
     }
 
+    /// Extract with a fake archive that opens only for `correct`, recording
+    /// every password tried.
+    fn attempt(
+        passwords: &mut PasswordAttempts<'_>,
+        correct: Option<&str>,
+    ) -> (anyhow::Result<UnpackResult>, Vec<Option<String>>) {
+        let mut tried = Vec::new();
+        loop {
+            let index = tried.len();
+            let password = passwords.order[index];
+            tried.push(password.map(str::to_string));
+            let result = if password == correct {
+                Ok(UnpackResult {
+                    success: true,
+                    files_extracted: Vec::new(),
+                    output: String::new(),
+                    error_output: String::new(),
+                })
+            } else {
+                Err(ArchivePasswordRequired.into())
+            };
+            if !passwords.try_next(index, &result) {
+                return (result, tried);
+            }
+        }
+    }
+
+    #[test]
+    fn password_candidates_follow_the_job_password_and_the_working_one_is_reused() {
+        let candidates = ["job", "", "two", "three"].map(str::to_string);
+        let mut passwords = PasswordAttempts::new(Some("job"), &candidates);
+
+        let (result, tried) = attempt(&mut passwords, Some("two"));
+        assert!(result.unwrap().success);
+        assert_eq!(tried, [Some("job".to_string()), Some("two".to_string())]);
+
+        let (result, tried) = attempt(&mut passwords, Some("two"));
+        assert!(result.unwrap().success);
+        assert_eq!(tried, [Some("two".to_string())]);
+    }
+
+    #[test]
+    fn password_candidates_are_not_tried_on_an_unencrypted_archive() {
+        let candidates = ["one".to_string()];
+        let mut passwords = PasswordAttempts::new(None, &candidates);
+        let (result, tried) = attempt(&mut passwords, None);
+        assert!(result.unwrap().success);
+        assert_eq!(tried, [None]);
+    }
+
+    #[test]
+    fn exhausted_password_candidates_stay_a_typed_password_failure() {
+        let candidates = ["one".to_string(), "two".to_string()];
+        let mut passwords = PasswordAttempts::new(None, &candidates);
+        let (result, tried) = attempt(&mut passwords, Some("other"));
+        let error = result.unwrap_err();
+        assert!(error.downcast_ref::<ArchivePasswordRequired>().is_some());
+        assert_eq!(tried.len(), 3);
+    }
+
+    #[test]
+    fn other_extraction_failures_do_not_try_more_passwords() {
+        let candidates = ["one".to_string()];
+        let mut passwords = PasswordAttempts::new(None, &candidates);
+        assert!(!passwords.try_next(0, &Err(anyhow::anyhow!("disk full"))));
+    }
+
     #[tokio::test]
     async fn nested_zip_archives_are_extracted_recursively() {
         let source = tempfile::tempdir().unwrap();
@@ -1373,8 +1520,14 @@ mod tests {
         write_zip(&outer, &[("inner.zip", &fs::read(&inner).unwrap())]);
         fs::remove_file(inner).unwrap();
 
-        let (result, _, failure_code) =
-            run_extract_stage(source.path(), Vec::new(), output.path(), None, 1).await;
+        let (result, _, failure_code) = run_extract_stage(
+            source.path(),
+            Vec::new(),
+            output.path(),
+            &mut PasswordAttempts::new(None, &[]),
+            1,
+        )
+        .await;
 
         assert_eq!(result.status, StageStatus::Success, "{result:?}");
         assert_eq!(failure_code, None);
@@ -1394,8 +1547,14 @@ mod tests {
         write_zip(&outer, &[("inner.zip", &fs::read(&inner).unwrap())]);
         fs::remove_file(inner).unwrap();
 
-        let (result, _, failure_code) =
-            run_extract_stage(source.path(), Vec::new(), output.path(), None, 0).await;
+        let (result, _, failure_code) = run_extract_stage(
+            source.path(),
+            Vec::new(),
+            output.path(),
+            &mut PasswordAttempts::new(None, &[]),
+            0,
+        )
+        .await;
 
         assert_eq!(result.status, StageStatus::Failed, "{result:?}");
         assert_eq!(failure_code, Some(JobFailureCode::ArchiveInvalid));

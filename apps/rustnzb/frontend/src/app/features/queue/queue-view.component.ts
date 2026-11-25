@@ -13,6 +13,11 @@ import { PauseStateService } from '../../core/services/pause-state.service';
 import { NzbJob, PauseReason, QueueResponse, StatusResponse } from '../../core/models/queue.model';
 import { formatBytes, formatBytesParts, formatSpeed } from '../../core/format';
 import { HistoryViewComponent } from '../history/history-view.component';
+import { MatDialog } from '@angular/material/dialog';
+import {
+  ArchivePasswordDialogComponent,
+  ArchivePasswordDialogData,
+} from '../../shared/archive-password-dialog.component';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
 import { httpErrorMessage, isAuthHandledError, showHttpError } from '../../core/http/http-error';
@@ -502,6 +507,15 @@ interface PipelineStep {
                   }
                 </td>
                 <td class="action-cell">
+                  <button
+                    class="row-action"
+                    [disabled]="isActionPending(job.id)"
+                    (click)="setPassword(job)"
+                    title="archive password"
+                    aria-label="Set archive password"
+                  >
+                    <app-icon name="key" [size]="12" />
+                  </button>
                   <button
                     class="row-action danger"
                     [disabled]="isActionPending(job.id)"
@@ -1218,6 +1232,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     private confirmSvc: ConfirmService,
     pauseState: PauseStateService,
     private announcer: AnnouncerService,
+    private dialog: MatDialog,
     liveState?: LiveStateService,
   ) {
     this.liveState = liveState ?? new LiveStateService(api);
@@ -1613,6 +1628,32 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       'Job resumed',
       'Failed to resume job',
     );
+  }
+
+  setPassword(job: NzbJob): void {
+    this.dialog
+      .open<ArchivePasswordDialogComponent, ArchivePasswordDialogData, string | null>(
+        ArchivePasswordDialogComponent,
+        {
+          data: {
+            title: 'Archive password',
+            message: `Set the archive password for ${job.name}. Leave it empty to clear it.`,
+            confirmLabel: 'Save',
+            allowEmpty: true,
+          },
+          width: '380px',
+        },
+      )
+      .afterClosed()
+      .subscribe((password) => {
+        if (password == null) return;
+        this.withPendingJobAction(
+          job.id,
+          () => this.api.put(`/queue/${job.id}/password`, { password }),
+          password ? 'Archive password set' : 'Archive password cleared',
+          'Failed to set the archive password',
+        );
+      });
   }
 
   setPriority(job: NzbJob, priority: number): void {
