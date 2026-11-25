@@ -1,4 +1,4 @@
-use crate::config::{self, Scenario, TestType, ARTICLE_SIZE, GB, MB, MSG_ID_DOMAIN};
+use crate::config::{self, ARTICLE_SIZE, GB, MB, MSG_ID_DOMAIN, Scenario, TestType};
 use crate::mock_nntp::{ArticleIndex, FileEntry};
 use crate::nzb::{self, NzbFile};
 use anyhow::Result;
@@ -180,11 +180,11 @@ pub async fn prepare_data(scenarios: &[Scenario], data_dir: &Path) -> Result<()>
 }
 
 async fn ensure_file(path: &Path, size: u64) -> Result<()> {
-    if let Ok(meta) = tokio::fs::metadata(path).await {
-        if meta.len() == size {
-            tracing::info!("  Exists: {} ({} MB)", path.display(), size / MB);
-            return Ok(());
-        }
+    if let Ok(meta) = tokio::fs::metadata(path).await
+        && meta.len() == size
+    {
+        tracing::info!("  Exists: {} ({} MB)", path.display(), size / MB);
+        return Ok(());
     }
     tracing::info!("  Generating {} ({} MB)...", path.display(), size / MB);
     generate_random_file(path, size).await
@@ -212,7 +212,7 @@ async fn generate_random_file(path: &Path, size: u64) -> Result<()> {
             rng.fill_bytes(&mut buf[..n]);
             f.write_all(&buf[..n])?;
             written += n as u64;
-            if size >= GB && written % (512 * MB) == 0 {
+            if size >= GB && written.is_multiple_of(512 * MB) {
                 let pct = written as f64 * 100.0 / size as f64;
                 let rate = written as f64 / MB as f64 / start.elapsed().as_secs_f64();
                 eprint!("\r    {pct:.0}% ({rate:.0} MB/s)");
@@ -450,12 +450,12 @@ async fn preflight_check(scenarios: &[Scenario], data_dir: &Path) -> Result<()> 
         let estimated_par2_mem = max_file_size / 5;
         if (needs_par2 || needs_7z) && avail < estimated_par2_mem {
             tracing::warn!(
-                    "Pre-flight: LOW MEMORY — par2 for {:.1} GB files may need ~{} MB, only {} MB available. \
+                "Pre-flight: LOW MEMORY — par2 for {:.1} GB files may need ~{} MB, only {} MB available. \
                      par2 may be OOM-killed.",
-                    max_file_size as f64 / GB as f64,
-                    estimated_par2_mem / MB,
-                    avail_mb
-                );
+                max_file_size as f64 / GB as f64,
+                estimated_par2_mem / MB,
+                avail_mb
+            );
         }
     }
 

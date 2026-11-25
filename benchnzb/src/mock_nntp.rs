@@ -5,8 +5,8 @@ use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -222,55 +222,60 @@ async fn handle_connection_inner(
                 stats.article_not_found.fetch_add(1, Ordering::Relaxed);
                 drop(st);
                 writer.write_all(b"430 No Such Article\r\n").await?;
-            } else if let Some((mf, offset, length, part, total_parts)) = st.lookup(&msg_id) {
-                stats.articles_served.fetch_add(1, Ordering::Relaxed);
-                stats
-                    .payload_bytes_served
-                    .fetch_add(length, Ordering::Relaxed);
-                drop(st);
+            } else {
+                match st.lookup(&msg_id) {
+                    Some((mf, offset, length, part, total_parts)) => {
+                        stats.articles_served.fetch_add(1, Ordering::Relaxed);
+                        stats
+                            .payload_bytes_served
+                            .fetch_add(length, Ordering::Relaxed);
+                        drop(st);
 
-                // Slice directly from mmap — no file open, seek, or read syscalls
-                let mmap = mf.mmap.as_ref().unwrap();
-                let data = &mmap[offset as usize..(offset + length) as usize];
+                        // Slice directly from mmap — no file open, seek, or read syscalls
+                        let mmap = mf.mmap.as_ref().unwrap();
+                        let data = &mmap[offset as usize..(offset + length) as usize];
 
-                let code = if is_article { "220" } else { "222" };
-                writer
-                    .write_all(format!("{code} 0 <{msg_id}>\r\n").as_bytes())
-                    .await?;
+                        let code = if is_article { "220" } else { "222" };
+                        writer
+                            .write_all(format!("{code} 0 <{msg_id}>\r\n").as_bytes())
+                            .await?;
 
-                if is_article {
-                    writer
-                        .write_all(
-                            format!(
-                                "From: bench@benchnzb\r\n\
+                        if is_article {
+                            writer
+                                .write_all(
+                                    format!(
+                                        "From: bench@benchnzb\r\n\
                                  Subject: {} ({}/{})\r\n\
                                  Message-ID: <{msg_id}>\r\n\
                                  Newsgroups: alt.binaries.test\r\n\
                                  \r\n",
-                                mf.filename, part, total_parts
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                }
+                                        mf.filename, part, total_parts
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await?;
+                        }
 
-                // yEnc encode from mmap slice and write
-                let (encoded, _crc) = yenc::encode_article(
-                    data,
-                    &mf.filename,
-                    part,
-                    total_parts,
-                    offset,
-                    mf.total_size,
-                );
-                stats
-                    .wire_bytes_served
-                    .fetch_add(encoded.len() as u64, Ordering::Relaxed);
-                writer.write_all(&encoded).await?;
-                writer.write_all(b".\r\n").await?;
-            } else {
-                drop(st);
-                writer.write_all(b"430 No Such Article\r\n").await?;
+                        // yEnc encode from mmap slice and write
+                        let (encoded, _crc) = yenc::encode_article(
+                            data,
+                            &mf.filename,
+                            part,
+                            total_parts,
+                            offset,
+                            mf.total_size,
+                        );
+                        stats
+                            .wire_bytes_served
+                            .fetch_add(encoded.len() as u64, Ordering::Relaxed);
+                        writer.write_all(&encoded).await?;
+                        writer.write_all(b".\r\n").await?;
+                    }
+                    _ => {
+                        drop(st);
+                        writer.write_all(b"430 No Such Article\r\n").await?;
+                    }
+                }
             }
         } else if upper.starts_with("STAT") {
             let msg_id = extract_message_id(cmd);

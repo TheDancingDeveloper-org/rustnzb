@@ -228,19 +228,17 @@ impl RustnzbClient {
                 for stage in stages {
                     let name = stage["name"].as_str().unwrap_or("");
                     let duration = stage["duration_secs"].as_f64().unwrap_or(0.0);
-                    if name == "Verify" {
-                        if let Some((source, skipped)) =
+                    if name == "Verify"
+                        && let Some((source, skipped)) =
                             stage["message"].as_str().and_then(parse_verify_tag)
-                        {
-                            timing.record_verify(source, skipped);
-                        }
+                    {
+                        timing.record_verify(source, skipped);
                     }
-                    if name == "Repair" {
-                        if let Some((path, read, secs)) =
+                    if name == "Repair"
+                        && let Some((path, read, secs)) =
                             stage["message"].as_str().and_then(parse_repair_tag)
-                        {
-                            timing.record_repair(path, read, secs);
-                        }
+                    {
+                        timing.record_repair(path, read, secs);
                     }
                     match name {
                         "Verify" | "Repair" => timing.par2_sec += duration,
@@ -253,16 +251,15 @@ impl RustnzbClient {
             // Download time from added_at -> first stage start or completed_at
             if let (Some(added), Some(completed)) =
                 (entry["added_at"].as_str(), entry["completed_at"].as_str())
-            {
-                if let (Ok(a), Ok(c)) = (
+                && let (Ok(a), Ok(c)) = (
                     chrono::DateTime::parse_from_rfc3339(added),
                     chrono::DateTime::parse_from_rfc3339(completed),
-                ) {
-                    let total = (c - a).num_milliseconds() as f64 / 1000.0;
-                    timing.download_sec = total - timing.par2_sec - timing.unpack_sec;
-                    if timing.download_sec < 0.0 {
-                        timing.download_sec = 0.0;
-                    }
+                )
+            {
+                let total = (c - a).num_milliseconds() as f64 / 1000.0;
+                timing.download_sec = total - timing.par2_sec - timing.unpack_sec;
+                if timing.download_sec < 0.0 {
+                    timing.download_sec = 0.0;
                 }
             }
         }
@@ -317,22 +314,20 @@ impl RustnzbClient {
             // Calculate download throughput from timestamps
             if let (Some(added), Some(completed)) =
                 (entry["added_at"].as_str(), entry["completed_at"].as_str())
-            {
-                if let (Ok(a), Ok(c)) = (
+                && let (Ok(a), Ok(c)) = (
                     chrono::DateTime::parse_from_rfc3339(added),
                     chrono::DateTime::parse_from_rfc3339(completed),
-                ) {
-                    // Use stage timing to isolate download phase
-                    let pp_time: f64 = metrics
-                        .stage_durations
-                        .iter()
-                        .map(|s| s.duration_secs)
-                        .sum();
-                    let total_secs = (c - a).num_milliseconds() as f64 / 1000.0;
-                    let dl_secs = (total_secs - pp_time).max(0.1);
-                    metrics.download_throughput_mbps =
-                        total_bytes as f64 / dl_secs / (1024.0 * 1024.0);
-                }
+                )
+            {
+                // Use stage timing to isolate download phase
+                let pp_time: f64 = metrics
+                    .stage_durations
+                    .iter()
+                    .map(|s| s.duration_secs)
+                    .sum();
+                let total_secs = (c - a).num_milliseconds() as f64 / 1000.0;
+                let dl_secs = (total_secs - pp_time).max(0.1);
+                metrics.download_throughput_mbps = total_bytes as f64 / dl_secs / (1024.0 * 1024.0);
             }
         }
 

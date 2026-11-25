@@ -1,5 +1,5 @@
-use bollard::container::StatsOptions;
 use bollard::Docker;
+use bollard::container::StatsOptions;
 use futures_util::StreamExt;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -45,13 +45,11 @@ impl MetricsCollector {
                 ..Default::default()
             }))
             .await
+            && let Some(c) = containers.first()
+            && let Some(id) = &c.id
         {
-            if let Some(c) = containers.first() {
-                if let Some(id) = &c.id {
-                    self.container_ids.insert(service.to_string(), id.clone());
-                    tracing::info!("Resolved {service} -> {}", &id[..12]);
-                }
-            }
+            self.container_ids.insert(service.to_string(), id.clone());
+            tracing::info!("Resolved {service} -> {}", &id[..12]);
         }
     }
 
