@@ -121,11 +121,10 @@ async fn wait_for_service(name: &str, url: &str, timeout_secs: u64) -> Result<()
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
+            && resp.status().is_success()
         {
-            if resp.status().is_success() {
-                tracing::info!("  {name}: ready");
-                return Ok(());
-            }
+            tracing::info!("  {name}: ready");
+            return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
