@@ -146,7 +146,7 @@ jobs:
         run: npm ci --no-audit --no-fund && npm run build -- --configuration=production
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99.1
+          toolchain: 1.100.0
           components: rustfmt,clippy
       - run: cargo fmt --all --check
       - name: Check
