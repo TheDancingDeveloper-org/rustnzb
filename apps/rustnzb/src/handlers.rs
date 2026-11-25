@@ -2114,6 +2114,7 @@ fn if_match_matches(header: &str, etag: &str) -> bool {
 pub async fn h_config_patch(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    extensions: http::Extensions,
     method: Option<Extension<AuthMethod>>,
     body: Result<Json<ConfigPatchBody>, JsonRejection>,
 ) -> Result<Json<ConfigPatchResponse>, ApiError> {
@@ -2181,7 +2182,13 @@ pub async fn h_config_patch(
     }
 
     if changed_sensitive {
-        ensure_step_up(&state, &headers, None, method.map(|extension| extension.0)).await?;
+        ensure_step_up(
+            &state,
+            &headers,
+            Some(&extensions),
+            method.map(|extension| extension.0),
+        )
+        .await?;
     }
 
     let confirm_exposure = body.confirm_exposure;
@@ -4891,7 +4898,10 @@ fn bind_is_loopback(addr: &str) -> bool {
     match ip {
         Some(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
         Some(std::net::IpAddr::V6(ip)) => {
-            ip.is_loopback() || ip.to_ipv4().is_some_and(|ip| ip.is_loopback())
+            // `to_ipv4_mapped` (not the deprecated `to_ipv4`) so the
+            // IPv4-compatible form `::127.0.0.1` is not accepted as loopback:
+            // only `::1` and the real mapped form `::ffff:127.0.0.1` are.
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
         }
         None => false,
     }
@@ -6362,6 +6372,10 @@ mod tests {
         assert!(super::bind_is_loopback("[::1]:8080"));
         assert!(super::bind_is_loopback("::ffff:127.0.0.1"));
         assert!(super::bind_is_loopback("[::ffff:127.0.0.1]:8080"));
+        // The deprecated IPv4-compatible form is not loopback: only the
+        // mapped form (::ffff:a.b.c.d) and ::1 itself are.
+        assert!(!super::bind_is_loopback("::127.0.0.1"));
+        assert!(!super::bind_is_loopback("[::127.0.0.1]:8080"));
         assert!(!super::bind_is_loopback("0.0.0.0:8080"));
         assert!(!super::bind_is_loopback("[2001:db8::1]:8080"));
         assert!(!super::bind_is_loopback("not-an-address"));
