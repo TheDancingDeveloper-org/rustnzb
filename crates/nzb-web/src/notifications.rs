@@ -400,7 +400,7 @@ mod tests {
                         .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
                         .await
                         .unwrap();
-                    return String::from_utf8_lossy(&buf).to_string();
+                    return String::from_utf8_lossy_owned(buf);
                 }
             }
         });

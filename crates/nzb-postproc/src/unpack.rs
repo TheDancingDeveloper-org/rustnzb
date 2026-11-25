@@ -478,8 +478,8 @@ async fn extract_rar_with(
     };
     let output = run_extractor(bin, args, password_arg.stdin_password(password)).await?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy_owned(output.stdout);
+    let stderr = String::from_utf8_lossy_owned(output.stderr);
     let combined = format!("{stdout}\n{stderr}");
     let success = output.status.success();
 
@@ -563,8 +563,8 @@ async fn extract_7z_with(
     )
     .await?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy_owned(output.stdout);
+    let stderr = String::from_utf8_lossy_owned(output.stderr);
     let combined = format!("{stdout}\n{stderr}");
     let success = output.status.success();
 
@@ -870,6 +870,14 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn lossy_owned_matches_borrowed_lossy_for_invalid_utf8() {
+        let bytes = vec![b'o', b'k', 0xFF, 0xFE, b'!'];
+        let expected = String::from_utf8_lossy(&bytes).into_owned();
+        assert_eq!(expected, "ok\u{FFFD}\u{FFFD}!");
+        assert_eq!(String::from_utf8_lossy_owned(bytes), expected);
+    }
 
     /// On Debian with p7zip-full and 7zip both installed, `7z` is p7zip
     /// (password from the terminal, so it has to go in argv) and `7zz` is

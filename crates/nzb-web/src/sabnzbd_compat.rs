@@ -549,7 +549,7 @@ fn percent_decode_lossy(value: &str) -> String {
             index += 1;
         }
     }
-    String::from_utf8_lossy(&decoded).into_owned()
+    String::from_utf8_lossy_owned(decoded)
 }
 
 /// Body encodings a SABnzbd client may use for a POST request.
@@ -3537,6 +3537,17 @@ fn format_timeleft(bytes_left: u64, speed_bps: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_decode_lossy_replaces_invalid_utf8() {
+        // %FF is not valid UTF-8: it becomes U+FFFD, valid bytes are kept.
+        assert_eq!(percent_decode_lossy("a%FFb%C3%A9"), "a\u{FFFD}b\u{e9}");
+        let bytes = vec![b'a', 0xFF];
+        assert_eq!(
+            String::from_utf8_lossy_owned(bytes.clone()),
+            String::from_utf8_lossy(&bytes)
+        );
+    }
 
     #[test]
     fn duplicate_refusal_matches_sabnzbd_so_arrs_blocklist_it() {
