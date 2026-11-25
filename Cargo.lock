@@ -1796,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "nzb-core"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "nzb-postproc"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -1938,7 +1938,7 @@ dependencies = [
 
 [[package]]
 name = "nzb-web"
-version = "0.4.25"
+version = "0.4.26"
 dependencies = [
  "anyhow",
  "arc-swap",

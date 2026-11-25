@@ -53,6 +53,7 @@ pub fn general_update_sensitive_fields(body_has: impl Fn(&str) -> bool) -> bool 
     const FIELDS: &[&str] = &[
         "data_dir",
         "scripts_dir",
+        "password_file",
         "script_success",
         "script_failure",
         "script_timeout_secs",
@@ -82,6 +83,7 @@ mod tests {
         for key in [
             "general.trusted_proxies",
             "general.local_import_dir",
+            "general.password_file",
             "general.step_up_ttl_secs",
             "notifications.webhook_url",
             "notifications.apprise_api_url",

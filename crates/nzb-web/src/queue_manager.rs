@@ -18,7 +18,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::nzb_core::config::{
-    CategoryConfig, DuplicatePolicy, NotificationConfig, ServerConfig, normalize_history_retention,
+    CategoryConfig, DuplicatePolicy, EncryptedAction, NotificationConfig, ServerConfig,
+    normalize_history_retention,
 };
 use crate::nzb_core::db::{Database, HistoryFilter, HistorySummary, nzb_digest};
 use crate::nzb_core::models::*;
@@ -36,8 +37,23 @@ use nzb_dispatch::{
     BandwidthConfig, BandwidthLimiter, DispatchEngine, DispatchHandle, ProgressUpdate,
 };
 
-fn cleanup_terminal_work_dir(job_id: &str, work_dir: &std::path::Path, final_status: JobStatus) {
+fn cleanup_terminal_work_dir(
+    job_id: &str,
+    work_dir: &std::path::Path,
+    final_status: JobStatus,
+    keep_for_password: bool,
+) {
     if !work_dir.exists() {
+        return;
+    }
+    if final_status == JobStatus::Failed && keep_for_password {
+        // Only the archive password is missing. A retry that supplies it
+        // reuses these files; deleting the history entry removes them.
+        info!(
+            job_id,
+            work_dir = %work_dir.display(),
+            "Keeping downloaded files for a retry with an archive password"
+        );
         return;
     }
 
@@ -391,6 +407,43 @@ struct PostProcScriptConfig {
     failure: Option<std::path::PathBuf>,
     timeout: Duration,
     max_output_bytes: usize,
+}
+
+/// Largest `general.password_file` that is read.
+const MAX_PASSWORD_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Read `general.password_file`: one password per line, blank lines skipped.
+/// Other whitespace is kept, as it may be part of a password. An unusable file
+/// is logged by path only and yields no passwords, so it never fails a job.
+fn read_password_file(path: &std::path::Path) -> Vec<String> {
+    use std::io::Read;
+
+    let read = || -> std::io::Result<String> {
+        // Not a device or FIFO, which could block or never end.
+        if !std::fs::metadata(path)?.is_file() {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        let mut contents = String::new();
+        std::fs::File::open(path)?
+            .take(MAX_PASSWORD_FILE_BYTES + 1)
+            .read_to_string(&mut contents)?;
+        if contents.len() as u64 > MAX_PASSWORD_FILE_BYTES {
+            return Err(std::io::Error::other("larger than 1 MiB"));
+        }
+        Ok(contents)
+    };
+    match read() {
+        Ok(contents) => contents
+            .trim_start_matches('\u{feff}')
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect(),
+        Err(error) => {
+            warn!(file = %path.display(), %error, "Cannot read the archive password file");
+            Vec::new()
+        }
+    }
 }
 
 fn resolve_script_path(
@@ -829,6 +882,13 @@ struct JobCheckpoint {
     /// Per-server article statistics accumulated so far.
     #[serde(default)]
     server_stats: Vec<ServerArticleStats>,
+    /// The archive password a failed job had, for its history retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+    /// Whether the job's encrypted archives were already acted on, so a
+    /// resumed job is not stopped for them again.
+    #[serde(default)]
+    encryption_checked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -892,6 +952,8 @@ fn checkpoint_for_job(job: &NzbJob, output_dir_claimed: bool) -> JobCheckpoint {
         download_time_secs: 0.0,
         carried_bytes: 0,
         server_stats: job.server_stats.clone(),
+        password: None,
+        encryption_checked: false,
     }
 }
 
@@ -901,6 +963,25 @@ fn checkpoint_for_job(job: &NzbJob, output_dir_claimed: bool) -> JobCheckpoint {
 fn restore_checkpoint_accounting(job: &mut NzbJob, checkpoint: &JobCheckpoint) -> (f64, u64) {
     job.server_stats = checkpoint.server_stats.clone();
     (checkpoint.download_time_secs, checkpoint.carried_bytes)
+}
+
+/// Drop the PAR2 volumes a complete download left unfetched from a job that
+/// failed only for want of a password. The first attempt reached extraction
+/// without them; with no article left to download, the engine could not tell
+/// that again and would fetch them all.
+fn drop_unneeded_recovery_volumes(job: &mut NzbJob) {
+    if job
+        .files
+        .iter()
+        .any(|file| !file.is_par2 && file.articles.iter().any(|article| !article.downloaded))
+    {
+        return;
+    }
+    job.files
+        .retain(|file| !file.is_par2 || file.articles.iter().any(|article| article.downloaded));
+    job.file_count = job.files.len();
+    job.total_bytes = job.files.iter().map(|file| file.bytes).sum();
+    job.article_count = job.files.iter().map(|file| file.articles.len()).sum();
 }
 
 fn apply_checkpoint(job: &mut NzbJob, checkpoint: &JobCheckpoint) {
@@ -1719,6 +1800,10 @@ struct JobState {
     /// The status the last progress save wrote to the queue row, so the save
     /// only takes the job-list and database locks together on a transition.
     persisted_status: Option<JobStatus>,
+    /// Whether this job's encrypted archives were already acted on.
+    encryption_checked: bool,
+    /// The job is being aborted for an encrypted archive, not missing articles.
+    encryption_abort: bool,
 }
 
 /// Field a manual queue sort orders by.
@@ -2052,6 +2137,10 @@ pub struct QueueManager {
     complete_action: Mutex<Option<String>>,
     /// `queue_complete_pers`: keep the action after it has run once.
     queue_complete_persist: AtomicBool,
+    /// `general.password_file`: archive passwords to try on encrypted jobs.
+    password_file: Mutex<Option<std::path::PathBuf>>,
+    /// `general.encrypted_action`.
+    encrypted_action: Mutex<EncryptedAction>,
     /// `par2.trust_inflight_verify`: let post-processing accept the slice map.
     trust_inflight_verify: AtomicBool,
     /// Stage-specific resource gates shared by all post-processing jobs.
@@ -2211,6 +2300,8 @@ impl QueueManager {
             auto_sort_remaining_pct: AtomicBool::new(false),
             duplicate_policy: Mutex::new(DuplicatePolicy::default()),
             postproc_scripts: Mutex::new(PostProcScriptConfig::default()),
+            password_file: Mutex::new(None),
+            encrypted_action: Mutex::new(EncryptedAction::default()),
             notifier: Mutex::new(Arc::new(Notifier::disabled())),
             complete_action: Mutex::new(None),
             queue_complete_persist: AtomicBool::new(false),
@@ -2513,6 +2604,136 @@ impl QueueManager {
             timeout: Duration::from_secs(timeout_secs.max(1)),
             max_output_bytes,
         };
+    }
+
+    /// `general.password_file`. The file is read when a job is extracted, so
+    /// edits to it need no reload.
+    pub fn set_password_file(&self, path: Option<std::path::PathBuf>) {
+        *self.password_file.lock() = path;
+    }
+
+    /// `general.encrypted_action`.
+    pub fn set_encrypted_action(&self, action: EncryptedAction) {
+        *self.encrypted_action.lock() = action;
+    }
+
+    /// Passwords to try on a job's archives besides its own: every password
+    /// its NZB lists, then those of `general.password_file`.
+    async fn listed_passwords(&self, job_id: &str) -> Vec<String> {
+        let nzb_data = self
+            .jobs
+            .lock()
+            .get(job_id)
+            .and_then(|state| state.nzb_data.clone());
+        let nzb_data = nzb_data.or_else(|| {
+            self.db
+                .lock()
+                .queue_get_nzb_data(job_id)
+                .unwrap_or_default()
+        });
+        let password_file = self.password_file.lock().clone();
+        tokio::task::spawn_blocking(move || {
+            let mut passwords = nzb_data
+                .as_deref()
+                .map(nzb_parser::nzb_passwords)
+                .unwrap_or_default();
+            if let Some(path) = password_file {
+                passwords.extend(read_password_file(&path));
+            }
+            passwords
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Act on `general.encrypted_action` if the completed file `path` of a
+    /// downloading job is an encrypted RAR that no known password opens.
+    ///
+    /// Runs beside the download, which is never held up by it: a job that has
+    /// moved on by the time the check ends is left alone.
+    async fn check_encryption(self: Arc<Self>, job_id: String, path: std::path::PathBuf) {
+        let checked = path.clone();
+        if !tokio::task::spawn_blocking(move || nzb_postproc::rar_is_encrypted(&checked))
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let password = {
+            let jobs = self.jobs.lock();
+            let Some(state) = jobs.get(&job_id) else {
+                return;
+            };
+            if state.encryption_checked {
+                return;
+            }
+            state.job.password.clone()
+        };
+        let mut candidates: Vec<String> = password
+            .iter()
+            .filter(|pw| !pw.is_empty())
+            .cloned()
+            .collect();
+        candidates.extend(self.listed_passwords(&job_id).await);
+        for candidate in &candidates {
+            match nzb_postproc::rar_password_rejected(&path, candidate).await {
+                Some(true) => {}
+                Some(false) => {
+                    if let Some(state) = self.jobs.lock().get_mut(&job_id) {
+                        state.encryption_checked = true;
+                    }
+                    return;
+                }
+                // Left for a volume that can tell.
+                None => return,
+            }
+        }
+
+        let action = *self.encrypted_action.lock();
+        let message = "Encrypted archive: no known password opens it";
+        {
+            let mut jobs = self.jobs.lock();
+            let Some(state) = jobs.get_mut(&job_id) else {
+                return;
+            };
+            if std::mem::replace(&mut state.encryption_checked, true)
+                || action == EncryptedAction::Ignore
+                || state.job.status != JobStatus::Downloading
+                || state.job.password != password
+            {
+                return;
+            }
+            if let Some(unpacker) = state.direct_unpacker.take() {
+                unpacker.abort();
+            }
+            state.encryption_abort = action == EncryptedAction::Abort;
+        }
+        warn!(job_id = %job_id, ?action, "{message}");
+        if action == EncryptedAction::Abort {
+            if !self.dispatch.abort_job(&job_id, message.to_string()) {
+                debug!(job_id = %job_id, "Encrypted job already ended");
+            }
+            return;
+        }
+        if let Err(error) = self.pause_job(&job_id) {
+            warn!(job_id = %job_id, %error, "Cannot pause encrypted job");
+            return;
+        }
+        let message = format!("Paused: {message}. Set its password, then resume");
+        if let Some(state) = self.jobs.lock().get_mut(&job_id) {
+            state.job.error_message = Some(message.clone());
+            state.failure_code = Some(JobFailureCode::ArchivePasswordRequired);
+        }
+        if let Err(error) = self
+            .db
+            .lock()
+            .queue_update_error_message(&job_id, Some(&message))
+        {
+            warn!(job_id = %job_id, %error, "Failed to persist the encryption pause");
+        }
+        // Keep the record of the check, so resuming after a restart does not
+        // pause the job again.
+        self.persist_job_progress_blocking(&job_id).await;
     }
 
     /// Replace the notification targets. Takes effect for events raised after
@@ -3002,6 +3223,8 @@ impl QueueManager {
                 par2_volumes: None,
                 output_dir_claimed: false,
                 persisted_status: None,
+                encryption_checked: false,
+                encryption_abort: false,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             if !requested_paused {
@@ -3030,6 +3253,8 @@ impl QueueManager {
             par2_volumes: None,
             output_dir_claimed: false,
             persisted_status: None,
+            encryption_checked: false,
+            encryption_abort: false,
         };
         self.jobs.lock().insert(job_id.clone(), state);
         self.job_order.lock().push(job_id);
@@ -3055,6 +3280,17 @@ impl QueueManager {
         self: &Arc<Self>,
         entry: &HistoryEntry,
     ) -> crate::nzb_core::Result<HistoryRetryOutcome> {
+        self.retry_history_entry_with_password(entry, None)
+    }
+
+    /// [`Self::retry_history_entry`] with an archive password that replaces
+    /// the one in the stored NZB. Empty counts as unset. A retry already in
+    /// flight is returned as it is, without changing its password.
+    pub fn retry_history_entry_with_password(
+        self: &Arc<Self>,
+        entry: &HistoryEntry,
+        password: Option<String>,
+    ) -> crate::nzb_core::Result<HistoryRetryOutcome> {
         let mut retries = self.history_retries.lock();
         {
             let jobs = self.jobs.lock();
@@ -3068,7 +3304,10 @@ impl QueueManager {
             return Ok(HistoryRetryOutcome::NoNzbData);
         };
         let retry_data = self.history_get_retry_data(&entry.id)?;
-        let job = self.prepare_retry_job(entry, &nzb_data, retry_data.as_deref())?;
+        let mut job = self.prepare_retry_job(entry, &nzb_data, retry_data.as_deref())?;
+        if let Some(password) = password.filter(|password| !password.is_empty()) {
+            job.password = Some(password);
+        }
         let job_id = job.id.clone();
         info!(
             name = %job.name,
@@ -3101,10 +3340,20 @@ impl QueueManager {
         job.output_dir = self.output_dir_for(&job.category, &job.name)?;
         job.work_dir = self.incomplete_dir().join(&job.id);
 
-        if entry.status == JobStatus::Failed
-            && let Some(data) = retry_data
-            && let Ok(checkpoint) = serde_json::from_slice::<JobCheckpoint>(data)
+        let checkpoint = retry_data
+            .filter(|_| entry.status == JobStatus::Failed)
+            .and_then(|data| serde_json::from_slice::<JobCheckpoint>(data).ok());
+        if let Some(password) = checkpoint.as_ref().and_then(|c| c.password.clone()) {
+            job.password = Some(password);
+        }
+        if let Some(checkpoint) = checkpoint
             && let Some(work_dir) = checkpoint.work_dir.as_ref()
+            // Several entries can name one directory (a failed retry of a
+            // failed job); only one live job may write to it.
+            && !self.jobs.lock().values().any(|state| {
+                state.job.work_dir == *work_dir
+                    && !matches!(state.job.status, JobStatus::Completed | JobStatus::Failed)
+            })
             && std::fs::canonicalize(self.incomplete_dir())
                 .ok()
                 .zip(std::fs::canonicalize(work_dir).ok())
@@ -3129,6 +3378,9 @@ impl QueueManager {
                 }
             }
             job.work_dir = work_dir.clone();
+            if entry.failure_code == Some(JobFailureCode::ArchivePasswordRequired) {
+                drop_unneeded_recovery_volumes(&mut job);
+            }
         }
 
         Ok(job)
@@ -3159,6 +3411,7 @@ impl QueueManager {
                                     serde_json::from_slice::<JobCheckpoint>(&cp_data)
                             {
                                 apply_checkpoint(&mut state.job, &checkpoint);
+                                state.encryption_checked |= checkpoint.encryption_checked;
                                 (state.prior_download_secs, state.carried_bytes) =
                                     restore_checkpoint_accounting(&mut state.job, &checkpoint);
                                 if !state.output_dir_claimed {
@@ -3406,6 +3659,7 @@ impl QueueManager {
                     yenc_filename,
                     ..
                 } => {
+                    let encrypted_action = *self.encrypted_action.lock();
                     self.speed.record(decoded_bytes);
                     job_speed.record(decoded_bytes);
 
@@ -3522,6 +3776,20 @@ impl QueueManager {
                                             total = state.job.file_count,
                                             "File assembly complete"
                                         );
+
+                                        if !file.is_par2
+                                            && !state.encryption_checked
+                                            && encrypted_action != EncryptedAction::Ignore
+                                            && self.post_processing_level_for(
+                                                state.job.pp_override,
+                                                &state.job.category,
+                                            ) >= 2
+                                        {
+                                            tokio::spawn(Arc::clone(&self).check_encryption(
+                                                job_id.clone(),
+                                                state.job.work_dir.join(&file.filename),
+                                            ));
+                                        }
 
                                         // Direct unpack: feed completed RAR volumes to the
                                         // unpacker so extraction overlaps with download.
@@ -3895,7 +4163,11 @@ impl QueueManager {
                 state.download_time_secs = Some(state.prior_download_secs + download_time_secs);
                 state.job.status = JobStatus::Failed;
                 state.job.error_message = Some(reason.clone());
-                state.failure_code = Some(JobFailureCode::ArticlesUnavailable);
+                state.failure_code = Some(if state.encryption_abort {
+                    JobFailureCode::ArchivePasswordRequired
+                } else {
+                    JobFailureCode::ArticlesUnavailable
+                });
                 state.job.articles_failed = state.job.articles_failed.max(articles_failed);
                 state.job.completed_at = Some(chrono::Utc::now());
                 let tracker = state.hopeless_tracker.as_ref();
@@ -4119,6 +4391,11 @@ impl QueueManager {
                     )
                 })
                 .unwrap_or_default();
+            let password_candidates = if pp_level >= 2 {
+                self.listed_passwords(job_id).await
+            } else {
+                Vec::new()
+            };
             let config = PostProcConfig {
                 cleanup_after_extract: true,
                 delete_archives,
@@ -4127,6 +4404,7 @@ impl QueueManager {
                 content_articles_failed,
                 skip_extract: direct_unpack_success,
                 password: password.clone(),
+                password_candidates,
                 max_nested_archive_depth: self.max_nested_archive_depth,
                 slice_map,
                 trust_inflight_verify: self.trust_inflight_verify.load(Ordering::SeqCst),
@@ -4166,13 +4444,17 @@ impl QueueManager {
             // Update job status based on pipeline result
             {
                 let mut jobs = self.jobs.lock();
-                if let Some(state) = jobs.get_mut(job_id)
-                    && !result.success
-                {
-                    state.job.status = JobStatus::Failed;
-                    state.job.error_message = result.error.clone();
-                    state.failure_code =
-                        result.failure_code.or(Some(JobFailureCode::DownloadFailed));
+                if let Some(state) = jobs.get_mut(job_id) {
+                    if let Some(password) = result.password.clone() {
+                        // Scripts and API clients see the password that worked.
+                        state.job.password = Some(password);
+                    }
+                    if !result.success {
+                        state.job.status = JobStatus::Failed;
+                        state.job.error_message = result.error.clone();
+                        state.failure_code =
+                            result.failure_code.or(Some(JobFailureCode::DownloadFailed));
+                    }
                 }
             }
 
@@ -4457,7 +4739,14 @@ impl QueueManager {
         state.job.status = final_status;
 
         // Insert into history with real stage results
-        if final_status == JobStatus::Failed && state.output_dir_claimed {
+        let needs_password = final_status == JobStatus::Failed
+            && state.failure_code == Some(JobFailureCode::ArchivePasswordRequired);
+        if needs_password && state.output_dir_claimed {
+            // Wrong passwords leave partial output behind. The folder is this
+            // job's own and the archives are kept, so clear it for the retry.
+            let _ = std::fs::remove_dir_all(&state.job.output_dir);
+            state.output_dir_claimed = false;
+        } else if final_status == JobStatus::Failed && state.output_dir_claimed {
             // A failed job keeps nothing in its reserved folder unless
             // extraction already wrote there; release an empty reservation so
             // a retry can claim the plain name again.
@@ -4466,8 +4755,11 @@ impl QueueManager {
             }
         }
 
-        let retry_data =
-            serde_json::to_vec(&checkpoint_for_job(&state.job, state.output_dir_claimed)).ok();
+        let mut checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
+        if final_status == JobStatus::Failed {
+            checkpoint.password = state.job.password.clone();
+        }
+        let retry_data = serde_json::to_vec(&checkpoint).ok();
         let history_entry = HistoryEntry {
             client_removal: None,
             id: state.job.id.clone(),
@@ -4547,7 +4839,12 @@ impl QueueManager {
 
         if history_persisted {
             self.notify_terminal(state, final_status);
-            cleanup_terminal_work_dir(&state.job.id, &state.job.work_dir, final_status);
+            cleanup_terminal_work_dir(
+                &state.job.id,
+                &state.job.work_dir,
+                final_status,
+                needs_password,
+            );
         } else {
             warn!(
                 job_id = %state.job.id,
@@ -4599,6 +4896,7 @@ impl QueueManager {
             };
             let mut checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
             checkpoint.carried_bytes = state.carried_bytes;
+            checkpoint.encryption_checked = state.encryption_checked;
             (
                 state.persisted_status != Some(state.job.status),
                 state.job.downloaded_bytes,
@@ -5115,6 +5413,41 @@ impl QueueManager {
             }
             None => Err(crate::nzb_core::NzbError::JobNotFound(id.to_string())),
         }
+    }
+
+    /// Set or clear (`None` or empty) a queued job's archive password. Refused
+    /// once the job is past downloading, when it could no longer take effect.
+    pub fn set_job_password(
+        &self,
+        id: &str,
+        password: Option<String>,
+    ) -> crate::nzb_core::Result<()> {
+        let password = password.filter(|password| !password.is_empty());
+        let mut jobs = self.jobs.lock();
+        let Some(state) = jobs.values_mut().find(|s| job_id_matches(&s.job.id, id)) else {
+            return Err(crate::nzb_core::NzbError::JobNotFound(id.to_string()));
+        };
+        if !matches!(
+            state.job.status,
+            JobStatus::Queued | JobStatus::Paused | JobStatus::Downloading
+        ) {
+            return Err(crate::nzb_core::NzbError::Other(
+                "the job has finished downloading; its password can no longer change".to_string(),
+            ));
+        }
+        self.db
+            .lock()
+            .queue_update_password(&state.job.id, password.as_deref())?;
+        if state.job.password != password
+            && let Some(unpacker) = state.direct_unpacker.take()
+        {
+            // It runs with the old password; extraction after the download
+            // uses the new one.
+            unpacker.abort();
+        }
+        state.job.password = password;
+        info!(job_id = %state.job.id, "Job archive password changed");
+        Ok(())
     }
 
     /// Change a job's category in the queue.
@@ -6428,7 +6761,13 @@ impl QueueManager {
             // closes, so it counts as a reference exactly like a visible one.
             // Failed rows own nothing: a failed job's partial download is
             // deleted when it fails, so any left over (from older versions)
-            // is reclaimable.
+            // is reclaimable. The exception is a job that only lacked an
+            // archive password, whose files wait for a retry.
+            paths.extend(
+                db.history_password_failure_retry_data()?
+                    .iter()
+                    .filter_map(|data| retry_checkpoint_work_dir(data)),
+            );
             for entry in visible.iter().chain(trashed.iter()) {
                 if entry.status != JobStatus::Failed {
                     paths.push(incomplete.join(&entry.id));
@@ -6767,6 +7106,7 @@ impl QueueManager {
             // is loaded lazily in launch_download() when they reach the front of
             // the queue. This keeps memory low with large queues (hundreds of jobs).
             let was_active = job.status == JobStatus::Downloading;
+            let mut encryption_checked = false;
             let mut output_dir_claimed = false;
             let mut prior_download_secs = 0.0;
             let mut carried_bytes = 0;
@@ -6802,6 +7142,7 @@ impl QueueManager {
                     match serde_json::from_slice::<JobCheckpoint>(data) {
                         Ok(checkpoint) => {
                             apply_checkpoint(&mut job, &checkpoint);
+                            encryption_checked = checkpoint.encryption_checked;
                             output_dir_claimed = restore_claimed_output_dir(&mut job, &checkpoint);
                             (prior_download_secs, carried_bytes) =
                                 restore_checkpoint_accounting(&mut job, &checkpoint);
@@ -6872,6 +7213,8 @@ impl QueueManager {
                 par2_volumes: None,
                 output_dir_claimed,
                 persisted_status: None,
+                encryption_checked,
+                encryption_abort: false,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);
@@ -6975,7 +7318,8 @@ impl QueueManager {
                 let Some(state) = jobs.get(id) else {
                     continue;
                 };
-                let checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
+                let mut checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
+                checkpoint.encryption_checked = state.encryption_checked;
                 match serde_json::to_vec(&checkpoint) {
                     Ok(data) => {
                         if let Err(e) = db.queue_store_job_data(id, &data) {
@@ -7519,6 +7863,24 @@ mod global_pause_tests {
         assert_eq!(manager.queue_size(), 1);
     }
 
+    #[test]
+    fn password_file_keeps_inner_whitespace_and_skips_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passwords.txt");
+        std::fs::write(&path, "\u{feff}first\r\n\n  \n two words \nlast").unwrap();
+        assert_eq!(read_password_file(&path), ["first", " two words ", "last"]);
+    }
+
+    #[test]
+    fn unusable_password_files_yield_no_passwords() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_password_file(&dir.path().join("missing")).is_empty());
+        assert!(read_password_file(dir.path()).is_empty());
+        let large = dir.path().join("large");
+        std::fs::write(&large, vec![b'a'; MAX_PASSWORD_FILE_BYTES as usize + 1]).unwrap();
+        assert!(read_password_file(&large).is_empty());
+    }
+
     fn manager() -> (Arc<QueueManager>, tempfile::TempDir) {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db = Database::open_memory().expect("database");
@@ -7579,6 +7941,8 @@ mod global_pause_tests {
                 par2_volumes: None,
                 output_dir_claimed: false,
                 persisted_status: None,
+                encryption_checked: false,
+                encryption_abort: false,
             },
         );
         manager.job_order.lock().push(id);

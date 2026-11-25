@@ -12,6 +12,10 @@ use crate::models::{Article, JobStatus, NzbFile, NzbJob, Priority};
 
 /// Parse an NZB XML file into an NzbJob.
 pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
+    parse_nzb_with_passwords(name, data).map(|(job, _)| job)
+}
+
+fn parse_nzb_with_passwords(name: &str, data: &[u8]) -> Result<(NzbJob, Vec<String>), NzbError> {
     if data.is_empty() {
         return Err(NzbError::InvalidNzb("NZB data is empty".into()));
     }
@@ -48,7 +52,7 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
     let mut in_groups = false;
     let mut in_segments = false;
     let mut buf = Vec::new();
-    let mut meta_password: Option<String> = None;
+    let mut meta_passwords: Vec<String> = Vec::new();
     let mut reading_password_meta = false;
     // quick-xml >= 0.38 no longer unescapes text inline: `&amp;` arrives as a
     // separate `GeneralRef` event between two `Text` events, and CDATA is its
@@ -212,7 +216,7 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
                 }
                 b"meta" => {
                     if reading_password_meta {
-                        meta_password = Some(text_buf.trim().to_string());
+                        meta_passwords.push(text_buf.trim().to_string());
                         reading_password_meta = false;
                     }
                     text_buf.clear();
@@ -263,7 +267,7 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
     let article_count: usize = files.iter().map(|f| f.articles.len()).sum();
     let file_count = files.len();
 
-    Ok(NzbJob {
+    let job = NzbJob {
         slice_map: None,
         held_par2_bytes: 0,
         id: uuid::Uuid::new_v4().to_string(),
@@ -282,14 +286,29 @@ pub fn parse_nzb(name: &str, data: &[u8]) -> Result<NzbJob, NzbError> {
         completed_at: None,
         work_dir: std::path::PathBuf::new(), // Set by queue manager
         output_dir: std::path::PathBuf::new(),
-        password: meta_password,
+        password: meta_passwords.last().cloned(),
         error_message: None,
         speed_bps: 0,
         pp_override: None,
         delete_archives: None,
         server_stats: Vec::new(),
         files,
-    })
+    };
+    Ok((job, meta_passwords))
+}
+
+/// Every `<meta type="password">` of an NZB, in document order, without blanks
+/// and repeats. An NZB that cannot be parsed has none.
+pub fn nzb_passwords(data: &[u8]) -> Vec<String> {
+    let mut passwords: Vec<String> = Vec::new();
+    if let Ok((_, found)) = parse_nzb_with_passwords("", data) {
+        for password in found {
+            if !password.is_empty() && !passwords.contains(&password) {
+                passwords.push(password);
+            }
+        }
+    }
+    passwords
 }
 
 /// Parse NZB from a file path.
@@ -637,6 +656,17 @@ mod tests {
         assert_eq!(job.files[0].groups.len(), 2);
         assert_eq!(job.files[0].groups[0], "alt.binaries.test");
         assert_eq!(job.files[0].groups[1], "alt.binaries.misc");
+    }
+
+    #[test]
+    fn every_meta_password_is_listed_once_in_order() {
+        let nzb = br#"<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><head>
+<meta type="password">one</meta><meta type="password">a &amp; b</meta>
+<meta type="password"> </meta><meta type="password">one</meta></head>
+<file poster="a" date="1" subject="&quot;x.rar&quot; yEnc (1/1)"><groups><group>a.b</group></groups>
+<segments><segment bytes="10" number="1">a@b</segment></segments></file></nzb>"#;
+        assert_eq!(nzb_passwords(nzb), ["one", "a & b"]);
+        assert!(nzb_passwords(b"not an nzb").is_empty());
     }
 
     #[test]

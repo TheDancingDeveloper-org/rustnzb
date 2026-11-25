@@ -4,7 +4,7 @@ export type IconName =
   | 'close'
   | 'play'
   | 'pause'
-  | 'retry'
+  | 'retry' | 'key'
   | 'chevron-down'
   | 'chevron-right'
   | 'drag-handle';
@@ -43,6 +43,10 @@ export type IconName =
             stroke-linecap="round"
             stroke-linejoin="round"
           />
+        }
+        @case ('key') {
+          <circle cx="5" cy="8" r="2.5" />
+          <path d="M7.5 8H14M11.5 8v2.5" stroke-linecap="round" />
         }
         @case ('chevron-down') {
           <path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round" />

@@ -656,6 +656,32 @@ pub fn settings() -> Vec<Setting> {
             granular: false,
         }),
         setting(Draft {
+            key: "general.password_file",
+            kind: Kind::Path { optional: true },
+            default: serde_json::Value::Null,
+            apply: Live,
+            class: Sensitive,
+            env: &[],
+            cli: None,
+            group: "post",
+            label: "Archive password file",
+            granular: true,
+        }),
+        setting(Draft {
+            key: "general.encrypted_action",
+            kind: Kind::Enum {
+                values: &["ignore", "pause", "abort"],
+            },
+            default: serde_json::json!(general.encrypted_action.to_string()),
+            apply: Live,
+            class: Normal,
+            env: &[],
+            cli: None,
+            group: "post",
+            label: "Encrypted RAR found while downloading",
+            granular: true,
+        }),
+        setting(Draft {
             key: "general.queue_complete_pers",
             kind: Kind::Bool,
             default: serde_json::json!(general.queue_complete_pers),
@@ -1026,6 +1052,7 @@ fn filled() -> AppConfig {
     config.general.rss_history_limit = Some(1);
     config.general.rss_downloaded_item_expiry_days = Some(1);
     config.general.local_import_dir = Some(path("/tmp/import"));
+    config.general.password_file = Some(path("/tmp/passwords.txt"));
     config.general.scripts_dir = Some(path("/tmp/scripts"));
     config.general.script_success = Some(path("/tmp/scripts/ok.sh"));
     config.general.script_failure = Some(path("/tmp/scripts/bad.sh"));

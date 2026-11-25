@@ -149,6 +149,8 @@ use `RUSTNZB_ALLOWED_ROOTS=/downloads:/data:/config`.
 | `auto_sort_remaining_pct` | `false` | Keep queued jobs ordered by remaining work. |
 | `duplicate_policy` | `"warn"` | When an NZB matches a queued or history job by name or content: `allow`, `warn` (log it) or `skip` (refuse it). |
 | `local_import_dir` | unset | The only directory SABnzbd `addlocalfile` may read. Unset refuses the mode. It also needs an API key. |
+| `password_file` | unset | File of archive passwords, one per line, tried in order when a RAR, 7z or ZIP archive needs a password, after the job's own and any others its NZB lists. Read again for each job. Must be UTF-8 and at most 1 MiB. Each try runs the extractor, so keep the list short. Passwords are not logged, but see [Archive passwords](KNOWN_ISSUES.md#archive-passwords). Encrypted ZIPs need 7-Zip. |
+| `encrypted_action` | `"ignore"` | When an encrypted RAR that no known password opens is found while downloading: `ignore` (keep downloading), `pause` (until a password is set) or `abort` (fail the job). SABnzbd pauses by default. A password is checked early only with unrar 6 or later; otherwise any known password counts as possibly right. A job that fails for want of a password keeps its files until its history entry is deleted or removed by an *arr, so a retry does not download them again. |
 | `queue_complete_pers` | `false` | Keep the SABnzbd `change_complete_action` after it runs once. SABnzbd's default is to reset it. |
 | `scripts_dir` | unset | Directory of post-processing scripts. |
 | `script_success` | unset | Script run after a successful job. |

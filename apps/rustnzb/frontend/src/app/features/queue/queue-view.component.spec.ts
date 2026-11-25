@@ -70,6 +70,7 @@ function makeComponent(
   route: RouteStub;
   router: RouterStub;
   announcer: AnnouncerService;
+  dialog: { open: ReturnType<typeof vi.fn> };
 } {
   const api: ApiStub = {
     get: vi.fn(() => of({})),
@@ -100,6 +101,7 @@ function makeComponent(
     confirm: vi.fn(() => of(true)),
   };
   const announcer = new AnnouncerService();
+  const dialog = { open: vi.fn(() => ({ afterClosed: () => of<string | null>(null) })) };
   const component = new QueueViewComponent(
     api as unknown as ApiService,
     http as unknown as import('@angular/common/http').HttpClient,
@@ -110,9 +112,10 @@ function makeComponent(
     confirmSvc as never,
     new PauseStateService(),
     announcer,
+    dialog as never,
   );
 
-  return { component, api, http, snackBar: snackbarStub, route, router, announcer };
+  return { component, api, http, snackBar: snackbarStub, route, router, announcer, dialog };
 }
 
 function makeJob(overrides: Partial<NzbJob> = {}): NzbJob {
@@ -139,6 +142,22 @@ function makeJob(overrides: Partial<NzbJob> = {}): NzbJob {
 }
 
 describe('QueueViewComponent', () => {
+  it('sets, clears or leaves a job password according to the dialog', () => {
+    for (const [answer, expected] of [
+      [' pass word ', { password: ' pass word ' }],
+      ['', { password: '' }],
+      [null, null],
+    ] as const) {
+      const { component, api, dialog } = makeComponent({
+        get: vi.fn(() => of({ jobs: [] })),
+      });
+      dialog.open.mockReturnValue({ afterClosed: () => of(answer) });
+      component.setPassword({ id: 'job-1', name: 'Job' } as never);
+      if (expected) expect(api.put).toHaveBeenCalledWith('/queue/job-1/password', expected);
+      else expect(api.put).not.toHaveBeenCalled();
+    }
+  });
+
   beforeEach(() => {
     installLocalStorageMock();
     localStorage.clear();

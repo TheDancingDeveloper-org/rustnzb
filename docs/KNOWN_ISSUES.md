@@ -27,6 +27,7 @@ optimization experiments are recorded in the
   preference to `7z`.
 - **Stored in plaintext.** Extraction needs the original password, so it is
   kept unencrypted in the queue database (`queue.password` in the SQLite
-  database under the data directory) and in the stored NZB. Keep the data
+  database under the data directory), in a failed job's retry data, and in
+  the stored NZB. Keep the data
   directory readable only by the rustnzb user. The SABnzbd-compatible queue
   returns it in each slot's `password`, as SABnzbd does.
