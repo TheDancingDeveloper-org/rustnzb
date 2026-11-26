@@ -66,7 +66,7 @@ async fn no_progress_timeout_aborts_silent_zombie_job() {
     // we want to observe Phase 6 reacting independently.
     engine
         .queue_manager
-        .set_max_worker_idle(Duration::from_secs(60));
+        .set_max_worker_idle(Duration::from_mins(1));
 
     let job_id = engine
         .submit_nzb_xml("no-progress", fixture.xml)

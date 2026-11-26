@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+const EVENT_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// How a test bends the standard scenario run.
 #[derive(Default)]

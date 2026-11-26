@@ -2329,7 +2329,7 @@ impl QueueManager {
             // Phase 6: 5-minute default. Long enough that a slow first
             // article doesn't accidentally abort a real download; short
             // enough that an obvious zombie is killed within minutes.
-            no_progress_timeout: Mutex::new(Duration::from_secs(300)),
+            no_progress_timeout: Mutex::new(Duration::from_mins(5)),
         })
     }
 
@@ -11069,7 +11069,7 @@ mod hopeless_tests {
         t.record_success(false);
         t.last_progress_at = Instant::now() - Duration::from_secs(301);
 
-        let result = t.time_based_check(Duration::from_secs(300));
+        let result = t.time_based_check(Duration::from_mins(5));
         assert!(result.is_some(), "late-stage stalls should abort");
         assert_eq!(result.unwrap().tier, "no_progress_timeout");
     }
@@ -11080,16 +11080,16 @@ mod hopeless_tests {
         // its progress clock is stale. Resuming must restart the clock (GH
         // #123) so the watchdog does not abort it on the next scan.
         let mut t = make_tracker(100, 10);
-        t.last_progress_at = Instant::now() - Duration::from_secs(600);
+        t.last_progress_at = Instant::now() - Duration::from_mins(10);
         assert!(
-            t.time_based_check(Duration::from_secs(300)).is_some(),
+            t.time_based_check(Duration::from_mins(5)).is_some(),
             "precondition: a stale clock should abort"
         );
 
         t.reset_progress_clock();
 
         assert!(
-            t.time_based_check(Duration::from_secs(300)).is_none(),
+            t.time_based_check(Duration::from_mins(5)).is_none(),
             "resuming a paused job must not abort it: paused time must not count toward the article timeout"
         );
     }

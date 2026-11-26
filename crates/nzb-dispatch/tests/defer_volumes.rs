@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+const EVENT_TIMEOUT: Duration = Duration::from_mins(1);
 const REPAIR_MARGIN: usize = 8;
 
 /// Run `scenario` to `JobFinished` and return the fixture and, in volume

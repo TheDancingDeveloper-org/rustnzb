@@ -294,7 +294,7 @@ async fn article_without_override_falls_through_to_404() {
 #[tokio::test]
 async fn auth_rate_limit_trips_after_threshold() {
     // Allow 2 attempts per long window. The 3rd PASS should be rejected.
-    let limiter = AuthRateLimit::new(2, Duration::from_secs(60));
+    let limiter = AuthRateLimit::new(2, Duration::from_mins(1));
 
     let server = MockNntpServer::start(MockConfig {
         auth_rate_limit: Some(limiter),
@@ -340,7 +340,7 @@ async fn auth_rate_limit_trips_after_threshold() {
 async fn auth_rate_limit_clones_share_state() {
     // Cloning the limiter (e.g. when MockConfig is cloned) must NOT reset
     // the state — both clones must observe the same window.
-    let limiter = AuthRateLimit::new(1, Duration::from_secs(60));
+    let limiter = AuthRateLimit::new(1, Duration::from_mins(1));
     let server1 = MockNntpServer::start(MockConfig {
         auth_rate_limit: Some(limiter.clone()),
         ..Default::default()

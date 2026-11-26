@@ -424,7 +424,7 @@ async fn an_encrypted_job_pauses_until_its_password_is_set() {
         .unwrap();
     assert!(
         engine
-            .wait_for_status(&id, Duration::from_secs(60), &[JobStatus::Paused])
+            .wait_for_status(&id, Duration::from_mins(1), &[JobStatus::Paused])
             .await,
         "encrypted job was not paused"
     );

@@ -16,7 +16,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(15 * 60); // 15 minutes
+const ACCESS_TOKEN_TTL: Duration = Duration::from_mins(15); // 15 minutes
 const REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60); // 30 days
 
 struct TokenEntry {
@@ -777,7 +777,7 @@ const FAILURE_BASE_DELAY: Duration = Duration::from_millis(500);
 const FAILURE_MAX_DELAY: Duration = Duration::from_secs(30);
 /// A client's failures are forgotten, and its entry evicted, once it has made
 /// no failed attempt for this long.
-const FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
+const FAILURE_WINDOW: Duration = Duration::from_mins(15);
 /// Clients tracked at once. When the table is full, expired entries are
 /// evicted first, then the least recently failed one, so a new client always
 /// starts with no failures.

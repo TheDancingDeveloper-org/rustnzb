@@ -90,7 +90,7 @@ fn finished(engine: &TestEngine, job_id: &str) -> bool {
 /// article lands for `STALL`, or the whole wait exceeds `CAP`.
 async fn assert_completes_after_limit_change(engine: &TestEngine, job_id: &str) {
     const STALL: Duration = Duration::from_secs(20);
-    const CAP: Duration = Duration::from_secs(120);
+    const CAP: Duration = Duration::from_mins(2);
 
     let start = Instant::now();
     let mut last_seen = downloaded(engine, job_id);

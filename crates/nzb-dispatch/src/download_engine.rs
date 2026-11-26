@@ -81,7 +81,7 @@ const WORKER_RAMP_DELAY: Duration = Duration::from_millis(15);
 /// Consecutive connect failures before circuit-breaking a server.
 const CIRCUIT_BREAK_THRESHOLD: u32 = 3;
 /// Cooldown after auth/permission failure (bad credentials, 502, account blocked).
-const AUTH_FAILURE_COOLDOWN: Duration = Duration::from_secs(120);
+const AUTH_FAILURE_COOLDOWN: Duration = Duration::from_mins(2);
 /// Cooldown after transient connection failures exceed threshold.
 const TRANSIENT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 /// Supervisor tick interval for detecting stuck jobs.
@@ -91,7 +91,7 @@ const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
 /// Tunable per pool via [`WorkerPool::set_max_worker_idle`]. Production code
 /// uses the default; the test harness shrinks this to make Phase 5 tests
 /// converge in seconds rather than minutes.
-const DEFAULT_MAX_WORKER_IDLE: Duration = Duration::from_secs(60);
+const DEFAULT_MAX_WORKER_IDLE: Duration = Duration::from_mins(1);
 /// Worker idle poll interval when the shared queue is empty.
 const WORKER_IDLE_POLL: Duration = Duration::from_millis(500);
 /// How often an idle worker checks that its socket is still open. Providers
@@ -1939,7 +1939,7 @@ impl WorkerPool {
                     let mut log = self.starvation_log.lock();
                     let should_log = log
                         .get(sid)
-                        .map(|t| now_instant.duration_since(*t) >= Duration::from_secs(60))
+                        .map(|t| now_instant.duration_since(*t) >= Duration::from_mins(1))
                         .unwrap_or(true);
                     if should_log {
                         log.insert(sid.clone(), now_instant);

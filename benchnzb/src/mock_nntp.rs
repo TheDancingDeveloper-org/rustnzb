@@ -188,7 +188,7 @@ async fn handle_connection_inner(
     loop {
         line.clear();
         let n = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
+            std::time::Duration::from_mins(5),
             reader.read_line(&mut line),
         )
         .await??;

@@ -27,7 +27,7 @@ use crate::connection::{ConnectionState, NntpConnection};
 use crate::error::{NntpError, NntpResult};
 
 /// How long an idle connection can sit before we health-check it.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// How long to wait for a connection from the pool before giving up.
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -116,7 +116,7 @@ impl ConnectionPool {
             semaphore: Arc::new(Semaphore::new(max_conns)),
             created_count: Mutex::new(0),
             // Allow the first connection immediately
-            last_connect: tokio::sync::Mutex::new(Instant::now() - Duration::from_secs(60)),
+            last_connect: tokio::sync::Mutex::new(Instant::now() - Duration::from_mins(1)),
             ramp_up_delay,
             config,
             budget: None,
@@ -894,7 +894,7 @@ mod tests {
         assert_eq!(pool.idle_count(), 1);
         let manager = tokio::spawn({
             let pool = Arc::clone(&pool);
-            async move { pool.manage_idle(Duration::from_secs(60)).await }
+            async move { pool.manage_idle(Duration::from_mins(1)).await }
         });
         // Let the manager start listening for contention.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -941,7 +941,7 @@ mod tests {
             ));
             let manager = tokio::spawn({
                 let pool = Arc::clone(&pool);
-                async move { pool.manage_idle(Duration::from_secs(60)).await }
+                async move { pool.manage_idle(Duration::from_mins(1)).await }
             });
             // Four readers at once, as a stream reads segments in parallel.
             // The floor is one permit, so they take turns on one socket.

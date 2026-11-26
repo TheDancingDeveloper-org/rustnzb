@@ -44,7 +44,7 @@ pub const PENALTY_502: Duration = Duration::from_secs(5);
 /// Penalty window after an authentication failure. Long enough that we
 /// don't hammer the auth endpoint; short enough that a password rotation
 /// recovers within a minute.
-pub const PENALTY_AUTH: Duration = Duration::from_secs(60);
+pub const PENALTY_AUTH: Duration = Duration::from_mins(1);
 
 /// `Server` groups a fixed pool of [`NewsWrapper`]s + aggregate health and
 /// penalty bookkeeping.

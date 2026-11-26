@@ -19,7 +19,7 @@ use crate::error::ApiError;
 pub const CONFIRM_HEADER: &str = "x-confirm-password";
 
 /// Default step-up window: five minutes.
-pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
+pub const DEFAULT_TTL: Duration = Duration::from_mins(5);
 
 /// How the request authenticated, as decided by the auth middleware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn window_is_required_then_satisfied_then_expired() {
         let secs = Arc::new(AtomicU64::new(1_000));
-        let store = StepUpStore::with_clock(Duration::from_secs(300), clock(secs.clone()));
+        let store = StepUpStore::with_clock(Duration::from_mins(5), clock(secs.clone()));
         assert!(!store.fresh(7), "required before any confirmation");
         store.record(7);
         assert!(store.fresh(7), "satisfied inside the window");
@@ -163,7 +163,7 @@ mod tests {
                 password: "correct horse".into(),
             })
             .unwrap();
-        let step = StepUpStore::new(Duration::from_secs(300));
+        let step = StepUpStore::new(Duration::from_mins(5));
         let mut throttle = LoginThrottle::default();
         throttle.base_delay = Duration::ZERO;
         let mut headers = HeaderMap::new();
@@ -206,7 +206,7 @@ mod tests {
                 password: "correct horse".into(),
             })
             .unwrap();
-        let step = StepUpStore::new(Duration::from_secs(300));
+        let step = StepUpStore::new(Duration::from_mins(5));
         let mut headers = HeaderMap::new();
         headers.insert(CONFIRM_HEADER, "correct horse".parse().unwrap());
         let throttle = LoginThrottle::default();
@@ -230,7 +230,7 @@ mod tests {
                 password: "correct horse".into(),
             })
             .unwrap();
-        let step = StepUpStore::new(Duration::from_secs(300));
+        let step = StepUpStore::new(Duration::from_mins(5));
         let mut throttle = LoginThrottle::default();
         throttle.base_delay = Duration::from_millis(40);
         let client = Some(std::net::IpAddr::from([203, 0, 113, 9]));

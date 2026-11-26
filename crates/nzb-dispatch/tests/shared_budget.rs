@@ -229,7 +229,7 @@ async fn import_and_playback_progress_and_reuse_sockets_while_downloads_saturate
     let import = dav_pool(&dav_config, &budget, BudgetTier::Import);
     let playback = dav_pool(&dav_config, &budget, BudgetTier::Playback);
     let managers = [Arc::clone(&import), Arc::clone(&playback)]
-        .map(|p| tokio::spawn(async move { p.manage_idle(Duration::from_secs(60)).await }));
+        .map(|p| tokio::spawn(async move { p.manage_idle(Duration::from_mins(1)).await }));
 
     // A fourth worker is queued for a download permit the whole time.
     // Neither import nor playback reconnects for it: it could not take the
@@ -291,7 +291,7 @@ async fn concurrent_playback_readers_take_turns_on_the_floor_while_downloads_sat
     let playback = dav_pool(&dav_config, &budget, BudgetTier::Playback);
     let manager = tokio::spawn({
         let playback = Arc::clone(&playback);
-        async move { playback.manage_idle(Duration::from_secs(60)).await }
+        async move { playback.manage_idle(Duration::from_mins(1)).await }
     });
 
     // Several segments read at once through one pool, with only the
