@@ -18,9 +18,7 @@ nzb-postproc = { version = "0.2.12", path = "../nzb-postproc" }
 nzb-dispatch = { version = "0.2.11", path = "../nzb-dispatch" }
 axum = { version = "0.8", features = ["multipart"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["cors", "trace"] }
 utoipa = { workspace = true }
-utoipa-swagger-ui = { version = "10", features = ["axum"] }
 http = "1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -34,7 +32,6 @@ parking_lot = "0.12"
 rand = "0.10"
 hex = "0.4"
 argon2 = "0.6"
-base64 = "0.23"
 sha2 = "0.11"
 governor = "0.10"
 arc-swap = "1"
@@ -50,11 +47,8 @@ flate2.workspace = true
 zip.workspace = true
 bzip2.workspace = true
 
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-
-[lints.rust]
-unused = "warn"
+[lints]
+workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

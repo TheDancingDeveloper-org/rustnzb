@@ -35,8 +35,5 @@ sha2 = { workspace = true }
 tempfile = "3"
 proptest = "1"
 
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-
-[lints.rust]
-unused = "warn"
+[lints]
+workspace = true
