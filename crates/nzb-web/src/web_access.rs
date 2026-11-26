@@ -58,7 +58,8 @@ pub fn admitted(
 }
 
 /// Whether an admitted client needs no login: no password is set, or
-/// `inet_exposure` is 5 and the client is local. An unusable
+/// `inet_exposure` is 5 and the client is local and used a known host name
+/// (a local peer under a foreign name is a DNS-rebinding page). An unusable
 /// `credentials.json` counts as a password, so damage never opens the UI.
 pub fn login_optional(
     state: &AppState,
@@ -71,7 +72,8 @@ pub fn login_optional(
     let general = &state.config().general;
     !state.credential_store.has_credentials()
         || (general.inet_exposure == 5
-            && check_access(general, peer(extensions), headers, ACCESS_LOCAL_ONLY))
+            && check_access(general, peer(extensions), headers, ACCESS_LOCAL_ONLY)
+            && check_hostname(general, headers))
 }
 
 /// Refusals are logged at most once a minute, so an exposed port cannot flood
