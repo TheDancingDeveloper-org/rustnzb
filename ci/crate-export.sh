@@ -123,6 +123,9 @@ crate_export_manifest() {
             # under [lints] keeps the header). The dotted and inline forms are
             # dropped the same way.
             if (heldlints != "") {
+                # Blank and comment lines between [lints] and its key travel
+                # with the header: dropped with it, or printed with it.
+                if ($0 ~ /^[ \t]*(#.*)?$/) { heldlints = heldlints "\n" $0; next }
                 h = heldlints; heldlints = ""
                 if ($0 ~ /^workspace[ \t]*=[ \t]*true[ \t]*(#.*)?$/) next
                 print h

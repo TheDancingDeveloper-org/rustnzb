@@ -76,6 +76,13 @@ expect_reject() {
 reset one two
 expect_pass 'all members inherit the floor'
 
+# A trailing TOML comment on the root rust-version line is not part of the floor.
+reset one two
+sed 's/^rust-version = "1.100"$/rust-version = "1.100" # the floor/' "$work/Cargo.toml" >"$work/Cargo.toml.new"
+mv "$work/Cargo.toml.new" "$work/Cargo.toml"
+grep -q '1.100" # the floor' "$work/Cargo.toml"
+expect_pass 'root rust-version with a trailing comment'
+
 # A published member with no rust-version at all is the failure the gate exists
 # for: it would silently drop Clippy's MSRV-gated lints for that crate.
 reset one two
