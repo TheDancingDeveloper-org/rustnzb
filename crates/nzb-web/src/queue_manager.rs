@@ -4182,10 +4182,10 @@ impl QueueManager {
                 warn!(
                     job_id = %job_id,
                     terminal_reason = %reason,
-                    missing_content_bytes = tracker.map_or(0, |t| t.content_bytes_missing),
-                    usable_recovery_bytes = tracker.map_or(0, |t| t.recovery_capacity_bytes.saturating_sub(t.recovery_bytes_unavailable)),
-                    recovery_blocks_total = tracker.map_or(0, |t| t.recovery_blocks_total),
-                    recovery_blocks_unavailable = tracker.map_or(0, |t| t.recovery_blocks_unavailable),
+                    missing_content_bytes = tracker.map_or_default(|t| t.content_bytes_missing),
+                    usable_recovery_bytes = tracker.map_or_default(|t| t.recovery_capacity_bytes.saturating_sub(t.recovery_bytes_unavailable)),
+                    recovery_blocks_total = tracker.map_or_default(|t| t.recovery_blocks_total),
+                    recovery_blocks_unavailable = tracker.map_or_default(|t| t.recovery_blocks_unavailable),
                     "Terminal job summary"
                 );
                 // Confirmed hopeless damage must not enter PAR2,
@@ -6151,7 +6151,7 @@ impl QueueManager {
         if !disk_space_available(threshold, &path_refs) {
             if self.disk_space_hold_since().is_none() {
                 warn!(
-                    free_bytes = paths.first().map_or(0, |path| get_disk_free(path)),
+                    free_bytes = paths.first().map_or_default(|path| get_disk_free(path)),
                     min_free_space = threshold,
                     "Low disk space on a configured storage volume, auto-pausing downloads"
                 );

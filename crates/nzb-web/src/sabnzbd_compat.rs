@@ -1579,7 +1579,7 @@ fn sab_status_servers(state: &AppState) -> Vec<serde_json::Value> {
             let active = connections
                 .iter()
                 .find(|(id, _, _)| *id == server.id)
-                .map_or(0, |(_, active, _)| *active);
+                .map_or_default(|(_, active, _)| *active);
             serde_json::json!({
                 "servername": if server.name.is_empty() { &server.host } else { &server.name },
                 "serveractiveconn": active,

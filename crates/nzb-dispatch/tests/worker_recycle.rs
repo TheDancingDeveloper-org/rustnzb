@@ -278,7 +278,7 @@ async fn raising_connection_count_live_adds_concurrent_transfers() {
             .active_connection_snapshot()
             .into_iter()
             .find(|(id, _, _)| id == "srv")
-            .map_or(0, |(_, active, _)| active);
+            .map_or_default(|(_, active, _)| active);
         peak = peak.max(active);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
