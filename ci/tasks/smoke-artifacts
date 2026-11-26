@@ -1,0 +1,91 @@
+#!/bin/sh
+# Start the x86_64-unknown-linux-musl release binary and check it: it serves
+# /api/health, and a second instance on the same data dir exits non-zero with
+# the instance-lock message. WI-4844 / GH #326 step 1.
+#
+# usage: ci/tasks/smoke-artifacts [BINARY]
+#   BINARY defaults to $RUSTNZB_SMOKE_BINARY; when neither is set the musl
+#   release binary is built with the Dockerfile's cargo-zigbuild invocation.
+#
+# Not covered yet (follow-ups): panic backtrace symbol resolution (needs a
+# product hook), aarch64 musl, Windows startup/lock/socket.
+set -eu
+. "$(dirname "$0")/lib.sh"
+
+binary=${1:-${RUSTNZB_SMOKE_BINARY:-}}
+attempts=${RUSTNZB_SMOKE_ATTEMPTS:-60}
+target=x86_64-unknown-linux-musl
+
+if [ -z "$binary" ]; then
+    . "$(dirname "$0")/auditable"
+    trap cleanup_task_frontend EXIT
+    task_start smoke-artifacts cargo cargo-zigbuild npm curl xz
+    task_target_dir smoke-artifacts
+    ensure_frontend
+    install_cargo_auditable
+    if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols
+    fi
+    auditable_cargo zigbuild --release --locked -p rustnzb \
+        --features webdav,vendored-openssl --target "$target"
+    binary=$CARGO_TARGET_DIR/$target/release/rustnzb
+else
+    task_start smoke-artifacts curl
+fi
+[ -x "$binary" ] || {
+    printf 'smoke-artifacts: binary not found or not executable: %s\n' "$binary" >&2
+    exit 1
+}
+
+work=$(mktemp -d)
+pid=
+cleanup_smoke() {
+    [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+    [ -z "$pid" ] || wait "$pid" 2>/dev/null || true
+    rm -rf "$work"
+}
+trap cleanup_smoke EXIT
+mkdir -p "$work/data" "$work/home"
+# A private HOME keeps the default config out of the runner's real one.
+export HOME=$work/home XDG_CONFIG_HOME=$work/home/.config XDG_DATA_HOME=$work/home/.local/share
+unset RUSTNZB_CONFIG RUSTNZB_DATA_DIR RUSTNZB_PORT RUSTNZB_LISTEN_ADDR
+
+port=$(( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 20000 + 30000 ))
+"$binary" --listen-addr 127.0.0.1 --port "$port" --data-dir "$work/data" \
+    >"$work/first.log" 2>&1 &
+pid=$!
+
+ready=false
+attempt=0
+while [ "$attempt" -lt "$attempts" ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    if curl -fsS "http://127.0.0.1:$port/api/health" >"$work/health.json" 2>/dev/null; then
+        ready=true
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+if [ "$ready" != true ]; then
+    printf 'smoke-artifacts: /api/health did not answer on port %s\n' "$port" >&2
+    sed 's/^/first: /' "$work/first.log" >&2 || true
+    exit 1
+fi
+grep -q '"status":"ok"' "$work/health.json"
+
+port2=$((port + 1))
+set +e
+timeout 30 "$binary" --listen-addr 127.0.0.1 --port "$port2" --data-dir "$work/data" \
+    >"$work/second.log" 2>&1
+status=$?
+set -e
+if [ "$status" -eq 0 ]; then
+    printf 'smoke-artifacts: second instance exited 0, expected the lock failure\n' >&2
+    exit 1
+fi
+if ! grep -Fq "another rustnzb instance is using $work/data; stop it or choose a different data_dir" "$work/second.log"; then
+    printf 'smoke-artifacts: second instance (status %s) lacks the lock message\n' "$status" >&2
+    sed 's/^/second: /' "$work/second.log" >&2 || true
+    exit 1
+fi
+printf 'smoke-artifacts passed for %s\n' "$binary"
