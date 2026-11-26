@@ -114,6 +114,7 @@ jobs:
             "$CROSS_IMAGE" sh -ec '
               ci/tasks/frontend-build
               ci/tasks/build-linux
+              ci/tasks/smoke-artifacts
               ci/tasks/build-linux-arm64
               ci/tasks/build-windows
               ci/tasks/package-release
