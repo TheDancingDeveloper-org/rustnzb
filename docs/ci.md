@@ -129,6 +129,30 @@ CodeQL classifies `*.rs` plus `Cargo.*` as Rust, and JS/TS/HTML sources plus
 languages in full; the per-language scope check applies only to `pull_request`,
 which CodeQL no longer triggers on.
 
+### Artifact smoke coverage
+
+The release dry run starts the built binaries, not just builds them
+(`ci/tasks/smoke-artifacts`, GH #326). Each start must answer `/api/health`,
+and a second start on the same data dir must exit non-zero with
+`another rustnzb instance is using <dir>; stop it or choose a different data_dir`.
+
+| Platform | Where | How |
+| --- | --- | --- |
+| Linux x86_64 (musl) | inside the `CROSS_IMAGE` block, after `build-linux` | the script on the freshly built binary |
+| Linux aarch64 (glibc) | a host step after packaging | the binary from the `linux-aarch64` release tarball, run in a digest-pinned arm64 glibc container under QEMU (`docker/setup-qemu-action`), with a longer health wait and lock timeout |
+
+The aarch64 leg reuses the `build-linux-arm64` output through the tarball, so
+there is no second build, and it needs no extra runner.
+
+**Windows parity exception.** There is no Windows runner, so the Windows
+binary is not started in CI. The Windows startup/lock path was checked by hand
+on a Windows 11 ARM64 VM for #333 (std file lock, `startup::` 9/9 plus 20
+repeats). The Windows socket-shutdown BrokenPipe mapping (Rust 1.97) and the
+Debug-escape check (Rust 1.98) are not automated. Revisit when a Windows runner
+exists.
+
+Also still open from #326: a panic/backtrace symbol check needs a product hook.
+
 ### Concurrency
 
 Every workflow that runs on PRs cancels in progress per ref (`github.ref`), so

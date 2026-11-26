@@ -7,13 +7,26 @@
 #   BINARY defaults to $RUSTNZB_SMOKE_BINARY; when neither is set the musl
 #   release binary is built with the Dockerfile's cargo-zigbuild invocation.
 #
+# The aarch64 leg runs this same script inside an arm64 container under QEMU
+# (release-dry-run.yml) against the binary from the release tarball; there set
+# RUSTNZB_SMOKE_ATTEMPTS (health wait, seconds) and RUSTNZB_SMOKE_LOCK_TIMEOUT
+# (second-start bound, seconds) higher, because emulation is slow.
+#
 # Not covered yet (follow-ups): panic backtrace symbol resolution (needs a
-# product hook), aarch64 musl, Windows startup/lock/socket.
+# product hook), Windows startup/lock/socket. See docs/ci.md, "Artifact smoke
+# coverage".
 set -eu
 . "$(dirname "$0")/lib.sh"
 
 binary=${1:-${RUSTNZB_SMOKE_BINARY:-}}
 attempts=${RUSTNZB_SMOKE_ATTEMPTS:-60}
+lock_timeout=${RUSTNZB_SMOKE_LOCK_TIMEOUT:-30}
+case $attempts$lock_timeout in
+    '' | *[!0-9]*)
+        printf 'smoke-artifacts: RUSTNZB_SMOKE_ATTEMPTS and RUSTNZB_SMOKE_LOCK_TIMEOUT must be whole seconds\n' >&2
+        exit 2
+        ;;
+esac
 target=x86_64-unknown-linux-musl
 
 if [ -z "$binary" ]; then
@@ -75,7 +88,7 @@ grep -q '"status":"ok"' "$work/health.json"
 
 port2=$((port + 1))
 set +e
-timeout 30 "$binary" --listen-addr 127.0.0.1 --port "$port2" --data-dir "$work/data" \
+timeout "$lock_timeout" "$binary" --listen-addr 127.0.0.1 --port "$port2" --data-dir "$work/data" \
     >"$work/second.log" 2>&1
 status=$?
 set -e

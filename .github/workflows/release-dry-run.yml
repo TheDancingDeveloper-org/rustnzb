@@ -124,6 +124,26 @@ jobs:
           mkdir -p .ci-output/packages
           docker cp "$container:/workspace/.ci-output/packages/." .ci-output/packages/
           (cd .ci-output/packages && sha256sum -c "SHA256SUMS-${TAG}.txt")
+      - uses: docker/setup-qemu-action@v4
+      - name: Smoke the aarch64 release binary under QEMU
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          # buildpack-deps:bookworm-curl (glibc, with curl), pinned by digest.
+          SMOKE_ARM64_IMAGE: buildpack-deps@sha256:47829a8a72a39ce95fd43d0676572a3e6b7488caa2d6cadae9fe90b0ff77e755
+        run: |
+          set -euo pipefail
+          # The shipped aarch64 binary is glibc (build-linux-arm64), so it runs
+          # in an arm64 glibc container; the binfmt handler comes from
+          # setup-qemu-action. The binary is the one in the release tarball.
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          tar -xzf ".ci-output/packages/rustnzb-${TAG}-linux-aarch64.tar.gz" \
+            -C "$work" "rustnzb-${TAG}/rustnzb"
+          cp "$work/rustnzb-${TAG}/rustnzb" "$work/rustnzb"
+          docker run --rm --platform linux/arm64 \
+            -e RUSTNZB_SMOKE_ATTEMPTS=300 -e RUSTNZB_SMOKE_LOCK_TIMEOUT=120 \
+            -v "$PWD/ci:/smoke/ci:ro" -v "$work/rustnzb:/smoke/rustnzb:ro" \
+            "$SMOKE_ARM64_IMAGE" sh /smoke/ci/tasks/smoke-artifacts /smoke/rustnzb
       - name: Build Linux AppImages from the release tarballs
         env:
           TAG: ${{ steps.tag.outputs.tag }}
