@@ -19,6 +19,9 @@ Two workflows also run outside a merge: `release-dry-run.yml` on a PR that
 touches the release tooling and the packaging paths, nightly on `main` (see below), and
 `quality-schedule.yml` on its own schedule.
 
+`ci-images.yml` is `workflow_dispatch` only: it wraps `ci/tasks/build-ci-images` to
+publish the CI images and prints their digests in the job summary for `ci/images.lock`.
+
 ### No run on push to `main`
 
 `ci.yml` has no `push` trigger. A rebase merge from the queue lands the exact
