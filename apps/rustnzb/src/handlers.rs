@@ -5376,6 +5376,11 @@ fn get_disk_space_total(path: &std::path::Path) -> u64 {
 /// Get (free, total) disk space in bytes for the filesystem containing
 /// `path`. Returns `(0, 0)` on error or on platforms without a `statvfs`
 /// equivalent wired up (currently: everything but Unix).
+// Deliberate exception, kept as `allow` rather than `expect`. The attribute is
+// live only on `cfg(not(unix))`, where `path` is unused because the body is the
+// `(0, 0)` stub; on Unix the same variable is read by the statvfs branch, so the
+// lint does not fire. An `expect` cannot be verified from Linux: it would be
+// unfulfilled on Unix and break the non-Unix build under `-D warnings`.
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn get_disk_space(path: &std::path::Path) -> (u64, u64) {
     #[cfg(unix)]
