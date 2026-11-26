@@ -81,7 +81,7 @@ pub fn login_optional(
 fn warn_due() -> bool {
     static LAST: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
     let mut last = LAST.lock();
-    let due = last.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60));
+    let due = last.is_none_or(|at| at.elapsed() >= std::time::Duration::from_mins(1));
     if due {
         *last = Some(std::time::Instant::now());
     }
