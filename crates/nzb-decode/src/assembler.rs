@@ -132,10 +132,12 @@ struct FileRegistration<'a> {
 
 /// Tracks assembly progress for a single output file.
 struct FileState {
-    /// Path to the output file on disk (retained for diagnostics).
+    /// Path to the output file on disk, as registered. The retained copy is
+    /// write-only: the handle in `file` does every write, and diagnostics name
+    /// the file by `job_id`/`file_id`.
     #[expect(
         dead_code,
-        reason = "kept so a future diagnostic or error path can name the file being assembled; only the handle in `file` is read today, so the path field is currently write-only"
+        reason = "nothing reads it once the file is registered: the handle in `file` does every write and `sync_data`, and every diagnostic and error here names the file by `job_id`/`file_id`, not by path. The path is used only in `register_inner` before construction, so the stored copy is write-only"
     )]
     output_path: PathBuf,
     /// Persistent file handle — opened once, reused for all segment writes.
