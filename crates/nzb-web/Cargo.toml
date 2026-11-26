@@ -49,11 +49,8 @@ flate2.workspace = true
 zip.workspace = true
 bzip2.workspace = true
 
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-
-[lints.rust]
-unused = "warn"
+[lints]
+workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
