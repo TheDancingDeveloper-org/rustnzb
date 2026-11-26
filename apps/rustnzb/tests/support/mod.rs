@@ -1,4 +1,7 @@
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "shared support module compiled into ~20 separate test binaries; no single binary exercises every helper, so each one flags the helpers it does not call"
+)]
 
 use std::collections::HashMap;
 use std::fmt::Write;

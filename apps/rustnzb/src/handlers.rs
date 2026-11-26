@@ -5308,9 +5308,15 @@ fn get_disk_space(path: &std::path::Path) -> (u64, u64) {
             let mut stat = MaybeUninit::<libc::statvfs>::uninit();
             if libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) == 0 {
                 let stat = stat.assume_init();
-                #[allow(clippy::unnecessary_cast)] // u32 on macOS, u64 on Linux
+                #[expect(
+                    clippy::unnecessary_cast,
+                    reason = "statvfs fields are u32 on macOS and u64 on Linux, so the cast to u64 is required on one platform and a no-op clippy flags on the other"
+                )]
                 let frsize = stat.f_frsize as u64;
-                #[allow(clippy::unnecessary_cast)]
+                #[expect(
+                    clippy::unnecessary_cast,
+                    reason = "same cross-platform statvfs width difference as f_frsize above"
+                )]
                 return (stat.f_bavail as u64 * frsize, stat.f_blocks as u64 * frsize);
             }
         }

@@ -13,7 +13,10 @@
 //! - `harness_zombie.rs` — canary test for the recurring zombie-worker bug
 //!   (#[ignore]'d until Phase 5 lands the idle-watchdog fix).
 
-#![allow(dead_code)] // Different test files use different parts of the harness.
+#![expect(
+    dead_code,
+    reason = "the harness is shared by every integration test binary, and each binary uses a different subset, so items unused by the current one are flagged"
+)]
 
 pub mod nzb_fixture;
 

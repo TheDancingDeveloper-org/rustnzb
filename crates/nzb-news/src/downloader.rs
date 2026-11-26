@@ -308,7 +308,10 @@ enum SchedulerMsg {
 /// scheduler can still use "all wrapper-worker senders dropped" to
 /// detect pool shutdown — the control sender lives on the public
 /// `DownloaderHandle`, independent of the worker fleet.
-#[allow(clippy::enum_variant_names)] // the "Job" suffix reads naturally for each variant
+#[expect(
+    clippy::enum_variant_names,
+    reason = "every message acts on one download job, so the shared `Job` suffix is what makes the variant names readable as a set"
+)]
 enum ControlMsg {
     /// Pause dispatching for a job. Articles for `job_id` stay in the
     /// scheduler's pending list but are not routed to any server queue
@@ -648,7 +651,10 @@ impl ServerSupervisor {
 /// at `id_offset`. Each task calls `server.register_wrapper()` before
 /// entering the loop (counter pre-incremented here to avoid a race where
 /// the task exits before `register_wrapper` runs).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "spawns the wrapper fleet for one server from the pieces the scheduler already holds; grouping them into a struct would just move the same fields to the call site"
+)]
 fn spawn_server_wrappers(
     server: Arc<Server>,
     queue: Arc<ServerQueue>,
@@ -685,7 +691,10 @@ fn spawn_server_wrappers(
 // Scheduler loop — routes pending articles to server queues and consumes
 // wrapper-worker results.
 // ---------------------------------------------------------------------------
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the scheduler's own channels, per-server queues and shared control state are all borrowed for its lifetime; a struct would not reduce what the loop touches"
+)]
 async fn scheduler_loop(
     servers: Vec<Arc<Server>>,
     server_queues: Vec<Arc<ServerQueue>>,
@@ -1059,7 +1068,10 @@ async fn scheduler_loop(
     info!("downloader scheduler exiting");
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one dispatch pass over several disjoint pieces of mutable scheduler state (pending, retry clock, probe tracker, probe tags, paused set) plus the shared senders"
+)]
 async fn dispatch_pending(
     servers: &[Arc<Server>],
     server_queues: &[Arc<ServerQueue>],
@@ -1291,7 +1303,10 @@ fn update_probe_on_result(
 /// side effects (respawn scheduling, backoff reset on healthy fetches),
 /// then forwards FetchResult / ReturnUnattempted to `handle_scheduler_msg`
 /// for the main dispatch logic. `AllWrappersExited` is consumed here.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "routes one scheduler message against the server list, supervisors, pending queue and probe state together; these are separate borrows the match arms need at once"
+)]
 async fn route_scheduler_msg(
     msg: SchedulerMsg,
     servers: &[Arc<Server>],

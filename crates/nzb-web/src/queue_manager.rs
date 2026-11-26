@@ -364,7 +364,10 @@ pub(crate) fn disk_space(path: &std::path::Path) -> (u64, u64) {
             let mut stat = MaybeUninit::<libc::statvfs>::uninit();
             if libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) == 0 {
                 let stat = stat.assume_init();
-                #[allow(clippy::unnecessary_cast)] // u32 on macOS, u64 on Linux
+                #[expect(
+                    clippy::unnecessary_cast,
+                    reason = "statvfs fields are u32 on macOS and u64 on Linux, so widening to u64 is load-bearing on one platform and a no-op clippy flags on the other"
+                )]
                 return (
                     stat.f_bavail as u64 * stat.f_frsize as u64,
                     stat.f_blocks as u64 * stat.f_frsize as u64,
@@ -2107,7 +2110,10 @@ impl QueueManager {
     const QUEUE_COMPLETE_ACTION_SETTING: &'static str = "queue_complete_action";
 
     /// Create a new queue manager.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the full set of runtime settings a queue manager is built from; callers pass config fields directly and a builder would just relocate the same list"
+    )]
     pub fn new(
         servers: Vec<ServerConfig>,
         db: Database,
@@ -2146,7 +2152,10 @@ impl QueueManager {
     }
 
     /// Create a queue manager with explicit post-processing worker limits.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "`new` delegating to this richer constructor is the only reason it has one more parameter; the settings themselves are the manager's whole configuration"
+    )]
     pub fn new_with_postproc_limits(
         servers: Vec<ServerConfig>,
         db: Database,
@@ -2674,7 +2683,10 @@ impl QueueManager {
     }
 
     /// Count currently downloading jobs.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "small read-only helper kept for diagnostics and tests; production callers use the inline count in the admission path instead"
+    )]
     fn active_download_count(&self) -> usize {
         let jobs = self.jobs.lock();
         jobs.values()
