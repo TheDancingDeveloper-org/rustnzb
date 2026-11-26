@@ -115,7 +115,7 @@ jobs:
     env:
       STABLE: ${{ needs.resolve.outputs.stable_tag }}
       SHA: ${{ needs.resolve.outputs.sha }}
-      CROSS_IMAGE: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:27641a62856a52a21378536ae607196a71bdedaaa428cc624260828998f550be
+      CROSS_IMAGE: repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:0e13e607c7477fd4c69d21170479ef99ffc97c4ee24e3be23df2a1b86bee1fc5
     steps:
       - uses: actions/checkout@v7
         with:
