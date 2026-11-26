@@ -90,6 +90,11 @@ jobs:
       CROSS_IMAGE: ${{ vars.RUSTNZB_CROSS_IMAGE }}
     steps:
       - uses: actions/checkout@v7
+      - name: Authenticate to Docker Hub (higher pull rate limit for base images)
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Derive the tag the release would use
         id: tag
         run: |
@@ -135,15 +140,28 @@ jobs:
           # The shipped aarch64 binary is glibc (build-linux-arm64), so it runs
           # in an arm64 glibc container; the binfmt handler comes from
           # setup-qemu-action. The binary is the one in the release tarball.
+          # The runner's docker daemon does not share the job workspace, so host
+          # bind mounts are invisible to it (WI-4853): copy the files in instead.
           work=$(mktemp -d)
-          trap 'rm -rf "$work"' EXIT
+          cid=
+          cleanup() {
+            if [ -n "$cid" ]; then docker rm -f "$cid" >/dev/null 2>&1 || true; fi
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
           tar -xzf ".ci-output/packages/rustnzb-${TAG}-linux-aarch64.tar.gz" \
             -C "$work" "rustnzb-${TAG}/rustnzb"
-          cp "$work/rustnzb-${TAG}/rustnzb" "$work/rustnzb"
-          docker run --rm --platform linux/arm64 \
+          mkdir "$work/smoke"
+          cp -a ci "$work/smoke/ci"
+          cp "$work/rustnzb-${TAG}/rustnzb" "$work/smoke/rustnzb"
+          cid=$(docker create --platform linux/arm64 \
             -e RUSTNZB_SMOKE_ATTEMPTS=300 -e RUSTNZB_SMOKE_LOCK_TIMEOUT=120 \
-            -v "$PWD/ci:/smoke/ci:ro" -v "$work/rustnzb:/smoke/rustnzb:ro" \
-            "$SMOKE_ARM64_IMAGE" sh /smoke/ci/tasks/smoke-artifacts /smoke/rustnzb
+            "$SMOKE_ARM64_IMAGE" sh /smoke/ci/tasks/smoke-artifacts /smoke/rustnzb)
+          # Copying the staged directory to / creates /smoke in the container.
+          docker cp "$work/smoke" "$cid:/"
+          status=0
+          docker start -a "$cid" || status=$?
+          exit "$status"
       - name: Build Linux AppImages from the release tarballs
         env:
           TAG: ${{ steps.tag.outputs.tag }}
