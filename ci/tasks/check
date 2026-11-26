@@ -8,7 +8,8 @@ prepare_placeholder_frontend
 sh "$REPO_ROOT/ci/tests/check-version.sh"
 sh "$REPO_ROOT/ci/check-rust-version.sh"
 sh "$REPO_ROOT/ci/tests/check-rust-version.sh"
-sh "$REPO_ROOT/ci/tests/smoke-artifacts.sh"
+sh "$REPO_ROOT/ci/tasks/verify-image-pins"
+sh "$REPO_ROOT/ci/tests/verify-image-pins.sh"
 cargo check --workspace --locked
 
 # Keep the dispatch boundary enforceable: QueueManager may depend on the
