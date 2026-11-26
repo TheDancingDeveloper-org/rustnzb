@@ -226,7 +226,7 @@ impl DirWatcher {
                 Some((name, password)) => (name, Some(password).filter(|pw| !pw.is_empty())),
                 None => (base.to_string(), None),
             };
-            let name = base.strip_suffix(".nzb").unwrap_or(&base);
+            let name = base.trim_suffix(".nzb");
             let name = if name.is_empty() { "unknown" } else { name };
             let mut job = crate::nzb_core::nzb_parser::parse_nzb(name, &data)
                 .map_err(|e| format!("parse failed for {nzb_name}: {e}"))?;

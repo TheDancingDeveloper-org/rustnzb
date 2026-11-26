@@ -1796,7 +1796,7 @@ fn handle_queue_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json
     let jobs = qm.get_jobs();
     let mut removed_ids: Vec<String> = Vec::new();
     for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
-        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+        let search_id = raw_id.trim_prefix("SABnzbd_nzo_");
         if let Some(job) = jobs.iter().find(|job| job_id_matches(&job.id, search_id)) {
             let _ = qm.remove_job(&job.id);
             tracing::info!(id = %job.id, "Job removed from queue via arr API (mode=queue)");
@@ -1810,7 +1810,7 @@ fn handle_queue_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json
 /// Handle mode=queue&name=pause&value=nzo_ID.
 fn handle_queue_item_pause(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
     let target = req.value.as_deref().unwrap_or("");
-    let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
+    let search_id = target.trim_prefix("SABnzbd_nzo_");
     let Some(job) = state
         .queue_manager
         .get_jobs()
@@ -1834,7 +1834,7 @@ fn handle_queue_item_resume(state: &AppState, req: &SabApiRequest) -> Json<serde
         }));
     }
     let target = req.value.as_deref().unwrap_or("");
-    let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
+    let search_id = target.trim_prefix("SABnzbd_nzo_");
     let Some(job) = state
         .queue_manager
         .get_jobs()
@@ -1871,7 +1871,7 @@ fn handle_queue_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_js
     let jobs = qm.get_jobs();
     let mut applied = false;
     for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
-        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+        let search_id = raw_id.trim_prefix("SABnzbd_nzo_");
         if let Some(job) = jobs.iter().find(|job| job_id_matches(&job.id, search_id))
             && if pause {
                 qm.pause_job(&job.id).is_ok()
@@ -1897,7 +1897,7 @@ fn handle_queue_rename(state: &AppState, req: &SabApiRequest) -> Json<serde_json
         }));
     }
 
-    let id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
+    let id = target.trim_prefix("SABnzbd_nzo_");
     // SABnzbd's rename also carries the archive password, as `value3`: the
     // job keeps its password when it is absent and loses it when it is empty.
     let result = state
@@ -2160,7 +2160,7 @@ fn history_slot_matches(slot: &SabHistorySlot, req: &SabApiRequest) -> bool {
                     .nzo_id
                     .strip_prefix("SABnzbd_nzo_")
                     .unwrap_or(&slot.nzo_id);
-                let query = id.strip_prefix("SABnzbd_nzo_").unwrap_or(id);
+                let query = id.trim_prefix("SABnzbd_nzo_");
                 id == slot.nzo_id || job_id_matches(raw, query)
             })
     })
@@ -2228,7 +2228,7 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
     } else {
         let mut matched: Vec<HistorySummary> = Vec::new();
         for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
-            let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+            let search_id = raw_id.trim_prefix("SABnzbd_nzo_");
             if let Some(entry) = entries
                 .iter()
                 .find(|entry| job_id_matches(&entry.id, search_id))
@@ -2611,7 +2611,7 @@ fn handle_pause(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     if let Some(nzo_id) = target_id
         && !nzo_id.is_empty()
     {
-        let search_id = nzo_id.strip_prefix("SABnzbd_nzo_").unwrap_or(nzo_id);
+        let search_id = nzo_id.trim_prefix("SABnzbd_nzo_");
 
         // Try to find and pause the job
         if let Some(job) = qm
@@ -2650,7 +2650,7 @@ fn handle_resume(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
                 "error": "Cannot resume an individual job while downloads are globally paused"
             }));
         }
-        let search_id = nzo_id.strip_prefix("SABnzbd_nzo_").unwrap_or(nzo_id);
+        let search_id = nzo_id.trim_prefix("SABnzbd_nzo_");
 
         let jobs = qm.get_jobs();
         for job in &jobs {
@@ -2683,7 +2683,7 @@ fn handle_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
         }));
     }
 
-    let search_id = target_id.strip_prefix("SABnzbd_nzo_").unwrap_or(target_id);
+    let search_id = target_id.trim_prefix("SABnzbd_nzo_");
 
     // Try to remove from queue
     let jobs = qm.get_jobs();
@@ -2722,7 +2722,7 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         }));
     }
 
-    let search_id = target_id.strip_prefix("SABnzbd_nzo_").unwrap_or(target_id);
+    let search_id = target_id.trim_prefix("SABnzbd_nzo_");
     let qm = &state.queue_manager;
     let Some(entry) = history_summaries(qm)
         .into_iter()
@@ -2810,7 +2810,7 @@ fn handle_switch(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
     // -- before handing it to `move_job`, which matches ids exactly.
     let qm = &state.queue_manager;
     let find_job = |requested: &str| {
-        let search_id = requested.strip_prefix("SABnzbd_nzo_").unwrap_or(requested);
+        let search_id = requested.trim_prefix("SABnzbd_nzo_");
         qm.get_jobs()
             .into_iter()
             .find(|job| job_id_matches(&job.id, search_id))
@@ -2884,7 +2884,7 @@ fn handle_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Va
         }));
     }
 
-    let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
+    let search_id = target.trim_prefix("SABnzbd_nzo_");
     let qm = &state.queue_manager;
     let Some(job) = qm
         .get_jobs()
@@ -2992,7 +2992,7 @@ fn handle_change_cat(state: &AppState, req: &SabApiRequest) -> Json<serde_json::
         .map(str::trim)
         .filter(|id| !id.is_empty())
     {
-        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+        let search_id = raw_id.trim_prefix("SABnzbd_nzo_");
         if qm.change_job_category(search_id, resolved_cat).is_ok() {
             changed = true;
         }
@@ -3012,7 +3012,7 @@ fn handle_rename(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
         }));
     }
 
-    let search_id = job_id.strip_prefix("SABnzbd_nzo_").unwrap_or(job_id);
+    let search_id = job_id.trim_prefix("SABnzbd_nzo_");
 
     let qm = &state.queue_manager;
     match qm.rename_job(search_id, new_name) {
