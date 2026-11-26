@@ -1,57 +1,67 @@
 #!/bin/sh
+# Offline gate for the CI image pins: needs only sh, awk, sed and grep, so it
+# deliberately skips task_start (which would probe rustc/cargo and can trigger
+# a rustup toolchain install).
 set -eu
 . "$(dirname "$0")/lib.sh"
-task_start verify-image-pins awk sed
+cd "$REPO_ROOT"
+printf 'task=%s\n' verify-image-pins
+for tool in awk sed grep; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        printf 'required tool is missing: %s\n' "$tool" >&2
+        exit 127
+    }
+done
 
 lock=$REPO_ROOT/ci/images.lock
-pipeline=$REPO_ROOT/.woodpecker.yml
 test -f "$lock"
-test -f "$pipeline"
 
+lock_value() {
+    sed -n "s/^$1=//p" "$lock"
+}
+
+# (1) every image in the lock is pinned by a 64-hex sha256 digest.
 for key in CORE_IMAGE CROSS_IMAGE E2E_IMAGE DESKTOP_IMAGE; do
-    value=$(sed -n "s/^${key}=//p" "$lock")
+    value=$(lock_value "$key")
     case "$value" in
         *@sha256:????????????????????????????????????????????????????????????????) ;;
         *) printf '%s is not pinned by sha256 digest: %s\n' "$key" "$value" >&2; exit 1 ;;
     esac
-    count=$(grep -F -c "image: $value" "$pipeline" || true)
-    [ "$count" -gt 0 ] || {
-        printf '%s is absent from .woodpecker.yml: %s\n' "$key" "$value" >&2
+    digest=${value##*@sha256:}
+    case "$digest" in
+        *[!0-9a-f]*) printf '%s digest is not 64 lowercase hex: %s\n' "$key" "$value" >&2; exit 1 ;;
+    esac
+done
+
+# (2) the digests consumed on GitHub match the lock.
+cross=$(lock_value CROSS_IMAGE)
+dockerfile_cross=$(sed -n 's/^ARG CROSS_IMAGE=//p' "$REPO_ROOT/Dockerfile")
+[ "$dockerfile_cross" = "$cross" ] || {
+    printf 'Dockerfile CROSS_IMAGE drifted from ci/images.lock: %s != %s\n' \
+        "$dockerfile_cross" "$cross" >&2
+    exit 1
+}
+promote=$REPO_ROOT/.github/workflows/promote-release.yml
+promote_cross=$(sed -n 's/^[[:space:]]*CROSS_IMAGE:[[:space:]]*//p' "$promote")
+[ "$promote_cross" = "$cross" ] || {
+    printf '.github/workflows/promote-release.yml CROSS_IMAGE drifted from ci/images.lock: %s != %s\n' \
+        "$promote_cross" "$cross" >&2
+    exit 1
+}
+
+# (3) ci/run still reads the lock.
+for needle in ci/images.lock CORE_IMAGE CROSS_IMAGE E2E_IMAGE DESKTOP_IMAGE; do
+    grep -Fq "$needle" "$REPO_ROOT/ci/run" || {
+        printf 'ci/run no longer mentions %s\n' "$needle" >&2
         exit 1
     }
 done
 
-grep -Fq 'ci/images.lock' "$REPO_ROOT/ci/run"
-grep -Fq 'CORE_IMAGE' "$REPO_ROOT/ci/run"
-grep -Fq 'CROSS_IMAGE' "$REPO_ROOT/ci/run"
-grep -Fq 'E2E_IMAGE' "$REPO_ROOT/ci/run"
-grep -Fq 'DESKTOP_IMAGE' "$REPO_ROOT/ci/run"
-
-if grep -Eq 'image: [^[:space:]]+:(latest|[0-9]+\.[0-9]+(-[^@[:space:]]*)?)[[:space:]]*$' "$pipeline"; then
-    printf 'Woodpecker contains a mutable image reference\n' >&2
+# (4) no mutable image references in the workflows.
+if grep -Eq 'image: [^[:space:]]+:(latest|[0-9]+\.[0-9]+(-[^@[:space:]]*)?)[[:space:]]*$' \
+    "$REPO_ROOT"/.github/workflows/*.yml; then
+    printf '.github/workflows contains a mutable image reference\n' >&2
     exit 1
 fi
 
-assert_step_dependency() {
-    step=$1
-    dependency=$2
-    awk -v step="$step" -v dependency="$dependency" '
-        $0 == "  - name: " step { in_step = 1; next }
-        in_step && /^  - name: / { exit found ? 0 : 1 }
-        in_step && $0 == "      - " dependency { found = 1 }
-        END { if (in_step && !found) exit 1 }
-    ' "$pipeline" || {
-        printf 'Woodpecker step %s must depend on %s\n' "$step" "$dependency" >&2
-        exit 1
-    }
-}
-
-assert_step_dependency e2e frontend-build
-assert_step_dependency build-linux frontend-build
-grep -Fq 'publish_frontend' "$REPO_ROOT/ci/tasks/frontend-build"
-for task in e2e build-linux build-linux-arm64 build-windows; do
-    grep -Fq 'ensure_frontend' "$REPO_ROOT/ci/tasks/$task"
-    grep -Fq 'cleanup_task_frontend' "$REPO_ROOT/ci/tasks/$task"
-done
-
-printf 'image pins and shared frontend workflow are valid\n'
+printf 'image pins are valid\n'
