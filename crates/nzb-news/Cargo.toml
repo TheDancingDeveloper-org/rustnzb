@@ -19,8 +19,5 @@ nzb-nntp = { version = "0.2.27", path = "../nzb-nntp", features = ["test-support
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-
-[lints.rust]
-unused = "warn"
+[lints]
+workspace = true
