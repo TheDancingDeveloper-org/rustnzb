@@ -1,2 +1,6 @@
 [registry]
 global-credential-providers = ["cargo:token"]
+global-min-publish-age = "7 days"
+
+[resolver]
+incompatible-publish-age = "deny"
