@@ -21,6 +21,9 @@
 #       key (optional, default-features) is set or overridden
 #   { version = "x", path = "../y" } ->  { version = "x" }
 #       (sibling nzb-* crates resolve from crates.io in the standalone repo)
+#   [lints] workspace = true         ->  dropped (the root [workspace.lints]
+#       does not exist in the standalone repo); also lints.workspace = true
+#       and lints = { workspace = true }
 # Any other workspace inheritance, a sibling path without a version, or a
 # sibling requirement below that sibling's current version is a hard error rather than a silently unbuildable manifest.
 crate_export_manifest() {
@@ -103,7 +106,7 @@ crate_export_manifest() {
                 next
             }
             if (inwsp && $0 ~ /^rust-version[ \t]*=/) {
-                floor = $0; sub(/^[^=]*=[ \t]*/, "", floor); gsub(/"/, "", floor)
+                floor = $0; sub(/^[^=]*=[ \t]*/, "", floor); sub(/[ \t]*#.*$/, "", floor); gsub(/"/, "", floor)
                 next
             }
             if (inws && $0 ~ /^[A-Za-z0-9_-]+[ \t]*=/) {
@@ -114,6 +117,19 @@ crate_export_manifest() {
             next
         }
         {
+            # [lints] workspace = true: the lint tables live in the root
+            # [workspace.lints], which a standalone repo does not have, so the
+            # inheritance is dropped (header and key together; any other key
+            # under [lints] keeps the header). The dotted and inline forms are
+            # dropped the same way.
+            if (heldlints != "") {
+                h = heldlints; heldlints = ""
+                if ($0 ~ /^workspace[ \t]*=[ \t]*true[ \t]*(#.*)?$/) next
+                print h
+            }
+            if ($0 ~ /^\[lints\][ \t]*(#.*)?$/) { heldlints = $0; next }
+            if ($0 ~ /^lints\.workspace[ \t]*=[ \t]*true[ \t]*(#.*)?$/) next
+            if ($0 ~ /^lints[ \t]*=[ \t]*\{[ \t]*workspace[ \t]*=[ \t]*true[ \t]*\}[ \t]*(#.*)?$/) next
             if ($0 ~ /^\[/) indev = ($0 ~ /^\[dev-dependencies\]/)
             line = $0
             self = "^" crate "[ \t]*=[ \t]*\\{[ \t]*workspace[ \t]*=[ \t]*true[ \t]*\\}"
@@ -124,7 +140,7 @@ crate_export_manifest() {
             # rust-version inherits from [workspace.package], not
             # [workspace.dependencies]; resolve it to a literal so the
             # standalone repo promises the same compiler floor.
-            if (line ~ /^rust-version\.workspace[ \t]*=[ \t]*true[ \t]*$/) {
+            if (line ~ /^rust-version\.workspace[ \t]*=[ \t]*true[ \t]*(#.*)?$/ || line ~ /^rust-version[ \t]*=[ \t]*\{[ \t]*workspace[ \t]*=[ \t]*true[ \t]*\}[ \t]*(#.*)?$/) {
                 if (floor == "") fail("rust-version inherits from the workspace but [workspace.package] has no rust-version")
                 print "rust-version = \"" floor "\""
                 next
@@ -166,6 +182,7 @@ crate_export_manifest() {
             }
             print line
         }
+        END { if (heldlints != "") print heldlints }
     ' Cargo.toml "$1" >"$1.export" || { rm -f "$1.export"; return 1; }
     mv "$1.export" "$1"
 }
