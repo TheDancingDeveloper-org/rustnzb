@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 const ACCESS_TOKEN_TTL: Duration = Duration::from_mins(15); // 15 minutes
-const REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60); // 30 days
+const REFRESH_TOKEN_TTL: Duration = Duration::from_hours(24 * 30); // 30 days
 
 struct TokenEntry {
     expires_at: Instant,
