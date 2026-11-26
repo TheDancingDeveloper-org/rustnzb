@@ -1,0 +1,78 @@
+name: CI images
+
+# Build and publish the four CI images (core, cross, e2e, desktop) from
+# Dockerfile.ci by wrapping `ci/tasks/build-ci-images`, which pushes
+# repo.indexarr.net/indexarr/rustnzb-ci-<target>:<sha> and :<toolchain tag>,
+# self-tests each image and prints one `<TARGET>_IMAGE=repo@sha256:...` line
+# per image (WI-4797). The digests land in the job summary so they can be
+# written into `ci/images.lock`.
+#
+# Manual only: never on a pull request, push or schedule. The registry token is
+# visible to the build step alone.
+
+on:
+  workflow_dispatch:
+    inputs:
+      toolchain_tag:
+        description: Mutable toolchain tag to publish alongside the commit tag
+        required: false
+        default: rust-1.100-node-22-v1
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-images
+  cancel-in-progress: false
+
+jobs:
+  build-ci-images:
+    runs-on: [self-hosted, docker, publish]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+        with:
+          name: rustnzb-release-builder
+      - name: Validate the toolchain tag
+        id: tag
+        env:
+          TOOLCHAIN_TAG: ${{ inputs.toolchain_tag }}
+        run: |
+          set -eu
+          tag=${TOOLCHAIN_TAG:-rust-1.100-node-22-v1}
+          case "$tag" in
+            ''|*[!A-Za-z0-9._-]*) echo "invalid toolchain_tag" >&2; exit 1 ;;
+          esac
+          printf 'tag=%s\n' "$tag" >>"$GITHUB_OUTPUT"
+      - name: Build, publish and self-test the CI images
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
+          CI_COMMIT_SHA: ${{ github.sha }}
+          CI_TOOLCHAIN_TAG: ${{ steps.tag.outputs.tag }}
+          CI_BUILDX_BUILDER: rustnzb-release-builder
+        run: |
+          set -euo pipefail
+          ci/tasks/build-ci-images | tee "$RUNNER_TEMP/build-ci-images.out"
+      - name: Publish the image digests
+        env:
+          TOOLCHAIN_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          grep -E '^(CORE|CROSS|E2E|DESKTOP)_IMAGE=.+@sha256:[0-9a-f]{64}$' \
+            "$RUNNER_TEMP/build-ci-images.out" >"$RUNNER_TEMP/images.txt" || true
+          count=$(wc -l <"$RUNNER_TEMP/images.txt")
+          {
+            printf '### CI images for %s (%s)\n\n' "$GITHUB_SHA" "$TOOLCHAIN_TAG"
+            printf '```\n'
+            cat "$RUNNER_TEMP/images.txt"
+            printf '```\n'
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [ "$count" -ne 4 ]; then
+            echo "expected 4 *_IMAGE= lines, found $count" >&2
+            exit 1
+          fi
