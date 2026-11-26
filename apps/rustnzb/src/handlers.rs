@@ -1852,11 +1852,6 @@ async fn ensure_step_up(
     extensions: Option<&http::Extensions>,
     method: Option<AuthMethod>,
 ) -> Result<(), ApiError> {
-    // SABnzbd has no password confirmation, so its rules leave none. An API
-    // key still cannot make sensitive writes.
-    if nzb_web::web_access::optional(state) && method.is_some_and(|m| m != AuthMethod::ApiKey) {
-        return Ok(());
-    }
     let client =
         extensions.and_then(|extensions| nzb_web::auth::client_ip(state, extensions, headers));
     let Some(method) = method else {

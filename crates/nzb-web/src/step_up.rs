@@ -31,8 +31,9 @@ pub enum AuthMethod {
     /// HTTP Basic with the web credentials. The password was just presented,
     /// so this request counts as step-up without a stored window.
     Basic,
-    /// No login: `general.auth_method = "optional"` (see `web_access`).
-    /// There is no password to confirm, so step-up does not apply.
+    /// No login was needed: `general.auth_method = "optional"` and
+    /// `web_access::login_optional` held. A session or Basic login under
+    /// optional mode is still `Bearer` or `Basic` and steps up as usual.
     Open,
 }
 

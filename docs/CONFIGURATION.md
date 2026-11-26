@@ -194,10 +194,12 @@ password set, so damage never opens the UI; a missing one does open it.
   and only non-local ones are asked. `0` to `2` admit none. **With no password,
   `4` and `5` give anyone who can reach the port full control**; use them only
   behind a proxy that authenticates or filters clients, or with a password.
-- Without a password, the host name must be `localhost`, an IP address,
-  `*.local`, this machine's name or in `host_whitelist`. Behind a proxy, list
+- Without a password, and for local clients skipping the login at level `5`,
+  the host name must be `localhost`, an IP address, `*.local`, this machine's
+  name or in `host_whitelist`. Behind a proxy, list
   the public name.
-- Sensitive settings ask for no password confirmation.
+- Sensitive settings ask for no password confirmation from clients that
+  needed no login. A logged-in session still confirms its password.
 - Browser writes from another site are refused where no login was needed. The
   web UI sends `X-Requested-With`; scripts outside a browser need nothing.
 - First-boot setup is not mandatory. `POST /api/auth/setup` sets a password.

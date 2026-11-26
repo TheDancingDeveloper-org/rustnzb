@@ -2426,3 +2426,64 @@ async fn optional_login_leaves_the_sabnzbd_api_key_and_corrupt_credentials_close
     let queue = client.get(format!("{}/api/queue", app.base_url));
     assert_eq!(status_of(queue).await, 401);
 }
+
+#[tokio::test]
+async fn optional_login_still_asks_a_session_for_the_password() {
+    let client = reqwest::Client::new();
+    let app = start_app_with(true, optional_login).await;
+    let login: serde_json::Value = client
+        .post(format!("{}/api/auth/login", app.base_url))
+        .json(&serde_json::json!({"username": "admin", "password": "password"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = login["access_token"].as_str().unwrap();
+    let write = |confirm: Option<&str>| {
+        let mut request = client
+            .put(format!("{}/api/config/general", app.base_url))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"port": 9191}));
+        if let Some(password) = confirm {
+            request = request.header("X-Confirm-Password", password);
+        }
+        request.send()
+    };
+    let refused = write(None).await.unwrap();
+    assert_eq!(refused.status(), 403);
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(body["error_kind"], "step_up_required");
+    assert_eq!(write(Some("password")).await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn optional_login_checks_the_host_before_waiving_a_set_login() {
+    // DNS rebinding: a foreign page reaches the API from a local browser.
+    let client = reqwest::Client::new();
+    let app = start_app_with(true, |config| {
+        optional_login(config);
+        config.general.inet_exposure = 5;
+        config.general.host_whitelist = vec!["nzb.example.com".into()];
+    })
+    .await;
+    let queue = |host: &'static str| {
+        client
+            .get(format!("{}/api/queue", app.base_url))
+            .header("Host", host)
+    };
+    assert_eq!(status_of(queue("evil.example")).await, 401);
+    let auth: serde_json::Value = client
+        .get(format!("{}/api/auth/status", app.base_url))
+        .header("Host", "evil.example")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(auth["login_required"], true);
+    assert_eq!(status_of(queue("nzb.example.com")).await, 200);
+    assert_eq!(status_of(queue("localhost")).await, 200);
+}
