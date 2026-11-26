@@ -31,5 +31,9 @@ printf '#!/bin/sh\nexit 3\n' >"$work/dies"
 chmod +x "$work/dies"
 expect_fail exits-early sh "$task" "$work/dies"
 
+# A non-numeric timeout is rejected before anything starts.
+RUSTNZB_SMOKE_LOCK_TIMEOUT=abc expect_fail bad-lock-timeout sh "$task" "$work/silent"
+RUSTNZB_SMOKE_ATTEMPTS=-1 expect_fail bad-attempts sh "$task" "$work/silent"
+
 [ "$fails" -eq 0 ] || exit 1
 printf 'smoke-artifacts tests passed\n'
