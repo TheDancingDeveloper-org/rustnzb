@@ -133,7 +133,10 @@ struct FileRegistration<'a> {
 /// Tracks assembly progress for a single output file.
 struct FileState {
     /// Path to the output file on disk (retained for diagnostics).
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "kept so a future diagnostic or error path can name the file being assembled; only the handle in `file` is read today, so the path field is currently write-only"
+    )]
     output_path: PathBuf,
     /// Persistent file handle — opened once, reused for all segment writes.
     file: File,

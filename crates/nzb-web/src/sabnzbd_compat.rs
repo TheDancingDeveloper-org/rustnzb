@@ -686,7 +686,10 @@ pub async fn h_sabnzbd_api_post(
 }
 
 /// Fold the fields of a multipart body into the request parameters.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each SABnzbd parameter in the multipart body has a destination out-parameter; a struct would only rename the same fields the form defines"
+)]
 async fn read_multipart_fields(
     multipart: &mut Multipart,
     mode: &mut String,
@@ -782,7 +785,10 @@ async fn read_multipart_fields(
 /// query string and (optional) body. `query_req.nzbname` carries the merged
 /// `nzbname` job-name override and `query_req.pp` the merged `pp`
 /// post-processing override.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the SAB API's addfile/addurl parameters, already split from the query string; they mirror the wire form field-for-field"
+)]
 async fn dispatch_post(
     state: &AppState,
     mode: String,

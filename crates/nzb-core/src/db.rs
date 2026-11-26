@@ -8,7 +8,10 @@ use tracing::info;
 use crate::error::NzbError;
 use crate::models::*;
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "documentation of the schema generation this build writes; migrations stamp the version into the table by SQL text, so the constant itself is never read"
+)]
 const SCHEMA_VERSION: u32 = 1;
 
 /// The content digest that recognises a repeated NZB: `sha256:` followed by
@@ -2473,7 +2476,6 @@ fn stamp_schema_version(tx: &rusqlite::Transaction<'_>, version: u32) -> Result<
     Ok(())
 }
 
-#[allow(dead_code)]
 fn add_column_if_missing(
     tx: &rusqlite::Transaction<'_>,
     table: &str,

@@ -4,7 +4,10 @@
 //! via the native API, and verifies they appear in the queue.
 //! It also exercises the SABnzbd compatibility API endpoints.
 
-#![allow(clippy::uninlined_format_args)]
+#![expect(
+    clippy::uninlined_format_args,
+    reason = "URLs are built with `format!(\"{}/path\", base_url)` because inlining `{base_url}` would push the host into the middle of the literal and read worse"
+)]
 
 mod support;
 

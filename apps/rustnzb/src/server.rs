@@ -192,10 +192,9 @@ pub struct ApiDoc;
 
 impl utoipa::OpenApi for ApiDoc {
     fn openapi() -> utoipa::openapi::OpenApi {
-        #[allow(unused_mut)]
-        let mut document = ApiDocBase::openapi();
+        let document = ApiDocBase::openapi();
         #[cfg(feature = "webdav")]
-        document.merge(ApiDocDav::openapi());
+        let document = document.merge_from(ApiDocDav::openapi());
         document
     }
 }
@@ -211,23 +210,22 @@ async fn h_root() -> Response {
 }
 
 /// SPA fallback: serve static file if it exists, otherwise index.html.
-#[allow(clippy::collapsible_if)]
 async fn h_spa_fallback(uri: axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     // Try exact file first
-    if !path.is_empty() {
-        if let Some(content) = StaticAssets::get(path) {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
-            return (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, mime.as_ref().to_string()),
-                    (header::CACHE_CONTROL, cache_header_for(path).to_string()),
-                ],
-                content.data.into_owned(),
-            )
-                .into_response();
-        }
+    if !path.is_empty()
+        && let Some(content) = StaticAssets::get(path)
+    {
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                (header::CACHE_CONTROL, cache_header_for(path).to_string()),
+            ],
+            content.data.into_owned(),
+        )
+            .into_response();
     }
     // SPA fallback to index.html
     serve_embedded_file("index.html")

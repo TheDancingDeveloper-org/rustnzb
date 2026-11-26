@@ -75,8 +75,11 @@ impl Par2Fixture {
         }
     }
 
-    // Not every integration-test binary that links this support module uses
-    // this builder; the per-binary compile flags it as dead there.
+    // External constraint: this support module is compiled into two separate
+    // integration-test binaries. `par2_deobfuscation_gate` calls this builder,
+    // so the lint does not fire there; `par2_slice_fixture` does not, so it
+    // does. An `#[expect]` would be unfulfilled in the first binary, so the
+    // suppression has to stay an `#[allow]`.
     #[allow(dead_code)]
     pub fn with_recovery_set_id(mut self, recovery_set_id: [u8; 16]) -> Self {
         self.recovery_set_id = recovery_set_id;

@@ -10,7 +10,10 @@
 //! subject-derived filenames lack proper extensions, causing the
 //! post-processor to report "No par2 files found" and "No archives found."
 
-#![allow(clippy::uninlined_format_args)]
+#![expect(
+    clippy::uninlined_format_args,
+    reason = "assertion messages use positional `{}`/`{:?}` placeholders so the recorded value pairs with its label; inlining would bury the diagnostics"
+)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
