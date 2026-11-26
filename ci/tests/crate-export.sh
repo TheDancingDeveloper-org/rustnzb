@@ -72,6 +72,10 @@ expect lints-table '[lints]
 workspace = true' ''
 expect lints-table-comment '[lints] # inherit
 workspace = true # yes' ''
+expect lints-table-gap '[lints]
+
+# inherit
+workspace = true' ''
 expect lints-dotted 'lints.workspace = true' ''
 expect lints-inline 'lints = { workspace = true }' ''
 expect lints-other-keys '[lints]

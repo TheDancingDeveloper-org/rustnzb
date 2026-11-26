@@ -23,7 +23,7 @@ REPO_ROOT=$(CDPATH= cd -- "$TASK_DIR/.." && pwd)
 cd "$REPO_ROOT"
 
 # rust-version = "..." in the [workspace.package] table of the root manifest.
-floor=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^rust-version *= *"\(.*\)"/\1/p;}' Cargo.toml | head -n1)
+floor=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^rust-version *= *"\([^"]*\)".*/\1/p;}' Cargo.toml | head -n1)
 test -n "$floor" || { echo "check-rust-version: no [workspace.package] rust-version in Cargo.toml" >&2; exit 1; }
 
 command -v cargo >/dev/null 2>&1 || { echo "check-rust-version: cargo is required" >&2; exit 127; }
