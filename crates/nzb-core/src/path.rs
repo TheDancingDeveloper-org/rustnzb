@@ -182,7 +182,7 @@ pub fn split_job_password(name: &str) -> Option<(String, String)> {
     let strip = |s: &str| s.trim_matches(['.', ' ']).to_string();
 
     // `{{` counts only after the first character, as in SABnzbd.
-    let first_len = name.chars().next().map_or(0, char::len_utf8);
+    let first_len = name.chars().next().map_or_default(char::len_utf8);
     let braces = name[first_len..]
         .find("{{")
         .map_or(name.len(), |index| index + first_len);
@@ -241,7 +241,7 @@ pub fn split_job_password(name: &str) -> Option<(String, String)> {
 /// SABnzbd's `strip_extensions` does via `os.path.splitext`.
 fn strip_nzb_extensions(mut name: &str) -> &str {
     loop {
-        let base_start = name.rfind('/').map_or(0, |index| index + 1);
+        let base_start = name.rfind('/').map_or_default(|index| index + 1);
         let base = &name[base_start..];
         // splitext ignores leading dots of the final component.
         let leading = base.len() - base.trim_start_matches('.').len();

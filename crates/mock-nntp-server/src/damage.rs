@@ -178,7 +178,7 @@ impl DamageRelease {
         };
         let size = self
             .data_file(filename)
-            .map_or(0, |f| f.payload.len() as u64);
+            .map_or_default(|f| f.payload.len() as u64);
         let count = size.div_ceil(DAMAGE_SLICE_SIZE) as u32;
         (base..base + count).collect()
     }
