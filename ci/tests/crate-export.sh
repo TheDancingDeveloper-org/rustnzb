@@ -14,6 +14,10 @@ cat >Cargo.toml <<'TOML'
 [workspace]
 members = []
 
+[workspace.package]
+edition = "2024"
+rust-version = "1.100"
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 utoipa = { version = "5", features = ["axum_extras", "chrono"] }
@@ -61,6 +65,7 @@ expect inline-optional 'tokio = { optional = true, workspace = true }' \
 expect inline-override 'serde = { workspace = true, default-features = true }' \
     'serde = { version = "1", default-features = true }'
 expect self-nested 'nzb-x = { workspace = true }' 'nzb-x = { path = ".." }'
+expect rust-version 'rust-version.workspace = true' 'rust-version = "1.100"'
 expect plain 'anyhow = "1"' 'anyhow = "1"'
 refuse inline-path 'mock-nntp-server = { workspace = true }' 'the workspace entry is a path dependency'
 refuse inline-missing 'nope = { workspace = true, optional = true }' '[workspace.dependencies] has no nope'

@@ -149,6 +149,11 @@ jobs:
           toolchain: 1.100.0
           components: rustfmt,clippy
       - run: cargo fmt --all --check
+      # The workspace compiler floor: every published member must declare it,
+      # so Clippy's MSRV-gated lints actually apply. Offline; reads cargo
+      # metadata, so it needs the toolchain installed above but no build.
+      - name: Rust version floor
+        run: ci/check-rust-version.sh
       - name: Check
         env:
           SCOPE_ARGS: ${{ steps.scope.outputs.args }}

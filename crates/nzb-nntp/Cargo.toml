@@ -2,6 +2,7 @@
 name = "nzb-nntp"
 version = "0.2.27"
 edition = "2024"
+rust-version.workspace = true
 description = "Async NNTP client with TLS, pipelining, connection pooling, and multi-server support"
 license = "MIT"
 repository = "https://github.com/TheDancingDeveloper-org/nzb-nntp"
