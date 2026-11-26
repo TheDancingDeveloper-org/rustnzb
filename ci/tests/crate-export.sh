@@ -16,7 +16,7 @@ members = []
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.100"
+rust-version = "1.100" # floor note
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -66,6 +66,20 @@ expect inline-override 'serde = { workspace = true, default-features = true }' \
     'serde = { version = "1", default-features = true }'
 expect self-nested 'nzb-x = { workspace = true }' 'nzb-x = { path = ".." }'
 expect rust-version 'rust-version.workspace = true' 'rust-version = "1.100"'
+expect rust-version-comment 'rust-version.workspace = true # floor' 'rust-version = "1.100"'
+expect rust-version-inline 'rust-version = { workspace = true }' 'rust-version = "1.100"'
+expect lints-table '[lints]
+workspace = true' ''
+expect lints-table-comment '[lints] # inherit
+workspace = true # yes' ''
+expect lints-dotted 'lints.workspace = true' ''
+expect lints-inline 'lints = { workspace = true }' ''
+expect lints-other-keys '[lints]
+rust.unused = "warn"' '[lints]
+rust.unused = "warn"'
+expect lints-subtable '[lints.clippy]
+all = "warn"' '[lints.clippy]
+all = "warn"'
 expect plain 'anyhow = "1"' 'anyhow = "1"'
 refuse inline-path 'mock-nntp-server = { workspace = true }' 'the workspace entry is a path dependency'
 refuse inline-missing 'nope = { workspace = true, optional = true }' '[workspace.dependencies] has no nope'
