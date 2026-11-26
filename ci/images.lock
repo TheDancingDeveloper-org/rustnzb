@@ -1,8 +1,8 @@
 # Generated from registry manifests after ci/tasks/build-ci-images succeeds.
 # The first custom-image bootstrap deliberately starts with pending entries;
 # ci/verify-image-pins rejects this file until real digests replace them.
-CORE_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:d03aebdc33355152013c1bd1ffe42231194ada26b5c40a06668abae85259d1d7
-CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:27641a62856a52a21378536ae607196a71bdedaaa428cc624260828998f550be
-E2E_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-e2e@sha256:6ec458ed0a30297844e05f70cb568974440f92343f3218dead146ad9a2451037
-DESKTOP_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-desktop@sha256:3e0365d875a2ae0165f3a05ff55e95fac9c144b0ea8bef3ffa454b99d39eb459
+CORE_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-core@sha256:5a3d802d2339db8d3f13da37d61550089d2389efb53e0bb86cf9425fdb27759f
+CROSS_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-cross@sha256:0e13e607c7477fd4c69d21170479ef99ffc97c4ee24e3be23df2a1b86bee1fc5
+E2E_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-e2e@sha256:1544dd0dfac2f074f3b2c0ad7b5f0c74e6e862a3853f75a9f6121713a82032fe
+DESKTOP_IMAGE=repo.indexarr.net/indexarr/rustnzb-ci-desktop@sha256:c5bdb46724e9ef142acc9e84258e35dbda834fab5f11d31f54541d2cc9f8be5f
 
