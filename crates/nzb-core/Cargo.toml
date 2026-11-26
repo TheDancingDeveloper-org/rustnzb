@@ -2,6 +2,7 @@
 name = "nzb-core"
 version = "0.2.24"
 edition = "2024"
+rust-version.workspace = true
 description = "Shared models, config, NZB parser, and SQLite database for NZB clients"
 license = "MIT"
 repository = "https://github.com/TheDancingDeveloper-org/nzb-core"

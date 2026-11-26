@@ -2,6 +2,7 @@
 name = "nzb-decode-ffi"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 description = "RapidYenc-compatible C ABI over nzb-decode's yEnc decoder, for loading through FFI"
 license = "MIT"
 repository = "https://github.com/TheDancingDeveloper-org/nzb-decode"

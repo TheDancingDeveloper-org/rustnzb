@@ -97,7 +97,15 @@ crate_export_manifest() {
             return name " = { " out " }"
         }
         FNR == NR {
-            if ($0 ~ /^\[/) { inws = ($0 ~ /^\[workspace\.dependencies\][ \t]*$/); next }
+            if ($0 ~ /^\[/) {
+                inws = ($0 ~ /^\[workspace\.dependencies\][ \t]*$/)
+                inwsp = ($0 ~ /^\[workspace\.package\][ \t]*$/)
+                next
+            }
+            if (inwsp && $0 ~ /^rust-version[ \t]*=/) {
+                floor = $0; sub(/^[^=]*=[ \t]*/, "", floor); gsub(/"/, "", floor)
+                next
+            }
             if (inws && $0 ~ /^[A-Za-z0-9_-]+[ \t]*=/) {
                 name = $0; sub(/[ \t]*=.*/, "", name)
                 val = $0; sub(/^[^=]*=[ \t]*/, "", val)
@@ -111,6 +119,14 @@ crate_export_manifest() {
             self = "^" crate "[ \t]*=[ \t]*\\{[ \t]*workspace[ \t]*=[ \t]*true[ \t]*\\}"
             if (line ~ self) {
                 print crate " = { path = \"..\" }"
+                next
+            }
+            # rust-version inherits from [workspace.package], not
+            # [workspace.dependencies]; resolve it to a literal so the
+            # standalone repo promises the same compiler floor.
+            if (line ~ /^rust-version\.workspace[ \t]*=[ \t]*true[ \t]*$/) {
+                if (floor == "") fail("rust-version inherits from the workspace but [workspace.package] has no rust-version")
+                print "rust-version = \"" floor "\""
                 next
             }
             if (line ~ /^[A-Za-z0-9_-]+\.workspace[ \t]*=[ \t]*true[ \t]*$/) {

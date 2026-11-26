@@ -42,9 +42,16 @@ drive it.
 | `docs/` | Development, releasing, known issues, performance status |
 | `website/` | Project site and browser demo |
 
-Cargo workspace: `resolver = "3"`, Rust 2024 edition, MSRV 1.99.
+Cargo workspace: `resolver = "3"`, Rust 2024 edition, MSRV 1.100.
 `default-members = ["apps/rustnzb"]`; `benchnzb` and `desktop` are excluded and
 must be built or tested with their own manifests.
+
+The compiler floor and the pinned toolchain are deliberately the same number,
+1.100: this is an application-led workspace that ships a binary, not a library
+crate promising a wide compatibility range, so the floor tracks the toolchain
+rather than lagging it. Every published member declares it — inherited with
+`rust-version.workspace = true`, or the literal `1.100` where a manifest sits
+outside the root workspace.
 
 The workspace crates are also published to crates.io and patched back to their
 local paths via `[patch.crates-io]` in the root `Cargo.toml`. If you change a

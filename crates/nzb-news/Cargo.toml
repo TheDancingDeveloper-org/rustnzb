@@ -2,6 +2,7 @@
 name = "nzb-news"
 version = "0.1.16"
 edition = "2024"
+rust-version.workspace = true
 description = "Layered NNTP download engine: persistent per-connection workers, priority-aware dispatch with cascade-retry, pipelined batch fetching. Pure fetch layer — no decode, no assembly."
 license = "MIT"
 repository = "https://github.com/TheDancingDeveloper-org/nzb-news"
