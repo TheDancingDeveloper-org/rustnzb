@@ -166,7 +166,7 @@ impl DownloaderConfig {
         Self {
             servers,
             max_concurrent_fetches,
-            article_timeout: Duration::from_secs(60),
+            article_timeout: Duration::from_mins(1),
             work_channel_capacity: 4096,
             outcome_channel_capacity: 4096,
             probe_policy: Some(ServerProbePolicy::default()),
@@ -586,11 +586,11 @@ const SUPERVISOR_INITIAL_COOLDOWN: Duration = Duration::from_secs(30);
 /// Upper bound on the exponential backoff. A provider that's been
 /// rejecting connections for 10 minutes is probably going to reject them
 /// for longer — but we keep probing so recovery is automatic.
-const SUPERVISOR_MAX_COOLDOWN: Duration = Duration::from_secs(600);
+const SUPERVISOR_MAX_COOLDOWN: Duration = Duration::from_mins(10);
 /// If a server stays healthy (any successful fetch) for this long after a
 /// respawn, the consecutive-offline counter resets so a future outage
 /// gets the short initial cooldown again.
-const SUPERVISOR_HEALTHY_RESET: Duration = Duration::from_secs(300);
+const SUPERVISOR_HEALTHY_RESET: Duration = Duration::from_mins(5);
 
 struct ServerSupervisor {
     server: Arc<Server>,
@@ -1948,7 +1948,7 @@ mod tests {
         assert_eq!(sup.consecutive_offline, 3);
 
         // A success inside the "still-flapping" window must NOT reset counter.
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
         sup.note_success();
         assert_eq!(
             sup.consecutive_offline, 3,

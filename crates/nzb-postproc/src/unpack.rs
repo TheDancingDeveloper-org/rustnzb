@@ -548,7 +548,7 @@ async fn extract_rar_with(
 }
 
 /// Longest a [`rar_password_rejected`] check may run.
-const PASSWORD_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const PASSWORD_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Link `file` into an empty temporary directory.
 fn link_alone(file: &Path) -> std::io::Result<(tempfile::TempDir, PathBuf)> {
@@ -2052,7 +2052,7 @@ mod tests {
             let out = work.path().join(out);
             async move {
                 tokio::time::timeout(
-                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_mins(1),
                     extract_7z_with(&sevenz, &archive, &out, password),
                 )
                 .await

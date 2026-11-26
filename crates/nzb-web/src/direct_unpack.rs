@@ -49,7 +49,7 @@ const UNRAR_PASSWORD_PATTERNS: &[&str] = &[
 
 /// A healthy extraction can wait for volumes, but a process that neither exits
 /// nor emits output is stuck (for example, waiting on an unrecognised prompt).
-const DIRECT_UNPACK_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const DIRECT_UNPACK_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Result of direct unpack for one RAR set.
 #[derive(Debug, Clone)]

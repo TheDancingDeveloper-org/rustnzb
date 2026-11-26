@@ -28,7 +28,7 @@ use tracing::{debug, info, trace, warn};
 /// under high concurrency where the overview DB is contended. 20s was
 /// too aggressive and killed healthy connections, causing reconnection
 /// churn and losing in-flight pipelined commands.
-const READ_LINE_TIMEOUT: Duration = Duration::from_secs(60);
+const READ_LINE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Timeout for reading each line of a multi-line body (article data).
 /// This is per-line, not per-article — large articles get many lines but
@@ -2951,7 +2951,7 @@ mod tests {
                 sock.get_mut().write_all(b"500 what\r\n").await.unwrap();
             }
             // Hold the socket open without ever reading again.
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            tokio::time::sleep(Duration::from_hours(1)).await;
             drop(sock);
         });
         port

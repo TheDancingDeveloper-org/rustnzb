@@ -71,7 +71,7 @@ impl ScheduleMonitor {
             let now = Local::now();
             let into_minute = Duration::from_secs(now.second() as u64)
                 + Duration::from_nanos(now.nanosecond() as u64);
-            let until_next = Duration::from_secs(60)
+            let until_next = Duration::from_mins(1)
                 .saturating_sub(into_minute)
                 .max(Duration::from_millis(50));
             tokio::select! {

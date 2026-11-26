@@ -167,7 +167,7 @@ impl Drop for DavHandle {
 
 /// How long a DAV socket may sit idle before it is closed and its budget
 /// permit handed back to the downloader.
-const DAV_IDLE_CLOSE: Duration = Duration::from_secs(60);
+const DAV_IDLE_CLOSE: Duration = Duration::from_mins(1);
 
 /// Look after idle DAV sockets until `cancel`. An idle socket is still open
 /// at the provider, so it keeps its budget permit until it is closed: as

@@ -114,7 +114,7 @@ async fn handle_connection_inner(stream: tokio::net::TcpStream, stats: &ServerSt
     loop {
         line.clear();
         let n = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
+            std::time::Duration::from_mins(5),
             reader.read_line(&mut line),
         )
         .await??;

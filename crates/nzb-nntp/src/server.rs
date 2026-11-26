@@ -12,9 +12,9 @@ use crate::error::NntpResult;
 use crate::pool::{ConnectionPool, PooledConnection};
 
 /// Penalty durations for various error conditions.
-const PENALTY_UNKNOWN: Duration = Duration::from_secs(3 * 60);
-const PENALTY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const PENALTY_AUTH: Duration = Duration::from_secs(10 * 60);
+const PENALTY_UNKNOWN: Duration = Duration::from_mins(3);
+const PENALTY_TIMEOUT: Duration = Duration::from_mins(10);
+const PENALTY_AUTH: Duration = Duration::from_mins(10);
 
 /// Number of speed samples to keep for the rolling average.
 const SPEED_WINDOW_SIZE: usize = 30;
@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn test_is_available_penalized() {
         let mut state = ServerState::new(make_config());
-        state.penalize("test error", Duration::from_secs(60));
+        state.penalize("test error", Duration::from_mins(1));
         assert!(!state.is_available());
         assert!(state.penalty_until.is_some());
         assert_eq!(state.last_error.as_deref(), Some("test error"));
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn test_clear_penalty() {
         let mut state = ServerState::new(make_config());
-        state.penalize("error", Duration::from_secs(600));
+        state.penalize("error", Duration::from_mins(10));
         assert!(!state.is_available());
 
         state.clear_penalty();

@@ -13,7 +13,7 @@ const MAX_WATCHED_NZB_BYTES: usize = 100 * 1024 * 1024;
 /// Interval between the size checks that decide a dropped file is complete.
 const SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 /// Give up waiting for a file that never stops changing and process it anyway.
-const MAX_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+const MAX_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_mins(10);
 /// Suffix of a file the watcher has claimed. Claimed files are never picked
 /// up again, so an NZB is enqueued at most once even if the final move fails.
 const CLAIM_SUFFIX: &str = ".processing";

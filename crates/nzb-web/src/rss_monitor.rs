@@ -461,7 +461,7 @@ impl RssMonitor {
 
 /// How long the monitor sleeps when no feed is due sooner; also the cadence
 /// of RSS item history maintenance.
-const IDLE_INTERVAL: Duration = Duration::from_secs(900);
+const IDLE_INTERVAL: Duration = Duration::from_mins(15);
 
 /// Smallest accepted `poll_interval_secs`. The API rejects anything lower,
 /// and the monitor clamps lower values from existing or hand-edited configs
@@ -937,7 +937,7 @@ mod tests {
         let refetched_at = requests.recv().await.expect("feed was re-fetched");
         let gap = refetched_at - fetched_at;
         assert!(
-            gap < std::time::Duration::from_secs(120),
+            gap < std::time::Duration::from_mins(2),
             "edited interval took {gap:?} to apply"
         );
 
@@ -948,7 +948,7 @@ mod tests {
                 Ok::<_, anyhow::Error>(())
             })
             .expect("delete feed");
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        tokio::time::sleep(std::time::Duration::from_hours(1)).await;
         while let Ok(at) = requests.try_recv() {
             assert!(
                 at <= refetched_at + std::time::Duration::from_secs(1),
@@ -991,10 +991,7 @@ mod tests {
             !schedule.is_due(&slow, at_61),
             "slow feed is not over-polled"
         );
-        assert_eq!(
-            schedule.next_due(&feeds),
-            Some(t0 + Duration::from_secs(60))
-        );
+        assert_eq!(schedule.next_due(&feeds), Some(t0 + Duration::from_mins(1)));
     }
 
     #[test]
@@ -1003,11 +1000,11 @@ mod tests {
         let mut feed = schedule_feed("f", "https://example.test/f", 900);
         let mut schedule = FeedSchedule::default();
         schedule.mark_checked(&feed, t0);
-        assert_eq!(schedule.due_at(&feed), Some(t0 + Duration::from_secs(900)));
+        assert_eq!(schedule.due_at(&feed), Some(t0 + Duration::from_mins(15)));
 
         feed.poll_interval_secs = 120;
         schedule.sync(std::slice::from_ref(&feed));
-        assert_eq!(schedule.due_at(&feed), Some(t0 + Duration::from_secs(120)));
+        assert_eq!(schedule.due_at(&feed), Some(t0 + Duration::from_mins(2)));
 
         feed.poll_interval_secs = u64::MAX;
         assert!(
