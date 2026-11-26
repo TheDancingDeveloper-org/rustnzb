@@ -2156,10 +2156,7 @@ fn history_slot_matches(slot: &SabHistorySlot, req: &SabApiRequest) -> bool {
     req.nzo_ids.as_deref().is_none_or(|ids| {
         ids.is_empty()
             || ids.split(',').map(str::trim).any(|id| {
-                let raw = slot
-                    .nzo_id
-                    .strip_prefix("SABnzbd_nzo_")
-                    .unwrap_or(&slot.nzo_id);
+                let raw = slot.nzo_id.trim_prefix("SABnzbd_nzo_");
                 let query = id.trim_prefix("SABnzbd_nzo_");
                 id == slot.nzo_id || job_id_matches(raw, query)
             })
