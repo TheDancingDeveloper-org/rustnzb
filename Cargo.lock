@@ -1823,8 +1823,6 @@ dependencies = [
 name = "nzb-decode"
 version = "0.1.9"
 dependencies = [
- "anyhow",
- "bytes",
  "crc32fast",
  "md-5 0.11.0",
  "parking_lot",
@@ -1832,7 +1830,6 @@ dependencies = [
  "rust-par2 0.2.0",
  "tempfile",
  "thiserror 2.0.20",
- "tokio",
  "tracing",
  "yenc-simd",
 ]
@@ -1889,12 +1886,9 @@ dependencies = [
 name = "nzb-nntp"
 version = "0.2.27"
 dependencies = [
- "anyhow",
- "arc-swap",
  "bytes",
  "dotenvy",
  "flate2",
- "governor",
  "nzb-nntp",
  "parking_lot",
  "rustls",
@@ -1944,7 +1938,6 @@ dependencies = [
  "arc-swap",
  "argon2",
  "axum",
- "base64 0.23.1",
  "bzip2",
  "chrono",
  "feed-rs",
@@ -1972,12 +1965,10 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tower",
- "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
  "utoipa",
- "utoipa-swagger-ui",
  "uuid",
  "yenc-simd",
  "zip",
