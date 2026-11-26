@@ -111,8 +111,8 @@ fn decode_payload_prefix(wire: &[u8], body_complete: bool, maximum: usize) -> De
     // an allocation from a caller-influenced value.
     let mut output = Vec::new();
     for raw_line in wire.split_inclusive(|byte| *byte == b'\n') {
-        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = raw_line.trim_suffix(b"\n");
+        let line = line.trim_suffix(b"\r");
         if !started {
             if line.starts_with(b"=ybegin ") {
                 started = true;

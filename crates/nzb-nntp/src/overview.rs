@@ -140,7 +140,7 @@ pub fn parse_lossless_overview_rows(
 
 fn wire_lines(data: &[u8]) -> impl Iterator<Item = &[u8]> {
     data.split(|byte| *byte == b'\n').filter_map(|line| {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = line.trim_suffix(b"\r");
         (!line.is_empty()).then_some(line)
     })
 }
