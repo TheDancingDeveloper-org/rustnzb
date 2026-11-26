@@ -7,6 +7,7 @@
 //! - `pipeline` — Orchestrate: verify -> repair -> extract -> cleanup
 
 pub mod detect;
+mod encryption;
 pub mod fold_repair;
 pub mod inflight;
 pub mod par2;
@@ -23,6 +24,7 @@ pub use detect::{
     ArchiveType, RarVolumeInfo, has_rar_signature, has_usable_output, parse_rar_volume,
     parse_rar_volume_at,
 };
+pub use encryption::rar_is_encrypted;
 pub use par2::recovery_can_cover;
 pub use par2_fold::{
     Feed, FoldError as RepairFoldError, MAX_ROW_BYTES, MAX_SLICE_SIZE, RepairBudget, RepairFold,
@@ -34,4 +36,5 @@ pub use pipeline::{
 pub use resources::{PostProcLimits, PostProcResourcePool, PostProcResourceSnapshot};
 pub use unpack::{
     extract_tar, extractor_reads_password_from_stdin, find_unrar, normalize_extracted_permissions,
+    rar_password_rejected,
 };

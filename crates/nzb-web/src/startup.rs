@@ -368,6 +368,8 @@ pub async fn initialize(
         config.general.script_timeout_secs,
         config.general.script_max_output_bytes,
     );
+    queue_manager.set_password_file(config.general.password_file.clone());
+    queue_manager.set_encrypted_action(config.general.encrypted_action);
     queue_manager.set_notifications(&config.notifications);
     queue_manager.set_queue_complete_persist(config.general.queue_complete_pers);
     queue_manager.set_defer_par2_volumes(config.par2.defer_volumes);

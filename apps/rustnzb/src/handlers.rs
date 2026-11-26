@@ -599,8 +599,8 @@ async fn read_upload(multipart: &mut Multipart) -> Result<UploadForm, ApiError> 
 /// Replace a job's archive password with [`PASSWORD_MASK`] (or `""` when it
 /// has none) for the native API, as server passwords are masked in config
 /// responses. The SABnzbd layer keeps the real value: its queue slot
-/// contract includes `password`. No native endpoint accepts a job password
-/// back, so the mask can never be stored in place of the real one.
+/// contract includes `password`. `PUT /api/queue/{id}/password` refuses the
+/// mask, so it can never be stored in place of the real one.
 fn mask_job_password(mut job: NzbJob) -> NzbJob {
     job.password = Some(if job.password.is_some_and(|pw| !pw.is_empty()) {
         PASSWORD_MASK.to_string()
@@ -1479,6 +1479,13 @@ pub async fn h_history_clear(
     Ok(Json(SimpleResponse { status: true }))
 }
 
+#[derive(Default, Deserialize, ToSchema)]
+pub struct HistoryRetryBody {
+    /// Archive password for the new job, replacing the one in the stored NZB.
+    /// Empty or absent keeps the NZB's own.
+    pub password: Option<String>,
+}
+
 /// POST /api/history/{id}/retry -- Re-add a failed/completed NZB from history.
 ///
 /// Idempotent per history entry: while a retry of `{id}` is still queued or
@@ -1493,9 +1500,10 @@ pub async fn h_history_clear(
     summary = "Retry a history entry",
     description = "Re-admits the entry's NZB with a new job id. Idempotent per entry: repeating the request while the retry is live resolves to the same new job.",
     params(("id" = String, Path, description = "History entry id")),
+    request_body(content = Option<HistoryRetryBody>, description = "Optional: the archive password for the new job"),
     responses(
         (status = 200, description = "Retry admitted", body = AddNzbResponse),
-        (status = 400, description = "The entry carries no NZB data", body = ApiError),
+        (status = 400, description = "The request body is not valid", body = ApiError),
         (status = 401, description = "Not authenticated", body = ApiError),
         (status = 404, description = "Entry not found", body = ApiError),
         (status = 409, description = "The retried NZB duplicates a live job", body = ApiError),
@@ -1504,13 +1512,28 @@ pub async fn h_history_clear(
 pub async fn h_history_retry(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
+    // The body is optional, so an empty one is accepted whatever its
+    // Content-Type. The parse error is not echoed: it can quote the password.
+    let password = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice::<Option<HistoryRetryBody>>(&body)
+            .map_err(|_| ApiError::bad_request("Invalid retry request body"))?
+            .unwrap_or_default()
+            .password
+    };
     let lookup_id = id.clone();
     let entry = qm_blocking(&state, move |qm| qm.history_get(&lookup_id))
         .await?
         .ok_or(ApiError::not_found("History entry not found"))?;
 
-    let job_id = match qm_blocking(&state, move |qm| qm.retry_history_entry(&entry)).await? {
+    let job_id = match qm_blocking(&state, move |qm| {
+        qm.retry_history_entry_with_password(&entry, password)
+    })
+    .await?
+    {
         HistoryRetryOutcome::Started(job_id) => job_id,
         HistoryRetryOutcome::InProgress(job_id) => {
             tracing::info!(
@@ -2114,6 +2137,7 @@ fn if_match_matches(header: &str, etag: &str) -> bool {
 pub async fn h_config_patch(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    extensions: http::Extensions,
     method: Option<Extension<AuthMethod>>,
     body: Result<Json<ConfigPatchBody>, JsonRejection>,
 ) -> Result<Json<ConfigPatchResponse>, ApiError> {
@@ -2181,7 +2205,13 @@ pub async fn h_config_patch(
     }
 
     if changed_sensitive {
-        ensure_step_up(&state, &headers, None, method.map(|extension| extension.0)).await?;
+        ensure_step_up(
+            &state,
+            &headers,
+            Some(&extensions),
+            method.map(|extension| extension.0),
+        )
+        .await?;
     }
 
     let confirm_exposure = body.confirm_exposure;
@@ -2733,6 +2763,12 @@ fn apply_restored_runtime(state: &Arc<AppState>) {
         config.general.script_timeout_secs,
         config.general.script_max_output_bytes,
     );
+    state
+        .queue_manager
+        .set_password_file(config.general.password_file.clone());
+    state
+        .queue_manager
+        .set_encrypted_action(config.general.encrypted_action);
     state.queue_manager.set_notifications(&config.notifications);
     state
         .queue_manager
@@ -4465,6 +4501,10 @@ pub struct UpdateGeneralBody {
     /// `allow`, `warn` or `skip`: what to do with an NZB that duplicates a job.
     pub duplicate_policy: Option<String>,
     pub rss_downloaded_item_expiry_days: Option<Option<u64>>,
+    /// Archive password file. Empty unsets it.
+    pub password_file: Option<String>,
+    /// `ignore`, `pause` or `abort`: an encrypted RAR found while downloading.
+    pub encrypted_action: Option<String>,
     pub scripts_dir: Option<String>,
     pub script_success: Option<String>,
     pub script_failure: Option<String>,
@@ -4648,6 +4688,8 @@ pub(crate) const SETTINGS_AUDIT: &[(&str, Result<&str, &str>)] = &[
             "security boundary for SABnzbd addlocalfile: widening it from the web UI would let a stolen session read arbitrary files, so it stays TOML/env only",
         ),
     ),
+    ("general.password_file", Ok("PUT /api/config/general")),
+    ("general.encrypted_action", Ok("PUT /api/config/general")),
     (
         "general.queue_complete_pers",
         Err("follow-up: SABnzbd queue-complete action persistence; only SABnzbd clients use it"),
@@ -4835,6 +4877,25 @@ fn validate_general_update(body: &UpdateGeneralBody) -> Result<(), ApiError> {
             "must be allow, warn or skip",
         ));
     }
+    if let Some(action) = body.encrypted_action.as_deref()
+        && action
+            .parse::<nzb_web::nzb_core::config::EncryptedAction>()
+            .is_err()
+    {
+        return Err(general_field_error(
+            "encrypted_action",
+            "must be ignore, pause or abort",
+        ));
+    }
+    if let Some(path) = body.password_file.as_deref().map(str::trim)
+        && !path.is_empty()
+        && !std::path::Path::new(path).is_absolute()
+    {
+        return Err(general_field_error(
+            "password_file",
+            "must be an absolute path",
+        ));
+    }
     if let Some(max) = body.max_active_downloads {
         validate_max_active_downloads(max)?;
     }
@@ -4891,7 +4952,10 @@ fn bind_is_loopback(addr: &str) -> bool {
     match ip {
         Some(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
         Some(std::net::IpAddr::V6(ip)) => {
-            ip.is_loopback() || ip.to_ipv4().is_some_and(|ip| ip.is_loopback())
+            // `to_ipv4_mapped` (not the deprecated `to_ipv4`) so the
+            // IPv4-compatible form `::127.0.0.1` is not accepted as loopback:
+            // only `::1` and the real mapped form `::ffff:127.0.0.1` are.
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
         }
         None => false,
     }
@@ -4929,6 +4993,7 @@ pub async fn h_general_update(
     if nzb_web::auth_class::general_update_sensitive_fields(|field| match field {
         "data_dir" => body.data_dir.is_some(),
         "scripts_dir" => body.scripts_dir.is_some(),
+        "password_file" => body.password_file.is_some(),
         "script_success" => body.script_success.is_some(),
         "script_failure" => body.script_failure.is_some(),
         "script_timeout_secs" => body.script_timeout_secs.is_some(),
@@ -5043,6 +5108,17 @@ pub async fn h_general_update(
         if let Some(days) = body.rss_downloaded_item_expiry_days {
             config.general.rss_downloaded_item_expiry_days = normalize_rss_expiry_days(days);
         }
+        if let Some(path) = body.password_file.as_deref().map(str::trim) {
+            config.general.password_file = (!path.is_empty()).then(|| path.into());
+        }
+        // Validated by `validate_general_update`.
+        if let Some(action) = body
+            .encrypted_action
+            .as_deref()
+            .and_then(|action| action.parse().ok())
+        {
+            config.general.encrypted_action = action;
+        }
         if let Some(directory) = body.scripts_dir.as_deref() {
             config.general.scripts_dir = if directory.is_empty() {
                 None
@@ -5122,6 +5198,12 @@ pub async fn h_general_update(
     }) {
         state.queue_manager.set_duplicate_policy(policy);
     }
+    state
+        .queue_manager
+        .set_password_file(config.general.password_file.clone());
+    state
+        .queue_manager
+        .set_encrypted_action(config.general.encrypted_action);
     if let Some(enabled) = body.par2_defer_volumes {
         state.queue_manager.set_defer_par2_volumes(enabled);
     }
@@ -5294,6 +5376,11 @@ fn get_disk_space_total(path: &std::path::Path) -> u64 {
 /// Get (free, total) disk space in bytes for the filesystem containing
 /// `path`. Returns `(0, 0)` on error or on platforms without a `statvfs`
 /// equivalent wired up (currently: everything but Unix).
+// Deliberate exception, kept as `allow` rather than `expect`. The attribute is
+// live only on `cfg(not(unix))`, where `path` is unused because the body is the
+// `(0, 0)` stub; on Unix the same variable is read by the statvfs branch, so the
+// lint does not fire. An `expect` cannot be verified from Linux: it would be
+// unfulfilled on Unix and break the non-Unix build under `-D warnings`.
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn get_disk_space(path: &std::path::Path) -> (u64, u64) {
     #[cfg(unix)]
@@ -5308,9 +5395,15 @@ fn get_disk_space(path: &std::path::Path) -> (u64, u64) {
             let mut stat = MaybeUninit::<libc::statvfs>::uninit();
             if libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) == 0 {
                 let stat = stat.assume_init();
-                #[allow(clippy::unnecessary_cast)] // u32 on macOS, u64 on Linux
+                #[expect(
+                    clippy::unnecessary_cast,
+                    reason = "statvfs fields are u32 on macOS and u64 on Linux, so the cast to u64 is required on one platform and a no-op clippy flags on the other"
+                )]
                 let frsize = stat.f_frsize as u64;
-                #[allow(clippy::unnecessary_cast)]
+                #[expect(
+                    clippy::unnecessary_cast,
+                    reason = "same cross-platform statvfs width difference as f_frsize above"
+                )]
                 return (stat.f_bavail as u64 * frsize, stat.f_blocks as u64 * frsize);
             }
         }
@@ -5476,6 +5569,49 @@ pub async fn h_queue_change_category(
         .queue_manager
         .change_job_category(&id, &body.category)
         .map_err(ApiError::from)?;
+    Ok(Json(SimpleResponse { status: true }))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct JobPasswordBody {
+    /// Archive password. Empty clears it.
+    pub password: String,
+}
+
+/// PUT /api/queue/{id}/password -- Set or clear a job's archive password.
+#[utoipa::path(
+    put,
+    path = "/api/queue/{id}/password",
+    tag = "queue",
+    summary = "Set a job's archive password",
+    params(("id" = String, Path, description = "Job id")),
+    request_body = JobPasswordBody,
+    responses(
+        (status = 200, description = "Password set", body = SimpleResponse),
+        (status = 400, description = "The password is the masked placeholder", body = ApiError),
+        (status = 401, description = "Not authenticated", body = ApiError),
+        (status = 404, description = "Job not found", body = ApiError),
+        (status = 409, description = "The job is past downloading", body = ApiError),
+    ),
+)]
+pub async fn h_queue_set_password(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<JobPasswordBody>,
+) -> Result<Json<SimpleResponse>, ApiError> {
+    // What the queue shows in place of a password must not replace it.
+    if body.password == PASSWORD_MASK {
+        return Err(ApiError::bad_request(
+            "the masked placeholder is not a password",
+        ));
+    }
+    qm_blocking(&state, move |qm| {
+        Ok(match qm.set_job_password(&id, Some(body.password)) {
+            Err(nzb_web::nzb_core::NzbError::Other(message)) => Err(ApiError::conflict(message)),
+            result => result.map_err(ApiError::from),
+        })
+    })
+    .await??;
     Ok(Json(SimpleResponse { status: true }))
 }
 
@@ -6362,6 +6498,10 @@ mod tests {
         assert!(super::bind_is_loopback("[::1]:8080"));
         assert!(super::bind_is_loopback("::ffff:127.0.0.1"));
         assert!(super::bind_is_loopback("[::ffff:127.0.0.1]:8080"));
+        // The deprecated IPv4-compatible form is not loopback: only the
+        // mapped form (::ffff:a.b.c.d) and ::1 itself are.
+        assert!(!super::bind_is_loopback("::127.0.0.1"));
+        assert!(!super::bind_is_loopback("[::127.0.0.1]:8080"));
         assert!(!super::bind_is_loopback("0.0.0.0:8080"));
         assert!(!super::bind_is_loopback("[2001:db8::1]:8080"));
         assert!(!super::bind_is_loopback("not-an-address"));

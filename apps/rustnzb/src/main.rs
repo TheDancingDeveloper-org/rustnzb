@@ -266,8 +266,8 @@ fn run_smoke_tests() -> i32 {
         Ok(output) => {
             let text = format!(
                 "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy_owned(output.stdout),
+                String::from_utf8_lossy_owned(output.stderr),
             );
             if text.to_lowercase().contains("unrar") {
                 println!("OK");
@@ -287,8 +287,8 @@ fn run_smoke_tests() -> i32 {
         Ok(output) => {
             let text = format!(
                 "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy_owned(output.stdout),
+                String::from_utf8_lossy_owned(output.stderr),
             );
             if text.contains("7-Zip") {
                 println!("OK");

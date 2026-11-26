@@ -2800,7 +2800,10 @@ async fn run_worker_serial(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one pipelined connection's whole working set: pool, target server, worker identity, pipeline depth, shutdown flag, connection and slot, and the progress clock — all owned by the caller and all needed per fetch loop"
+)]
 async fn run_worker_pipelined(
     pool: &Arc<WorkerPool>,
     primary_server: &ServerConfig,
@@ -3473,7 +3476,10 @@ fn fail_incomplete_nzb_article(
 /// and the failure was per-server (NotFound, ServerDown, …), we promote it
 /// to a definitive `NotFound` for the hopeless tracker. DecodeError stays
 /// classified as DecodeError because it's typically not server-specific.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a failure is classified against every piece of routing state at once — the item, its server, the server list, health map, job context and queue — so a struct would only rename the same fields"
+)]
 fn handle_article_not_available(
     item: &mut WorkItem,
     primary_server: &ServerConfig,

@@ -21,6 +21,7 @@ response) until the process restarts; the settings UI shows a
 | `general.min_free_space_bytes`, `general.abort_hopeless` | Paths & disk | at once |
 | `general.direct_unpack`, `max_nested_archive_depth`, `max_post_processing_jobs`, `max_repair_workers`, `max_extract_workers` | Post-processing | restart required |
 | `par2.defer_volumes`, `par2.trust_inflight_verify` | Post-processing | at once |
+| `general.password_file`, `encrypted_action` | Post-processing | at once |
 | `general.scripts_dir`, `script_success`, `script_failure`, `script_timeout_secs`, `script_max_output_bytes` | Post-processing | at once |
 | `general.listen_addr`, `general.port` | API | restart required |
 | `general.api_key` (regenerate) | API | at once |

@@ -81,6 +81,7 @@ export interface HistoryEntry {
   output_dir: string;
   stages: StageResult[];
   error_message: string | null;
+  failure_code?: string | null;
   server_stats: ServerArticleStats[];
   has_nzb_data: boolean;
   duration_secs?: number;

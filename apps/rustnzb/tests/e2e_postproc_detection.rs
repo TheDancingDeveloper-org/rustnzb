@@ -10,7 +10,10 @@
 //! subject-derived filenames lack proper extensions, causing the
 //! post-processor to report "No par2 files found" and "No archives found."
 
-#![allow(clippy::uninlined_format_args)]
+#![expect(
+    clippy::uninlined_format_args,
+    reason = "assertion messages use positional `{}`/`{:?}` placeholders so the recorded value pairs with its label; inlining would bury the diagnostics"
+)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -163,6 +166,7 @@ async fn normal_subjects_pipeline_finds_files() {
         content_articles_failed: 0,
         skip_extract: false,
         password: None,
+        password_candidates: Vec::new(),
         max_nested_archive_depth: 5,
         slice_map: None,
         trust_inflight_verify: true,
@@ -194,6 +198,7 @@ async fn normal_subjects_pipeline_finds_files() {
         content_articles_failed: 1,
         skip_extract: false,
         password: None,
+        password_candidates: Vec::new(),
         max_nested_archive_depth: 5,
         slice_map: None,
         trust_inflight_verify: true,
@@ -333,6 +338,7 @@ async fn obfuscated_pipeline_skips_everything() {
         content_articles_failed: 0,
         skip_extract: false,
         password: None,
+        password_candidates: Vec::new(),
         max_nested_archive_depth: 5,
         slice_map: None,
         trust_inflight_verify: true,
@@ -530,6 +536,7 @@ async fn deobfuscation_enables_full_pipeline() {
         content_articles_failed: 0,
         skip_extract: false,
         password: None,
+        password_candidates: Vec::new(),
         max_nested_archive_depth: 5,
         slice_map: None,
         trust_inflight_verify: true,
@@ -557,6 +564,7 @@ async fn deobfuscation_enables_full_pipeline() {
         content_articles_failed: 1,
         skip_extract: false,
         password: None,
+        password_candidates: Vec::new(),
         max_nested_archive_depth: 5,
         slice_map: None,
         trust_inflight_verify: true,
@@ -727,6 +735,7 @@ async fn pipeline_with_only_archives_no_par2() {
         content_articles_failed: 0,
         skip_extract: false,
         password: None,
+        password_candidates: Vec::new(),
         max_nested_archive_depth: 5,
         slice_map: None,
         trust_inflight_verify: true,

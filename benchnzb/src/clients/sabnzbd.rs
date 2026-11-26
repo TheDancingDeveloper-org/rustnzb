@@ -105,10 +105,10 @@ impl SabnzbdClient {
     pub async fn all_finished(&self) -> Result<bool> {
         // Queue must be empty
         let queue = self.api_get(&[("mode", "queue")]).await?;
-        if let Some(slots) = queue["queue"]["slots"].as_array() {
-            if !slots.is_empty() {
-                return Ok(false);
-            }
+        if let Some(slots) = queue["queue"]["slots"].as_array()
+            && !slots.is_empty()
+        {
+            return Ok(false);
         }
 
         // History must have completed entries
@@ -199,15 +199,15 @@ impl SabnzbdClient {
                         if let Some(actions) = stage["actions"].as_array() {
                             for action in actions {
                                 let text = action.as_str().unwrap_or("");
-                                if name.contains("Repair") || name.contains("Verif") {
-                                    if let Some(secs) = parse_duration(text) {
-                                        timing.par2_sec += secs;
-                                    }
+                                if (name.contains("Repair") || name.contains("Verif"))
+                                    && let Some(secs) = parse_duration(text)
+                                {
+                                    timing.par2_sec += secs;
                                 }
-                                if name.contains("Unpack") {
-                                    if let Some(secs) = parse_duration(text) {
-                                        timing.unpack_sec += secs;
-                                    }
+                                if name.contains("Unpack")
+                                    && let Some(secs) = parse_duration(text)
+                                {
+                                    timing.unpack_sec += secs;
                                 }
                             }
                         }
@@ -295,19 +295,17 @@ impl SabnzbdClient {
 fn parse_duration(text: &str) -> Option<f64> {
     let text = text.to_lowercase();
     let mut total: f64 = 0.0;
-    if let Some(idx) = text.find("min") {
-        if let Some(num_str) = text[..idx].split_whitespace().last() {
-            if let Ok(m) = num_str.parse::<f64>() {
-                total += m * 60.0;
-            }
-        }
+    if let Some(idx) = text.find("min")
+        && let Some(num_str) = text[..idx].split_whitespace().last()
+        && let Ok(m) = num_str.parse::<f64>()
+    {
+        total += m * 60.0;
     }
-    if let Some(idx) = text.find("sec") {
-        if let Some(num_str) = text[..idx].split_whitespace().last() {
-            if let Ok(s) = num_str.parse::<f64>() {
-                total += s;
-            }
-        }
+    if let Some(idx) = text.find("sec")
+        && let Some(num_str) = text[..idx].split_whitespace().last()
+        && let Ok(s) = num_str.parse::<f64>()
+    {
+        total += s;
     }
     if total > 0.0 { Some(total) } else { None }
 }

@@ -220,6 +220,15 @@ pub struct GeneralConfig {
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub local_import_dir: Option<PathBuf>,
+    /// File of archive passwords, one per line, tried in order when an archive
+    /// needs a password the job does not have. Read again for each job.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub password_file: Option<PathBuf>,
+    /// What to do when an encrypted RAR that no known password opens is found
+    /// during the download: `ignore` (default), `pause` or `abort`.
+    #[serde(default)]
+    pub encrypted_action: EncryptedAction,
     /// Keep the SABnzbd `change_complete_action` after it has run once. When
     /// false (SABnzbd's default) the action is reset after each run.
     #[serde(default)]
@@ -405,6 +414,8 @@ impl Default for GeneralConfig {
             duplicate_policy: DuplicatePolicy::Warn,
             rss_downloaded_item_expiry_days: None,
             local_import_dir: None,
+            password_file: None,
+            encrypted_action: EncryptedAction::Ignore,
             queue_complete_pers: false,
             scripts_dir: None,
             script_success: None,
@@ -476,6 +487,45 @@ impl OtelConfig {
 
 /// NNTP server configuration — re-exported from the `nzb-nntp` crate.
 pub use nzb_nntp::ServerConfig;
+
+/// What to do when a RAR that is encrypted, and that no known password opens,
+/// is found while its job is still downloading.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum EncryptedAction {
+    /// Keep downloading; extraction reports the missing password (default).
+    #[default]
+    Ignore,
+    /// Pause the job so a password can be set.
+    Pause,
+    /// Fail the job. Its files are kept for a retry with a password.
+    Abort,
+}
+
+impl std::fmt::Display for EncryptedAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Ignore => "ignore",
+            Self::Pause => "pause",
+            Self::Abort => "abort",
+        })
+    }
+}
+
+impl std::str::FromStr for EncryptedAction {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ignore" => Ok(Self::Ignore),
+            "pause" => Ok(Self::Pause),
+            "abort" => Ok(Self::Abort),
+            other => Err(format!(
+                "encrypted_action must be ignore, pause or abort, not `{other}`"
+            )),
+        }
+    }
+}
 
 /// Category configuration for organizing downloads.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

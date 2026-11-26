@@ -65,7 +65,10 @@ pub struct DirectUnpackResult {
 /// Tracks which volumes are available for a single RAR set.
 #[derive(Debug)]
 struct RarSetState {
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "the set is keyed by name in the map, so the field is never read; it is kept to name the set on debug output"
+    )]
     set_name: String,
     /// volume_number → file path on disk (assembled and ready)
     volumes: BTreeMap<u32, PathBuf>,
@@ -269,7 +272,10 @@ fn run_direct_unpack(
 }
 
 /// Process a single RAR set: spawn unrar, feed volumes as they become available.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "processes one RAR set with the unrar command, the set's paths and password, and the shared state/notify/kill/runtime handles it must watch while volumes stream in"
+)]
 fn unpack_set(
     unrar_bin: &str,
     set_name: &str,
@@ -306,6 +312,7 @@ fn unpack_set(
     // Spawn unrar with -vp (pause between volumes).
     // -o+ = overwrite, -y = assume yes, -vp = pause between volumes
     let mut child = match Command::new(unrar_bin)
+        .envs(nzb_postproc::unpack::extractor_locale())
         .args(["x", "-o+", "-y", "-vp"])
         .arg(&pw_flag)
         .arg(first_volume)

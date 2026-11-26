@@ -1,6 +1,6 @@
 [package]
 name = "nzb-web"
-version = "0.4.25"
+version = "0.4.26"
 edition = "2024"
 description = "Usenet download engine: queue management, download orchestration, and background services"
 license = "MIT"
@@ -13,7 +13,7 @@ groups-db = ["nzb-postproc/groups-db"]
 [dependencies]
 nzb-nntp = { version = "0.2.27", path = "../nzb-nntp" }
 nzb-decode = { version = "0.1.9", path = "../nzb-decode" }
-nzb-postproc = { version = "0.2.11", path = "../nzb-postproc" }
+nzb-postproc = { version = "0.2.12", path = "../nzb-postproc" }
 nzb-dispatch = { version = "0.2.11", path = "../nzb-dispatch" }
 axum = { version = "0.8", features = ["multipart"] }
 tower = "0.5"
@@ -28,7 +28,6 @@ tracing = "0.1"
 opentelemetry.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
 anyhow = "1"
-async-trait = "0.1"
 thiserror = "2"
 parking_lot = "0.12"
 rand = "0.10"

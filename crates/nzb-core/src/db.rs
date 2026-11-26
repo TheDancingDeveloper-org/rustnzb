@@ -8,7 +8,10 @@ use tracing::info;
 use crate::error::NzbError;
 use crate::models::*;
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "documentation of the schema generation this build writes; migrations stamp the version into the table by SQL text, so the constant itself is never read"
+)]
 const SCHEMA_VERSION: u32 = 1;
 
 /// The content digest that recognises a repeated NZB: `sha256:` followed by
@@ -1136,6 +1139,15 @@ impl Database {
         Ok(())
     }
 
+    /// Update a queued job's archive password.
+    pub fn queue_update_password(&self, id: &str, password: Option<&str>) -> Result<(), NzbError> {
+        self.conn.execute(
+            "UPDATE queue SET password=?2 WHERE id=?1",
+            params![id, password],
+        )?;
+        Ok(())
+    }
+
     /// Update job priority in the queue.
     pub fn queue_update_priority(&self, id: &str, priority: i32) -> Result<(), NzbError> {
         self.conn.execute(
@@ -1540,6 +1552,21 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(NzbError::Database(e)),
         }
+    }
+
+    /// Retry checkpoints of the rows (trashed ones included) that failed for
+    /// want of an archive password and that no external client has removed:
+    /// the failed rows whose downloaded files are kept for a retry.
+    pub fn history_password_failure_retry_data(&self) -> Result<Vec<Vec<u8>>, NzbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT retry_data FROM history
+             WHERE failure_code = 'archive_password_required' AND retry_data IS NOT NULL
+               AND id NOT IN (SELECT id FROM history_client_removals)",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// Enforce history retention limit by deleting oldest entries, and the
@@ -2449,7 +2476,6 @@ fn stamp_schema_version(tx: &rusqlite::Transaction<'_>, version: u32) -> Result<
     Ok(())
 }
 
-#[allow(dead_code)]
 fn add_column_if_missing(
     tx: &rusqlite::Transaction<'_>,
     table: &str,

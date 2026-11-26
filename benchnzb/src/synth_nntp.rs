@@ -1,8 +1,8 @@
 use crate::config::{ARTICLE_SIZE, MSG_ID_DOMAIN};
 use crate::yenc;
 use anyhow::Result;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
 

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.99 or newer
+- Rust 1.100 or newer
 - Node.js 22 for the Angular frontend
 - Docker and Docker Buildx for container and browser-task workflows
 - `7z` for archive extraction at runtime
@@ -18,6 +18,27 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test --manifest-path benchnzb/Cargo.toml --all-targets --locked
 ```
+
+## Dependency cooldown
+
+`.cargo/config.toml` sets a resolver policy:
+`registry.global-min-publish-age = "7 days"` with
+`resolver.incompatible-publish-age = "deny"`. Cargo will not
+select a version published more recently than the cooldown; a version already
+present in `Cargo.lock` is never blocked, and an already-locked build is
+unaffected. This is a resolver policy, not a vulnerability scanner, and it does
+not replace `cargo audit`, `cargo deny`, or dependency review — keep running
+those. Do not set `incompatible-publish-age` to `allow` globally to work around
+the cooldown. For an urgent security fix, update the one crate with the cooldown
+overridden to zero in that command's environment only, then land the resulting
+`Cargo.lock` change as a normal reviewed pull request whose body names the
+advisory:
+
+```bash
+CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE=0 cargo update -p <crate> --precise <version>
+```
+
+`.cargo/config.toml` is not edited for such a bypass.
 
 ## Frontend checks
 

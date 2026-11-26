@@ -38,6 +38,8 @@ pub struct SabApiRequest {
     pub name: Option<String>,
     pub value: Option<String>,
     pub value2: Option<String>,
+    /// Archive password for `mode=queue&name=rename`.
+    pub value3: Option<String>,
     pub apikey: Option<String>,
     pub output: Option<String>,
     pub cat: Option<String>,
@@ -549,7 +551,7 @@ fn percent_decode_lossy(value: &str) -> String {
             index += 1;
         }
     }
-    String::from_utf8_lossy(&decoded).into_owned()
+    String::from_utf8_lossy_owned(decoded)
 }
 
 /// Body encodings a SABnzbd client may use for a POST request.
@@ -684,7 +686,10 @@ pub async fn h_sabnzbd_api_post(
 }
 
 /// Fold the fields of a multipart body into the request parameters.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each SABnzbd parameter in the multipart body has a destination out-parameter; a struct would only rename the same fields the form defines"
+)]
 async fn read_multipart_fields(
     multipart: &mut Multipart,
     mode: &mut String,
@@ -780,7 +785,10 @@ async fn read_multipart_fields(
 /// query string and (optional) body. `query_req.nzbname` carries the merged
 /// `nzbname` job-name override and `query_req.pp` the merged `pp`
 /// post-processing override.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the SAB API's addfile/addurl parameters, already split from the query string; they mirror the wire form field-for-field"
+)]
 async fn dispatch_post(
     state: &AppState,
     mode: String,
@@ -979,6 +987,7 @@ async fn dispatch_post(
                 // here, silently breaking those actions over POST.
                 value: query_req.value,
                 value2: query_req.value2,
+                value3: query_req.value3,
                 apikey: None, // already validated by the caller
                 output: None,
                 cat,
@@ -1889,7 +1898,18 @@ fn handle_queue_rename(state: &AppState, req: &SabApiRequest) -> Json<serde_json
     }
 
     let id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
-    match state.queue_manager.rename_job(id, new_name) {
+    // SABnzbd's rename also carries the archive password, as `value3`: the
+    // job keeps its password when it is absent and loses it when it is empty.
+    let result = state
+        .queue_manager
+        .rename_job(id, new_name)
+        .and_then(|()| match &req.value3 {
+            Some(password) => state
+                .queue_manager
+                .set_job_password(id, Some(password.clone())),
+            None => Ok(()),
+        });
+    match result {
         Ok(()) => Json(serde_json::json!({ "status": true })),
         Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
     }
@@ -2715,7 +2735,7 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     // At most one retry of an entry is in flight: a repeat while it is still
     // queued or running returns the existing job's nzo_id (status true)
     // rather than enqueueing a duplicate.
-    match retry_history_job(state, &entry) {
+    match retry_history_job(state, &entry, req.password.clone()) {
         Ok(nzo_id) => Json(serde_json::json!({ "status": true, "nzo_ids": [nzo_id] })),
         Err(error) => Json(serde_json::json!({ "status": false, "error": error })),
     }
@@ -2739,7 +2759,7 @@ fn handle_retry_all(state: &AppState) -> Json<serde_json::Value> {
         .iter()
         .filter(|entry| entry.status == JobStatus::Failed && entry.nzb_data.is_some())
         .map(|entry| {
-            retry_history_job(state, entry)
+            retry_history_job(state, entry, None)
                 .inspect_err(|error| {
                     tracing::warn!(history_id = %entry.id, %error, "retry_all: retry failed");
                 })
@@ -2753,8 +2773,15 @@ fn handle_retry_all(state: &AppState) -> Json<serde_json::Value> {
 /// `nzo_id`. Shared by `mode=retry` and `mode=retry_all`. A repeat while the
 /// earlier retry is still queued or running returns that job's nzo_id instead
 /// of enqueueing a duplicate.
-fn retry_history_job(state: &AppState, entry: &HistoryEntry) -> Result<String, String> {
-    match state.queue_manager.retry_history_entry(entry) {
+fn retry_history_job(
+    state: &AppState,
+    entry: &HistoryEntry,
+    password: Option<String>,
+) -> Result<String, String> {
+    match state
+        .queue_manager
+        .retry_history_entry_with_password(entry, password)
+    {
         Ok(HistoryRetryOutcome::Started(job_id) | HistoryRetryOutcome::InProgress(job_id)) => {
             Ok(format!("SABnzbd_nzo_{}", sab_id_prefix(&job_id)))
         }
@@ -3537,6 +3564,17 @@ fn format_timeleft(bytes_left: u64, speed_bps: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_decode_lossy_replaces_invalid_utf8() {
+        // %FF is not valid UTF-8: it becomes U+FFFD, valid bytes are kept.
+        assert_eq!(percent_decode_lossy("a%FFb%C3%A9"), "a\u{FFFD}b\u{e9}");
+        let bytes = vec![b'a', 0xFF];
+        assert_eq!(
+            String::from_utf8_lossy_owned(bytes.clone()),
+            String::from_utf8_lossy(&bytes)
+        );
+    }
 
     #[test]
     fn duplicate_refusal_matches_sabnzbd_so_arrs_blocklist_it() {
@@ -4822,6 +4860,30 @@ mod tests {
             .find(|job| job.id == "queue-rename-job")
             .expect("job still queued");
         assert_eq!(job.name, "New Name");
+    }
+
+    /// SABnzbd's queue rename sets the archive password through `value3`.
+    #[tokio::test]
+    async fn queue_rename_value3_sets_the_password() {
+        let test_state = test_state();
+        add_live_job(&test_state, "queue-password-job");
+        for (value3, expected) in [
+            (Some("s3cr3t"), Some("s3cr3t")),
+            (None, Some("s3cr3t")),
+            (Some(""), None),
+        ] {
+            let req = SabApiRequest {
+                name: Some("rename".into()),
+                value: Some("queue-password-job".into()),
+                value2: Some("Same Name".into()),
+                value3: value3.map(str::to_string),
+                ..SabApiRequest::default()
+            };
+            let response = dispatch_mode(&test_state.state, "queue", &req).0;
+            assert_eq!(response["status"], serde_json::json!(true), "{response}");
+            let job = test_state.state.queue_manager.get_jobs().pop().unwrap();
+            assert_eq!(job.password.as_deref(), expected, "{value3:?}");
+        }
     }
 
     /// SABnzbd's real `get_cats` reports the default category as `"*"`, not
@@ -6418,6 +6480,30 @@ mod tests {
         for response in &responses {
             assert_eq!(response["status"], serde_json::json!(true), "{response}");
             assert_eq!(&response["nzo_ids"][0], first, "{response}");
+        }
+    }
+
+    /// SABnzbd `mode=retry` takes the archive password for the new job.
+    #[tokio::test]
+    async fn retry_applies_the_password_parameter() {
+        let test_state = test_state();
+        for (id, password, expected) in [
+            ("with-password", Some("s3cr3t"), Some("s3cr3t")),
+            ("empty-password", Some(""), None),
+            ("no-password", None, None),
+        ] {
+            insert_retryable_history(&test_state, id);
+            let req = SabApiRequest {
+                value: Some(id.into()),
+                password: password.map(str::to_string),
+                ..SabApiRequest::default()
+            };
+            let response = handle_retry(&test_state.state, &req).0;
+            assert_eq!(response["status"], serde_json::json!(true), "{response}");
+            let qm = &test_state.state.queue_manager;
+            let job = qm.get_jobs().pop().expect("retried job");
+            assert_eq!(job.password.as_deref(), expected, "{id}");
+            qm.remove_job(&job.id).expect("remove retried job");
         }
     }
 

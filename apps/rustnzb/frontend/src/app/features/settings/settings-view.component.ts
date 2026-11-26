@@ -150,6 +150,8 @@ interface GeneralDirs {
   max_post_processing_jobs?: number;
   max_repair_workers?: number;
   max_extract_workers?: number;
+  password_file?: string | null;
+  encrypted_action?: string;
   scripts_dir?: string | null;
   script_success?: string | null;
   script_failure?: string | null;
@@ -179,6 +181,8 @@ export interface PostprocForm {
   max_post_processing_jobs: number;
   max_repair_workers: number;
   max_extract_workers: number;
+  password_file: string;
+  encrypted_action: string;
   scripts_dir: string;
   script_success: string;
   script_failure: string;
@@ -882,6 +886,23 @@ function emptyCategory(): CategoryConfig {
           </div>
 
           <div class="panel">
+            <h3>Archive passwords</h3>
+            <div class="body">
+              <div class="form">
+                <label for="password-file">Password file</label>
+                <input id="password-file" type="text" [(ngModel)]="postprocForm.password_file" placeholder="(none)" />
+
+                <label for="encrypted-action">Encrypted RAR while downloading</label>
+                <select id="encrypted-action" [(ngModel)]="postprocForm.encrypted_action">
+                  <option value="ignore">Keep downloading</option>
+                  <option value="pause">Pause the job</option>
+                  <option value="abort">Fail the job</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
             <h3>Scripts</h3>
             <div class="body">
               <div class="form">
@@ -915,7 +936,7 @@ function emptyCategory(): CategoryConfig {
               On success, .rar / .par2 are removed from the output directory. File-deletion rules
               (glob patterns and unwanted extensions) are set per category under
               <a (click)="tab = 'categories'" style="cursor:pointer">Categories</a>. On failure,
-              partial files are kept for retry.
+              partial files are deleted, except when only the archive password is missing.
             </div>
           </div>
 
@@ -2447,6 +2468,8 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
     max_post_processing_jobs: 2,
     max_repair_workers: 1,
     max_extract_workers: 1,
+    password_file: '',
+    encrypted_action: 'ignore',
     scripts_dir: '',
     script_success: '',
     script_failure: '',
@@ -2630,6 +2653,8 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
       max_post_processing_jobs: g.max_post_processing_jobs ?? p.max_post_processing_jobs,
       max_repair_workers: g.max_repair_workers ?? p.max_repair_workers,
       max_extract_workers: g.max_extract_workers ?? p.max_extract_workers,
+      password_file: g.password_file ?? '',
+      encrypted_action: g.encrypted_action ?? p.encrypted_action,
       scripts_dir: g.scripts_dir ?? '',
       script_success: g.script_success ?? '',
       script_failure: g.script_failure ?? '',
@@ -2689,6 +2714,8 @@ export class SettingsViewComponent implements OnInit, HasUnsavedChanges {
         max_post_processing_jobs: Number(f.max_post_processing_jobs),
         max_repair_workers: Number(f.max_repair_workers),
         max_extract_workers: Number(f.max_extract_workers),
+        password_file: f.password_file.trim(),
+        encrypted_action: f.encrypted_action,
         scripts_dir: f.scripts_dir.trim(),
         script_success: f.script_success.trim(),
         script_failure: f.script_failure.trim(),

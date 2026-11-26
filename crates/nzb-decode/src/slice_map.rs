@@ -124,8 +124,7 @@ impl SliceVerifier {
         };
         let end_g = self.file_bounds[file_index + 1];
         let (w0, w1) = (offset, offset + len);
-        for gi in start_g..end_g {
-            let cell = &mut self.cells[gi];
+        for (gi, cell) in self.cells.iter_mut().enumerate().take(end_g).skip(start_g) {
             if cell.state != SliceState::Unknown {
                 continue;
             }
@@ -285,6 +284,28 @@ mod tests {
             );
         }
         assert!(v.is_complete());
+    }
+
+    #[test]
+    fn multi_file_writes_return_global_indices() {
+        let (first, _) = one_file(250, 100); // global slices 0..3
+        let (second, _) = one_file(200, 100); // global slices 3..5
+        let (third, _) = one_file(150, 100); // global slices 5..7
+        let layout = SliceLayout {
+            slice_size: 100,
+            files: [first, second, third]
+                .into_iter()
+                .flat_map(|l| l.files)
+                .collect(),
+        };
+        let mut v = SliceVerifier::new(&layout);
+
+        // A middle file must report global indices and stop at its own bound.
+        assert_eq!(v.mark_written(1, 0, 200), vec![3, 4]);
+        // Neighbouring files are untouched by that write.
+        assert_eq!(v.mark_written(0, 0, 250), vec![0, 1, 2]);
+        assert_eq!(v.mark_written(2, 100, 50), vec![6]);
+        assert_eq!(v.mark_written(2, 0, 100), vec![5]);
     }
 
     #[test]

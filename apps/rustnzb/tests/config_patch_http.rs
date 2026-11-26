@@ -2,9 +2,17 @@
 
 mod support;
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwap;
+use nzb_web::auth::{CredentialStore, TokenStore};
 use nzb_web::nzb_core::config::AppConfig;
+use nzb_web::nzb_core::db::Database;
 use nzb_web::nzb_core::overrides::{OverrideSet, OverrideSource, OverrideValue};
+use nzb_web::{AppState, LogBuffer, QueueManager};
 use reqwest::StatusCode;
+use rustnzb::server::{build_router, into_make_service};
 use support::start_test_server_with_overrides;
 
 async fn access_token(client: &reqwest::Client, base_url: &str) -> String {
@@ -431,5 +439,147 @@ async fn loopback_port_change_does_not_need_exposure_confirm() {
             .general
             .listen_addr,
         "0.0.0.0"
+    );
+}
+
+/// A server that records each connection's peer address (`ConnectInfo`), so
+/// the step-up throttle sees a client and `X-Forwarded-For` is honoured.
+/// Served through `into_make_service`, as the real server is.
+struct PeerApp {
+    base_url: String,
+    state: Arc<AppState>,
+    _tmp: tempfile::TempDir,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PeerApp {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn start_peer_app() -> PeerApp {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    let mut config = AppConfig::default();
+    // The test client connects from 127.0.0.1, so trusting the loopback range
+    // lets each request name its own client through `X-Forwarded-For`.
+    config.general.trusted_proxies = vec!["127.0.0.0/8".into(), "::1".into()];
+    config.save(&config_path).unwrap();
+    let logs = LogBuffer::new();
+    let queue = QueueManager::new(
+        Vec::new(),
+        Database::open_memory().unwrap(),
+        tmp.path().join("incomplete"),
+        tmp.path().join("complete"),
+        logs.clone(),
+        config.general.max_active_downloads,
+        config.categories.clone(),
+        config.general.min_free_space_bytes,
+        config.general.speed_limit_bps,
+        false,
+        config.general.max_nested_archive_depth,
+        config.general.abort_hopeless,
+        config.general.early_failure_check,
+        config.general.required_completion_pct,
+        config.general.article_timeout_secs,
+    );
+    let state = Arc::new(AppState::new(
+        Arc::new(ArcSwap::from_pointee(config)),
+        config_path,
+        queue,
+        logs,
+        Arc::new(TokenStore::new()),
+        Arc::new(CredentialStore::new(tmp.path().to_path_buf())),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let router_state = state.clone();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, into_make_service(build_router(router_state)))
+            .await
+            .unwrap();
+    });
+    PeerApp {
+        base_url,
+        state,
+        _tmp: tmp,
+        handle,
+    }
+}
+
+/// One wrong-confirm-password PATCH of a sensitive setting from `client_ip`,
+/// returning how long the answer was held.
+async fn wrong_confirm(app: &PeerApp, token: &str, tag: &str, client_ip: &'static str) -> Duration {
+    let started = Instant::now();
+    let response = reqwest::Client::new()
+        .patch(format!("{}/api/config", app.base_url))
+        .bearer_auth(token)
+        .header(reqwest::header::IF_MATCH, tag)
+        .header("X-Forwarded-For", client_ip)
+        .header("X-Confirm-Password", "not-the-password")
+        .json(&serde_json::json!({
+            "settings": { "general.data_dir": "/tmp/rustnzb-patch-per-client" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN, "{client_ip}");
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(error_kind(&body), "step_up_required");
+    started.elapsed()
+}
+
+#[tokio::test]
+async fn wrong_confirm_password_is_throttled_per_client_not_globally() {
+    let app = start_peer_app().await;
+    let client = reqwest::Client::new();
+    let token = access_token(&client, &app.base_url).await;
+    let tag = etag(&client, &app.base_url, &token).await;
+
+    let a = std::net::IpAddr::from([203, 0, 113, 1]);
+    let b = std::net::IpAddr::from([203, 0, 113, 2]);
+
+    // Client A burns three attempts. Each failure doubles the hold from the
+    // 500 ms base, so A is now firmly throttled.
+    for _ in 0..3 {
+        wrong_confirm(&app, &token, &tag, "203.0.113.1").await;
+    }
+    assert_eq!(
+        app.state.credential_store.failed_attempts(a),
+        3,
+        "A's failures must be counted against A"
+    );
+
+    // Client B is a different address and has made no attempt: it must not
+    // inherit A's count, and its first wrong password is held for the base
+    // delay only, never for A's accumulated hold.
+    assert_eq!(
+        app.state.credential_store.failed_attempts(b),
+        0,
+        "B must start with no failures"
+    );
+    let held = wrong_confirm(&app, &token, &tag, "203.0.113.2").await;
+    assert!(
+        held < Duration::from_millis(1500),
+        "B must not inherit A's throttle, held {held:?}"
+    );
+    assert_eq!(
+        app.state.credential_store.failed_attempts(b),
+        1,
+        "B's own wrong password is counted against B"
+    );
+    assert_eq!(
+        app.state.credential_store.failed_attempts(a),
+        3,
+        "B's attempt must not touch A's bucket"
+    );
+
+    // A's next attempt is still held far longer than B's first: the buckets
+    // really are separate.
+    let held = wrong_confirm(&app, &token, &tag, "203.0.113.1").await;
+    assert!(
+        held >= Duration::from_secs(2),
+        "A must stay throttled after exhausting its attempts, held {held:?}"
     );
 }

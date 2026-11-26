@@ -39,6 +39,7 @@ describe('HistoryViewComponent', () => {
   };
   let confirm: { confirm: ReturnType<typeof vi.fn> };
   let announcer: AnnouncerService;
+  let dialog: { open: ReturnType<typeof vi.fn> };
   let component: HistoryViewComponent;
 
   beforeEach(() => {
@@ -56,11 +57,13 @@ describe('HistoryViewComponent', () => {
     snack = { open: vi.fn(), success: vi.fn(), info: vi.fn(), error: vi.fn(), undo: vi.fn() };
     confirm = { confirm: vi.fn(() => of(true)) };
     announcer = new AnnouncerService();
+    dialog = { open: vi.fn(() => ({ afterClosed: () => of(null) })) };
     component = new HistoryViewComponent(
       api as unknown as ApiService,
       snack as never,
       confirm as never,
       announcer,
+      dialog as never,
     );
   });
 
@@ -88,6 +91,17 @@ describe('HistoryViewComponent', () => {
     expect(
       component.clientRemovalText({ removed_by: 'Radarr', removed_at: 'not a date', files_deleted: false }),
     ).toBe('by Radarr, not a date');
+  });
+
+  it('retries with the archive password entered in the dialog', () => {
+    dialog.open.mockReturnValue({ afterClosed: () => of(' pass word ') });
+    component.retryWithPassword(entry({ status: 'failed' }));
+    expect(api.post).toHaveBeenCalledWith('/history/history-1/retry', { password: ' pass word ' });
+  });
+
+  it('does not retry when the archive password dialog is cancelled', () => {
+    component.retryWithPassword(entry({ status: 'failed' }));
+    expect(api.post).not.toHaveBeenCalled();
   });
 
   it('skips background polls while the tab is hidden', () => {
