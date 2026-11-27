@@ -31,13 +31,15 @@ target=x86_64-unknown-linux-musl
 
 if [ -z "$binary" ]; then
     . "$(dirname "$0")/auditable"
-    trap cleanup_task_frontend EXIT
     task_start smoke-artifacts cargo cargo-zigbuild npm curl xz
     task_target_dir smoke-artifacts
     ensure_frontend
     install_cargo_auditable
+    # Mirrors the shipped musl binary, the Dockerfile image build (its
+    # RELEASE_OPTIMIZED profile: LTO=thin, CGU=1, strip=symbols), not
+    # build-linux's fat-LTO profile. Release builds are the tag builds here.
     if [ -n "${CI_COMMIT_TAG:-}" ]; then
-        export CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols
+        export CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols
     fi
     auditable_cargo zigbuild --release --locked -p rustnzb \
         --features webdav,vendored-openssl --target "$target"
@@ -56,6 +58,11 @@ cleanup_smoke() {
     [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
     [ -z "$pid" ] || wait "$pid" 2>/dev/null || true
     rm -rf "$work"
+    # A self-built frontend dist; the function exists only when `auditable`
+    # was sourced (the prebuilt-binary path never does).
+    if command -v cleanup_task_frontend >/dev/null 2>&1; then
+        cleanup_task_frontend
+    fi
 }
 trap cleanup_smoke EXIT
 mkdir -p "$work/data" "$work/home"

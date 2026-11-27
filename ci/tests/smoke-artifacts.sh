@@ -35,5 +35,13 @@ expect_fail exits-early sh "$task" "$work/dies"
 RUSTNZB_SMOKE_LOCK_TIMEOUT=abc expect_fail bad-lock-timeout sh "$task" "$work/silent"
 RUSTNZB_SMOKE_ATTEMPTS=-1 expect_fail bad-attempts sh "$task" "$work/silent"
 
+# The EXIT trap must still run the self-built frontend cleanup.
+if grep -q 'command -v cleanup_task_frontend' "$task" && ! grep -q '^    trap cleanup_task_frontend' "$task"; then
+    printf 'ok   cleanup-calls-frontend-cleanup\n'
+else
+    printf 'FAIL cleanup-calls-frontend-cleanup\n' >&2
+    fails=$((fails + 1))
+fi
+
 [ "$fails" -eq 0 ] || exit 1
 printf 'smoke-artifacts tests passed\n'
