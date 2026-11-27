@@ -153,7 +153,9 @@ repeats). The Windows socket-shutdown BrokenPipe mapping (Rust 1.97) and the
 Debug-escape check (Rust 1.98) are not automated. Revisit when a Windows runner
 exists.
 
-Also still open from #326: a panic/backtrace symbol check needs a product hook.
+The panic/backtrace symbol check is deliberately not automated: the shipped
+binary carries no test-only panic code (operator decision, WI-4855) and the
+release binary is stripped.
 
 ### Concurrency
 
