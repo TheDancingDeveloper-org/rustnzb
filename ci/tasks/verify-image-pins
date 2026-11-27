@@ -49,6 +49,12 @@ promote_cross=$(sed -n 's/^[[:space:]]*CROSS_IMAGE:[[:space:]]*//p' "$promote")
     exit 1
 }
 
+# The cross image is pinned only in the lock, never by a repo variable.
+if grep -Fq 'RUSTNZB_CROSS_IMAGE' "$REPO_ROOT"/.github/workflows/*.yml; then
+    printf '.github/workflows references RUSTNZB_CROSS_IMAGE; read CROSS_IMAGE from ci/images.lock\n' >&2
+    exit 1
+fi
+
 # (3) ci/run still reads the lock.
 for needle in ci/images.lock CORE_IMAGE CROSS_IMAGE E2E_IMAGE DESKTOP_IMAGE; do
     grep -Fq "$needle" "$REPO_ROOT/ci/run" || {

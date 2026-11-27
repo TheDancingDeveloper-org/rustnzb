@@ -12,8 +12,7 @@ name: Release dry run
 #
 # The build steps and the artefact names must stay in step with the
 # `release-assets` job in `.github/workflows/release.yml`. `CROSS_IMAGE` is
-# `vars.RUSTNZB_CROSS_IMAGE`, the same variable that job uses. The job is
-# skipped when that variable is unset.
+# read from ci/images.lock, as in that job.
 
 on:
   pull_request:
@@ -81,15 +80,14 @@ jobs:
     # The build authenticates to repo.indexarr.net with FORGEJO_CARGO_TOKEN.
     # A fork's PR run does not receive secrets, so it cannot run this job.
     if: >-
-      vars.RUSTNZB_CROSS_IMAGE != '' &&
-      (github.event_name != 'pull_request' ||
-       github.event.pull_request.head.repo.full_name == github.repository)
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, docker, publish]
     timeout-minutes: 120
-    env:
-      CROSS_IMAGE: ${{ vars.RUSTNZB_CROSS_IMAGE }}
     steps:
       - uses: actions/checkout@v7
+      - name: Read CROSS_IMAGE from ci/images.lock
+        run: printf 'CROSS_IMAGE=%s\n' "$(sh ci/image-from-lock CROSS_IMAGE)" >>"$GITHUB_ENV"
       - name: Authenticate to Docker Hub (higher pull rate limit for base images)
         uses: docker/login-action@v4
         with:

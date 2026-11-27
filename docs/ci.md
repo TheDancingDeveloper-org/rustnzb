@@ -119,6 +119,8 @@ The tag it builds is derived from the workspace version (`v<version>`), so the
 dry run validates packaging against the version a release would ship. The
 `CROSS_IMAGE` digest must stay in step with `release.yml`; a comment in each
 file names the other.
+The cross image pin lives only in `ci/images.lock`; the release workflows read
+it with `ci/image-from-lock`, and `verify-image-pins` rejects `vars.RUSTNZB_CROSS_IMAGE`.
 
 PR runs of the dry run are limited to branches in this repository, because the
 build authenticates to `repo.indexarr.net` with `FORGEJO_CARGO_TOKEN`, which a
