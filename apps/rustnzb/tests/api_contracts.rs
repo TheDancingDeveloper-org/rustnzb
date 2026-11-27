@@ -2487,3 +2487,102 @@ async fn optional_login_checks_the_host_before_waiving_a_set_login() {
     assert_eq!(status_of(queue("nzb.example.com")).await, 200);
     assert_eq!(status_of(queue("localhost")).await, 200);
 }
+
+/// Fetches the effective-config ETag that `PATCH /api/config` needs.
+async fn effective_etag(
+    client: &reqwest::Client,
+    app: &ContractApp,
+    bearer: Option<&str>,
+) -> String {
+    let mut request = client.get(format!("{}/api/config/effective", app.base_url));
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .expect("ETag")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// `PATCH /api/config` with a registry-sensitive key.
+fn patch_sensitive(
+    client: &reqwest::Client,
+    app: &ContractApp,
+    tag: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .patch(format!("{}/api/config", app.base_url))
+        .header(reqwest::header::IF_MATCH, tag)
+        .json(&serde_json::json!({
+            "settings": { "general.local_import_dir": "/tmp/rn-patch-import" }
+        }))
+}
+
+#[tokio::test]
+async fn patch_config_sensitive_key_needs_no_password_while_login_is_off() {
+    // No credentials stored, login optional: there is no password to confirm,
+    // so a sensitive key is saved without `X-Confirm-Password`.
+    let client = reqwest::Client::new();
+    let app = start_app_with(false, optional_login).await;
+    let tag = effective_etag(&client, &app, None).await;
+    let (status, body) = call(patch_sensitive(&client, &app, &tag)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["applied"][0], "general.local_import_dir", "{body}");
+    assert_eq!(
+        app.state.config().general.local_import_dir.as_deref(),
+        Some(std::path::Path::new("/tmp/rn-patch-import"))
+    );
+}
+
+#[tokio::test]
+async fn patch_config_wrong_confirm_password_is_refused_and_throttled() {
+    let app = start_app(true).await;
+    let client = client_from([127, 0, 0, 1]);
+    let (access, _) = login(&app, &client).await;
+    let tag = effective_etag(&client, &app, Some(&access)).await;
+    let before = app.state.config().general.local_import_dir.clone();
+    for expected in 1..=2 {
+        let (status, body) = call(
+            patch_sensitive(&client, &app, &tag)
+                .bearer_auth(&access)
+                .header("X-Confirm-Password", "wrong"),
+        )
+        .await;
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(body["error_kind"], "step_up_required", "{body}");
+        assert_eq!(failures(&app, [127, 0, 0, 1]), expected);
+    }
+    assert_eq!(app.state.config().general.local_import_dir, before);
+    // The right password is accepted and clears the count.
+    let (status, body) = call(
+        patch_sensitive(&client, &app, &tag)
+            .bearer_auth(&access)
+            .header("X-Confirm-Password", "password"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(failures(&app, [127, 0, 0, 1]), 0);
+}
+
+#[tokio::test]
+async fn patch_config_non_sensitive_key_needs_no_step_up() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let (access, _) = login(&app, &client).await;
+    let tag = effective_etag(&client, &app, Some(&access)).await;
+    let (status, body) = call(
+        client
+            .patch(format!("{}/api/config", app.base_url))
+            .bearer_auth(&access)
+            .header(reqwest::header::IF_MATCH, &tag)
+            .json(&serde_json::json!({"settings": {"general.history_retention": 7}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["applied"][0], "general.history_retention", "{body}");
+}
