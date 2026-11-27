@@ -202,19 +202,18 @@ jobs:
 
   release-assets:
     needs: verify-release-ref
-    if: vars.RUSTNZB_CROSS_IMAGE != ''
     permissions:
       contents: write
       # Keyless signing and build-provenance / SBOM attestations use this job's OIDC token.
       id-token: write
       attestations: write
     runs-on: [self-hosted, docker, publish]
-    env:
-      # Keep in step with `.github/workflows/release-dry-run.yml`, which mirrors
-      # this build without publishing.
-      CROSS_IMAGE: ${{ vars.RUSTNZB_CROSS_IMAGE }}
+    # Keep in step with `.github/workflows/release-dry-run.yml`, which mirrors
+    # this build without publishing. CROSS_IMAGE comes from ci/images.lock.
     steps:
       - uses: actions/checkout@v7
+      - name: Read CROSS_IMAGE from ci/images.lock
+        run: printf 'CROSS_IMAGE=%s\n' "$(sh ci/image-from-lock CROSS_IMAGE)" >>"$GITHUB_ENV"
       - name: Build Linux, arm64, Windows, and package artifacts
         env:
           GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}

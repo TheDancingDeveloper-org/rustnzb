@@ -56,6 +56,10 @@ sed -i "s/^\( *CROSS_IMAGE: .*\)@sha256:.*/\1@sha256:$bad/" "$work/t/.github/wor
 expect 'promote-release digest drift fails' fail
 
 fresh
+printf 'x:\n  env:\n    CROSS_IMAGE: ${{ vars.RUSTNZB_CROSS_IMAGE }}\n' >"$work/t/.github/workflows/zz.yml"
+expect 'RUSTNZB_CROSS_IMAGE variable reference fails' fail
+
+fresh
 printf 'x:\n  image: foo/bar:1.2\n' >"$work/t/.github/workflows/zz.yml"
 expect 'mutable workflow image fails' fail
 

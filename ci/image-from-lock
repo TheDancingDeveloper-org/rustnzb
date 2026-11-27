@@ -1,0 +1,19 @@
+#!/bin/sh
+# Print the value of KEY (default CROSS_IMAGE) from ci/images.lock. For
+# CROSS_IMAGE, fail unless it is a digest-pinned rustnzb-ci-cross reference.
+# Usage: ci/image-from-lock [KEY]
+set -eu
+key=${1:-CROSS_IMAGE}
+case "$key" in
+    *[!A-Z0-9_]*|'') printf 'invalid key: %s\n' "$key" >&2; exit 2 ;;
+esac
+lock=$(dirname "$0")/images.lock
+value=$(sed -n "s/^$key=//p" "$lock")
+if [ "$key" = CROSS_IMAGE ]; then
+    printf '%s\n' "$value" | grep -Eq '^repo\.indexarr\.net/indexarr/rustnzb-ci-cross@sha256:[0-9a-f]{64}$' || {
+        printf 'CROSS_IMAGE in ci/images.lock is not a pinned cross image\n' >&2
+        exit 1
+    }
+fi
+[ -n "$value" ] || { printf '%s not found in ci/images.lock\n' "$key" >&2; exit 1; }
+printf '%s\n' "$value"
