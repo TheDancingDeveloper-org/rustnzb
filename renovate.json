@@ -8,5 +8,13 @@
   ],
   "schedule": [
     "before 6am on Monday"
+  ],
+  "packageRules": [
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "minimumReleaseAge": "7 days"
+    }
   ]
 }
