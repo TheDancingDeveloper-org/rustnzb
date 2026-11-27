@@ -213,7 +213,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Read CROSS_IMAGE from ci/images.lock
-        run: printf 'CROSS_IMAGE=%s\n' "$(sh ci/image-from-lock CROSS_IMAGE)" >>"$GITHUB_ENV"
+        run: |
+          set -euo pipefail
+          value=$(sh ci/image-from-lock CROSS_IMAGE)
+          printf 'CROSS_IMAGE=%s\n' "$value" >>"$GITHUB_ENV"
       - name: Build Linux, arm64, Windows, and package artifacts
         env:
           GIT_AUTH_TOKEN: ${{ secrets.FORGEJO_CARGO_TOKEN }}
