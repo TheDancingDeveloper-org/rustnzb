@@ -9,11 +9,15 @@ case "$key" in
 esac
 lock=$(dirname "$0")/images.lock
 value=$(sed -n "s/^$key=//p" "$lock")
+[ -n "$value" ] || { printf '%s not found in ci/images.lock\n' "$key" >&2; exit 1; }
+[ "$(printf '%s\n' "$value" | wc -l)" -eq 1 ] || {
+    printf '%s appears more than once in ci/images.lock\n' "$key" >&2
+    exit 1
+}
 if [ "$key" = CROSS_IMAGE ]; then
     printf '%s\n' "$value" | grep -Eq '^repo\.indexarr\.net/indexarr/rustnzb-ci-cross@sha256:[0-9a-f]{64}$' || {
         printf 'CROSS_IMAGE in ci/images.lock is not a pinned cross image\n' >&2
         exit 1
     }
 fi
-[ -n "$value" ] || { printf '%s not found in ci/images.lock\n' "$key" >&2; exit 1; }
 printf '%s\n' "$value"

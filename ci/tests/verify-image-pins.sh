@@ -63,5 +63,43 @@ fresh
 printf 'x:\n  image: foo/bar:1.2\n' >"$work/t/.github/workflows/zz.yml"
 expect 'mutable workflow image fails' fail
 
+# image-from-lock: runs against a temp copy of the lock.
+ifl() {
+    mkdir -p "$work/l"
+    cp "$ROOT/ci/image-from-lock" "$work/l/image-from-lock"
+    cp "$ROOT/ci/images.lock" "$work/l/images.lock"
+}
+ifl_expect() {
+    name=$1
+    want=$2
+    status=0
+    sh "$work/l/image-from-lock" CROSS_IMAGE >/dev/null 2>&1 || status=$?
+    if { [ "$want" = pass ] && [ "$status" -eq 0 ]; } || { [ "$want" = fail ] && [ "$status" -ne 0 ]; }; then
+        printf 'ok   %s\n' "$name"
+    else
+        printf 'FAIL %s (status %s)\n' "$name" "$status"
+        fails=$((fails + 1))
+    fi
+}
+
+ifl
+ifl_expect 'image-from-lock: real lock passes' pass
+
+ifl
+grep '^CROSS_IMAGE=' "$work/l/images.lock" >"$work/l/dup"; cat "$work/l/dup" >>"$work/l/images.lock"
+ifl_expect 'image-from-lock: duplicate key fails' fail
+
+ifl
+sed -i "s/^\(CROSS_IMAGE=.*@sha256:\).*/\1$bad-x/" "$work/l/images.lock"
+ifl_expect 'image-from-lock: malformed digest fails' fail
+
+ifl
+sed -i 's/^CROSS_IMAGE=.*/CROSS_IMAGE=/' "$work/l/images.lock"
+ifl_expect 'image-from-lock: empty value fails' fail
+
+ifl
+sed -i '/^CROSS_IMAGE=/d' "$work/l/images.lock"
+ifl_expect 'image-from-lock: missing key fails' fail
+
 [ "$fails" -eq 0 ] || exit 1
 printf 'verify-image-pins tests passed\n'
