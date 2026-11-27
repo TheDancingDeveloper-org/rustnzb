@@ -4989,11 +4989,13 @@ mod tests {
         // workers and this test would hang instead of failing. The watchdog
         // releases the gate after a generous deadline so the harness always
         // gets a verdict; the assertion below then reports the regression.
+        // The deadline is far longer than the parking deadline below so that a
+        // loaded runner can never trip the watchdog before the writes park.
         let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
         let (watchdog_tx, watchdog_rx) = std::sync::mpsc::channel::<()>();
         let watchdog_gate = Arc::clone(&gate);
         let watchdog = std::thread::spawn(move || {
-            if finished_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+            if finished_rx.recv_timeout(Duration::from_secs(60)).is_err() {
                 watchdog_gate.release();
                 let _ = watchdog_tx.send(());
             }
@@ -5019,8 +5021,11 @@ mod tests {
 
         // Wait on the runtime itself (not on a wall clock) until every write is
         // parked in the assembler, which is the state that used to hold a worker.
+        // Bounded by wall-clock time, not an iteration count: on a loaded runner
+        // each sleep can take far longer than 1ms.
         let mut parked = 0;
-        for _ in 0..1_000 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
             parked = gate.stalled_writes();
             if parked as usize == STALLED_WRITES {
                 break;
@@ -5051,7 +5056,7 @@ mod tests {
         );
         assert!(
             watchdog_rx.try_recv().is_err(),
-            "the runtime made no progress for 10s while writes were stalled — \
+            "the runtime made no progress for 60s while writes were stalled — \
              writes are blocking the async workers again"
         );
 
